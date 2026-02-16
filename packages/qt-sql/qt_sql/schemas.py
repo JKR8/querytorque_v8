@@ -116,12 +116,18 @@ class BenchmarkConfig:
     semantic_sample_pct: float = 2.0  # TABLESAMPLE percentage
     semantic_timeout_ms: int = 30_000  # 30s max per mini query
 
-    # Tiered patch mode (analyst + worker split)
+    # Tiered patch mode (analyst + worker split) — legacy, maps to focused
     tiered_patch_enabled: bool = False
     analyst_model: str = "deepseek/deepseek-r1"
     worker_model: str = "qwen/qwen3-coder"
     target_speedup: float = 100.0
     snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
+
+    # Beam mode routing
+    beam_mode: str = "auto"       # "auto" | "wide" | "focused"
+    wide_max_probes: int = 16     # Max probes for wide mode
+    focused_max_sorties: int = 5  # Max sorties for focused mode
+    wide_worker_model: Optional[str] = None  # Override worker model for wide (default: use worker_model)
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -151,6 +157,10 @@ class BenchmarkConfig:
             worker_model=data.get("worker_model", "qwen/qwen3-coder"),
             target_speedup=data.get("target_speedup", 100.0),
             snipe_rounds=data.get("snipe_rounds", 2),
+            beam_mode=data.get("beam_mode", "auto"),
+            wide_max_probes=data.get("wide_max_probes", 16),
+            focused_max_sorties=data.get("focused_max_sorties", 5),
+            wide_worker_model=data.get("wide_worker_model", None),
         )
 
 

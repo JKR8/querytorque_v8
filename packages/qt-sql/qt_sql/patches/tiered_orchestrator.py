@@ -1,7 +1,7 @@
-"""Tiered orchestrator: Analyst (DeepSeek) → Worker (qwen) patch pipeline.
+"""Orchestrator: Analyst → Worker patch pipeline.
 
-DeepSeek outputs structural targets (IR node maps).
-qwen converts each target into an executable PatchPlan JSON.
+Analyst outputs structural targets (IR node maps).
+Workers convert each target into an executable PatchPlan JSON.
 Patch engine applies plans to IR. Unchanged validation downstream.
 """
 
@@ -15,65 +15,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
-
-
-# ── Worker Roles & Routing ────────────────────────────────────────────────
-
-WORKER_ROLES: Dict[str, Dict[str, Any]] = {
-    "W1": {
-        "key": "W1",
-        "name": "Reducer",
-        "families": ["A", "D"],
-        "focus": "Cardinality reduction — WHERE filters, set operations, early pruning",
-        "description": (
-            "Reduce row counts early: push predicates into CTEs, convert set "
-            "operations to EXISTS/NOT EXISTS, apply early filtering before "
-            "expensive joins."
-        ),
-    },
-    "W2": {
-        "key": "W2",
-        "name": "Unnester",
-        "families": ["B", "C"],
-        "focus": "Logic simplification — decorrelation, aggregation pushdown",
-        "description": (
-            "Eliminate per-row re-execution: convert correlated subqueries to "
-            "GROUP BY CTEs, push aggregation before joins when GROUP BY keys "
-            "⊇ join keys."
-        ),
-    },
-    "W3": {
-        "key": "W3",
-        "name": "Builder",
-        "families": ["F", "E"],
-        "focus": "Structural optimization — join restructuring, materialization",
-        "description": (
-            "Restructure join topology and materialize repeated work: convert "
-            "comma joins to explicit INNER JOIN, extract shared scans into "
-            "CTEs, prefetch dimension tables."
-        ),
-    },
-    "W4": {
-        "key": "W4",
-        "name": "Wildcard",
-        "families": [],  # Dynamic — assigned the #1 priority target
-        "focus": "Deep specialist for the #1 identified problem",
-        "description": (
-            "Focus entirely on the highest-priority optimization target. May "
-            "combine strategies from multiple families or try novel approaches "
-            "not covered by other workers."
-        ),
-    },
-}
-
-FAMILY_TO_WORKER: Dict[str, str] = {
-    "A": "W1",
-    "D": "W1",
-    "B": "W2",
-    "C": "W2",
-    "F": "W3",
-    "E": "W3",
-}
 
 
 @dataclass
@@ -140,14 +81,14 @@ class TieredOrchestrator:
         explain_text: str,
         ir_node_map: str,
     ) -> Tuple[List[AnalystTarget], str, str]:
-        """Build tiered analyst prompt, call DeepSeek, parse response into targets.
+        """Build reasoning prompt, call R1, parse response into targets.
 
         Returns:
             (targets, prompt, response) — parsed targets, raw prompt, raw response.
         """
-        from .beam_prompt_builder import build_beam_prompt_tiered
+        from .beam_prompt_builder import build_reasoning_prompt
 
-        prompt = build_beam_prompt_tiered(
+        prompt = build_reasoning_prompt(
             query_id=query_id,
             original_sql=original_sql,
             explain_text=explain_text,
@@ -158,17 +99,17 @@ class TieredOrchestrator:
         )
 
         logger.info(
-            f"[{query_id}] Tiered analyst prompt: {len(prompt)} chars"
+            f"[{query_id}] Reasoning prompt: {len(prompt)} chars"
         )
 
         response = self.analyst_call_fn(prompt)
         logger.info(
-            f"[{query_id}] Tiered analyst response: {len(response)} chars"
+            f"[{query_id}] Reasoning response: {len(response)} chars"
         )
 
         targets = self._parse_analyst_response(response)
         logger.info(
-            f"[{query_id}] Parsed {len(targets)} analyst targets"
+            f"[{query_id}] Parsed {len(targets)} targets"
         )
 
         return targets, prompt, response
@@ -180,21 +121,12 @@ class TieredOrchestrator:
         targets: List[AnalystTarget],
         script_ir: Any,
         dialect_enum: Any,
-        force_full_roster: bool = False,
     ) -> Tuple[List["AppliedPatch"], int, List[AnalystTarget]]:
         """Call workers in parallel (one per target). Apply each patch.
 
-        Workers are routed to specialized roles based on target family:
-        - W4 "Wildcard": always gets the #1 target (highest relevance)
-        - W1 "Reducer" (A/D), W2 "Unnester" (B/C), W3 "Builder" (F/E)
-
-        Args:
-            force_full_roster: If True, create synthetic targets to fill
-                all 4 worker slots when analyst produces fewer than 4.
-
         Returns:
             (patches, n_api_calls, all_targets) — applied patches, LLM call
-            count, and all assigned targets (including synthetic/AST).
+            count, and all targets.
         """
         from .beam_prompt_builder import build_worker_patch_prompt
         from ..sessions.beam_session import AppliedPatch
@@ -204,11 +136,7 @@ class TieredOrchestrator:
         api_call_count = [0]  # mutable for thread-safe increment
         api_lock = threading.Lock()
 
-        assignments = self._assign_workers(targets, force_full_roster=force_full_roster)
-
-        def process_assignment(
-            target: AnalystTarget, worker_role: Dict[str, Any]
-        ) -> AppliedPatch:
+        def process_target(target: AnalystTarget) -> AppliedPatch:
             patch = AppliedPatch(
                 patch_id=target.target_id,
                 family=target.family,
@@ -216,9 +144,9 @@ class TieredOrchestrator:
                 relevance_score=target.relevance_score,
             )
 
-            # Find gold patch plan(s) from recommended examples
-            gold_patches = self._find_all_gold_patches(target)
-            if not gold_patches:
+            # Find gold patch plan from recommended examples
+            gold_patch = self._find_gold_patch(target)
+            if not gold_patch:
                 patch.apply_error = (
                     f"No gold patch plan found for examples: "
                     f"{target.recommended_examples}"
@@ -226,36 +154,14 @@ class TieredOrchestrator:
                 patch.status = "FAIL"
                 return patch
 
-            # Build worker prompt with role context
-            # Primary gold plan for the template
-            gold_patch = gold_patches[0]
             worker_prompt = build_worker_patch_prompt(
                 original_sql=original_sql,
                 ir_node_map=ir_node_map,
                 target=target.to_dict(),
                 gold_patch_plan=gold_patch,
                 dialect=self.dialect,
-                worker_role=worker_role,
             )
 
-            # For compound families, append additional gold examples
-            if len(gold_patches) > 1:
-                extra_lines = [
-                    "\n## Additional Gold Examples (for compound strategy)\n"
-                ]
-                for i, extra_plan in enumerate(gold_patches[1:], 2):
-                    extra_lines.append(f"**Gold Example {i}:**")
-                    extra_lines.append("```json")
-                    extra_lines.append(json.dumps(extra_plan, indent=2))
-                    extra_lines.append("```\n")
-                extra_lines.append(
-                    "Combine techniques from ALL gold examples above "
-                    "into a single unified patch plan."
-                )
-                worker_prompt += "\n".join(extra_lines)
-
-            # Capture worker role for logging
-            patch.worker_role = worker_role.get("key", "?")
             patch.worker_prompt = worker_prompt
 
             # Call worker LLM
@@ -278,10 +184,10 @@ class TieredOrchestrator:
             )
 
         # Run workers in parallel
-        with ThreadPoolExecutor(max_workers=len(assignments) or 1) as pool:
+        with ThreadPoolExecutor(max_workers=len(targets) or 1) as pool:
             futures = {
-                pool.submit(process_assignment, target, role): target
-                for target, role in assignments
+                pool.submit(process_target, target): target
+                for target in targets
             }
             for future in as_completed(futures):
                 target = futures[future]
@@ -302,11 +208,10 @@ class TieredOrchestrator:
                     ))
 
         # Sort by original target order
-        all_targets = [t for t, _role in assignments]
-        target_order = {t.target_id: i for i, t in enumerate(all_targets)}
+        target_order = {t.target_id: i for i, t in enumerate(targets)}
         results.sort(key=lambda p: target_order.get(p.patch_id, 99))
 
-        return results, api_call_count[0], all_targets
+        return results, api_call_count[0], targets
 
     def retry_worker(
         self,
@@ -328,18 +233,12 @@ class TieredOrchestrator:
         if not gold_patch:
             return None
 
-        # Derive worker role from family
-        primary_family = target.family.split("+")[0].strip()
-        worker_key = FAMILY_TO_WORKER.get(primary_family, "W3")
-        worker_role = WORKER_ROLES.get(worker_key)
-
         worker_prompt = build_worker_patch_prompt(
             original_sql=original_sql,
             ir_node_map=ir_node_map,
             target=target.to_dict(),
             gold_patch_plan=gold_patch,
             dialect=self.dialect,
-            worker_role=worker_role,
         )
 
         retry_prompt = build_worker_retry_prompt(worker_prompt, error)
@@ -386,17 +285,12 @@ class TieredOrchestrator:
         if not gold_patch:
             return None
 
-        primary_family = target.family.split("+")[0].strip()
-        worker_key = FAMILY_TO_WORKER.get(primary_family, "W3")
-        worker_role = WORKER_ROLES.get(worker_key)
-
         worker_prompt = build_worker_patch_prompt(
             original_sql=original_sql,
             ir_node_map=ir_node_map,
             target=target.to_dict(),
             gold_patch_plan=gold_patch,
             dialect=self.dialect,
-            worker_role=worker_role,
         )
 
         retry_prompt = build_worker_semantic_retry_prompt(
@@ -420,277 +314,7 @@ class TieredOrchestrator:
             patch, response, retry_prompt, script_ir, dialect_enum,
         )
 
-    def run_snipe(
-        self,
-        query_id: str,
-        original_sql: str,
-        explain_text: str,
-        ir_node_map: str,
-        patches: List[Any],
-        patch_explains: Dict[str, str],
-        all_prior_iterations: Optional[List[List[Any]]] = None,
-        iteration: int = 1,
-    ) -> Tuple[List[AnalystTarget], str, str]:
-        """Build snipe prompt from benchmark results, call analyst, parse targets.
-
-        Args:
-            query_id: Query identifier.
-            original_sql: Full original SQL.
-            explain_text: EXPLAIN text for original query.
-            ir_node_map: IR node map.
-            patches: Patches from the LATEST iteration (for detailed view).
-            patch_explains: EXPLAIN texts for latest iteration's patches.
-            all_prior_iterations: ALL prior iteration patch lists (for history table).
-            iteration: Current iteration number (1-based: 1 = first snipe round).
-
-        Returns:
-            (targets, prompt, response) — parsed targets, raw prompt, raw response.
-        """
-        from .beam_prompt_builder import build_beam_tiered_snipe_prompt
-
-        prompt = build_beam_tiered_snipe_prompt(
-            query_id=query_id,
-            original_sql=original_sql,
-            explain_text=explain_text,
-            ir_node_map=ir_node_map,
-            all_5_examples=self.gold_examples,
-            dialect=self.dialect,
-            patches=patches,
-            patch_explains=patch_explains,
-            all_prior_iterations=all_prior_iterations,
-            iteration=iteration,
-        )
-
-        logger.info(
-            f"[{query_id}] Snipe prompt: {len(prompt)} chars"
-        )
-
-        response = self.analyst_call_fn(prompt)
-        logger.info(
-            f"[{query_id}] Snipe response: {len(response)} chars"
-        )
-
-        targets = self._parse_analyst_response(response)
-        logger.info(
-            f"[{query_id}] Parsed {len(targets)} snipe targets"
-        )
-
-        return targets, prompt, response
-
     # ── Internal helpers ──────────────────────────────────────────────────
-
-    # Default family + transform for each worker when creating synthetic targets
-    _WORKER_DEFAULTS: Dict[str, Tuple[str, str]] = {
-        "W1": ("A", "early_filter"),
-        "W2": ("B", "decorrelate"),
-        "W3": ("E", "materialize_cte"),
-    }
-
-    def _assign_workers(
-        self,
-        targets: List[AnalystTarget],
-        force_full_roster: bool = False,
-    ) -> List[Tuple[AnalystTarget, Dict[str, Any]]]:
-        """Assign targets to specialized workers via AST-anchored draft.
-
-        Draft algorithm:
-        1. W4 "Wildcard" gets the **AST top match** (guaranteed slot from
-           detection). If no AST match, falls back to analyst's #1 target.
-        2. ALL analyst targets route to family workers W1-W3:
-           - W1 "Reducer" (A, D)
-           - W2 "Unnester" (B, C)
-           - W3 "Builder" (F, E)
-        3. If a worker has multiple targets (e.g. both E and F → W3),
-           merge them into a compound target.
-        4. If force_full_roster is True and fewer than 4 workers assigned,
-           create synthetic targets for unfilled slots.
-
-        Returns:
-            List of (target, worker_role) tuples (max 4).
-        """
-        if not targets and not self.ast_top_match:
-            return []
-
-        sorted_targets = sorted(
-            targets, key=lambda t: t.relevance_score, reverse=True
-        )
-
-        assignments: List[Tuple[AnalystTarget, Dict[str, Any]]] = []
-
-        # W4 gets the AST top match (guaranteed detection-driven slot)
-        if self.ast_top_match:
-            ast_family = self.ast_top_match["family"]
-            ast_transform = self.ast_top_match["transform_id"]
-            ast_gap = self.ast_top_match.get("gap", "")
-
-            # Find gold example for this transform/family
-            family_ex = self.gold_examples.get(ast_family)
-            example_id = family_ex.get("id", ast_transform) if family_ex else ast_transform
-
-            # Check if analyst already produced a target for this exact transform
-            analyst_match = next(
-                (t for t in sorted_targets if t.transform == ast_transform),
-                None,
-            )
-            if analyst_match:
-                # Analyst already covers it — use the analyst's richer target
-                w4_target = analyst_match
-                logger.info(
-                    f"W4 Wildcard ← {w4_target.target_id} "
-                    f"(AST+analyst match: {ast_transform}, "
-                    f"family {ast_family})"
-                )
-                # Exclude matched target from family routing (W4 has it)
-                remaining = [t for t in sorted_targets if t is not analyst_match]
-            else:
-                # Create target from AST detection
-                ref_ir = sorted_targets[0].target_ir if sorted_targets else ""
-                w4_target = AnalystTarget(
-                    target_id="ast_w4",
-                    family=ast_family,
-                    transform=ast_transform,
-                    relevance_score=1.0,
-                    hypothesis=(
-                        f"AST detection: {ast_transform} "
-                        f"({self.ast_top_match['overlap']:.0%} overlap). "
-                        f"Engine gap: {ast_gap}."
-                    ),
-                    target_ir=ref_ir,
-                    recommended_examples=[example_id],
-                )
-                logger.info(
-                    f"W4 Wildcard ← ast_w4 (AST-driven: {ast_transform}, "
-                    f"family {ast_family}, "
-                    f"{self.ast_top_match['overlap']:.0%} overlap)"
-                )
-                # ALL analyst targets go to family workers
-                remaining = sorted_targets
-
-            assignments.append((w4_target, WORKER_ROLES["W4"]))
-        elif sorted_targets:
-            # No AST match — fall back to analyst's #1 target for W4
-            assignments.append((sorted_targets[0], WORKER_ROLES["W4"]))
-            logger.info(
-                f"W4 Wildcard ← {sorted_targets[0].target_id} "
-                f"(analyst #1, family {sorted_targets[0].family}, "
-                f"relevance {sorted_targets[0].relevance_score:.2f})"
-            )
-            remaining = sorted_targets[1:]
-        else:
-            remaining = []
-
-        # Group analyst targets by super-family worker
-        worker_groups: Dict[str, List[AnalystTarget]] = {}
-        for target in remaining:
-            primary_family = target.family.split("+")[0].strip()
-            worker_key = FAMILY_TO_WORKER.get(primary_family, "W3")
-            worker_groups.setdefault(worker_key, []).append(target)
-
-        # Create one assignment per worker group (W1, W2, W3 order)
-        assigned_workers: set = set()
-        for worker_key in ["W1", "W2", "W3"]:
-            group = worker_groups.get(worker_key)
-            if not group:
-                continue
-
-            if len(group) == 1:
-                merged = group[0]
-            else:
-                merged = self._merge_targets(group)
-
-            assignments.append((merged, WORKER_ROLES[worker_key]))
-            assigned_workers.add(worker_key)
-            logger.info(
-                f"{worker_key} {WORKER_ROLES[worker_key]['name']} ← "
-                f"{merged.target_id} (family {merged.family}, "
-                f"{len(group)} target(s))"
-            )
-
-        # Fill empty slots with synthetic targets on first iteration
-        if force_full_roster and len(assignments) < 4:
-            for worker_key in ["W1", "W2", "W3"]:
-                if worker_key in assigned_workers:
-                    continue
-                if len(assignments) >= 4:
-                    break
-                ref = sorted_targets[0] if sorted_targets else w4_target
-                synthetic = self._create_synthetic_target(worker_key, ref)
-                assignments.append((synthetic, WORKER_ROLES[worker_key]))
-                logger.info(
-                    f"{worker_key} {WORKER_ROLES[worker_key]['name']} ← "
-                    f"{synthetic.target_id} (SYNTHETIC, family {synthetic.family})"
-                )
-
-        return assignments[:4]
-
-    def _create_synthetic_target(
-        self, worker_key: str, reference_target: AnalystTarget,
-    ) -> AnalystTarget:
-        """Create a fallback target for an unfilled worker slot.
-
-        Uses the worker's default family/transform and borrows IR context
-        from the top analyst target so the worker has structural context.
-        """
-        family, transform = self._WORKER_DEFAULTS.get(worker_key, ("A", "early_filter"))
-        role = WORKER_ROLES[worker_key]
-
-        # Find a gold example ID for this family
-        family_ex = self.gold_examples.get(family)
-        example_id = family_ex.get("id", transform) if family_ex else transform
-
-        return AnalystTarget(
-            target_id=f"syn_{worker_key.lower()}",
-            family=family,
-            transform=transform,
-            relevance_score=0.3,
-            hypothesis=(
-                f"Synthetic target for {role['name']}: {role['focus']}. "
-                f"Apply {transform} patterns to the query."
-            ),
-            target_ir=reference_target.target_ir,
-            recommended_examples=[example_id],
-        )
-
-    @staticmethod
-    def _merge_targets(targets: List[AnalystTarget]) -> AnalystTarget:
-        """Merge multiple targets for the same super-family worker into one compound target.
-
-        The compound target has:
-        - family: unique families joined by "+" (e.g. "E+F", not "E+E")
-        - hypothesis: all hypotheses joined by " | "
-        - target_ir: all IRs joined by separator
-        - recommended_examples: deduplicated union
-        - relevance_score: max across targets
-        """
-        # Deduplicate families (e.g. two "B" targets → just "B", not "B+B")
-        seen_families: list = []
-        for t in targets:
-            for f in t.family.split("+"):
-                f = f.strip()
-                if f not in seen_families:
-                    seen_families.append(f)
-        family = "+".join(seen_families)
-
-        transforms = "+".join(t.transform for t in targets)
-        hypotheses = " | ".join(t.hypothesis for t in targets if t.hypothesis)
-        target_irs = "\n---\n".join(t.target_ir for t in targets if t.target_ir)
-
-        # Deduplicate examples preserving order
-        examples: list = []
-        for t in targets:
-            for ex in t.recommended_examples:
-                if ex not in examples:
-                    examples.append(ex)
-
-        return AnalystTarget(
-            target_id=targets[0].target_id,
-            family=family,
-            transform=transforms,
-            relevance_score=max(t.relevance_score for t in targets),
-            hypothesis=hypotheses,
-            target_ir=target_irs,
-            recommended_examples=examples,
-        )
 
     def _parse_analyst_response(self, response: str) -> List[AnalystTarget]:
         """Parse analyst JSON array (or individual objects) into AnalystTarget objects."""
@@ -810,7 +434,7 @@ class TieredOrchestrator:
                 patch.output_sql = result.output_sql
             else:
                 error_msg = (
-                    "; ".join(result.errors[:2])
+                    "; ".join(result.errors)
                     if result.errors
                     else "Unknown apply error"
                 )

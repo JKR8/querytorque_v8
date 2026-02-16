@@ -8,7 +8,6 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Shared application settings loaded from environment.
 
-    These settings are used by both qt-sql and qt-dax products.
     Product-specific settings should be defined in their respective packages.
     """
 

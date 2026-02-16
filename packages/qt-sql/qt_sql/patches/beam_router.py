@@ -1,18 +1,18 @@
-"""Beam workload router — classifies queries into wide or focused mode.
+"""Beam workload router — classifies queries into BEAM or REASONING mode.
 
 Routes based on baseline runtime:
-- HEAVY queries (top 20% that account for ~80% of total runtime) → beam_focused
-- LIGHT queries (remaining 80%) → beam_wide
+- HEAVY queries (top 20% that account for ~80% of total runtime) → REASONING (pure R1)
+- LIGHT queries (remaining 80%) → BEAM (qwen probes + R1 sniper)
 
 Usage:
     from qt_sql.patches.beam_router import classify_workload, BeamMode
 
     assignments = classify_workload(baselines, mode="auto")
     for query_id, mode in assignments.items():
-        if mode == BeamMode.WIDE:
-            # fire 16 qwen probes
+        if mode == BeamMode.BEAM:
+            # fire 12-16 qwen probes + R1 sniper 2-shot
         else:
-            # fire 4 R1 strikes
+            # R1 2-shot (2 API calls × 2 outputs = 4 candidates)
 """
 
 from __future__ import annotations
@@ -26,8 +26,11 @@ logger = logging.getLogger(__name__)
 
 
 class BeamMode(str, Enum):
-    WIDE = "wide"
-    FOCUSED = "focused"
+    BEAM = "beam"
+    REASONING = "reasoning"
+    # Aliases for backwards compatibility
+    WIDE = "beam"
+    FOCUSED = "reasoning"
 
 
 @dataclass
@@ -66,11 +69,11 @@ def classify_workload(
 
     total_ms = sum(baselines.values())
     if total_ms <= 0:
-        # All zeros — default to wide
+        # All zeros — default to beam
         return {
             qid: WorkloadAssignment(
                 query_id=qid,
-                mode=BeamMode.WIDE if mode != "focused" else BeamMode.FOCUSED,
+                mode=BeamMode.BEAM if mode not in ("focused", "reasoning") else BeamMode.REASONING,
                 baseline_ms=ms,
                 workload_pct=0.0,
             )
@@ -78,21 +81,21 @@ def classify_workload(
         }
 
     # Force mode
-    if mode == "wide":
+    if mode in ("wide", "beam"):
         return {
             qid: WorkloadAssignment(
                 query_id=qid,
-                mode=BeamMode.WIDE,
+                mode=BeamMode.BEAM,
                 baseline_ms=ms,
                 workload_pct=(ms / total_ms) * 100,
             )
             for qid, ms in baselines.items()
         }
-    elif mode == "focused":
+    elif mode in ("focused", "reasoning"):
         return {
             qid: WorkloadAssignment(
                 query_id=qid,
-                mode=BeamMode.FOCUSED,
+                mode=BeamMode.REASONING,
                 baseline_ms=ms,
                 workload_pct=(ms / total_ms) * 100,
             )
@@ -123,7 +126,7 @@ def classify_workload(
         if qid in heavy_ids and ms >= min_focused_ms:
             assignments[qid] = WorkloadAssignment(
                 query_id=qid,
-                mode=BeamMode.FOCUSED,
+                mode=BeamMode.REASONING,
                 baseline_ms=ms,
                 workload_pct=pct,
             )
@@ -131,18 +134,18 @@ def classify_workload(
         else:
             assignments[qid] = WorkloadAssignment(
                 query_id=qid,
-                mode=BeamMode.WIDE,
+                mode=BeamMode.BEAM,
                 baseline_ms=ms,
                 workload_pct=pct,
             )
             n_light += 1
 
-    heavy_ms = sum(a.baseline_ms for a in assignments.values() if a.mode == BeamMode.FOCUSED)
-    light_ms = sum(a.baseline_ms for a in assignments.values() if a.mode == BeamMode.WIDE)
+    heavy_ms = sum(a.baseline_ms for a in assignments.values() if a.mode == BeamMode.REASONING)
+    light_ms = sum(a.baseline_ms for a in assignments.values() if a.mode == BeamMode.BEAM)
 
     logger.info(
-        f"Workload routing: {n_heavy} FOCUSED ({heavy_ms:.0f}ms, "
-        f"{heavy_ms/total_ms*100:.0f}%) + {n_light} WIDE ({light_ms:.0f}ms, "
+        f"Workload routing: {n_heavy} REASONING ({heavy_ms:.0f}ms, "
+        f"{heavy_ms/total_ms*100:.0f}%) + {n_light} BEAM ({light_ms:.0f}ms, "
         f"{light_ms/total_ms*100:.0f}%)"
     )
 

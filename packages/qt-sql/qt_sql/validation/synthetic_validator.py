@@ -19,7 +19,7 @@ import duckdb
 import random
 import string
 from datetime import datetime, timedelta
-from typing import Dict, List, Set, Tuple, Any
+from typing import Dict, List, Set, Tuple, Any, Optional
 import json
 import re
 
@@ -27,53 +27,155 @@ import re
 logger = logging.getLogger(__name__)
 
 
-# TPC-DS column prefix to table name mapping
-TPCDS_PREFIX_MAP = {
-    'sr': 'store_returns',
-    'ss': 'store_sales',
-    'cr': 'catalog_returns',
-    'cs': 'catalog_sales',
-    'wr': 'web_returns',
-    'ws': 'web_sales',
-    'cp': 'catalog_page',
-    'cc': 'call_center',
-    'web': 'web_site',
-    'd': 'date_dim',
-    't': 'time_dim',
-    'c': 'customer',
-    'ca': 'customer_address',
-    'cd': 'customer_demographics',
-    's': 'store',
-    'i': 'item',
-    'p': 'promotion',
-    'w': 'warehouse',
-    'wp': 'web_page',
-    'hd': 'household_demographics',
-    'ib': 'income_band',
-    'r': 'reason',
-    'sm': 'ship_mode',
-    'inv': 'inventory',
-}
+def _singularize(token: str) -> str:
+    """Best-effort singularization for table/column token matching."""
+    if token.endswith('ies') and len(token) > 3:
+        return token[:-3] + 'y'
+    if token.endswith('ses') and len(token) > 3:
+        return token[:-2]
+    if token.endswith('s') and not token.endswith('ss') and len(token) > 1:
+        return token[:-1]
+    return token
 
 
-def get_table_from_column(col_name: str) -> str:
-    """Get table name from TPC-DS column naming convention."""
+def _table_abbreviation(table_name: str) -> str:
+    """Return abbreviation from table tokens (e.g., customer_address -> ca)."""
+    tokens = [t for t in table_name.lower().split('_') if t]
+    if not tokens:
+        return ''
+    if len(tokens) == 1:
+        return tokens[0][0]
+    return ''.join(t[0] for t in tokens)
+
+
+def _table_name_variants(table_name: str) -> Set[str]:
+    """Return lexical variants for matching column/table naming conventions."""
+    table_lower = table_name.lower()
+    tokens = [t for t in table_lower.split('_') if t]
+
+    variants = {table_lower, _singularize(table_lower)}
+    for tok in tokens:
+        variants.add(tok)
+        variants.add(_singularize(tok))
+
+    if tokens:
+        compact = ''.join(tokens)
+        variants.add(compact)
+        variants.add(_singularize(compact))
+        variants.add(tokens[-1])
+        variants.add(_singularize(tokens[-1]))
+
+    return {v for v in variants if v}
+
+
+def get_table_from_column(col_name: str, table_names: Optional[Set[str]] = None) -> Optional[str]:
+    """Infer likely source table from column naming + available tables.
+
+    The scoring is deliberately conservative: if two tables tie, return None.
+    """
+    if not table_names:
+        return None
+
     col_lower = col_name.lower()
-    if '_' in col_lower:
-        prefix = col_lower.split('_')[0]
-        # Check full prefix first (handles 3-letter like 'web', 'inv')
-        if prefix in TPCDS_PREFIX_MAP:
-            return TPCDS_PREFIX_MAP[prefix]
-        # Then two-letter prefix (handles 'ss', 'sr', 'cs', 'cr', etc.)
-        if len(prefix) >= 2:
-            two_letter = prefix[:2]
-            if two_letter in TPCDS_PREFIX_MAP:
-                return TPCDS_PREFIX_MAP[two_letter]
-        # Then single letter (handles 'd', 'c', 's', etc.)
-        if len(prefix) >= 1:
-            one_letter = prefix[0]
-            if one_letter in TPCDS_PREFIX_MAP:
-                return TPCDS_PREFIX_MAP[one_letter]
+    parts = [p for p in col_lower.split('_') if p]
+    prefix = parts[0] if parts else col_lower
+    body_tokens = set(parts[1:] if len(parts) > 1 else [])
+
+    best_table = None
+    best_score = 0
+    is_tie = False
+
+    for table_name in table_names:
+        table_lower = table_name.lower()
+        table_tokens = [t for t in table_lower.split('_') if t]
+        variants = _table_name_variants(table_name)
+        abbrev = _table_abbreviation(table_name)
+
+        score = 0
+
+        if col_lower.startswith(f"{table_lower}_"):
+            score += 14
+        singular_table = _singularize(table_lower)
+        if singular_table != table_lower and col_lower.startswith(f"{singular_table}_"):
+            score += 13
+        if prefix in variants:
+            score += 12
+        if abbrev and prefix == abbrev:
+            score += 15 if len(abbrev) >= 2 else 8
+        # Data warehouse dimensions often use a single-letter prefix from
+        # the first token (e.g., d_year for date_dim, t_time for time_dim).
+        if (
+            len(prefix) == 1
+            and table_tokens
+            and table_lower.endswith('_dim')
+            and prefix == table_tokens[0][0]
+        ):
+            score += 11
+        if body_tokens.intersection(variants):
+            score += 2
+        score += len(body_tokens.intersection(set(table_tokens)))
+
+        if score > best_score:
+            best_score = score
+            best_table = table_name
+            is_tie = False
+        elif score == best_score and score > 0:
+            is_tie = True
+
+    if is_tie or best_score == 0:
+        return None
+    return best_table
+
+
+def get_table_for_column(col_name: str, tables: Dict[str, Dict]) -> Optional[str]:
+    """Resolve a column to a table using schema ownership, then name heuristics."""
+    col_lower = col_name.lower()
+    owners = []
+    for table_name, info in tables.items():
+        for existing_col in info.get('columns', {}):
+            if existing_col.lower() == col_lower:
+                owners.append(table_name)
+                break
+
+    if len(owners) == 1:
+        return owners[0]
+    if len(owners) > 1:
+        return None
+
+    return get_table_from_column(col_name, set(tables.keys()))
+
+
+def find_primary_key_column(table_name: str, column_names: List[str]) -> Optional[str]:
+    """Best-effort PK detection for synthetic FK wiring."""
+    if not column_names:
+        return None
+
+    lower_to_original = {c.lower(): c for c in column_names}
+    table_variants = _table_name_variants(table_name)
+
+    # Strongest signal: table-specific surrogate/natural key.
+    for variant in sorted(table_variants, key=len, reverse=True):
+        for suffix in ('_sk', '_id'):
+            candidate = f'{variant}{suffix}'
+            if candidate in lower_to_original:
+                return lower_to_original[candidate]
+
+    # Common warehouse pattern: prefixed table key (e.g., c_customer_sk).
+    for col_lower, col in lower_to_original.items():
+        for variant in table_variants:
+            if col_lower.endswith(f'_{variant}_sk') or col_lower.endswith(f'_{variant}_id'):
+                return col
+
+    # Generic fallback.
+    for col_lower, col in lower_to_original.items():
+        if col_lower.endswith('_sk'):
+            return col
+    for col_lower, col in lower_to_original.items():
+        if col_lower.endswith('_id'):
+            return col
+    if 'id' in lower_to_original:
+        return lower_to_original['id']
+
     return None
 
 
@@ -109,7 +211,7 @@ class SchemaExtractor:
                 'key': f"{table_name}_sk"  # assume surrogate key pattern
             }
         
-        # Extract columns using TPC-DS naming conventions
+        # Extract columns using explicit qualifiers + generic name heuristics
         self._extract_columns_from_expression(self.parsed, tables, cte_names)
         
         return tables
@@ -168,11 +270,12 @@ class SchemaExtractor:
                         'nullable': True
                     }
             else:
-                # No table prefix — skip derived column aliases
-                if col_name in derived_col_aliases:
+                # Try generic naming convention against available tables
+                matched_table = get_table_from_column(col_name, set(tables.keys()))
+                # If this token is a derived alias and cannot be mapped to a
+                # concrete base table, treat it as derived and skip.
+                if not matched_table and col_name in derived_col_aliases:
                     continue
-                # Try TPC-DS naming convention
-                matched_table = get_table_from_column(col_name)
                 if matched_table and matched_table in tables:
                     if col_name not in tables[matched_table]['columns']:
                         col_type = self._infer_column_type(col_name)
@@ -201,6 +304,8 @@ class SchemaExtractor:
                            'd_dom', 'd_dow', 'd_fy_year', 'd_fy_quarter_seq', 'd_fy_week_seq',
                            'd_week_seq', 'd_month_seq', 'd_quarter_seq',
                            'd_first_dom', 'd_last_dom', 'd_same_day_ly', 'd_same_day_lq']:
+            return 'INTEGER'
+        elif col_lower.endswith('_year') or col_lower.endswith('_month') or col_lower.endswith('_quarter'):
             return 'INTEGER'
         elif col_lower in ['year', 'month', 'moy', 'qoy', 'dom']:
             return 'INTEGER'
@@ -280,22 +385,8 @@ class SyntheticDataGenerator:
                 values_parts.append('(' + ', '.join(vals) + ')')
             self.conn.execute(f"INSERT INTO {table_name} ({col_list}) VALUES {', '.join(values_parts)}")
         
-        # Store PK values for this table so other tables can reference them as FKs
-        # The PK is typically {prefix}_{table}_sk format (e.g., s_store_sk, c_customer_sk)
-        pk_col = None
-        for col_name in col_names:
-            col_lower = col_name.lower()
-            # Check for {table}_sk pattern (e.g., store_sk for store table)
-            if col_lower == f'{table_name.lower()}_sk':
-                pk_col = col_name
-                break
-            # Check for TPC-DS pattern: {letter}_{table}_sk (e.g., s_store_sk)
-            elif col_lower.endswith(f'_{table_name.lower()}_sk'):
-                pk_col = col_name
-                break
-            # Check for any _sk column
-            elif col_lower.endswith('_sk') and pk_col is None:
-                pk_col = col_name
+        # Store PK values for this table so other tables can reference them as FKs.
+        pk_col = find_primary_key_column(table_name, col_names)
         
         if pk_col:
             if table_name not in self.foreign_key_values:
@@ -323,6 +414,7 @@ class SyntheticDataGenerator:
         """Generate a single synthetic value."""
         col_name_lower = col_name.lower()
         foreign_keys = foreign_keys or {}
+        col_type_upper = col_type.upper()
 
         decimal_info = self._parse_decimal_type(col_type)
 
@@ -331,8 +423,10 @@ class SyntheticDataGenerator:
         filter_vals = getattr(self, 'filter_literal_values', {})
         if table_name and table_name in filter_vals and col_name in filter_vals[table_name]:
             vals = filter_vals[table_name][col_name]
-            if vals and self.random.random() < 0.7:
-                chosen = self.random.choice(vals)
+            if vals:
+                # Deterministic cycling ensures every filtered column gets
+                # satisfying values even under highly selective workloads.
+                chosen = vals[row_idx % len(vals)]
                 # Handle BETWEEN ranges
                 if isinstance(chosen, str) and chosen.startswith('BETWEEN:'):
                     _, low, high = chosen.split(':', 2)
@@ -340,17 +434,59 @@ class SyntheticDataGenerator:
                         try:
                             low_d = datetime.strptime(low, '%Y-%m-%d')
                             high_d = datetime.strptime(high, '%Y-%m-%d')
-                            offset = self.random.randint(0, max(1, (high_d - low_d).days))
+                            span = max(1, (high_d - low_d).days)
+                            offset = row_idx % (span + 1)
                             return (low_d + timedelta(days=offset)).strftime('%Y-%m-%d')
                         except ValueError:
                             pass
                     elif 'INTEGER' in col_type:
                         return self.random.randint(int(low), int(high))
                     else:
-                        return float(low) + self.random.random() * (float(high) - float(low))
+                        low_f = float(low)
+                        high_f = float(high)
+                        span = max(high_f - low_f, 1.0)
+                        return low_f + ((row_idx % 1000) / 1000.0) * span
                 # Handle comparison operators (>:, >=:, <:)
                 elif isinstance(chosen, str) and ':' in chosen and chosen[0] in '><':
-                    pass  # Fall through to normal generation
+                    op, v = chosen.split(':', 1)
+                    # Date comparisons
+                    if 'DATE' in col_type or 'date' in col_name_lower:
+                        try:
+                            base = datetime.strptime(v, '%Y-%m-%d')
+                            if op == '>':
+                                return (base + timedelta(days=1 + (row_idx % 365))).strftime('%Y-%m-%d')
+                            if op == '>=':
+                                return (base + timedelta(days=(row_idx % 365))).strftime('%Y-%m-%d')
+                            if op == '<':
+                                return (base - timedelta(days=1 + (row_idx % 365))).strftime('%Y-%m-%d')
+                            if op == '<=':
+                                return (base - timedelta(days=(row_idx % 365))).strftime('%Y-%m-%d')
+                        except ValueError:
+                            pass
+                    # Numeric comparisons
+                    try:
+                        if 'INTEGER' in col_type:
+                            n = int(float(v))
+                            if op == '>':
+                                return n + 1 + (row_idx % 50)
+                            if op == '>=':
+                                return n + (row_idx % 50)
+                            if op == '<':
+                                return max(0, n - 1 - (row_idx % 50))
+                            if op == '<=':
+                                return max(0, n - (row_idx % 50))
+                        if 'DECIMAL' in col_type:
+                            n = float(v)
+                            if op == '>':
+                                return round(n + 0.01 + (row_idx % 50) * 0.1, 2)
+                            if op == '>=':
+                                return round(n + (row_idx % 50) * 0.1, 2)
+                            if op == '<':
+                                return round(n - 0.01 - (row_idx % 50) * 0.1, 2)
+                            if op == '<=':
+                                return round(n - (row_idx % 50) * 0.1, 2)
+                    except (ValueError, TypeError):
+                        pass
                 else:
                     # Direct equality / IN value
                     if 'INTEGER' in col_type:
@@ -380,7 +516,12 @@ class SyntheticDataGenerator:
                     return self.random.choice(fk_vals)
         
         # Surrogate keys - sequential
-        if col_name_lower.endswith('_sk') or col_name_lower == 'id':
+        is_numeric_type = any(
+            t in col_type_upper for t in ('INT', 'DECIMAL', 'BIGINT', 'SMALLINT', 'FLOAT', 'DOUBLE')
+        )
+        if col_name_lower.endswith('_sk') or col_name_lower == 'id' or (
+            col_name_lower.endswith('_id') and is_numeric_type
+        ):
             if decimal_info:
                 max_val = 10 ** (decimal_info['precision'] - decimal_info['scale']) - 1
                 val = min(row_idx + 1, max_val)
@@ -388,27 +529,22 @@ class SyntheticDataGenerator:
                 val = row_idx + 1
             return val
         
-        # Date columns
-        if col_name_lower == 'd_date':
-            base_date = datetime(1990, 1, 1)
-            offset = row_idx % (365 * 30)  # 30 years of dates
+        # Date/time-like columns
+        if col_name_lower in {'d_date', 'date'}:
+            base_date = datetime(2000, 1, 1)
+            offset = row_idx % (365 * 25)  # 25 years of stable synthetic dates
             return (base_date + timedelta(days=offset)).strftime('%Y-%m-%d')
-        elif col_name_lower == 'd_year':
-            # Distribute years but ensure 2000 is well-represented (common TPC-DS filter)
-            years = list(range(1990, 2021)) + [2000] * 100  # Heavy oversample of 2000
-            return years[row_idx % len(years)]
-        elif col_name_lower == 'd_month' or col_name_lower == 'd_moy':
-            # Month of year - ensure month 1 (January) is well represented
-            months = list(range(1, 13)) + [1] * 20  # Oversample January
-            return months[row_idx % len(months)]
-        elif col_name_lower == 'd_day':
+        elif col_name_lower in {'d_year', 'year'} or col_name_lower.endswith('_year'):
+            return 1990 + (row_idx % 36)
+        elif col_name_lower in {'d_month', 'd_moy', 'month', 'moy'} or col_name_lower.endswith('_month'):
+            return 1 + (row_idx % 12)
+        elif col_name_lower in {'d_day', 'day', 'dom'} or col_name_lower.endswith('_day'):
             return 1 + (row_idx % 28)
-        elif col_name_lower in ('d_quarter', 'd_qoy'):
+        elif col_name_lower in {'d_quarter', 'd_qoy', 'quarter', 'qoy'} or col_name_lower.endswith('_quarter'):
             return 1 + (row_idx % 4)
         elif 'date' in col_name_lower or col_type == 'DATE':
-            # Generate dates from 2020-2023 to match common query filters
-            base_date = datetime(2020, 1, 1)
-            offset = self.random.randint(0, 365 * 4)  # 4 years: 2020-2023
+            base_date = datetime(2000, 1, 1)
+            offset = row_idx % (365 * 25)
             return (base_date + timedelta(days=offset)).strftime('%Y-%m-%d')
         
         # Numeric types
@@ -451,26 +587,22 @@ class SyntheticDataGenerator:
         # String types
         if 'VARCHAR' in col_type:
             if 'state' in col_name_lower or col_name_lower == 's_state':
-                # Ensure SD and other common TPC-DS filter states are well-represented
-                # Oversample states commonly used in TPC-DS queries (SD is very common)
-                states = (['CA', 'TX', 'NY', 'FL', 'IL', 'PA', 'OH', 'GA', 'NC', 'MI'] * 2 +
-                         ['SD'] * 100 +  # Heavy oversample of SD for TPC-DS Q1
-                         ['TN', 'KY', 'LA', 'AL', 'OK', 'UT', 'NV', 'NM', 'KS'] * 5)
+                states = [
+                    'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+                    'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+                    'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+                    'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+                    'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY',
+                ]
                 return states[row_idx % len(states)]
             elif 'city' in col_name_lower:
                 cities = ['New York', 'Los Angeles', 'Chicago', 'Houston', 'Phoenix', 
                          'Philadelphia', 'San Antonio', 'San Diego', 'Dallas', 'San Jose',
                          'Austin', 'Jacksonville', 'Fort Worth', 'Columbus', 'Charlotte']
                 return cities[row_idx % len(cities)]
-            # Check specific column names BEFORE generic patterns
-            elif col_name_lower == 's_store_name':
-                # Include 'ese' for TPC-DS Q5 style queries
-                names = ['ese', 'abc', 'def', 'ghi', 'jkl', 'mno', 'pqr', 'stu', 'vwx', 'yz'] * 10
-                return names[row_idx % len(names)]
-            elif col_name_lower == 's_store_id':
-                return f"STORE{row_idx:04d}"
-            elif 'customer_id' in col_name_lower:
-                return f"AAAAAAA{row_idx % 10000000:07d}"
+            elif col_name_lower.endswith('_id') or col_name_lower == 'id':
+                id_prefix = ''.join(part[:1] for part in (table_name or 'id').split('_')).upper()
+                return f"{id_prefix}{row_idx:07d}"
             elif 'name' in col_name_lower:
                 return f"Name_{row_idx}_{self.random.randint(1000, 9999)}"
             elif 'type' in col_name_lower:
@@ -487,56 +619,9 @@ class SyntheticDataGenerator:
         return None
     
     def _track_filter_matched_values(self, table_name: str, pk_col: str, col_names: List[str], rows: List[tuple]):
-        """Track PK values that match common filter conditions for this table type."""
-        self.filter_matched_values[table_name] = []
-        
-        # Define filter conditions based on table name
-        filter_checks = []
-        col_indices = {}
-        
-        for i, col_name in enumerate(col_names):
-            col_lower = col_name.lower()
-            col_indices[col_lower] = i
-            
-            if table_name == 'store' or table_name == 'stores':
-                if col_lower == 's_store_name':
-                    filter_checks.append(lambda row, idx=i: row[idx] == 'ese')
-                elif col_lower == 's_state':
-                    filter_checks.append(lambda row, idx=i: row[idx] == 'SD')
-            elif table_name == 'date_dim':
-                if col_lower == 'd_year':
-                    filter_checks.append(lambda row, idx=i: row[idx] == 2000)
-                elif col_lower == 'd_moy':
-                    filter_checks.append(lambda row, idx=i: row[idx] == 1)
-            elif table_name == 'customer' or table_name == 'customers':
-                if col_lower == 'c_customer_id':
-                    filter_checks.append(lambda row, idx=i: row[idx] is not None)
-            elif table_name == 'customer_address':
-                if col_lower == 'ca_address_sk':
-                    filter_checks.append(lambda row, idx=i: row[idx] is not None)
-        
-        # Find PK column index
+        """Track PK values available for downstream FK assignment."""
         pk_idx = col_names.index(pk_col)
-        
-        # Check each row against filter conditions
-        for row in rows:
-            # A row is "good" if it matches ANY filter condition (OR logic)
-            # or if there are no specific filters defined
-            is_good = len(filter_checks) == 0
-            for check in filter_checks:
-                try:
-                    if check(row):
-                        is_good = True
-                        break
-                except:
-                    pass
-            
-            if is_good:
-                self.filter_matched_values[table_name].append(row[pk_idx])
-        
-        # If no filter-matched values found, use all PK values
-        if not self.filter_matched_values[table_name]:
-            self.filter_matched_values[table_name] = [row[pk_idx] for row in rows]
+        self.filter_matched_values[table_name] = [row[pk_idx] for row in rows]
 
 
 class SchemaFromDB:
@@ -784,21 +869,11 @@ class SyntheticValidator:
             for table_name in list(tables.keys()):
                 ref_schema = self.schema_extractor.get_table_schema(table_name)
                 if ref_schema:
-                    # Start with ALL reference DB columns (complete schema)
-                    merged = {}
-                    for col_name, col_info in ref_schema.items():
-                        merged[col_name] = col_info
-                    # Add any AST-discovered columns not in reference DB
-                    # (e.g., derived columns that only exist in the query)
-                    # Use case-insensitive comparison to avoid duplicates
-                    ref_lower = {k.lower() for k in ref_schema}
-                    for col_name, col_info in tables[table_name]['columns'].items():
-                        if col_name.lower() not in ref_lower:
-                            merged[col_name] = col_info
-                    tables[table_name]['columns'] = merged
+                    # In reference-schema mode, trust database metadata as
+                    # authoritative to avoid AST heuristic false positives
+                    # creating ambiguous synthetic schemas.
+                    tables[table_name]['columns'] = dict(ref_schema)
                     logger.debug("  %s: %d cols from reference DB", table_name, len(ref_schema))
-        
-        self._create_schema(tables)
         
         # 4. Detect FK relationships from JOIN conditions + heuristics, create indexes
         fk_relationships = self._detect_fk_from_joins(sql, tables)
@@ -810,16 +885,12 @@ class SyntheticValidator:
             for col, target in fks.items():
                 if col not in fk_relationships[table_name]:
                     fk_relationships[table_name][col] = target
-        self._create_indexes(tables, sql)
 
         # 5. Extract filter values from WHERE clause for data generation
         filter_values = self._extract_filter_values(sql, tables)
 
         # 6. Generate synthetic data
         logger.debug("Generating synthetic data...")
-        generator = SyntheticDataGenerator(self.conn, all_schemas=tables)
-        generator.filter_literal_values = filter_values
-
         # Estimate rows needed per table based on query complexity
         table_row_counts = self._estimate_row_counts(sql, tables, target_rows)
 
@@ -836,86 +907,118 @@ class SyntheticValidator:
         logger.debug("Dimension tables: %s", dim_tables)
         logger.debug("Fact tables: %s", fact_tables)
         logger.debug("FK relationships: %s", fk_relationships)
-        
-        # Generate dimension tables first
-        for table_name in dim_tables:
-            schema = tables[table_name]
-            row_count = table_row_counts.get(table_name, 1000)
-            logger.debug("  %s: %d rows (dimension)", table_name, row_count)
-            generator.generate_table_data(table_name, schema, row_count, foreign_keys={})
-
-        # After dimension generation, find PKs matching actual query filters
-        # This ensures fact FK values point to dimension rows that pass WHERE clauses
-        self._update_filter_matched_pks(generator, tables, dim_tables, filter_values)
-
-        # Print available FK values
-        logger.debug("Available FK values: %s", list(generator.foreign_key_values.keys()))
-        
-        # Generate fact tables with FKs pointing to dimension tables
-        for table_name in fact_tables:
-            schema = tables[table_name]
-            row_count = table_row_counts.get(table_name, 1000)
-            table_fks = fk_relationships.get(table_name, {})
-            logger.debug("  %s: %d rows (fact), FKs: %s", table_name, row_count, table_fks)
-            generator.generate_table_data(table_name, schema, row_count, foreign_keys=table_fks)
-        
-        # 6b. Deduplicate columns used by scalar subqueries
-        #     A scalar subquery (used with = comparison) must return exactly 1 row.
-        #     Synthetic data can violate this — deduplicate the relevant columns.
         scalar_uniques = self._detect_scalar_subquery_uniques(sql, tables)
-        if scalar_uniques:
-            logger.debug("Enforcing scalar subquery uniqueness...")
-            for table_name, col_set in scalar_uniques:
-                cols_csv = ', '.join(col_set)
-                try:
-                    self.conn.execute(f"""
-                        CREATE TABLE {table_name}__dedup AS
-                        SELECT * FROM (
-                            SELECT *, ROW_NUMBER() OVER (
-                                PARTITION BY {cols_csv} ORDER BY 1
-                            ) AS __rn FROM {table_name}
-                        ) WHERE __rn = 1
-                    """)
-                    self.conn.execute(f"DROP TABLE {table_name}")
-                    self.conn.execute(f"ALTER TABLE {table_name}__dedup RENAME TO {table_name}")
-                    # Drop the helper column
-                    self.conn.execute(f"ALTER TABLE {table_name} DROP COLUMN __rn")
-                    remaining = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-                    logger.debug("  %s: deduped on (%s), %d rows remain", table_name, cols_csv, remaining)
-                except Exception as e:
-                    logger.debug("  %s: dedup failed: %s", table_name, e)
+
+        def _populate_synthetic_data(row_multiplier: int = 1):
+            # Reset schema/data for each synthesis attempt.
+            self._create_schema(tables)
+            self._create_indexes(tables, sql)
+
+            generator = SyntheticDataGenerator(self.conn, all_schemas=tables)
+            generator.filter_literal_values = filter_values
+
+            # Generate dimension tables first
+            for table_name in dim_tables:
+                schema = tables[table_name]
+                base_count = table_row_counts.get(table_name, 1000)
+                row_count = max(10, min(base_count * row_multiplier, 200000))
+                logger.debug("  %s: %d rows (dimension, x%d)", table_name, row_count, row_multiplier)
+                generator.generate_table_data(table_name, schema, row_count, foreign_keys={})
+
+            # Ensure fact FK values point to dimension rows that pass WHERE.
+            self._update_filter_matched_pks(generator, tables, dim_tables, filter_values)
+            logger.debug("Available FK values: %s", list(generator.foreign_key_values.keys()))
+
+            # Generate fact tables with FKs pointing to dimension tables
+            for table_name in fact_tables:
+                schema = tables[table_name]
+                base_count = table_row_counts.get(table_name, 1000)
+                row_count = max(10, min(base_count * row_multiplier, 200000))
+                table_fks = fk_relationships.get(table_name, {})
+                logger.debug("  %s: %d rows (fact, x%d), FKs: %s", table_name, row_count, row_multiplier, table_fks)
+                generator.generate_table_data(table_name, schema, row_count, foreign_keys=table_fks)
+
+            # Deduplicate columns used by scalar subqueries.
+            if scalar_uniques:
+                logger.debug("Enforcing scalar subquery uniqueness...")
+                for table_name, col_set in scalar_uniques:
+                    cols_csv = ', '.join(col_set)
+                    try:
+                        self.conn.execute(f"""
+                            CREATE TABLE {table_name}__dedup AS
+                            SELECT * FROM (
+                                SELECT *, ROW_NUMBER() OVER (
+                                    PARTITION BY {cols_csv} ORDER BY 1
+                                ) AS __rn FROM {table_name}
+                            ) WHERE __rn = 1
+                        """)
+                        self.conn.execute(f"DROP TABLE {table_name}")
+                        self.conn.execute(f"ALTER TABLE {table_name}__dedup RENAME TO {table_name}")
+                        self.conn.execute(f"ALTER TABLE {table_name} DROP COLUMN __rn")
+                        remaining = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                        logger.debug("  %s: deduped on (%s), %d rows remain", table_name, cols_csv, remaining)
+                    except Exception as e:
+                        logger.debug("  %s: dedup failed: %s", table_name, e)
+
+        _populate_synthetic_data(1)
 
         # 7. Run query
         logger.debug("Running query...")
-        try:
-            result = self.conn.execute(sql).fetchall()
-            actual_rows = len(result)
-            in_range = min_rows <= actual_rows <= max_rows
-            range_status = "✓" if in_range else "⚠"
-            logger.debug("Query returned %d rows (target range: %d-%d)", actual_rows, min_rows, max_rows)
-            
-            # Get column names
-            columns = [desc[0] for desc in self.conn.description] if self.conn.description else []
-            
-            return {
-                'success': True,
-                'target_rows': target_rows,
-                'min_rows': min_rows,
-                'max_rows': max_rows,
-                'actual_rows': actual_rows,
-                'in_range': min_rows <= actual_rows <= max_rows,
-                'columns': columns,
-                'sample_results': result[:10] if result else [],
-                'tables_created': list(tables.keys())
-            }
-            
-        except Exception as e:
-            logger.debug("Query failed: %s", e)
-            return {
-                'success': False,
-                'error': str(e),
-                'tables_created': list(tables.keys())
-            }
+        exec_sql = sql
+        best_success = None
+        last_error = None
+
+        # Adaptive retries: if query executes but yields 0 rows, repopulate with
+        # more synthetic data to increase predicate/join hit probability.
+        for attempt_idx, multiplier in enumerate([1, 3]):
+            if attempt_idx > 0 and min_rows > 0 and best_success and best_success.get('actual_rows', 0) == 0:
+                logger.debug("Repopulating synthetic data with row multiplier x%d", multiplier)
+                _populate_synthetic_data(multiplier)
+
+            for _ in range(4):
+                try:
+                    result = self.conn.execute(exec_sql).fetchall()
+                    actual_rows = len(result)
+                    in_range = min_rows <= actual_rows <= max_rows
+                    logger.debug("Query returned %d rows (target range: %d-%d)", actual_rows, min_rows, max_rows)
+
+                    columns = [desc[0] for desc in self.conn.description] if self.conn.description else []
+                    payload = {
+                        'success': True,
+                        'target_rows': target_rows,
+                        'min_rows': min_rows,
+                        'max_rows': max_rows,
+                        'actual_rows': actual_rows,
+                        'in_range': in_range,
+                        'columns': columns,
+                        'sample_results': result[:10] if result else [],
+                        'tables_created': list(tables.keys())
+                    }
+
+                    if in_range or min_rows == 0 or actual_rows > 0:
+                        return payload
+
+                    # Success with 0 rows, not in range: try larger synth set.
+                    best_success = payload
+                    break
+                except Exception as e:
+                    last_error = str(e)
+                    if "Ambiguous reference to column name" in last_error:
+                        fixed_sql = self._resolve_ambiguous_from_error(exec_sql, last_error)
+                        if fixed_sql != exec_sql:
+                            exec_sql = fixed_sql
+                            continue
+                    break
+
+        if best_success:
+            return best_success
+
+        logger.debug("Query failed: %s", last_error)
+        return {
+            'success': False,
+            'error': last_error or 'Unknown query execution error',
+            'tables_created': list(tables.keys())
+        }
     
     def validate_sql_pair(
         self,
@@ -1093,11 +1196,10 @@ class SyntheticValidator:
                 continue
 
             # Find the PK column
-            pk_col = None
-            for col in tables[table_name]['columns']:
-                if col.lower().endswith('_sk'):
-                    pk_col = col
-                    break
+            pk_col = find_primary_key_column(
+                table_name,
+                list(tables[table_name]['columns'].keys()),
+            )
             if not pk_col:
                 continue
 
@@ -1167,6 +1269,10 @@ class SyntheticValidator:
         """Create indexes on join columns for better query performance."""
         parsed = sqlglot.parse_one(sql)
         join_columns = {}
+
+        def _is_key_col(col_name: str) -> bool:
+            col_lower = col_name.lower()
+            return col_lower.endswith('_sk') or col_lower.endswith('_id') or col_lower == 'id'
         
         for join in parsed.find_all(exp.Join):
             for eq in join.find_all(exp.EQ):
@@ -1195,12 +1301,12 @@ class SyntheticValidator:
                 right = eq.right
 
                 if isinstance(left, exp.Column) and isinstance(right, exp.Column):
-                    left_table = left.table or get_table_from_column(left.name)
+                    left_table = left.table or get_table_for_column(left.name, tables)
                     left_col = left.name
-                    right_table = right.table or get_table_from_column(right.name)
+                    right_table = right.table or get_table_for_column(right.name, tables)
                     right_col = right.name
 
-                    if left_col.endswith('_sk') or right_col.endswith('_sk'):
+                    if _is_key_col(left_col) or _is_key_col(right_col):
                         if left_table and left_table in tables:
                             if left_table not in join_columns:
                                 join_columns[left_table] = set()
@@ -1222,6 +1328,10 @@ class SyntheticValidator:
         """Extract exact FK relationships from JOIN and WHERE conditions."""
         fk_relationships = {}
         parsed = sqlglot.parse_one(sql)
+
+        def _is_key_col(col_name: str) -> bool:
+            col_lower = col_name.lower()
+            return col_lower.endswith('_sk') or col_lower.endswith('_id') or col_lower == 'id'
 
         # Build alias map
         alias_map = {}
@@ -1251,11 +1361,11 @@ class SyntheticValidator:
             left_col = eq.left.name
             right_col = eq.right.name
 
-            # Resolve None tables using TPC-DS column prefix heuristic
+            # Resolve missing table qualifiers using schema-aware heuristics
             if not left_table or left_table not in tables:
-                left_table = get_table_from_column(left_col)
+                left_table = get_table_for_column(left_col, tables)
             if not right_table or right_table not in tables:
-                right_table = get_table_from_column(right_col)
+                right_table = get_table_for_column(right_col, tables)
 
             if not left_table or not right_table:
                 continue
@@ -1263,28 +1373,27 @@ class SyntheticValidator:
                 continue
             if left_table not in tables or right_table not in tables:
                 continue
-            if not (left_col.endswith('_sk') or right_col.endswith('_sk')):
+            if not (_is_key_col(left_col) or _is_key_col(right_col)):
                 continue
 
-            # Determine FK direction using _sk column count heuristic
-            # Fact tables have many _sk columns (FKs), dimension tables have few (just PK)
-            left_sk_count = sum(1 for c in tables[left_table]['columns'] if c.lower().endswith('_sk'))
-            right_sk_count = sum(1 for c in tables[right_table]['columns'] if c.lower().endswith('_sk'))
+            # Determine FK direction using key-column count heuristic.
+            left_key_count = sum(1 for c in tables[left_table]['columns'] if _is_key_col(c))
+            right_key_count = sum(1 for c in tables[right_table]['columns'] if _is_key_col(c))
 
-            if left_sk_count > right_sk_count:
-                # left table has more _sk cols → likely fact table → left col is FK
+            if left_key_count > right_key_count:
+                # left table has more key-like cols -> likely fact table -> left col is FK
                 if left_table not in fk_relationships:
                     fk_relationships[left_table] = {}
                 fk_relationships[left_table][left_col.lower()] = (right_table, right_col)
-            elif right_sk_count > left_sk_count:
-                # right table has more _sk cols → likely fact table → right col is FK
+            elif right_key_count > left_key_count:
+                # right table has more key-like cols -> likely fact table -> right col is FK
                 if right_table not in fk_relationships:
                     fk_relationships[right_table] = {}
                 fk_relationships[right_table][right_col.lower()] = (left_table, left_col)
             else:
-                # Equal _sk count — use column prefix to determine PK ownership
-                left_guessed = get_table_from_column(left_col)
-                right_guessed = get_table_from_column(right_col)
+                # Equal _sk count: use schema/name inference to pick PK owner.
+                left_guessed = get_table_for_column(left_col, tables)
+                right_guessed = get_table_for_column(right_col, tables)
                 if left_guessed == left_table and right_guessed != right_table:
                     # left column belongs to its table → PK, right is FK
                     if right_table not in fk_relationships:
@@ -1328,7 +1437,7 @@ class SyntheticValidator:
                 if isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Literal):
                     table = alias_map.get(eq.left.table, eq.left.table)
                     if not table:
-                        table = get_table_from_column(eq.left.name)
+                        table = get_table_for_column(eq.left.name, tables)
                     if table and table in tables:
                         col = eq.left.name
                         val = eq.right.this
@@ -1343,7 +1452,7 @@ class SyntheticValidator:
                 if isinstance(in_expr.this, exp.Column):
                     table = alias_map.get(in_expr.this.table, in_expr.this.table)
                     if not table:
-                        table = get_table_from_column(in_expr.this.name)
+                        table = get_table_for_column(in_expr.this.name, tables)
                     if table and table in tables:
                         col = in_expr.this.name
                         if table not in filter_values:
@@ -1359,7 +1468,7 @@ class SyntheticValidator:
                 if isinstance(between.this, exp.Column):
                     table = alias_map.get(between.this.table, between.this.table)
                     if not table:
-                        table = get_table_from_column(between.this.name)
+                        table = get_table_for_column(between.this.name, tables)
                     if table and table in tables:
                         col = between.this.name
                         low = between.args.get('low')
@@ -1375,7 +1484,7 @@ class SyntheticValidator:
                     if isinstance(cmp.left, exp.Column) and isinstance(cmp.right, exp.Literal):
                         table = alias_map.get(cmp.left.table, cmp.left.table)
                         if not table:
-                            table = get_table_from_column(cmp.left.name)
+                            table = get_table_for_column(cmp.left.name, tables)
                         if table and table in tables:
                             col = cmp.left.name
                             if table not in filter_values:
@@ -1387,70 +1496,68 @@ class SyntheticValidator:
         return filter_values
 
     def _detect_foreign_keys(self, sql: str, tables: Dict) -> Dict[str, Dict[str, Tuple[str, str]]]:
-        """Detect foreign key relationships using TPC-DS naming conventions.
-
-        Only adds an FK when the target PK column is verified to exist in the
-        target table's schema. This prevents fabricating columns like
-        ``w_web_site_sk`` that don't actually exist.
-        """
+        """Detect foreign key relationships using generic naming conventions."""
         fk_relationships = {}
+        all_tables = set(tables.keys())
 
-        def _target_has_col(target_table: str, pk_col: str) -> bool:
-            """Return True only if target table's schema contains pk_col."""
-            return pk_col in tables.get(target_table, {}).get('columns', {})
+        def _same_name_col(target_table: str, col_name: str) -> Optional[str]:
+            """Return case-preserving matching column name in target table."""
+            col_lower = col_name.lower()
+            for existing_col in tables.get(target_table, {}).get('columns', {}):
+                if existing_col.lower() == col_lower:
+                    return existing_col
+            return None
 
         for table_name in tables:
             table_fks = {}
-            for col_name in tables[table_name]['columns']:
+            table_cols = list(tables[table_name]['columns'].keys())
+            table_pk = find_primary_key_column(table_name, table_cols)
+
+            for col_name in table_cols:
                 col_lower = col_name.lower()
-                if not col_lower.endswith('_sk'):
+                if not (col_lower.endswith('_sk') or col_lower.endswith('_id')):
                     continue
 
-                # Pattern 1: TPC-DS style - {prefix}_{target}_sk
-                # e.g., sr_store_sk -> store.s_store_sk
-                if '_' in col_lower:
-                    parts = col_lower.split('_')
-                    if len(parts) >= 3:
-                        potential_table = '_'.join(parts[1:-1])
-                        for known_table in tables:
-                            if known_table.lower() == potential_table and known_table != table_name:
-                                # Try to find the actual PK column in the target
-                                pk_prefix = known_table.split('_')[0][0] if '_' in known_table else known_table[0]
-                                pk_col = f"{pk_prefix}_{potential_table}_sk"
-                                if _target_has_col(known_table, pk_col):
-                                    table_fks[col_lower] = (known_table, pk_col)
-                                elif _target_has_col(known_table, col_name):
-                                    # Fallback: same column name in target
-                                    table_fks[col_lower] = (known_table, col_name)
-                                break
+                # Skip likely PK column in current table.
+                if table_pk and col_lower == table_pk.lower():
+                    continue
 
-                # Pattern 2: Simple FK - {table}_sk references {table}.{table}_sk
-                if col_lower not in table_fks:
-                    potential_base = col_lower[:-3]  # Remove _sk
+                candidate_tables = []
+
+                guessed = get_table_from_column(col_name, all_tables - {table_name})
+                if guessed:
+                    candidate_tables.append(guessed)
+
+                parts = [p for p in col_lower.split('_') if p]
+                if len(parts) >= 2:
+                    body_tokens = parts[1:-1] if len(parts) > 2 else [parts[0]]
                     for known_table in tables:
-                        if known_table != table_name:
-                            known_lower = known_table.lower()
-                            if potential_base == known_lower or potential_base == known_lower.rstrip('s'):
-                                pk_col = col_name  # Same name
-                                if _target_has_col(known_table, pk_col):
-                                    table_fks[col_lower] = (known_table, pk_col)
-                                break
+                        if known_table == table_name:
+                            continue
+                        variants = _table_name_variants(known_table)
+                        if any(tok in variants for tok in body_tokens):
+                            candidate_tables.append(known_table)
 
-                # Pattern 3: Complex FK - {prefix}_{context}_{table}_sk
-                # e.g., wr_returning_customer_sk -> customer
-                # Only match if we can verify the PK column exists
-                if col_lower not in table_fks:
-                    parts = col_lower.split('_')
-                    if len(parts) >= 3:
-                        potential_table = parts[-2]
-                        for known_table in tables:
-                            if known_table != table_name:
-                                known_lower = known_table.lower()
-                                if potential_table == known_lower or potential_table == known_lower.rstrip('s'):
-                                    # Try the FK column name as PK (often same in TPC-DS)
-                                    if _target_has_col(known_table, col_name):
-                                        table_fks[col_lower] = (known_table, col_name)
-                                    break
+                # Deduplicate while preserving order.
+                seen = set()
+                ordered_candidates = []
+                for cand in candidate_tables:
+                    if cand not in seen:
+                        seen.add(cand)
+                        ordered_candidates.append(cand)
+
+                for target_table in ordered_candidates:
+                    target_pk = find_primary_key_column(
+                        target_table, list(tables[target_table]['columns'].keys())
+                    )
+                    if target_pk:
+                        table_fks[col_lower] = (target_table, target_pk)
+                        break
+
+                    same_name = _same_name_col(target_table, col_name)
+                    if same_name:
+                        table_fks[col_lower] = (target_table, same_name)
+                        break
 
             if table_fks:
                 fk_relationships[table_name] = table_fks
@@ -1538,6 +1645,53 @@ class SyntheticValidator:
         if modified:
             return parsed.sql(dialect='duckdb')
         return sql
+
+    @staticmethod
+    def _resolve_ambiguous_from_error(sql: str, error_msg: str) -> str:
+        """Resolve a specific ambiguous-column binder error from DuckDB text.
+
+        Example error:
+          Ambiguous reference to column name "inv_item_sk"
+          (use: "inventory.inv_item_sk" or "item.inv_item_sk")
+        """
+        m = re.search(
+            r'Ambiguous reference to column name "([^"]+)"\s*\(use:\s*"([^"]+)"\s*or\s*"([^"]+)"\)',
+            error_msg,
+        )
+        if not m:
+            return sql
+
+        col_name = m.group(1)
+        ref_a = m.group(2)
+        ref_b = m.group(3)
+
+        candidates = []
+        for ref in (ref_a, ref_b):
+            if "." not in ref:
+                continue
+            table, ref_col = ref.split(".", 1)
+            if ref_col.lower() == col_name.lower():
+                candidates.append(table)
+
+        if not candidates:
+            return sql
+
+        chosen = get_table_from_column(col_name, set(candidates)) or candidates[0]
+
+        try:
+            parsed = sqlglot.parse_one(sql)
+        except Exception:
+            return sql
+
+        modified = False
+        for col in parsed.find_all(exp.Column):
+            if not col.table and col.name.lower() == col_name.lower():
+                col.set('table', exp.to_identifier(chosen))
+                modified = True
+
+        if not modified:
+            return sql
+        return parsed.sql(dialect='duckdb')
 
     def _detect_scalar_subquery_uniques(self, sql: str, tables: Dict) -> List[Tuple[str, List[str]]]:
         """Detect scalar subqueries and return (table, filter_cols) pairs.
@@ -1643,12 +1797,12 @@ class SyntheticValidator:
         has_cte = bool(list(parsed.find_all(exp.CTE)))
         has_subquery = any(parsed.find_all(exp.Subquery))
         
-        # Detect if this is a TPC-DS style query (complex with CTEs and multiple filters)
-        is_tpcds_style = has_cte and has_subquery and join_count >= 2 and has_where
+        # Detect heavy analytic query shape (complex CTE/subquery join graph + filters)
+        is_heavy_analytic_shape = has_cte and has_subquery and join_count >= 2 and has_where
         
         # Row estimation based on query complexity
-        if is_tpcds_style:
-            # TPC-DS queries need substantial data but correlated subqueries are slow
+        if is_heavy_analytic_shape:
+            # Deep analytic queries need substantial data, but avoid excessive runtime.
             base_rows = 1000
         elif has_cte or has_subquery:
             base_rows = min(target_rows * 20, 20000)
@@ -1665,7 +1819,7 @@ class SyntheticValidator:
             base_rows = min(target_rows * 2, 3000)
         
         # Moderate increase for WHERE clauses
-        if has_where and not is_tpcds_style:
+        if has_where and not is_heavy_analytic_shape:
             filter_count = 0
             for where in parsed.find_all(exp.Where):
                 for eq in where.find_all(exp.EQ):

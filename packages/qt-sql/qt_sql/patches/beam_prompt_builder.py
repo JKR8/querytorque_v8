@@ -136,27 +136,16 @@ def format_family_section(
     # Before SQL
     before_sql = gold_example.get("original_sql", "")
     if before_sql:
-        # Truncate to first 10 lines for readability
-        before_lines = before_sql.split("\n")[:10]
-        before_display = "\n".join(before_lines)
-        if len(before_sql.split("\n")) > 10:
-            before_display += "\n..."
-
         lines.append("")
         lines.append("**BEFORE (slow):**")
-        lines.append(f"```sql\n{before_display}\n```")
+        lines.append(f"```sql\n{before_sql.strip()}\n```")
 
     # After SQL
     after_sql = gold_example.get("optimized_sql", "")
     if after_sql:
-        after_lines = after_sql.split("\n")[:10]
-        after_display = "\n".join(after_lines)
-        if len(after_sql.split("\n")) > 10:
-            after_display += "\n..."
-
         lines.append("")
         lines.append("**AFTER (fast):**")
-        lines.append(f"```sql\n{after_display}\n```")
+        lines.append(f"```sql\n{after_sql.strip()}\n```")
 
     # IR node maps (if enriched)
     ir_before = gold_example.get("ir_node_map_before")
@@ -338,9 +327,9 @@ pathology is detected, your primary target SHOULD address it.
     return sections, n_families
 
 
-# ── Main Prompt Builder ────────────────────────────────────────────────────
+# ── Reasoning Prompt Builder (R1 2-shot, outputs 2 PatchPlans) ──────────
 
-def build_beam_prompt(
+def build_reasoning_prompt(
     query_id: str,
     original_sql: str,
     explain_text: str,
@@ -349,230 +338,45 @@ def build_beam_prompt(
     dialect: str,
     intelligence_brief: str = "",
 ) -> str:
-    """Build the complete beam patch optimization prompt.
+    """Build the R1 reasoning prompt — full intelligence, outputs 2 PatchPlans.
+
+    Used as shot 1 in REASONING mode. The same prompt prefix is reused
+    in shot 2 (via append_shot_results) for cache-hit efficiency.
 
     Args:
         query_id: Query identifier (e.g., "query_21")
         original_sql: Full original SQL
         explain_text: EXPLAIN ANALYZE output as text
         ir_node_map: IR node map (from render_ir_node_map)
-        all_5_examples: Dict mapping family ID (A-E) to gold example JSON
+        all_5_examples: Dict mapping family ID (A-F) to gold example JSON
         dialect: SQL dialect (duckdb, postgres, snowflake)
         intelligence_brief: Pre-computed detection + classification summary.
 
     Returns:
         Complete prompt string
     """
+    engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
     role_text = (
-        "You are a SQL optimization specialist. Your task is to propose "
-        "**exactly 4 independent patch plans** for this query, each targeting "
-        "a different optimization family.\n\n"
+        f"You are a SQL optimization specialist for {engine_name}. "
+        "Your task is to analyze this query's execution plan, identify the primary "
+        "bottleneck, and propose **exactly 2 independent patch plans** that target "
+        "different optimization strategies.\n\n"
         "Each patch plan must:\n"
         "- Be atomic (steps applied sequentially: s1 → s2 → s3 → ...)\n"
         "- Transform the original query using patch operations\n"
         "- Preserve semantic equivalence (same rows, columns, ordering)\n"
-        "- Follow the patterns shown in reference examples below\n\n"
-        "You will **choose 4 of the 6 families** based on relevance to THIS SPECIFIC QUERY."
+        "- Follow the patterns shown in reference examples below"
     )
 
     sections, n_families = _build_prompt_body(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
+        include_patch_plans=True,
         intelligence_brief=intelligence_brief,
     )
 
-    # ── Section 6: Output Format (full patch plans) ────────────────────
-    n_to_choose = min(4, n_families)
-    sections.append(
-        f"## Your Task\n\n"
-        f"Analyze this query against the {n_families} families above.\n\n"
-        f"**Choose up to {n_to_choose} families** that are most relevant. For each chosen family:\n"
-        f"1. Create a patch plan with atomic steps\n"
-        f"2. Score relevance (0.0\u20131.0) based on how well it matches this query\n"
-        f"3. Provide reasoning for your choice\n"
-    )
-
-    sections.append("""**Output format**:
-
-```json
-[
-  {
-    "family": "A",
-    "transform": "date_cte_isolate",
-    "plan_id": "t1_family_a",
-    "relevance_score": 0.95,
-    "reasoning": "Query has late calendar_date filter on large fact table, CTE cascade structure → early pushdown = high ROI",
-    "steps": [
-      {
-        "step_id": "s1",
-        "op": "insert_cte",
-        "target": {"by_node_id": "S0"},
-        "payload": {"cte_name": "date_filter", "cte_query_sql": "SELECT ... WHERE calendar_date > ..."},
-        "description": "Extract date filter into separate CTE"
-      },
-      {
-        "step_id": "s2",
-        "op": "replace_from",
-        "target": {"by_node_id": "S0"},
-        "payload": {"from_sql": "fact_table JOIN date_filter ON ..."},
-        "description": "Join via filtered CTE instead of raw table"
-      }
-    ]
-  },
-  {
-    "family": "B",
-    "transform": "decorrelate_subquery",
-    "plan_id": "t2_family_b",
-    "relevance_score": 0.88,
-    "reasoning": "Correlated subquery in WHERE with DELIM_SCAN in plan → decorrelation = medium ROI",
-    "steps": [...]
-  },
-  {
-    "family": "E",
-    "transform": "materialized_prefetch",
-    "plan_id": "t3_family_e",
-    "relevance_score": 0.72,
-    "reasoning": "Multiple independent dimension filters applied → materialization saves repeated scans",
-    "steps": [...]
-  },
-  {
-    "family": "D",
-    "transform": "intersect_to_exists",
-    "plan_id": "t4_family_d",
-    "relevance_score": 0.61,
-    "reasoning": "Set operation subquery pattern detected → EXISTS conversion feasible",
-    "steps": [...]
-  }
-]
-```
-
-**Rules**:
-- Output up to """ + str(n_to_choose) + """ patch plans
-- Each plan has its own `plan_id`, `family`, `transform` name
-- Each plan includes `relevance_score` (0.0–1.0) and brief `reasoning`
-- Each step in `steps` array is complete, executable SQL (no ellipsis)
-- Preserve all WHERE filters (removing filters = semantic bug)
-- Order patches by relevance_score (highest first)
-
-After JSON, provide analysis:
-```
-## Analysis
-
-For each available family, explain relevance (HIGH / MEDIUM / LOW) in 1-2 sentences.
-
-**Chosen families**: [list]
-**Expected speedups**: t1: Nx, t2: Nx, ...
-**Confidence**: High/Medium/Low (brief justification)
-```
-
-Now output your JSON array of patch plans:
-""")
-
-    return "\n\n".join(sections)
-
-
-# ── Tiered Prompt Builder (Analyst → Worker split) ────────────────────────
-
-def build_beam_prompt_tiered(
-    query_id: str,
-    original_sql: str,
-    explain_text: str,
-    ir_node_map: str,
-    all_5_examples: Dict[str, Dict[str, Any]],
-    dialect: str,
-    intelligence_brief: str = "",
-) -> str:
-    """Build tiered analyst prompt: sections 1-5 shared + Section 6 asks for target IR maps.
-
-    The analyst (DeepSeek) outputs structural targets only — no full patch plans.
-    A separate worker (qwen) converts each target into a PatchPlan JSON.
-
-    Args:
-        query_id: Query identifier
-        original_sql: Full original SQL
-        explain_text: EXPLAIN ANALYZE output
-        ir_node_map: IR node map (from render_ir_node_map)
-        all_5_examples: Dict mapping family ID (A-E) to gold example JSON
-        dialect: SQL dialect
-        intelligence_brief: Pre-computed detection + classification summary.
-
-    Returns:
-        Complete tiered analyst prompt string
-    """
-    role_text = (
-        "You are a SQL optimization analyst. Your task is to analyze this query, "
-        "identify the primary bottleneck, and design structural optimization targets.\n\n"
-        "For each target, describe the STRUCTURAL SHAPE of the optimized query "
-        "using an IR node map (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY). "
-        "A separate code-generation worker will convert your targets into executable patch plans.\n\n"
-        "Identify the primary bottleneck. Only provide secondary targets if they are "
-        "distinct and high-confidence. **Quality > Quantity.**"
-    )
-
-    sections, n_families = _build_prompt_body(
-        query_id, original_sql, explain_text, ir_node_map,
-        all_5_examples, dialect, role_text,
-        include_patch_plans=False,
-        intelligence_brief=intelligence_brief,
-    )
-
-    # ── Section 5c: Worker Routing ───────────────────────────────────────
-    sections.append("""## Worker Routing
-
-Your targets will be routed to specialized workers:
-- **W1 "Reducer"** (Families A, D): Cardinality reduction — early filtering, set operations
-- **W2 "Unnester"** (Families B, C): Decorrelation, aggregation pushdown
-- **W3 "Builder"** (Families F, E): Join restructuring, materialization/prefetch
-- **W4 "Wildcard"** (Dynamic): Deep specialist — your **#1 target** gets maximum effort
-
-The highest-relevance target always goes to W4. Design diverse targets across worker roles for maximum coverage.
-""")
-
-    # ── Section 6: Tiered Output Format (target IR maps) ────────────────
-    n_to_choose = min(4, n_families)
-    sections.append(
-        f"## Your Task\n\n"
-        f"Analyze this query against the {n_families} families above.\n\n"
-        f"Identify the **primary bottleneck**. Only provide secondary targets if they are "
-        f"distinct and high-confidence. Quality > Quantity.\n\n"
-        f"For each target (1 to {n_to_choose}):\n"
-        f"1. Describe the bottleneck hypothesis\n"
-        f"2. Design a TARGET IR node map showing what the optimized query SHOULD look like\n"
-        f"3. Score relevance (0.0\u20131.0)\n"
-        f"4. Recommend which gold example(s) a code-generation worker should use as reference\n"
-    )
-
-    sections.append("""**Output format**:
-
-```json
-[
-  {
-    "family": "B",
-    "transform": "shared_scan_decorrelate",
-    "target_id": "t1",
-    "relevance_score": 0.95,
-    "hypothesis": "Correlated scalar subquery re-scans web_sales per row. Shared-scan variant: inner=outer table with same date filter.",
-    "target_ir": "S0 [SELECT]\\n  CTE: common_scan  (via Q1)\\n    FROM: web_sales, date_dim\\n    WHERE: d_date BETWEEN ... AND d_date_sk = ws_sold_date_sk\\n  CTE: thresholds  (via Q2)\\n    FROM: common_scan\\n    GROUP BY: ws_item_sk\\n  MAIN QUERY (via Q0)\\n    FROM: common_scan cs, item, thresholds t\\n    WHERE: i_manufact_id = 320 AND ... AND cs.ws_ext_discount_amt > t.threshold\\n    ORDER BY: sum(ws_ext_discount_amt)",
-    "recommended_examples": ["sf_shared_scan_decorrelate"]
-  }
-]
-```
-
-**Rules**:
-- target_ir must follow the IR node map format (same as Section 4)
-- target_ir describes the STRUCTURAL SHAPE of the optimized query (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY)
-- recommended_examples: list gold example IDs the worker should use as reference patch template
-- Each target should represent a DIFFERENT optimization strategy
-- Rank by relevance_score (highest first)
-- Output up to """ + str(n_to_choose) + """ targets
-
-After JSON, provide analysis:
-
-## Analysis
-For each available family, explain relevance (HIGH / MEDIUM / LOW) in 1-2 sentences.
-**Chosen families**: [list]
-**Confidence**: High/Medium/Low
-""")
+    # ── Section 6: Task — output 2 PatchPlans ──────────────────────────
+    sections.append(_build_patchplan_task_section(n_plans=2))
 
     return "\n\n".join(sections)
 
@@ -727,7 +531,7 @@ def build_worker_semantic_retry_prompt(
     # Error summary
     if sem_result.errors:
         lines.append("**Errors:**")
-        for err in sem_result.errors[:5]:
+        for err in sem_result.errors:
             lines.append(f"- {err}")
         lines.append("")
 
@@ -762,12 +566,8 @@ def build_worker_semantic_retry_prompt(
     sql_diff = SQLDiffer.unified_diff(original_sql, rewrite_sql)
     if sql_diff:
         lines.append("**SQL diff (original → rewrite):**")
-        # Truncate to 30 lines
-        diff_lines = sql_diff.split("\n")[:30]
         lines.append("```diff")
-        lines.extend(diff_lines)
-        if len(sql_diff.split("\n")) > 30:
-            lines.append("... (truncated)")
+        lines.append(sql_diff)
         lines.append("```")
         lines.append("")
 
@@ -775,24 +575,21 @@ def build_worker_semantic_retry_prompt(
     return "\n".join(lines)
 
 
-def build_beam_tiered_snipe_prompt(
+def build_beam_sniper_prompt(
     query_id: str,
     original_sql: str,
     explain_text: str,
     ir_node_map: str,
     all_5_examples: Dict[str, Dict[str, Any]],
     dialect: str,
-    patches: List[Any],
-    patch_explains: Dict[str, str],
-    all_prior_iterations: Optional[List[List[Any]]] = None,
-    iteration: int = 1,
+    strike_results: List[Dict[str, Any]],
+    intelligence_brief: str = "",
 ) -> str:
-    """Build snipe prompt for the analyst after seeing benchmark results.
+    """Build the R1 sniper prompt for BEAM mode — sees BDA + intelligence, outputs 2 PatchPlans.
 
-    Reuses sections 1-5 from the tiered prompt, then adds:
-    - History summary table (all prior iterations, compact)
-    - Detailed latest iteration (EXPLAIN plans, SQL, errors)
-    - V4 task protocol (Compare EXPLAIN Plans → Design Targets)
+    Called after qwen probe workers. The sniper sees all probe results (BDA),
+    EXPLAIN plans for winners, and the full engine intelligence. Outputs 2
+    PatchPlans that build on/combine winning probes.
 
     Args:
         query_id: Query identifier.
@@ -801,118 +598,164 @@ def build_beam_tiered_snipe_prompt(
         ir_node_map: IR node map.
         all_5_examples: Gold examples dict.
         dialect: SQL dialect.
-        patches: List of AppliedPatch objects from the LATEST iteration.
-        patch_explains: Dict mapping patch_id → EXPLAIN text for latest iteration.
-        all_prior_iterations: ALL prior iteration patch lists (for history table).
-        iteration: Current iteration number (0-based from beam_session).
+        strike_results: List of dicts with probe_id, transform_id, family,
+            status, speedup, error, explain_text, sql.
+        intelligence_brief: Pre-computed detection + classification summary.
 
     Returns:
-        Complete snipe prompt string.
+        Complete sniper prompt string.
     """
+    n_total = len(strike_results)
+    n_pass = sum(1 for s in strike_results if s.get("status") in ("PASS", "WIN", "IMPROVED"))
+    n_win = sum(1 for s in strike_results if s.get("status") == "WIN")
+
+    engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
     role_text = (
-        "You are a SQL optimization analyst reviewing benchmark results. "
-        "Analyze what worked, what failed, and design refined targets "
-        "for the next round of workers.\n\n"
-        "Identify the primary bottleneck. Only provide secondary targets if they are "
-        "distinct and high-confidence. Quality > Quantity.\n\n"
-        "You will see the original query, execution plan, IR structure, "
-        "and detailed results from previous rounds."
+        f"You are a SQL optimization specialist for {engine_name}. "
+        f"{n_total} transform probes were fired against query {query_id}. "
+        f"{n_pass} passed validation, {n_win} showed speedup.\n\n"
+        "Your task: analyze the probe results (BDA), identify what worked "
+        "and why, then design **exactly 2 patch plans** that build on the "
+        "best insights — combining or refining winning strategies."
     )
 
     sections, n_families = _build_prompt_body(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
-        include_patch_plans=False,
+        include_patch_plans=True,
+        intelligence_brief=intelligence_brief,
     )
 
-    # ── Section 6: History Summary Table (all prior iterations) ───────
-    if all_prior_iterations and len(all_prior_iterations) > 0:
-        summary = _build_history_summary_table(all_prior_iterations)
-        sections.append(f"## Optimization History\n\n{summary}")
-        sections.append("")
+    # ── Section 6: BDA Table ──────────────────────────────────────────
+    bda_lines = [
+        "## Strike BDA (Battle Damage Assessment)\n",
+        "| Probe | Transform | Family | Status | Speedup | Error/Notes |",
+        "|-------|-----------|--------|--------|---------|-------------|",
+    ]
+    for s in strike_results:
+        speedup = s.get("speedup")
+        speedup_str = f"{speedup:.2f}x" if speedup else "-"
+        error_str = s.get("error") or ""
+        bda_lines.append(
+            f"| {s.get('probe_id', '?')} | {s.get('transform_id', '?')} | "
+            f"{s.get('family', '?')} | {s.get('status', '?')} | "
+            f"{speedup_str} | {error_str} |"
+        )
+    sections.append("\n".join(bda_lines))
 
-    # ── Section 7: Detailed Latest Iteration ──────────────────────────
-    detail = _build_detailed_iteration_section(
-        iteration=len(all_prior_iterations) - 1 if all_prior_iterations else 0,
-        patches=patches,
-        original_explain=explain_text,
-        explains=patch_explains,
-    )
-    sections.append(detail)
+    # ── Section 7: EXPLAIN Plans for winning strikes ──────────────────
+    winning = [
+        s for s in strike_results
+        if s.get("status") in ("WIN", "IMPROVED", "PASS")
+        and s.get("speedup") and s["speedup"] >= 1.0
+        and s.get("explain_text")
+    ]
 
-    # ── Section 8: V4 Task Protocol ───────────────────────────────────
-    n_to_choose = min(4, n_families)
+    if winning:
+        explain_sections = ["## EXPLAIN Plans (winning strikes)\n"]
+        for s in sorted(winning, key=lambda x: -(x.get("speedup") or 0)):
+            explain_sections.append(
+                f"### {s['probe_id']}: {s['transform_id']} ({s['speedup']:.2f}x)\n"
+                f"```\n{s['explain_text'].strip()}\n```\n"
+            )
+        sections.append("\n".join(explain_sections))
 
-    # Build a compact result summary line for the protocol header
-    status_counts: Dict[str, int] = {}
-    for p in patches:
-        s = getattr(p, "status", "?")
-        status_counts[s] = status_counts.get(s, 0) + 1
-    status_line = ", ".join(f"{v} {k}" for k, v in sorted(status_counts.items()))
+    # ── Section 8: SQL of winning strikes ─────────────────────────────
+    if winning:
+        sql_sections = ["## SQL of Winning Strikes\n"]
+        for s in sorted(winning, key=lambda x: -(x.get("speedup") or 0)):
+            sql = s.get("sql")
+            if sql:
+                sql_sections.append(
+                    f"### {s['probe_id']}: {s['transform_id']} ({s['speedup']:.2f}x)\n"
+                    f"```sql\n{sql.strip()}\n```\n"
+                )
+        sections.append("\n".join(sql_sections))
 
-    sections.append(f"\n## Your Task — Snipe Round {iteration}\n")
-    sections.append(
-        f"Results from latest iteration: **{status_line}**.\n\n"
-        "Follow this protocol exactly.\n\n"
-        "### Step 1 — Compare EXPLAIN Plans\n\n"
-        "For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.\n\n"
-        "For each **WIN**, answer:\n"
-        "- QUOTE the operator line(s) from the original that got cheaper or "
-        "were eliminated. Give the exact operator name, time, and row count "
-        "from the plan text above.\n"
-        "- What structural SQL change caused that operator improvement?\n"
-        "- What is the **most expensive remaining operator** in this winner's "
-        "plan? QUOTE its line (name, time, rows).\n\n"
-        "For each **FAIL/NEUTRAL/REGRESSION**:\n"
-        "- QUOTE the operator(s) that got MORE expensive vs the original.\n"
-        "- Why did the structural change backfire?\n\n"
-        "Then classify winners as REDUNDANT (same core structural change, "
-        "same operators improved) or COMPLEMENTARY (different operators "
-        "improved, different structural changes).\n\n"
-        "### Step 2 — Design Targets by Combining Strategies\n\n"
-        "Start from the **best winner's SQL** as your baseline.\n\n"
-        "**CRITICAL**: Do NOT invent new hypotheses about row counts or "
-        "selectivity. Every claim about rows, times, or costs MUST be a "
-        "direct quote from an EXPLAIN plan above. If a number is not in "
-        "the plans, you do not know it.\n\n"
-        "**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites "
-        "(UNION\u2194UNION ALL, JOIN\u2194WHERE IN, CTE\u2194subquery). These produce "
-        "identical plans. Focus on changes that **eliminate operators** or "
-        "**reduce input rows to expensive operators** as shown in the plans.\n\n"
-        f"Design up to {n_to_choose} targets, prioritized:\n\n"
-        "1. **Combination** (primary if complementary winners exist): Take "
-        "the best winner's SQL. Layer on the structural change from a "
-        "complementary winner that addresses a DIFFERENT expensive operator. "
-        "Cite both operators by name from the EXPLAIN plans.\n"
-        "2. **Refinement**: Take the best winner's SQL. Target its most "
-        "expensive remaining operator (quoted in Step 1). Design a structural "
-        "change that reduces input rows to that operator. CITE the operator "
-        "and its current row count from the plan.\n"
-        "3. **Rescue** (if a failed patch had a sound structural idea): "
-        "Fix the implementation while preserving the best winner's gains.\n"
-        "4. **Novel**: A new structural approach that targets the most "
-        "expensive remaining operator. Cite the operator from the plan.\n\n"
-        "**Combined families**: You MAY combine families in a single target "
-        "(e.g. \"A+B\", \"B+E\", \"A+F\"). The worker will receive gold examples "
-        "from ALL referenced families.\n\n"
-        f"Output up to {n_to_choose} targets. Same JSON format:\n\n"
-        "```json\n"
-        "[\n"
-        "  {\n"
-        "    \"family\": \"A+B\",\n"
-        "    \"transform\": \"early_filter_then_decorrelate\",\n"
-        "    \"target_id\": \"t1\",\n"
-        "    \"relevance_score\": 0.95,\n"
-        "    \"hypothesis\": \"...\",\n"
-        "    \"target_ir\": \"...\",\n"
-        "    \"recommended_examples\": [\"date_cte_isolate\", \"shared_scan_decorrelate\"]\n"
-        "  }\n"
-        "]\n"
-        "```\n\n"
-        f"Output up to {n_to_choose} targets. Fewer strong targets beat padding with weak ones.\n"
-    )
+    # ── Section 9: Task — output 2 PatchPlans ─────────────────────────
+    sections.append("""## Your Task
+
+The BDA tells you WHAT WORKS on this query. Design 2 patch plans:
+
+1. **Analyze winning strikes**: Compare their EXPLAINs to original —
+   where did row counts drop? Which operators changed? What bottleneck
+   remains?
+
+2. **Learn from failures**: Which transforms made things worse or broke
+   correctness? What should NOT be combined?
+
+3. **Design 2 patch plans**: Stack winning transforms together or refine
+   the best. If probe p01 pushed a filter and p03 decorrelated, try both
+   in one rewrite.
+
+""" + _build_patchplan_task_section(n_plans=2))
 
     return "\n\n".join(sections)
+
+
+# ── Shared PatchPlan Task Section ──────────────────────────────────────────
+
+def _build_patchplan_task_section(n_plans: int = 2) -> str:
+    """Build the shared output format section for PatchPlan JSON.
+
+    Used by build_reasoning_prompt, build_beam_sniper_prompt, and append_shot_results.
+    """
+    return f"""Output exactly **{n_plans} patch plans** as a JSON array.
+
+### Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+### Output Format
+
+```json
+[
+  {{
+    "plan_id": "r1",
+    "family": "B",
+    "transform": "decorrelate",
+    "hypothesis": "Correlated subquery re-scans store_sales per row...",
+    "target_ir": "S0 [SELECT]\\n  CTE: thresholds (GROUP BY item_sk)...",
+    "dialect": "postgres",
+    "steps": [
+      {{"step_id": "s1", "op": "insert_cte", "target": {{"by_node_id": "S0"}}, "payload": {{"cte_name": "...", "cte_query_sql": "..."}}}},
+      {{"step_id": "s2", "op": "replace_from", "target": {{"by_node_id": "S0"}}, "payload": {{"from_sql": "..."}}}}
+    ]
+  }},
+  {{
+    "plan_id": "r2",
+    "family": "A",
+    "transform": "early_filter",
+    "hypothesis": "Late date filter after full scan...",
+    "target_ir": "...",
+    "dialect": "postgres",
+    "steps": [...]
+  }}
+]
+```
+
+### Semantic Guards (MUST preserve)
+- All WHERE/HAVING/ON conditions preserved exactly
+- All literal values unchanged (35*0.01 stays as 35*0.01, NOT 0.35)
+- Column names, aliases, ORDER BY, and LIMIT exactly
+- Do NOT add new filter conditions
+- Same row count as original query
+
+### Rules
+- Output exactly {n_plans} plans — each targeting a DIFFERENT optimization strategy
+- Each plan must have unique plan_id, family, transform
+- Each step's SQL in payloads must be complete, executable (no ellipsis)
+- Target all steps at by_node_id: "S0" (the main statement)
+- Include hypothesis explaining WHY this optimization should help (cite EXPLAIN evidence)
+
+Output ONLY the JSON array (no markdown fences, no explanation before/after):"""
 
 
 # ── Helper: Load Gold Examples ─────────────────────────────────────────────
@@ -1012,7 +855,7 @@ def _build_history_summary_table(
             speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "—"
             orig_str = f"{p.original_ms:.0f}" if p.original_ms is not None else "—"
             patch_str = f"{p.patch_ms:.0f}" if p.patch_ms is not None else "—"
-            err_str = (p.apply_error or "")[:40]
+            err_str = p.apply_error or ""
             lines.append(
                 f"| {iter_idx} | {p.patch_id} | {p.family} | "
                 f"{p.transform} | {speedup_str} | {p.status} | "
@@ -1223,7 +1066,7 @@ def _build_detailed_iteration_section(
         orig_str = f"{p.original_ms:.0f}" if p.original_ms is not None else "—"
         patch_str = f"{p.patch_ms:.0f}" if p.patch_ms is not None else "—"
         sem_str = "PASS" if p.semantic_passed else "FAIL"
-        error_str = (p.apply_error or "")[:80]
+        error_str = p.apply_error or ""
         sections.append(
             f"| {p.patch_id} | {p.family} | {p.transform} | "
             f"{speedup_str} | {p.status} | "
@@ -1248,18 +1091,12 @@ def _build_detailed_iteration_section(
     sections.append("\n#### Patched SQL\n")
     for p in patches:
         if p.output_sql:
-            # Truncate to 30 lines max
-            sql_lines = p.output_sql.strip().split("\n")[:30]
-            sql_display = "\n".join(sql_lines)
-            if len(p.output_sql.strip().split("\n")) > 30:
-                sql_display += "\n-- ... (truncated)"
-
             label = f"{p.patch_id} (Family {p.family}, {p.transform})"
             if p.speedup is not None:
                 label += f" — {p.speedup:.2f}x {p.status}"
 
             sections.append(f"**{label}:**")
-            sections.append(f"```sql\n{sql_display}\n```\n")
+            sections.append(f"```sql\n{p.output_sql.strip()}\n```\n")
         else:
             sections.append(
                 f"**{p.patch_id}** (Family {p.family}): "
@@ -1307,240 +1144,73 @@ def _build_detailed_iteration_section(
     return "\n".join(sections)
 
 
-def build_beam_snipe_prompt(
-    original_prompt: str,
-    iteration: int,
+def append_shot_results(
+    base_prompt: str,
     patches: List[Any],
-    original_explain: str,
     explains: Dict[str, str],
-    race_result: Optional[Any] = None,
-    all_prior_iterations: Optional[List[List[Any]]] = None,
 ) -> str:
-    """Build snipe prompt: original prompt + summary history + detailed latest results.
+    """Append shot 1 results to the base prompt for shot 2 (cache-hit pattern).
 
-    Context management: instead of re-appending the full original prompt + all results
-    each iteration (which would grow unbounded), we use:
-    - COMPACT SUMMARY TABLE of ALL prior iterations (1 line per patch)
-    - FULL DETAIL of only the MOST RECENT iteration (SQL, EXPLAIN, errors)
-
-    This keeps prompt size roughly constant regardless of iteration count.
+    The base prompt prefix is preserved exactly so the LLM's KV cache
+    can be reused. Only results + new task are appended.
 
     Args:
-        original_prompt: The initial prompt (from build_beam_prompt)
-        iteration: Current iteration number (0-based internal, displayed as 1-based)
-        patches: List of AppliedPatch from the most recent iteration
-        original_explain: EXPLAIN text for original query
-        explains: Dict mapping patch_id → EXPLAIN text
-        race_result: Optional RaceResult from race validation
-        all_prior_iterations: List of patch lists from ALL prior iterations
-            (for building the summary table). If None, only current patches shown.
+        base_prompt: The shot 1 prompt (from build_reasoning_prompt or build_beam_sniper_prompt).
+        patches: List of AppliedPatch objects from shot 1 validation.
+        explains: Dict mapping patch_id → EXPLAIN text for shot 1 patches.
 
     Returns:
-        Complete snipe prompt string
+        Shot 2 prompt = base_prompt + results + new task.
     """
-    sections = [original_prompt]
+    lines = [base_prompt, "", "## Shot 1 Results", ""]
 
-    sections.append(f"\n\n## Previous Attempt Results\n")
+    # Results table
+    lines.append("| # | Family | Transform | Speedup | Status | Error |")
+    lines.append("|---|--------|-----------|---------|--------|-------|")
 
-    # ── Summary table of ALL iterations (compact, ~1 line per patch) ──
-    if all_prior_iterations and len(all_prior_iterations) > 0:
-        # Include all prior iterations in the summary table
-        summary = _build_history_summary_table(all_prior_iterations)
-        sections.append(summary)
-        sections.append("")
-
-    # ── Detailed results for MOST RECENT iteration only ───────────────
-    detail = _build_detailed_iteration_section(
-        iteration=iteration,
-        patches=patches,
-        original_explain=original_explain,
-        explains=explains,
-        race_result=race_result,
-    )
-    sections.append(detail)
-
-    # ── Task for next iteration ──────────────────────────────────────
-    # Build a compact result summary line for the protocol header
-    status_counts: Dict[str, int] = {}
     for p in patches:
-        s = getattr(p, "status", "?")
-        status_counts[s] = status_counts.get(s, 0) + 1
-    status_line = ", ".join(f"{v} {k}" for k, v in sorted(status_counts.items()))
-
-    sections.append(f"\n## Your Task (Iteration {iteration + 2})\n")
-    sections.append(
-        f"Results from iteration {iteration + 1}: **{status_line}**.\n\n"
-        "Follow this protocol exactly.\n\n"
-        "### Step 1 — Compare EXPLAIN Plans\n\n"
-        "For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.\n\n"
-        "For each **WIN**, answer:\n"
-        "- QUOTE the operator line(s) from the original that got cheaper or "
-        "were eliminated. Give the exact operator name, time, and row count "
-        "from the plan text above.\n"
-        "- What structural SQL change caused that operator improvement?\n"
-        "- What is the **most expensive remaining operator** in this winner's "
-        "plan? QUOTE its line (name, time, rows).\n\n"
-        "For each **FAIL/NEUTRAL/REGRESSION**:\n"
-        "- QUOTE the operator(s) that got MORE expensive vs the original.\n"
-        "- Why did the structural change backfire?\n\n"
-        "Then classify winners as REDUNDANT (same core structural change, "
-        "same operators improved) or COMPLEMENTARY (different operators "
-        "improved, different structural changes).\n\n"
-        "### Step 2 — Design Targets by Combining Strategies\n\n"
-        "Start from the **best winner's SQL** as your baseline.\n\n"
-        "**CRITICAL**: Do NOT invent new hypotheses about row counts or "
-        "selectivity. Every claim about rows, times, or costs MUST be a "
-        "direct quote from an EXPLAIN plan above. If a number is not in "
-        "the plans, you do not know it.\n\n"
-        "**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites "
-        "(UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce "
-        "identical plans. Focus on changes that **eliminate operators** or "
-        "**reduce input rows to expensive operators** as shown in the plans.\n\n"
-        "Design up to 4 targets, prioritized:\n\n"
-        "1. **Combination** (primary if complementary winners exist): Take "
-        "the best winner's SQL. Layer on the structural change from a "
-        "complementary winner that addresses a DIFFERENT expensive operator. "
-        "Cite both operators by name from the EXPLAIN plans.\n"
-        "2. **Refinement**: Take the best winner's SQL. Target its most "
-        "expensive remaining operator (quoted in Step 1). Design a structural "
-        "change that reduces input rows to that operator. CITE the operator "
-        "and its current row count from the plan.\n"
-        "3. **Rescue** (if a failed patch had a sound structural idea): "
-        "Fix the implementation while preserving the best winner's gains.\n"
-        "4. **Novel**: A new structural approach that targets the most "
-        "expensive remaining operator. Cite the operator from the plan.\n\n"
-        "Output a new JSON array of up to 4 targets (same format as before).\n"
-    )
-
-    return "\n".join(sections)
-
-
-def build_beam_retry_prompt(
-    original_prompt: str,
-    previous_response: str,
-    all_patches: List[Any],
-    errors: List[tuple],
-) -> str:
-    """Build retry prompt showing ALL patches with stats, not just errors.
-
-    The LLM needs full context: what worked, what didn't, and why.
-
-    Args:
-        original_prompt: The original prompt that generated these patches.
-        previous_response: The raw LLM response (for reference).
-        all_patches: All AppliedPatch objects (both successful and failed).
-        errors: List of (patch_id, error_msg) for patches that failed to parse/apply.
-
-    Returns:
-        Retry prompt string.
-    """
-    lines = [
-        original_prompt,
-        "",
-        "## RETRY — Fix Malformed Patches",
-        "",
-        "Your previous response produced these patches:",
-        "",
-        "| Patch | Family | Transform | Status | Error |",
-        "|-------|--------|-----------|--------|-------|",
-    ]
-
-    for p in all_patches:
-        status = "OK" if p.output_sql else "FAILED"
-        err = (p.apply_error or "")[:60]
+        speedup_str = f"{p.speedup:.2f}x" if getattr(p, "speedup", None) is not None else "-"
+        status = getattr(p, "status", "?")
+        error = getattr(p, "apply_error", "") or ""
+        family = getattr(p, "family", "?")
+        transform = getattr(p, "transform", "?")
+        patch_id = getattr(p, "patch_id", "?")
         lines.append(
-            f"| {p.patch_id} | {p.family} | {p.transform} | {status} | {err} |"
+            f"| {patch_id} | {family} | {transform} | "
+            f"{speedup_str} | {status} | {error} |"
         )
 
     lines.append("")
 
-    # Show SQL for successful patches (so LLM knows what worked)
-    ok_patches = [p for p in all_patches if p.output_sql]
-    if ok_patches:
-        lines.append("### Working patches (keep these unchanged):\n")
-        for p in ok_patches:
-            sql_preview = "\n".join(p.output_sql.strip().split("\n")[:15])
-            lines.append(f"**{p.patch_id}** (Family {p.family}, {p.transform}):")
-            lines.append(f"```sql\n{sql_preview}\n```\n")
+    # Show EXPLAIN plans for patches with speedup
+    for p in patches:
+        pid = getattr(p, "patch_id", "?")
+        speedup = getattr(p, "speedup", None)
+        status = getattr(p, "status", "?")
 
-    # Show error details
-    failed_patches = [p for p in all_patches if not p.output_sql]
-    if failed_patches:
-        lines.append("### Failed patches (fix these):\n")
-        for p in failed_patches:
-            lines.append(f"**{p.patch_id}** (Family {p.family}, {p.transform}):")
-            lines.append(f"  Error: {p.apply_error}")
+        if pid in explains and explains[pid]:
+            speedup_str = f"{speedup:.2f}x" if speedup is not None else "?"
+            lines.append(f"### {pid} EXPLAIN ({speedup_str} {status}):")
+            lines.append(f"```\n{explains[pid].strip()}\n```")
+            lines.append("")
+        elif getattr(p, "apply_error", None):
+            lines.append(f"### {pid} Error:")
+            lines.append(p.apply_error)
             lines.append("")
 
+    # Shot 2 task
     lines.extend([
-        "Please output the COMPLETE JSON array again with fixes.",
-        "Keep working patches unchanged. Fix only the broken ones.",
-        f"Output exactly {max(len(all_patches), 4)} patch plans:",
+        "## Shot 2 — Design 2 More Patch Plans",
+        "",
+        "Build on shot 1 results:",
+        "1. Your first plan should refine or extend the best winner (or fix its remaining bottleneck)",
+        "2. Your second should try a different approach not yet attempted",
+        "",
+        "If all shot 1 plans failed, diagnose why and try fundamentally different strategies.",
+        "",
     ])
-    return "\n".join(lines)
 
-
-# ── Runtime Error Retry Prompt ─────────────────────────────────────────────
-
-def build_beam_runtime_error_retry_prompt(
-    original_prompt: str,
-    good_patches: List[Any],
-    failed_patches: List[Any],
-) -> str:
-    """Build a targeted retry prompt for patches that errored at runtime.
-
-    Multi-handling: the LLM sees all kept patches (wins, neutrals, AND
-    regressions — all valid signal) plus the errored patches with exact
-    error messages. Only needs to produce replacements for the errored ones.
-
-    Args:
-        original_prompt: The original prompt (for query/IR context).
-        good_patches: AppliedPatch objects that ran successfully (any status except ERROR).
-        failed_patches: AppliedPatch objects that errored at runtime.
-
-    Returns:
-        Retry prompt string asking for len(failed_patches) replacement patches.
-    """
-    lines = [
-        original_prompt,
-        "",
-        "## Runtime Error — Replace Errored Patches",
-        "",
-        f"From your previous response, **{len(good_patches)} patches ran** "
-        f"and **{len(failed_patches)} errored at runtime**.",
-        "",
-        "### Kept patches (do NOT re-emit these):",
-        "",
-    ]
-
-    for p in good_patches:
-        speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
-        orig_str = f"{p.original_ms:.0f}ms" if p.original_ms is not None else "?"
-        patch_str = f"{p.patch_ms:.0f}ms" if p.patch_ms is not None else "?"
-        lines.append(
-            f"- **{p.patch_id}** (Family {p.family}, {p.transform}): "
-            f"{speedup_str} {p.status} (orig={orig_str}, patch={patch_str})"
-        )
-
-    lines.extend(["", "### Errored (provide replacements for these):", ""])
-
-    for p in failed_patches:
-        lines.append(f"**{p.patch_id}** (Family {p.family}, {p.transform}):")
-        lines.append(f"  - **Error**: {p.apply_error or 'unknown'}")
-        if p.output_sql:
-            sql_preview = "\n".join(p.output_sql.strip().split("\n")[:20])
-            lines.append(f"  - **SQL that failed**:")
-            lines.append(f"```sql\n{sql_preview}\n```")
-        lines.append("")
-
-    n_needed = len(failed_patches)
-    lines.extend([
-        f"Provide exactly **{n_needed} replacement patch plan(s)** in the same JSON format.",
-        "Each replacement should fix the runtime error while targeting the same optimization opportunity.",
-        "If the original family is incompatible with this engine, choose a different family.",
-        "",
-        f"Output a JSON array of {n_needed} patch plans:",
-    ])
+    lines.append(_build_patchplan_task_section(n_plans=2))
 
     return "\n".join(lines)
 

@@ -186,7 +186,7 @@ class PatchGateValidator:
             return PatchValidationGate(
                 gate_name="SEMANTIC_MATCH",
                 passed=False,
-                error=f"Synthetic validation failed: {str(e)[:200]}"
+                error=f"Synthetic validation failed: {str(e)}"
             )
 
     def validate_speedup(
@@ -386,7 +386,7 @@ class BeamPatchValidator:
                 result.gates.append(PatchValidationGate(
                     gate_name="PATCH_APPLICATION",
                     passed=False,
-                    error=f"Patch failed: {'; '.join(patch_result.errors[:2])}"
+                    error=f"Patch failed: {'; '.join(patch_result.errors)}"
                 ))
                 return result
 
@@ -641,7 +641,7 @@ def save_validation_report(report: BeamValidationReport, output_path: Path):
                     }
                     for g in p.gates
                 ],
-                "errors": p.error_messages[:3],
+                "errors": p.error_messages,
                 "correlation": p.correlation_note
             }
             for p in report.patches

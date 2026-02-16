@@ -171,7 +171,7 @@ function Products() {
               </div>
               <ArrowUpRight size={18}/>
             </div>
-            <p style={{ fontSize:14,color:"var(--t2)",lineHeight:1.65,marginBottom:20 }}>Autonomous SQL & DAX optimization engine. Detects slow queries, generates optimized rewrites, validates for correctness, and deploys — no human in the loop.</p>
+            <p style={{ fontSize:14,color:"var(--t2)",lineHeight:1.65,marginBottom:20 }}>Autonomous SQL optimization engine. Detects slow queries, generates optimized rewrites, validates for correctness, and deploys — no human in the loop.</p>
             <div style={{ display:"flex",gap:24 }}>
               {[{v:"85%",l:"avg gain"},{v:"4.7×",l:"speedup"},{v:"0",l:"regressions",c:"var(--grn)"}].map((s,i)=>(
                 <div key={i}><span className="mono" style={{ fontSize:24,fontWeight:500,color:s.c||"var(--t1)" }}>{s.v}</span><span style={{ display:"block",fontSize:11,color:"var(--t3)",marginTop:2 }}>{s.l}</span></div>
@@ -211,7 +211,6 @@ function QueryTorqueSection() {
   ];
   const caps = [
     { icon:<Activity size={18}/>,t:"SQL Optimization",d:"Autonomous rewrites for Snowflake, Databricks, PostgreSQL, BigQuery, Redshift, SQL Server." },
-    { icon:<BarChart size={18}/>,t:"DAX Remediation",d:"Measure optimization for Power BI. Fixes iterator abuse, context transition failures." },
     { icon:<RefreshCw size={18}/>,t:"Continuous Learning",d:"Every optimization feeds the FAISS index. Regression patterns catalogued and avoided." },
     { icon:<Shield size={18}/>,t:"Quality Gates",d:"Semantic + runtime validation. Promotion thresholds. Instant rollback." },
     { icon:<GitBranch size={18}/>,t:"CI/CD Integration",d:"Hooks into deployment pipelines. Review optimized queries like code." },
@@ -223,7 +222,7 @@ function QueryTorqueSection() {
         <div className="reveal" style={{ marginBottom:64,maxWidth:640 }}>
           <span className="label" style={{ color:"var(--grn)" }}>QueryTorque</span>
           <h2 style={{ fontSize:"clamp(28px,3.5vw,44px)",fontWeight:600,letterSpacing:"-.02em",lineHeight:1.15,marginBottom:16 }}>We fix the code.<br/>Automatically.</h2>
-          <p style={{ fontSize:16,color:"var(--t2)",lineHeight:1.7 }}>Autonomous remediation engine for SQL and DAX. Monitors your warehouse, identifies underperforming queries, generates optimized rewrites, and validates every change before deployment.</p>
+          <p style={{ fontSize:16,color:"var(--t2)",lineHeight:1.7 }}>Autonomous remediation engine for SQL. Monitors your warehouse, identifies underperforming queries, generates optimized rewrites, and validates every change before deployment.</p>
         </div>
         <div className="reveal" style={{ marginBottom:80 }}>
           <span className="label">The Pipeline</span>
@@ -307,7 +306,7 @@ function Research() {
 }
 
 function Platforms() {
-  const p = ["Snowflake","Databricks","BigQuery","Redshift","PostgreSQL","SQL Server","Power BI","dbt","Airflow","GitHub"];
+  const p = ["Snowflake","Databricks","BigQuery","Redshift","PostgreSQL","SQL Server","dbt","Airflow","GitHub"];
   return (
     <section style={{ padding:"60px 0",borderTop:"1px solid var(--brd)" }}>
       <div className="container">

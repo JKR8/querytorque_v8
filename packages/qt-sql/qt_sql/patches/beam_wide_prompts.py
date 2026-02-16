@@ -1,12 +1,11 @@
-"""Beam Wide prompt builders — 8-16 qwen probes + R1 sniper synthesis.
+"""Beam prompt builders — qwen dispatcher + workers for BEAM mode.
 
-Pipeline: AST front gate → R1 analyst (8-16 probes) → qwen strikes → R1 sniper.
+Pipeline: R1 dispatcher (8-16 probes) → qwen workers → (sniper handled by beam_prompt_builder).
 
 Functions:
-    filter_applicable_transforms() — AST front gate, wraps detection.py
-    build_wide_analyst_prompt()   — R1 analyst: hypothesis + 8-16 probes
-    build_wide_strike_prompt()    — qwen worker: one transform, SQL-in/SQL-out
-    build_wide_sniper_prompt()    — R1 synthesizer: combine probe BDA
+    build_beam_dispatcher_prompt() — R1 analyst: hypothesis + 8-16 probes
+    build_beam_worker_prompt()     — qwen worker: one transform, PatchPlan out
+    parse_scout_response()         — parse dispatcher JSON response
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,76 +40,6 @@ class ScoutResult:
     hypothesis: str       # compressed bottleneck reasoning
     probes: List[ProbeSpec]
     dropped: List[Dict[str, str]]  # [{transform_id, reason}]
-
-
-@dataclass
-class ApplicableTransform:
-    """A transform that passed the AST front gate."""
-    id: str
-    family: str
-    principle: str
-    gap: Optional[str]
-    overlap_ratio: float
-    engines: List[str]
-    contraindications: List[Dict[str, Any]]
-    notes: str = ""
-
-
-# ── AST Front Gate ────────────────────────────────────────────────────────────
-
-def filter_applicable_transforms(
-    sql: str,
-    engine: str,
-    dialect: str = "postgres",
-    min_overlap: float = 0.5,
-) -> List[ApplicableTransform]:
-    """AST front gate: filter transforms by precondition overlap.
-
-    Deterministic, <50ms, no LLM calls. Kills transforms that can't
-    possibly apply to this query's structure.
-
-    Args:
-        sql: Original SQL query.
-        engine: Target engine ("duckdb", "postgresql", "snowflake").
-        dialect: SQL dialect for parsing.
-        min_overlap: Minimum precondition overlap ratio to survive.
-
-    Returns:
-        List of applicable transforms, sorted by overlap ratio descending.
-    """
-    from ..detection import detect_transforms, load_transforms
-
-    transforms = load_transforms()
-
-    # Normalize engine name for detection
-    engine_key = engine.replace("postgresql", "postgres") if engine else None
-    if engine_key == "postgres":
-        engine_key = "postgresql"
-
-    matches = detect_transforms(sql, transforms, engine=engine_key, dialect=dialect)
-
-    applicable = []
-    for m in matches:
-        if m.overlap_ratio < min_overlap:
-            continue
-
-        # Check contraindications — if any are active, skip
-        # (conservative: skip if any contraindication could apply)
-        # For now we include them but pass caution to analyst
-        t_data = next((t for t in transforms if t["id"] == m.id), {})
-
-        applicable.append(ApplicableTransform(
-            id=m.id,
-            family=t_data.get("family", "?"),
-            principle=t_data.get("principle", ""),
-            gap=m.gap,
-            overlap_ratio=m.overlap_ratio,
-            engines=m.engines,
-            contraindications=m.contraindications,
-            notes=t_data.get("notes", ""),
-        ))
-
-    return applicable
 
 
 # ── Gold Example Loader ───────────────────────────────────────────────────────
@@ -173,36 +102,33 @@ def _load_gold_example_by_id(
     return None
 
 
-# ── Wide Analyst Prompt (R1) ──────────────────────────────────────────────────
+# ── Beam Dispatcher Prompt (R1) ───────────────────────────────────────────────
 
-def build_wide_analyst_prompt(
+def build_beam_dispatcher_prompt(
     query_id: str,
     original_sql: str,
     explain_text: str,
     ir_node_map: str,
-    applicable_transforms: List[ApplicableTransform],
     gold_examples: Optional[Dict[str, Dict[str, Any]]] = None,
     dialect: str = "postgres",
     intelligence_brief: str = "",
 ) -> str:
-    """Build the wide analyst prompt — same intelligence as focused, 8-16 probes out.
+    """Build the beam dispatcher prompt — diagnose bottleneck, design 8-16 probes.
 
-    Same sections as focused analyst (query, EXPLAIN, IR, gold examples,
-    engine playbook) but different task: design 8-16 independent probes
-    instead of 4 deep targets.
+    Shows all transforms from catalog with match/no-match annotations.
+    No AST gate — the dispatcher sees everything and decides what to fire.
 
     Args:
         query_id: Query identifier.
         original_sql: Full original SQL.
         explain_text: EXPLAIN ANALYZE output.
         ir_node_map: IR node map (from render_ir_node_map).
-        applicable_transforms: Transforms that passed the AST front gate.
         gold_examples: Dict mapping family ID to gold example JSON.
         dialect: SQL dialect.
         intelligence_brief: Pre-computed detection + classification summary.
 
     Returns:
-        Complete analyst prompt.
+        Complete dispatcher prompt.
     """
     from .beam_prompt_builder import _build_prompt_body
 
@@ -214,8 +140,8 @@ def build_wide_analyst_prompt(
         "A team of workers will execute each probe independently — one transform "
         "per worker. Each worker outputs a PatchPlan JSON that transforms the "
         "query's IR structure. You design the strike package, they execute it.\n\n"
-        "You have the full engine playbook, gold examples, and AST-detected "
-        "transform matches below. Use them to design probes that exploit KNOWN "
+        "You have the full engine playbook, gold examples, and the complete "
+        "transform catalog below. Use them to design probes that exploit KNOWN "
         "engine weaknesses, not generic rewrites."
     )
 
@@ -231,24 +157,8 @@ def build_wide_analyst_prompt(
         intelligence_brief=intelligence_brief,
     )
 
-    # ── AST Catalog Matches (additional suggestions) ─────────────────
-    if applicable_transforms:
-        transform_lines = [
-            "## AST-Detected Transform Matches\n",
-            "These transforms matched this query's AST structure (precondition "
-            "overlap). Use as additional suggestions — you are NOT limited to "
-            "this list.\n",
-        ]
-
-        for t in applicable_transforms:
-            transform_lines.append(
-                f"- **{t.id}** (Family {t.family}, {t.overlap_ratio:.0%} overlap): "
-                f"{t.principle}"
-            )
-            if t.gap:
-                transform_lines.append(f"  Engine gap: {t.gap}")
-
-        sections.append("\n".join(transform_lines))
+    # ── Transform Catalog (all transforms, with match annotations) ───
+    sections.append(_build_transform_catalog_section(original_sql, dialect))
 
     # ── Wide Task: Design 8-16 Probes ────────────────────────────────
     sections.append("""## Your Task
@@ -309,13 +219,14 @@ Rules:
     return "\n\n".join(sections)
 
 
-# Keep old name as alias for backwards compatibility
-build_wide_scout_prompt = build_wide_analyst_prompt
+# Keep old names as aliases for backwards compatibility
+build_wide_analyst_prompt = build_beam_dispatcher_prompt
+build_wide_scout_prompt = build_beam_dispatcher_prompt
 
 
-# ── Strike Worker Prompt (qwen) ───────────────────────────────────────────────
+# ── Beam Worker Prompt (qwen) ─────────────────────────────────────────────────
 
-def build_wide_strike_prompt(
+def build_beam_worker_prompt(
     original_sql: str,
     ir_node_map: str,
     hypothesis: str,
@@ -399,166 +310,88 @@ def build_wide_strike_prompt(
     return "\n".join(lines)
 
 
-# ── Sniper Prompt (R1 synthesizer) ────────────────────────────────────────────
-
-@dataclass
-class StrikeBDA:
-    """Battle Damage Assessment for a single strike."""
-    probe_id: str
-    transform_id: str
-    family: str
-    status: str          # PASS, FAIL, REGRESSION, NEUTRAL, WIN
-    speedup: Optional[float]
-    error: Optional[str]
-    explain_text: Optional[str]
-    sql: Optional[str]
+# Keep old name as alias
+build_wide_strike_prompt = build_beam_worker_prompt
 
 
-def build_wide_sniper_prompt(
-    query_id: str,
-    original_sql: str,
-    original_explain: str,
-    hypothesis: str,
-    strike_results: List[StrikeBDA],
-    dialect: str = "postgres",
+# ── Transform Catalog (all transforms with match annotations) ────────────────
+
+def _build_transform_catalog_section(
+    sql: str,
+    dialect: str,
 ) -> str:
-    """Build the sniper synthesis prompt for beam wide.
+    """Build the full transform catalog with match/no-match annotations.
 
-    The sniper sees all probe BDA and combines winning strategies into
-    compound rewrites.
+    Loads ALL transforms from the catalog and runs AST detection to
+    annotate which ones match this query. No filtering — the dispatcher
+    sees everything and decides what to fire.
 
     Args:
-        query_id: Query identifier.
-        original_sql: Full original SQL.
-        original_explain: EXPLAIN ANALYZE of original.
-        hypothesis: Scout's bottleneck hypothesis.
-        strike_results: BDA for all strikes.
+        sql: Original SQL for AST detection.
         dialect: SQL dialect.
 
     Returns:
-        Sniper synthesis prompt.
+        Formatted catalog section string.
     """
-    n_total = len(strike_results)
-    n_pass = sum(1 for s in strike_results if s.status in ("PASS", "WIN", "IMPROVED"))
-    n_win = sum(1 for s in strike_results if s.status == "WIN")
+    from ..detection import detect_transforms, load_transforms
 
-    sections = []
+    transforms = load_transforms()
 
-    # ── Role ──────────────────────────────────────────────────────────
-    sections.append(
-        "## Role\n\n"
-        f"You are a strike synthesizer for {dialect.upper().replace('POSTGRES', 'PostgreSQL')}. "
-        f"{n_total} transform probes were fired against query {query_id}. "
-        f"{n_pass} passed validation, {n_win} showed speedup. "
-        "Your job: combine the best insights into 2-3 compound rewrites."
-    )
+    # Run detection to get overlap ratios
+    engine_key = dialect.replace("postgresql", "postgres") if dialect else None
+    if engine_key == "postgres":
+        engine_key = "postgresql"
 
-    # ── Original ──────────────────────────────────────────────────────
-    sections.append(
-        f"## Original SQL\n\n```sql\n{original_sql}\n```"
-    )
+    try:
+        matches = detect_transforms(sql, transforms, engine=engine_key, dialect=dialect)
+        match_map = {m.id: m for m in matches}
+    except Exception as e:
+        logger.warning(f"AST detection failed, showing all transforms without annotations: {e}")
+        match_map = {}
 
-    sections.append(
-        f"## Bottleneck Hypothesis (from scout)\n\n{hypothesis}"
-    )
+    # Split into matched and unmatched
+    matched = []
+    unmatched = []
+    for t in transforms:
+        tid = t["id"]
+        m = match_map.get(tid)
+        if m and m.overlap_ratio >= 0.5:
+            matched.append((t, m))
+        else:
+            unmatched.append(t)
 
-    if original_explain:
-        explain_lines = original_explain.strip().split("\n")[:40]
-        explain_display = "\n".join(explain_lines)
-        sections.append(
-            f"## EXPLAIN (Original)\n\n```\n{explain_display}\n```"
-        )
+    # Sort matched by overlap ratio descending
+    matched.sort(key=lambda x: x[1].overlap_ratio, reverse=True)
 
-    # ── BDA Table ─────────────────────────────────────────────────────
-    bda_lines = [
-        "## Strike BDA (Battle Damage Assessment)\n",
-        "| Probe | Transform | Family | Status | Speedup | Error/Notes |",
-        "|-------|-----------|--------|--------|---------|-------------|",
-    ]
-    for s in strike_results:
-        speedup_str = f"{s.speedup:.2f}x" if s.speedup else "-"
-        error_str = (s.error or "")[:60]
-        bda_lines.append(
-            f"| {s.probe_id} | {s.transform_id} | {s.family} | "
-            f"{s.status} | {speedup_str} | {error_str} |"
-        )
-    sections.append("\n".join(bda_lines))
+    lines = ["## Transform Catalog\n"]
 
-    # ── EXPLAIN Plans for winning strikes ─────────────────────────────
-    winning = [s for s in strike_results
-               if s.status in ("WIN", "IMPROVED", "PASS")
-               and s.speedup and s.speedup >= 1.0
-               and s.explain_text]
-
-    if winning:
-        explain_sections = ["## EXPLAIN Plans (winning strikes)\n"]
-        for s in sorted(winning, key=lambda x: -(x.speedup or 0)):
-            explain_lines = s.explain_text.strip().split("\n")[:40]
-            explain_display = "\n".join(explain_lines)
-            explain_sections.append(
-                f"### {s.probe_id}: {s.transform_id} ({s.speedup:.2f}x)\n"
-                f"```\n{explain_display}\n```\n"
+    if matched:
+        lines.append("### Matched (preconditions overlap with this query):\n")
+        for t, m in matched:
+            family = t.get("family", "?")
+            principle = t.get("principle", "")
+            gap_str = f" — Engine gap: {m.gap}" if m.gap else ""
+            lines.append(
+                f"- **{t['id']}** (Family {family}, {m.overlap_ratio:.0%} overlap): "
+                f"{principle}{gap_str}"
             )
-        sections.append("\n".join(explain_sections))
+        lines.append("")
 
-    # ── SQL of winning strikes (for reference) ────────────────────────
-    if winning:
-        sql_sections = ["## SQL of Winning Strikes\n"]
-        for s in sorted(winning, key=lambda x: -(x.speedup or 0))[:3]:
-            if s.sql:
-                sql_lines = s.sql.strip().split("\n")[:30]
-                sql_display = "\n".join(sql_lines)
-                if len(s.sql.strip().split("\n")) > 30:
-                    sql_display += "\n..."
-                sql_sections.append(
-                    f"### {s.probe_id}: {s.transform_id} ({s.speedup:.2f}x)\n"
-                    f"```sql\n{sql_display}\n```\n"
-                )
-        sections.append("\n".join(sql_sections))
+    if unmatched:
+        lines.append("### Available (no precondition match — try if EXPLAIN warrants):\n")
+        for t in unmatched:
+            family = t.get("family", "?")
+            principle = t.get("principle", "")
+            lines.append(f"- **{t['id']}** (Family {family}): {principle}")
+        lines.append("")
 
-    # ── Task ──────────────────────────────────────────────────────────
-    sections.append("""## Your Task
-
-The BDA tells you WHAT WORKS on this query. Design 2-3 compound rewrites:
-
-1. **Analyze winning strikes**: Compare their EXPLAINs to original —
-   where did row counts drop? Which operators changed? What bottleneck
-   remains?
-
-2. **Learn from failures**: Which transforms made things worse or broke
-   correctness? What should NOT be combined?
-
-3. **Design compound rewrites**: Stack winning transforms together.
-   If probe p01 pushed a filter and p03 decorrelated, try both in one rewrite.
-
-Output format:
-
-```json
-[
-  {
-    "strike_id": "s1",
-    "strategy": "B1+A2: decorrelate + push item filter",
-    "based_on": ["p01", "p03"],
-    "confidence": 0.9,
-    "sql": "WITH filtered_items AS (...) SELECT ..."
-  }
-]
-```
-
-Rules:
-- Output ONLY the JSON array
-- Each rewrite must be complete, executable SQL
-- Do NOT change literal values
-- Do NOT remove WHERE conditions
-- Preserve column names, ordering, and LIMIT""")
-
-    return "\n\n".join(sections)
+    return "\n".join(lines)
 
 
-# ── Parse Scout Response ──────────────────────────────────────────────────────
+# ── Parse Dispatcher Response ────────────────────────────────────────────────
 
 def parse_scout_response(response: str) -> Optional[ScoutResult]:
-    """Parse the scout analyst's JSON response into a ScoutResult.
+    """Parse the dispatcher's JSON response into a ScoutResult.
 
     Args:
         response: Raw LLM response text.
@@ -578,13 +411,13 @@ def parse_scout_response(response: str) -> Optional[ScoutResult]:
         if json_match:
             json_text = json_match.group(0).strip()
         else:
-            logger.warning("No JSON found in scout response")
+            logger.warning("No JSON found in dispatcher response")
             return None
 
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse scout JSON: {e}")
+        logger.warning(f"Failed to parse dispatcher JSON: {e}")
         return None
 
     hypothesis = data.get("hypothesis", "")
@@ -606,37 +439,3 @@ def parse_scout_response(response: str) -> Optional[ScoutResult]:
         probes=probes,
         dropped=dropped,
     )
-
-
-def parse_sniper_response(response: str) -> List[Dict[str, Any]]:
-    """Parse the sniper's JSON response into compound rewrite specs.
-
-    Args:
-        response: Raw LLM response text.
-
-    Returns:
-        List of rewrite dicts with strike_id, strategy, sql, confidence.
-    """
-    import re
-
-    json_match = re.search(r'```json\s*\n?(.*?)\n?```', response, re.DOTALL)
-    if json_match:
-        json_text = json_match.group(1).strip()
-    else:
-        json_match = re.search(r'\[[\s\S]*\]', response)
-        if json_match:
-            json_text = json_match.group(0).strip()
-        else:
-            logger.warning("No JSON array found in sniper response")
-            return []
-
-    try:
-        rewrites = json.loads(json_text)
-    except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse sniper JSON: {e}")
-        return []
-
-    if not isinstance(rewrites, list):
-        return []
-
-    return rewrites

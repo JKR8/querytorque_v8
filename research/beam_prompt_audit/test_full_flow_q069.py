@@ -1,25 +1,27 @@
-"""Test full beam flow on Q069: analyst → workers → sniper.
+"""Test full beam flow on Q069: BEAM + REASONING modes.
 
-Tests BOTH modes end-to-end without validation/benchmarking.
-Just checks if the LLM calls produce reasonable SQL.
+Renders all 4 prompt types without LLM calls:
+  1. beam_dispatcher.txt — qwen designs 8-16 probes
+  2. beam_worker.txt    — qwen executes one probe → PatchPlan
+  3. beam_sniper.txt    — R1 sees BDA + intelligence → 2 PatchPlans
+  4. reasoning.txt      — R1 full intelligence → 2 PatchPlans
+
+Pass --live to actually call the LLM (requires QT_DEEPSEEK_API_KEY).
 """
 
 import json
 import sys
-import time
 import functools
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Force unbuffered output so we can monitor progress
 print = functools.partial(print, flush=True)
 
 sys.path.insert(0, "packages/qt-shared")
 sys.path.insert(0, "packages/qt-sql")
 sys.path.insert(0, ".")
 
-OUT_DIR = Path("research/beam_prompt_audit/full_flow")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+RENDERED_DIR = Path("packages/qt-sql/qt_sql/patches/rendered_prompts")
+RENDERED_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Load Q069 data ──────────────────────────────────────────────────────────
 
@@ -44,18 +46,16 @@ ir_node_map = render_ir_node_map(script_ir)
 # ── Load gold examples ──────────────────────────────────────────────────────
 
 from qt_sql.patches.beam_wide_prompts import (
-    filter_applicable_transforms,
-    build_wide_analyst_prompt,
-    build_wide_strike_prompt,
-    build_wide_sniper_prompt,
+    build_beam_dispatcher_prompt,
+    build_beam_worker_prompt,
     parse_scout_response,
     _load_gold_example_for_family,
-    StrikeBDA,
+    ProbeSpec,
 )
-from qt_sql.patches.beam_focused_prompts import (
-    build_focused_analyst_prompt,
-    build_focused_strike_prompt,
-    build_focused_sniper_prompt,
+from qt_sql.patches.beam_prompt_builder import (
+    build_reasoning_prompt,
+    build_beam_sniper_prompt,
+    append_shot_results,
 )
 
 gold_examples = {}
@@ -64,161 +64,15 @@ for fam in ["A", "B", "C", "D", "E", "F"]:
     if ex:
         gold_examples[fam] = ex
 
-# ── LLM setup ──────────────────────────────────────────────────────────────
-
-from qt_shared.config import get_settings
-settings = get_settings()
-
-from qt_sql.generate import CandidateGenerator
-analyst_gen = CandidateGenerator(provider=settings.llm_provider, model="deepseek/deepseek-r1")
-worker_gen = CandidateGenerator(provider=settings.llm_provider, model="qwen/qwen-2.5-coder-32b-instruct")
-
-print(f"Provider: {settings.llm_provider}")
-print(f"Analyst:  deepseek-r1")
-print(f"Worker:   qwen-2.5-coder-32b")
+print(f"Loaded {len(gold_examples)} gold example families: {list(gold_examples.keys())}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WIDE MODE: analyst → qwen workers → sniper
+# PROMPT 1: BEAM Dispatcher (R1 designs 8-16 probes)
 # ══════════════════════════════════════════════════════════════════════════════
 
-print("\n" + "=" * 80)
-print("WIDE MODE: Analyst → Workers → Sniper")
-print("=" * 80)
+print("\n[1/4] Rendering BEAM dispatcher prompt...")
 
-# ── Phase 1: Wide Analyst ───────────────────────────────────────────────────
-
-print("\n[WIDE ANALYST] Designing 8-16 probes...")
-
-applicable = filter_applicable_transforms(
-    sql=original_sql, engine="postgresql", dialect="postgres", min_overlap=0.5,
-)
-
-wide_analyst_prompt = build_wide_analyst_prompt(
-    query_id="query069_multi_i1",
-    original_sql=original_sql,
-    explain_text=explain_text,
-    ir_node_map=ir_node_map,
-    applicable_transforms=applicable,
-    gold_examples=gold_examples,
-    dialect="postgres",
-)
-
-t0 = time.time()
-wide_analyst_response = analyst_gen._analyze(wide_analyst_prompt)
-wide_analyst_time = time.time() - t0
-
-with open(OUT_DIR / "wide_analyst.txt", "w") as f:
-    f.write(wide_analyst_response)
-
-scout_result = parse_scout_response(wide_analyst_response)
-if not scout_result or not scout_result.probes:
-    print("ERROR: No probes returned")
-    sys.exit(1)
-
-probes = scout_result.probes[:12]  # limit to 12
-print(f"  → {len(probes)} probes in {wide_analyst_time:.1f}s")
-for p in probes:
-    print(f"     {p.probe_id}: {p.transform_id} (Family {p.family}, conf {p.confidence:.0%})")
-
-# ── Phase 2: Wide Workers (parallel qwen) ───────────────────────────────────
-
-print(f"\n[WIDE WORKERS] Firing {len(probes)} qwen workers in parallel...")
-
-wide_worker_results = []
-
-with ThreadPoolExecutor(max_workers=8) as pool:
-    futures = {}
-    for probe in probes:
-        gold_ex = gold_examples.get(probe.family)
-        gold_patch_plan = gold_ex.get("patch_plan") if gold_ex else None
-
-        worker_prompt = build_wide_strike_prompt(
-            original_sql=original_sql,
-            ir_node_map=ir_node_map,
-            hypothesis=scout_result.hypothesis,
-            probe=probe,
-            gold_patch_plan=gold_patch_plan,
-            dialect="postgres",
-        )
-
-        future = pool.submit(worker_gen._analyze, worker_prompt)
-        futures[future] = probe
-
-    for future in as_completed(futures):
-        probe = futures[future]
-        try:
-            response = future.result(timeout=300)
-            wide_worker_results.append({
-                "probe_id": probe.probe_id,
-                "transform_id": probe.transform_id,
-                "family": probe.family,
-                "response": response,
-                "status": "RESPONSE",
-            })
-            # Save individual worker response
-            with open(OUT_DIR / f"wide_worker_{probe.probe_id}.txt", "w") as f:
-                f.write(response)
-            print(f"  ✓ {probe.probe_id}: {len(response)} chars")
-        except Exception as e:
-            print(f"  ✗ {probe.probe_id}: {e}")
-            wide_worker_results.append({
-                "probe_id": probe.probe_id,
-                "transform_id": probe.transform_id,
-                "family": probe.family,
-                "error": str(e),
-                "status": "ERROR",
-            })
-
-# ── Phase 3: Wide Sniper (synthesize) ───────────────────────────────────────
-
-print(f"\n[WIDE SNIPER] Synthesizing compound rewrites from {len(wide_worker_results)} results...")
-
-# Mock BDA results (we don't have real benchmarks)
-strike_bdas = []
-for r in wide_worker_results:
-    bda = StrikeBDA(
-        probe_id=r["probe_id"],
-        transform_id=r["transform_id"],
-        family=r["family"],
-        status="PASS" if r["status"] == "RESPONSE" else "FAIL",
-        speedup=1.0 if r["status"] == "RESPONSE" else None,
-        error=r.get("error"),
-        explain_text=None,  # no EXPLAIN in quick test
-        sql=r.get("response"),
-    )
-    strike_bdas.append(bda)
-
-sniper_prompt = build_wide_sniper_prompt(
-    query_id="query069_multi_i1",
-    original_sql=original_sql,
-    original_explain=explain_text,
-    hypothesis=scout_result.hypothesis,
-    strike_results=strike_bdas,
-    dialect="postgres",
-)
-
-t0 = time.time()
-sniper_response = analyst_gen._analyze(sniper_prompt)
-sniper_time = time.time() - t0
-
-with open(OUT_DIR / "wide_sniper.txt", "w") as f:
-    f.write(sniper_response)
-
-print(f"  → Sniper response: {len(sniper_response)} chars in {sniper_time:.1f}s")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FOCUSED MODE: analyst → R1 workers → sniper
-# ══════════════════════════════════════════════════════════════════════════════
-
-print("\n" + "=" * 80)
-print("FOCUSED MODE: Analyst → Workers → Sniper")
-print("=" * 80)
-
-# ── Phase 1: Focused Analyst ────────────────────────────────────────────────
-
-print("\n[FOCUSED ANALYST] Designing 1-4 deep targets...")
-
-focused_analyst_prompt = build_focused_analyst_prompt(
+dispatcher_prompt = build_beam_dispatcher_prompt(
     query_id="query069_multi_i1",
     original_sql=original_sql,
     explain_text=explain_text,
@@ -227,157 +81,177 @@ focused_analyst_prompt = build_focused_analyst_prompt(
     dialect="postgres",
 )
 
-t0 = time.time()
-focused_analyst_response = analyst_gen._analyze(focused_analyst_prompt)
-focused_analyst_time = time.time() - t0
+out_path = RENDERED_DIR / "beam_dispatcher.txt"
+out_path.write_text(dispatcher_prompt)
+print(f"  -> {out_path} ({len(dispatcher_prompt)} chars)")
 
-with open(OUT_DIR / "focused_analyst.txt", "w") as f:
-    f.write(focused_analyst_response)
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPT 2: BEAM Worker (qwen executes one probe → PatchPlan)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Parse targets (JSON array)
-import re
-targets_match = re.search(r'\[[\s\S]*\]', focused_analyst_response)
-if not targets_match:
-    print("ERROR: No targets JSON found")
-    sys.exit(1)
+print("\n[2/4] Rendering BEAM worker prompt...")
 
-try:
-    targets = json.loads(targets_match.group(0))
-except:
-    print("ERROR: Failed to parse targets JSON")
-    sys.exit(1)
-
-print(f"  → {len(targets)} targets in {focused_analyst_time:.1f}s")
-for t in targets:
-    print(f"     {t.get('target_id')}: {t.get('transform')} (Family {t.get('family')}, score {t.get('relevance_score', 0):.2f})")
-
-# ── Phase 2: Focused Workers (parallel R1) ──────────────────────────────────
-
-print(f"\n[FOCUSED WORKERS] Firing {len(targets)} R1 workers in parallel...")
-
-from qt_sql.patches.beam_focused_prompts import FocusedTarget
-
-focused_worker_results = []
-
-with ThreadPoolExecutor(max_workers=4) as pool:
-    futures = {}
-    for t_dict in targets:
-        target = FocusedTarget(
-            target_id=t_dict["target_id"],
-            family=t_dict["family"],
-            transform=t_dict["transform"],
-            relevance_score=t_dict["relevance_score"],
-            hypothesis=t_dict["hypothesis"],
-            target_ir=t_dict["target_ir"],
-            recommended_examples=t_dict.get("recommended_examples", []),
-        )
-
-        # Load recommended gold examples
-        target_gold = []
-        for ex_id in target.recommended_examples:
-            from qt_sql.patches.beam_wide_prompts import _load_gold_example_by_id
-            ex = _load_gold_example_by_id(ex_id, "postgres")
-            if ex:
-                target_gold.append(ex)
-
-        worker_prompt = build_focused_strike_prompt(
-            original_sql=original_sql,
-            explain_text=explain_text,
-            target=target,
-            gold_examples=target_gold,
-            dialect="postgres",
-            engine_version="14.3",
-        )
-
-        future = pool.submit(analyst_gen._analyze, worker_prompt)  # R1 for focused
-        futures[future] = target
-
-    for future in as_completed(futures):
-        target = futures[future]
-        try:
-            response = future.result(timeout=300)
-            focused_worker_results.append({
-                "target_id": target.target_id,
-                "transform": target.transform,
-                "family": target.family,
-                "response": response,
-                "status": "RESPONSE",
-            })
-            with open(OUT_DIR / f"focused_worker_{target.target_id}.txt", "w") as f:
-                f.write(response)
-            print(f"  ✓ {target.target_id}: {len(response)} chars")
-        except Exception as e:
-            print(f"  ✗ {target.target_id}: {e}")
-            focused_worker_results.append({
-                "target_id": target.target_id,
-                "transform": target.transform,
-                "family": target.family,
-                "error": str(e),
-                "status": "ERROR",
-            })
-
-# ── Phase 3: Focused Sniper ─────────────────────────────────────────────────
-
-print(f"\n[FOCUSED SNIPER] Compounding from {len(focused_worker_results)} results...")
-
-from qt_sql.patches.beam_focused_prompts import SortieResult
-
-# Mock sortie result
-sortie = SortieResult(
-    sortie=0,
-    strikes=[
-        {
-            "strike_id": r["target_id"],
-            "family": r["family"],
-            "transform": r["transform"],
-            "speedup": 1.0 if r["status"] == "RESPONSE" else None,
-            "status": "PASS" if r["status"] == "RESPONSE" else "FAIL",
-            "error": r.get("error"),
-        }
-        for r in focused_worker_results
-    ],
-    explains={},  # no EXPLAINs in quick test
+# Mock probe for rendering
+mock_probe = ProbeSpec(
+    probe_id="p01",
+    transform_id="decorrelate_not_exists_to_cte",
+    family="B",
+    target=(
+        "Convert the NOT EXISTS correlated subquery into a MATERIALIZED CTE: "
+        "SELECT DISTINCT customer_sk FROM web_sales JOIN date_dim WHERE d_year = 2002. "
+        "Then replace NOT EXISTS with LEFT JOIN cte ... IS NULL anti-pattern."
+    ),
+    confidence=0.90,
 )
 
-sniper_prompt_focused = build_focused_sniper_prompt(
-    query_id="query069_multi_i1",
+gold_ex = gold_examples.get("B")
+gold_patch_plan = gold_ex.get("patch_plan") if gold_ex else None
+
+worker_prompt = build_beam_worker_prompt(
     original_sql=original_sql,
-    original_explain=explain_text,
-    sortie_history=[sortie],
-    gold_examples=gold_examples,
+    ir_node_map=ir_node_map,
+    hypothesis="The bottleneck is repeated correlated subqueries scanning store_sales per row.",
+    probe=mock_probe,
+    gold_patch_plan=gold_patch_plan,
     dialect="postgres",
 )
 
-t0 = time.time()
-sniper_response_focused = analyst_gen._analyze(sniper_prompt_focused)
-sniper_time_focused = time.time() - t0
+out_path = RENDERED_DIR / "beam_worker.txt"
+out_path.write_text(worker_prompt)
+print(f"  -> {out_path} ({len(worker_prompt)} chars)")
 
-with open(OUT_DIR / "focused_sniper.txt", "w") as f:
-    f.write(sniper_response_focused)
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPT 3: BEAM Sniper (R1 sees BDA → 2 PatchPlans)
+# ══════════════════════════════════════════════════════════════════════════════
 
-print(f"  → Sniper response: {len(sniper_response_focused)} chars in {sniper_time_focused:.1f}s")
+print("\n[3/4] Rendering BEAM sniper prompt...")
+
+# Mock strike results (BDA)
+mock_strike_results = [
+    {
+        "probe_id": "p01",
+        "transform_id": "decorrelate_not_exists_to_cte",
+        "family": "B",
+        "status": "WIN",
+        "speedup": 1.45,
+        "error": None,
+        "explain_text": "HashJoin (actual rows=150, loops=1)\n  -> SeqScan store_sales (actual rows=28000)",
+        "sql": "WITH cte AS (SELECT DISTINCT ...) SELECT ... FROM ... LEFT JOIN cte ...",
+    },
+    {
+        "probe_id": "p02",
+        "transform_id": "date_cte_isolate",
+        "family": "A",
+        "status": "PASS",
+        "speedup": 1.02,
+        "error": None,
+        "explain_text": None,
+        "sql": "WITH date_filter AS (...) SELECT ...",
+    },
+    {
+        "probe_id": "p03",
+        "transform_id": "comma_join_to_explicit",
+        "family": "F",
+        "status": "FAIL",
+        "speedup": None,
+        "error": "Syntax error near line 12",
+        "explain_text": None,
+        "sql": None,
+    },
+    {
+        "probe_id": "p04",
+        "transform_id": "or_to_union",
+        "family": "D",
+        "status": "WIN",
+        "speedup": 1.30,
+        "error": None,
+        "explain_text": "Append (actual rows=200)\n  -> Index Scan (actual rows=100)\n  -> Index Scan (actual rows=100)",
+        "sql": "SELECT ... UNION ALL SELECT ...",
+    },
+]
+
+sniper_prompt = build_beam_sniper_prompt(
+    query_id="query069_multi_i1",
+    original_sql=original_sql,
+    explain_text=explain_text,
+    ir_node_map=ir_node_map,
+    all_5_examples=gold_examples,
+    dialect="postgres",
+    strike_results=mock_strike_results,
+)
+
+out_path = RENDERED_DIR / "beam_sniper.txt"
+out_path.write_text(sniper_prompt)
+print(f"  -> {out_path} ({len(sniper_prompt)} chars)")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPT 4: REASONING (R1 full intelligence → 2 PatchPlans)
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n[4/4] Rendering REASONING prompt...")
+
+reasoning_prompt = build_reasoning_prompt(
+    query_id="query069_multi_i1",
+    original_sql=original_sql,
+    explain_text=explain_text,
+    ir_node_map=ir_node_map,
+    all_5_examples=gold_examples,
+    dialect="postgres",
+)
+
+out_path = RENDERED_DIR / "reasoning.txt"
+out_path.write_text(reasoning_prompt)
+print(f"  -> {out_path} ({len(reasoning_prompt)} chars)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
 
-print("\n" + "=" * 80)
-print("SUMMARY")
-print("=" * 80)
+print("\n" + "=" * 60)
+print("RENDERED PROMPTS:")
+print("=" * 60)
+for p in sorted(RENDERED_DIR.glob("*.txt")):
+    size = p.stat().st_size
+    print(f"  {p.name:30s} {size:>6,} chars")
+print(f"\nAll outputs saved to {RENDERED_DIR}/")
 
-n_wide_success = sum(1 for r in wide_worker_results if r["status"] == "RESPONSE")
-n_focused_success = sum(1 for r in focused_worker_results if r["status"] == "RESPONSE")
+# ── Bonus: render append_shot_results example ──────────────────────────────
 
-print(f"""
-WIDE MODE:
-  Analyst:  {len(probes)} probes designed
-  Workers:  {n_wide_success}/{len(probes)} succeeded
-  Sniper:   {len(sniper_response)} chars
+print("\n[BONUS] Rendering shot-2 example (append_shot_results)...")
 
-FOCUSED MODE:
-  Analyst:  {len(targets)} targets designed
-  Workers:  {n_focused_success}/{len(targets)} succeeded
-  Sniper:   {len(sniper_response_focused)} chars
+# Mock AppliedPatch-like objects
+class MockPatch:
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
 
-All outputs saved to {OUT_DIR}/
-""")
+mock_patches = [
+    MockPatch(
+        patch_id="r1", family="B", transform="decorrelate",
+        output_sql="WITH cte AS (...) SELECT ...",
+        apply_error=None, status="OK",
+        speedup=1.42, speedup_status="WIN",
+    ),
+    MockPatch(
+        patch_id="r2", family="E", transform="materialize_cte",
+        output_sql=None,
+        apply_error="Syntax error near CTE", status="FAIL",
+        speedup=None, speedup_status=None,
+    ),
+]
+
+mock_explains = {"r1": "HashJoin (actual rows=150)"}
+
+shot2_prompt = append_shot_results(
+    base_prompt=reasoning_prompt,
+    patches=mock_patches,
+    explains=mock_explains,
+)
+
+out_path = RENDERED_DIR / "shot2_example.txt"
+out_path.write_text(shot2_prompt)
+
+# Show just the appended portion
+appended = shot2_prompt[len(reasoning_prompt):]
+print(f"  -> {out_path} ({len(shot2_prompt)} chars total, {len(appended)} chars appended)")
+print(f"  (Shot 2 appends {len(appended)} chars to reuse KV cache on the {len(reasoning_prompt)}-char prefix)")

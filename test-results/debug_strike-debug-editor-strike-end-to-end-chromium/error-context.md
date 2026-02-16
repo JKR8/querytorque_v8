@@ -1,0 +1,135 @@
+# Page snapshot
+
+```yaml
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - link "QueryTorque" [ref=e4] [cursor=pointer]:
+        - /url: "#"
+        - img [ref=e6]
+        - generic [ref=e10]: QueryTorque
+      - generic [ref=e12]: Fleet Command Centre
+    - generic [ref=e13]:
+      - generic [ref=e14]: duckdb_tpcds
+      - generic [ref=e15]: ·
+      - generic [ref=e16]: DuckDB
+      - generic [ref=e17]: ·
+      - generic [ref=e18]: 20 queries
+      - generic [ref=e19]: ·
+      - generic [ref=e21]: TRIAGE REVIEW
+      - link "?" [ref=e23] [cursor=pointer]:
+        - /url: /help
+  - generic [ref=e24]:
+    - navigation [ref=e25]:
+      - button "Triage" [ref=e26] [cursor=pointer]:
+        - img [ref=e27]
+        - text: Triage
+      - button "Execution" [ref=e32] [cursor=pointer]:
+        - img [ref=e33]
+        - text: Execution
+      - button "Editor" [ref=e35] [cursor=pointer]:
+        - img [ref=e36]
+        - text: Editor
+    - generic [ref=e39]:
+      - generic [ref=e40]:
+        - combobox [ref=e41] [cursor=pointer]:
+          - option "Select a query..."
+          - option "query_1 217ms [LOW]" [selected]
+        - generic [ref=e42]:
+          - generic [ref=e43]: 217ms
+          - generic [ref=e45]: Low
+          - generic [ref=e46]: decorrelate 100%
+        - combobox [ref=e47] [cursor=pointer]:
+          - option "Select strategy..." [disabled] [selected]
+          - option "decorrelate 100%"
+          - option "prefetch_fact_join 100%"
+          - option "dimension_cte_isolate 100%"
+          - option "self_join_decomposition 100%"
+          - option "multi_dimension_prefetch 75%"
+        - generic [ref=e48]:
+          - button "Fire Beam" [disabled] [ref=e49]:
+            - img [ref=e50]
+            - text: Fire Beam
+          - button "Fire Strike" [disabled] [ref=e53]:
+            - img [ref=e54]
+            - text: Fire Strike
+      - generic [ref=e56]:
+        - generic [ref=e58]:
+          - generic [ref=e59]:
+            - generic [ref=e60]: Original SQL
+            - button "Copy" [ref=e61] [cursor=pointer]
+          - generic [ref=e62]:
+            - generic [ref=e63]:
+              - generic [ref=e64]: "1"
+              - generic [ref=e65]: "2"
+              - generic [ref=e66]: "3"
+              - generic [ref=e67]: "4"
+              - generic [ref=e68]: "5"
+              - generic [ref=e69]: "6"
+              - generic [ref=e70]: "7"
+              - generic [ref=e71]: "8"
+              - generic [ref=e72]: "9"
+              - generic [ref=e73]: "10"
+              - generic [ref=e74]: "11"
+              - generic [ref=e75]: "12"
+              - generic [ref=e76]: "13"
+              - generic [ref=e77]: "14"
+              - generic [ref=e78]: "15"
+              - generic [ref=e79]: "16"
+              - generic [ref=e80]: "17"
+              - generic [ref=e81]: "18"
+              - generic [ref=e82]: "19"
+              - generic [ref=e83]: "20"
+              - generic [ref=e84]: "21"
+              - generic [ref=e85]: "22"
+              - generic [ref=e86]: "23"
+              - generic [ref=e87]: "24"
+              - generic [ref=e88]: "25"
+            - generic [ref=e89]:
+              - generic:
+                - code: "-- start query 1 in stream 0 using template query1.tpl with customer_total_return as (select sr_customer_sk as ctr_customer_sk ,sr_store_sk as ctr_store_sk ,sum(SR_FEE) as ctr_total_return from store_returns ,date_dim where sr_returned_date_sk = d_date_sk and d_year =2000 group by sr_customer_sk ,sr_store_sk) select c_customer_id from customer_total_return ctr1 ,store ,customer where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_store_sk = ctr2.ctr_store_sk) and s_store_sk = ctr1.ctr_store_sk and s_state = 'SD' and ctr1.ctr_customer_sk = c_customer_sk order by c_customer_id LIMIT 100; -- end query 1 in stream 0 using template query1.tpl"
+              - textbox "Select a query to load SQL..." [ref=e90]: "-- start query 1 in stream 0 using template query1.tpl with customer_total_return as (select sr_customer_sk as ctr_customer_sk ,sr_store_sk as ctr_store_sk ,sum(SR_FEE) as ctr_total_return from store_returns ,date_dim where sr_returned_date_sk = d_date_sk and d_year =2000 group by sr_customer_sk ,sr_store_sk) select c_customer_id from customer_total_return ctr1 ,store ,customer where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_store_sk = ctr2.ctr_store_sk) and s_store_sk = ctr1.ctr_store_sk and s_state = 'SD' and ctr1.ctr_customer_sk = c_customer_sk order by c_customer_id LIMIT 100; -- end query 1 in stream 0 using template query1.tpl"
+        - generic [ref=e93]:
+          - generic [ref=e94]:
+            - generic [ref=e95]: Rewrite SQL
+            - button "Reset to Original" [ref=e96] [cursor=pointer]
+          - generic [ref=e97]:
+            - generic [ref=e99]: "1"
+            - generic [ref=e100]:
+              - generic:
+                - code
+              - textbox "Optimized SQL will appear here..." [ref=e101]
+        - generic [ref=e105]: Strike...
+      - generic [ref=e106]:
+        - generic [ref=e107] [cursor=pointer]:
+          - generic [ref=e108]: Query Context
+          - generic [ref=e109]: ▼
+        - generic [ref=e110]:
+          - generic [ref=e111]:
+            - button "EXPLAIN" [ref=e112] [cursor=pointer]
+            - button "Transforms" [ref=e113] [cursor=pointer]
+            - button "Knowledge" [ref=e114] [cursor=pointer]
+            - button "Results" [ref=e115] [cursor=pointer]
+          - generic [ref=e117]:
+            - generic [ref=e118]:
+              - text: "Total:"
+              - strong [ref=e119]: 217ms
+              - text: · 5 operators
+            - generic [ref=e120]:
+              - generic [ref=e121]: PROJECTION
+              - generic [ref=e124]: 0ms
+              - generic [ref=e125]: 539,331 rows
+            - generic [ref=e127]: "Top: 100"
+            - generic [ref=e128]:
+              - generic [ref=e129]: HASH_GROUP_BY
+              - generic [ref=e132]: 380ms
+              - generic [ref=e133]: 539,331 rows
+            - generic [ref=e134]:
+              - generic [ref=e135]: PROJECTION
+              - generic [ref=e138]: 0ms
+              - generic [ref=e139]: 557,705 rows
+            - generic [ref=e140]:
+              - generic [ref=e141]: PROJECTION
+              - generic [ref=e142]: 557,705 rows
+            - generic [ref=e144]: "Join Type: LEFT"
+```

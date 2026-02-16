@@ -4,7 +4,7 @@ import './CodeEditor.css'
 interface CodeEditorProps {
   value: string
   onChange: (value: string) => void
-  language: 'sql' | 'dax'
+  language?: 'sql'
   disabled?: boolean
   placeholder?: string
 }
@@ -22,25 +22,8 @@ const SQL_KEYWORDS = [
   'WITH', 'RECURSIVE', 'OVER', 'PARTITION', 'ROW_NUMBER', 'RANK', 'DENSE_RANK',
 ]
 
-// DAX keywords for highlighting
-const DAX_KEYWORDS = [
-  'CALCULATE', 'CALCULATETABLE', 'FILTER', 'ALL', 'ALLEXCEPT', 'ALLSELECTED',
-  'VALUES', 'DISTINCT', 'SUMMARIZE', 'SUMMARIZECOLUMNS', 'ADDCOLUMNS',
-  'SELECTCOLUMNS', 'TOPN', 'GENERATE', 'GENERATEALL', 'CROSSJOIN',
-  'UNION', 'INTERSECT', 'EXCEPT', 'NATURALINNERJOIN', 'NATURALLEFTOUTERJOIN',
-  'VAR', 'RETURN', 'IF', 'SWITCH', 'TRUE', 'FALSE', 'BLANK', 'ERROR',
-  'SUM', 'SUMX', 'COUNT', 'COUNTX', 'COUNTA', 'COUNTAX', 'COUNTROWS',
-  'AVERAGE', 'AVERAGEX', 'MIN', 'MINX', 'MAX', 'MAXX', 'DIVIDE',
-  'RELATED', 'RELATEDTABLE', 'LOOKUPVALUE', 'EARLIER', 'EARLIEST',
-  'USERELATIONSHIP', 'CROSSFILTER', 'TREATAS',
-  'DATEADD', 'DATESYTD', 'DATESMTD', 'DATESQTD', 'SAMEPERIODLASTYEAR',
-  'TOTALYTD', 'TOTALMTD', 'TOTALQTD', 'PREVIOUSYEAR', 'PREVIOUSMONTH',
-  'FORMAT', 'CONCATENATE', 'CONCATENATEX', 'LEFT', 'RIGHT', 'MID', 'LEN',
-  'ISBLANK', 'ISERROR', 'ISLOGICAL', 'ISNUMBER', 'ISTEXT',
-]
-
-function highlightCode(code: string, language: 'sql' | 'dax'): string {
-  const keywords = language === 'sql' ? SQL_KEYWORDS : DAX_KEYWORDS
+function highlightCode(code: string): string {
+  const keywords = SQL_KEYWORDS
   let result = code
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -98,7 +81,6 @@ function highlightCode(code: string, language: 'sql' | 'dax'): string {
 export default function CodeEditor({
   value,
   onChange,
-  language,
   disabled = false,
   placeholder = ''
 }: CodeEditorProps) {
@@ -118,7 +100,7 @@ export default function CodeEditor({
   const lineCount = lines.length
 
   // Highlighted HTML
-  const highlightedCode = highlightCode(value, language)
+  const highlightedCode = highlightCode(value)
 
   return (
     <div className="code-editor">

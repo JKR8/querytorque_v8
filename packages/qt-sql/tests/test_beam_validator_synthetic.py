@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import duckdb
 
 # Ensure sibling package imports work
 QT_SQL_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +88,260 @@ class TestSyntheticValidatorPair:
         assert result['match'] is False
         assert result['row_count_match'] is True
         assert "value mismatch" in result['reason'].lower()
+
+    def test_non_tpcds_schema_query_matches(self):
+        """Generic OLTP-style schemas should validate, not just benchmark naming."""
+        v = self._make_validator()
+        original = """
+            SELECT c.customer_id, SUM(o.total_amount) AS total_spend
+            FROM customers c
+            JOIN orders o ON o.customer_id = c.customer_id
+            WHERE c.state IN ('CA', 'TX')
+              AND o.order_date BETWEEN '2021-01-01' AND '2021-12-31'
+            GROUP BY c.customer_id
+        """
+        optimized = """
+            SELECT c.customer_id, SUM(o.total_amount) AS total_spend
+            FROM orders o
+            INNER JOIN customers c ON c.customer_id = o.customer_id
+            WHERE o.order_date BETWEEN '2021-01-01' AND '2021-12-31'
+              AND c.state IN ('CA', 'TX')
+            GROUP BY c.customer_id
+        """
+        result = v.validate_sql_pair(
+            original_sql=original,
+            optimized_sql=optimized,
+        )
+        assert result['match'] is True
+        assert result['orig_success'] is True
+        assert result['opt_success'] is True
+
+
+class TestTableInferenceHelpers:
+    """Table-resolution helpers should be generic and ambiguity-safe."""
+
+    def test_get_table_from_column_generic_prefix(self):
+        from qt_sql.validation.synthetic_validator import get_table_from_column
+
+        table = get_table_from_column(
+            "order_date",
+            {"orders", "line_items", "customers"},
+        )
+        assert table == "orders"
+
+    def test_get_table_from_column_abbreviation(self):
+        from qt_sql.validation.synthetic_validator import get_table_from_column
+
+        table = get_table_from_column(
+            "ca_city",
+            {"customer_address", "customer"},
+        )
+        assert table == "customer_address"
+
+    def test_get_table_from_column_ambiguous_returns_none(self):
+        from qt_sql.validation.synthetic_validator import get_table_from_column
+
+        table = get_table_from_column(
+            "c_id",
+            {"customer", "catalog"},
+        )
+        assert table is None
+
+
+class TestSyntheticGenerationRobustness:
+    """Low-level generation tests to ensure generic (non-TPCDS) behavior."""
+
+    def test_pk_tracking_for_generic_id_schema(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        conn.execute("CREATE TABLE customers (customer_id INTEGER, state VARCHAR)")
+        schema = {
+            "columns": {
+                "customer_id": {"type": "INTEGER", "nullable": False},
+                "state": {"type": "VARCHAR(2)", "nullable": True},
+            },
+            "key": "customer_id",
+        }
+
+        gen = SyntheticDataGenerator(conn)
+        gen.generate_table_data("customers", schema, row_count=20)
+
+        assert "customers" in gen.foreign_key_values
+        assert len(gen.foreign_key_values["customers"]) == 20
+        assert set(gen.foreign_key_values["customers"]) == set(range(1, 21))
+
+    def test_fk_generation_uses_parent_values_for_id_columns(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        conn.execute("CREATE TABLE customers (customer_id INTEGER, state VARCHAR)")
+        conn.execute("CREATE TABLE orders (order_id INTEGER, customer_id INTEGER, total_amount DECIMAL(10,2))")
+
+        customer_schema = {
+            "columns": {
+                "customer_id": {"type": "INTEGER", "nullable": False},
+                "state": {"type": "VARCHAR(2)", "nullable": True},
+            },
+            "key": "customer_id",
+        }
+        orders_schema = {
+            "columns": {
+                "order_id": {"type": "INTEGER", "nullable": False},
+                "customer_id": {"type": "INTEGER", "nullable": False},
+                "total_amount": {"type": "DECIMAL(10,2)", "nullable": True},
+            },
+            "key": "order_id",
+        }
+
+        gen = SyntheticDataGenerator(conn)
+        gen.generate_table_data("customers", customer_schema, row_count=50)
+
+        # Force child FK selection to prefer this filtered subset.
+        gen.filter_matched_values["customers"] = [1, 2, 3]
+        gen.generate_table_data(
+            "orders",
+            orders_schema,
+            row_count=200,
+            foreign_keys={"customer_id": ("customers", "customer_id")},
+        )
+
+        used_fks = {r[0] for r in conn.execute("SELECT DISTINCT customer_id FROM orders").fetchall()}
+        assert used_fks.issubset({1, 2, 3})
+
+    def test_filter_literal_injection_between_and_in(self, monkeypatch):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        gen = SyntheticDataGenerator(conn)
+        gen.filter_literal_values = {
+            "orders": {
+                "order_date": ["BETWEEN:2021-01-01:2021-01-31"],
+                "state": ["CA", "TX"],
+            }
+        }
+
+        # Make injection deterministic (always inject).
+        monkeypatch.setattr(gen.random, "random", lambda: 0.0)
+
+        d = gen._generate_value(
+            "order_date",
+            "DATE",
+            row_idx=0,
+            total_rows=100,
+            table_name="orders",
+        )
+        s = gen._generate_value(
+            "state",
+            "VARCHAR(2)",
+            row_idx=0,
+            total_rows=100,
+            table_name="orders",
+        )
+
+        assert "2021-01-01" <= d <= "2021-01-31"
+        assert s in {"CA", "TX"}
+
+    def test_filter_literal_injection_numeric_between(self, monkeypatch):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        gen = SyntheticDataGenerator(conn)
+        gen.filter_literal_values = {
+            "orders": {
+                "quantity": ["BETWEEN:10:20"],
+            }
+        }
+
+        monkeypatch.setattr(gen.random, "random", lambda: 0.0)
+        q = gen._generate_value(
+            "quantity",
+            "INTEGER",
+            row_idx=0,
+            total_rows=100,
+            table_name="orders",
+        )
+        assert 10 <= q <= 20
+
+    def test_varchar_id_generation_uses_generic_table_prefix(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        gen = SyntheticDataGenerator(conn)
+        value = gen._generate_value(
+            "external_id",
+            "VARCHAR(20)",
+            row_idx=7,
+            total_rows=100,
+            table_name="purchase_orders",
+        )
+        assert value.startswith("PO")
+        assert value.endswith("0000007")
+
+    def test_detect_fk_from_joins_supports_generic_id_columns(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+            SELECT *
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.customer_id
+        """
+        tables = {
+            "orders": {
+                "columns": {
+                    "order_id": {"type": "INTEGER", "nullable": False},
+                    "customer_id": {"type": "INTEGER", "nullable": False},
+                    "total_amount": {"type": "DECIMAL(10,2)", "nullable": True},
+                },
+                "alias": "o",
+                "key": "order_id",
+            },
+            "customers": {
+                "columns": {
+                    "customer_id": {"type": "INTEGER", "nullable": False},
+                    "state": {"type": "VARCHAR(2)", "nullable": True},
+                },
+                "alias": "c",
+                "key": "customer_id",
+            },
+        }
+
+        fk = v._detect_fk_from_joins(sql, tables)
+        assert "orders" in fk
+        assert fk["orders"]["customer_id"] == ("customers", "customer_id")
+
+    def test_detect_foreign_keys_supports_generic_names(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+            SELECT *
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.customer_id
+        """
+        tables = {
+            "orders": {
+                "columns": {
+                    "order_id": {"type": "INTEGER", "nullable": False},
+                    "customer_id": {"type": "INTEGER", "nullable": False},
+                },
+                "alias": "o",
+                "key": "order_id",
+            },
+            "customers": {
+                "columns": {
+                    "customer_id": {"type": "INTEGER", "nullable": False},
+                    "state": {"type": "VARCHAR(2)", "nullable": True},
+                },
+                "alias": "c",
+                "key": "customer_id",
+            },
+        }
+
+        fk = v._detect_foreign_keys(sql, tables)
+        assert "orders" in fk
+        assert fk["orders"]["customer_id"] == ("customers", "customer_id")
 
 
 # ── PatchGateValidator integration tests ────────────────────────────────────

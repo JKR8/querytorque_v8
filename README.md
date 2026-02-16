@@ -4,27 +4,27 @@
 
 QueryTorque gathers **generalised intelligence on database engine optimizers** — what they handle well, where their gaps are, and which SQL rewrites exploit those gaps for measurable speedup. Each engine has a **master intelligence document** (`knowledge/{engine}.md`) that is the single source of truth, continuously refined by automated benchmarking, transform detection, and evidence-based distillation.
 
-QueryTorque is a comprehensive query optimization platform for SQL and DAX. It analyzes queries, identifies performance issues, and provides actionable recommendations with AI-powered explanations.
+QueryTorque is a comprehensive query optimization platform. It analyzes SQL queries, identifies performance issues, and provides actionable recommendations with AI-powered explanations.
 
 ## Architecture
 
 ```
                                     QueryTorque Architecture
 
-    +------------------+     +------------------+
-    |    Qt-SQL UI     |     |    Qt-DAX UI     |
-    |   (React/Vite)   |     |   (React/Vite)   |
-    +--------+---------+     +--------+---------+
-             |                        |
-             v                        v
-    +------------------+     +------------------+
-    |   Qt-SQL API     |     |   Qt-DAX API     |
-    |   (FastAPI)      |     |   (FastAPI)      |
-    |   Port: 8002     |     |   Port: 8003     |
-    +--------+---------+     +--------+---------+
-             |                        |
-             |    +-------------+     |
-             +--->|  Qt-Shared  |<----+
+    +------------------+
+    |    Qt-SQL UI     |
+    |   (React/Vite)   |
+    +--------+---------+
+             |
+             v
+    +------------------+
+    |   Qt-SQL API     |
+    |   (FastAPI)      |
+    |   Port: 8002     |
+    +--------+---------+
+             |
+             |    +-------------+
+             +--->|  Qt-Shared  |
                   | - Auth      |
                   | - Billing   |
                   | - Database  |
@@ -55,16 +55,6 @@ packages/
     qt_sql/
       analyzers/   # SQL analysis rules
       execution/   # Query execution engine
-      templates/   # Report templates
-    cli/           # Command-line interface
-    api/           # FastAPI endpoints
-    web/           # Web interface
-
-  qt-dax/          # DAX optimization product (Python)
-    qt_dax/
-      analyzers/   # DAX analysis rules
-      parsers/     # VPAX parsing
-      connections/ # Power BI connections
       templates/   # Report templates
     cli/           # Command-line interface
     api/           # FastAPI endpoints
@@ -131,7 +121,6 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 # Install packages in development mode
 pip install -e packages/qt-shared[dev,all-llm]
 pip install -e packages/qt-sql[dev]
-pip install -e packages/qt-dax[dev]
 ```
 
 4. **Run database migrations**
@@ -146,10 +135,6 @@ alembic upgrade head
 # Terminal 1: Qt-SQL API
 cd packages/qt-sql
 uvicorn qt_sql.api.main:app --reload --port 8002
-
-# Terminal 2: Qt-DAX API
-cd packages/qt-dax
-uvicorn qt_dax.api.main:app --reload --port 8003
 ```
 
 ### Docker Compose (Full Stack)
@@ -179,7 +164,6 @@ docker-compose down
 |--------------------|------------------------|--------------------------------------|
 | Qt-Calcite         | http://localhost:8001  | SQL parsing service                  |
 | Qt-SQL API         | http://localhost:8002  | SQL optimization API                 |
-| Qt-DAX API         | http://localhost:8003  | DAX optimization API                 |
 | PostgreSQL         | localhost:5432         | Application database (Docker)        |
 | DSB PostgreSQL     | localhost:5433         | Benchmarking database (Docker)       |
 
@@ -222,31 +206,6 @@ qt-sql check query.sql --threshold 70
 qt-sql explain query.sql --connection postgres://...
 ```
 
-### Qt-DAX CLI
-
-```bash
-# Analyze a VPAX file
-qt-dax analyze model.vpax
-
-# Analyze with detailed output
-qt-dax analyze model.vpax --verbose
-
-# Analyze with JSON output
-qt-dax analyze model.vpax --format json
-
-# Generate optimization report
-qt-dax report model.vpax --output report.html
-
-# Analyze specific measures only
-qt-dax analyze model.vpax --measures "Total Sales,Profit Margin"
-
-# Check against quality gate
-qt-dax check model.vpax --threshold 70
-
-# Connect to Power BI service
-qt-dax connect --workspace "Sales Analytics" --dataset "Sales Model"
-```
-
 ## Testing
 
 ```bash
@@ -258,7 +217,6 @@ pytest --cov=packages --cov-report=html
 
 # Run specific package tests
 pytest packages/qt-sql/tests/
-pytest packages/qt-dax/tests/
 pytest packages/qt-shared/tests/
 
 # Run specific test file
@@ -306,8 +264,6 @@ When running locally, API documentation is available at:
 
 - Qt-SQL: http://localhost:8002/docs (Swagger UI)
 - Qt-SQL: http://localhost:8002/redoc (ReDoc)
-- Qt-DAX: http://localhost:8003/docs (Swagger UI)
-- Qt-DAX: http://localhost:8003/redoc (ReDoc)
 
 ## Configuration
 

@@ -135,10 +135,6 @@ function Hero(){
           QueryTorque rewrites your costliest queries, validates every change for semantic equivalence, and only promotes what's measurably faster. No regressions. No guesswork.
         </p>
 
-        <p className="rv d2" style={{fontSize:14,lineHeight:1.65,color:"var(--t3)",maxWidth:520,marginBottom:32}}>
-          On TPC-DS: 33% median speedup, 6–10× on the hardest queries. In early production pilots, teams are seeing 30–40% compute cost reductions.
-        </p>
-
         <div className="rv d3" style={{display:"flex",flexWrap:"wrap",gap:10,marginBottom:56}}>
           <button onClick={()=>go("contact")} className="bp">Book a demo <ArrowR/></button>
           <button onClick={()=>go("how")} className="bs">See how it works</button>
@@ -303,7 +299,7 @@ function How(){
 
         {/* platform support */}
         <div className="rv" style={{display:"flex",flexWrap:"wrap",justifyContent:"center",gap:"4px 22px",marginTop:40,paddingTop:24,borderTop:"1px solid var(--brd)"}}>
-          {["Snowflake","Databricks","BigQuery","Redshift","PostgreSQL","SQL Server","DuckDB","Power BI","dbt","Airflow"].map(p=>(
+          {["Snowflake","Databricks","BigQuery","Redshift","PostgreSQL","SQL Server","DuckDB","dbt","Airflow"].map(p=>(
             <span key={p} style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--t3)",padding:"4px 0"}}>{p}</span>
           ))}
         </div>
@@ -442,7 +438,6 @@ function Results(){
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(min(100%,280px),1fr))",gap:12,marginTop:12}}>
             {[
               {icon:<ActI/>,t:"SQL optimization",d:"Snowflake · Databricks · BigQuery · Redshift · PostgreSQL · SQL Server · DuckDB"},
-              {icon:<BarI/>,t:"DAX remediation",d:"Power BI & SSAS. Iterator abuse, context transitions, relationship patterns."},
               {icon:<RefI/>,t:"Continuous learning",d:"Every validated optimization feeds the FAISS index. The system improves with use."},
               {icon:<GitB/>,t:"CI/CD integration",d:"Review optimizations like PRs. Approve, auto-merge, or gate on confidence score."},
               {icon:<FileI/>,t:"Audit trail",d:"What changed, why, measured impact, rollback path. Built for FinOps and compliance."},
@@ -478,7 +473,7 @@ function Pricing(){
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(min(100%,250px),1fr))",gap:14,maxWidth:820,margin:"0 auto"}}>
           {[
             {name:"Starter",price:"$499",per:"/mo",desc:"For teams evaluating the approach.",feat:["10K queries/day","SQL optimization","Reporting dashboard","Email support"],hl:false},
-            {name:"Pro",price:"$1,999",per:"/mo",desc:"Full pipeline with autonomous mode.",feat:["100K queries/day","SQL + DAX","CI/CD integration","Priority support","Configurable quality gates"],hl:true},
+            {name:"Pro",price:"$1,999",per:"/mo",desc:"Full pipeline with autonomous mode.",feat:["100K queries/day","SQL optimization","CI/CD integration","Priority support","Configurable quality gates"],hl:true},
             {name:"Enterprise",price:"Custom",per:"",desc:"Priced on validated savings.",feat:["Unlimited queries","On-prem / VPC deployment","SSO & RBAC","Dedicated CSM","SOC 2 & HIPAA ready"],hl:false},
           ].map((p,i)=>(
             <div key={i} className="rv cd" style={{border:p.hl?"2px solid var(--t1)":"1px solid var(--brd)",display:"flex",flexDirection:"column"}}>

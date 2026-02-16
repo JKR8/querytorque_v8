@@ -93,26 +93,18 @@ class PathologyClassifier:
         marker = "## DOCUMENTED CASES"
         idx = text.find(marker)
         if idx < 0:
-            # Fallback: return first 3000 chars
-            return text[:3000]
+            return text
 
-        # Return from marker to end (or next major section)
-        section = text[idx:]
-        # Truncate to ~3000 chars to keep prompt small
-        if len(section) > 3000:
-            section = section[:3000] + "\n... (truncated)"
-        return section
+        return text[idx:]
 
     def _build_prompt(self, sql: str, explain_text: str) -> str:
         """Build classification prompt (~2.5K tokens)."""
         explain_section = ""
         if explain_text:
-            # Truncate EXPLAIN to 60 lines
-            lines = explain_text.split("\n")[:60]
             explain_section = f"""
 ## Execution Plan
 ```
-{chr(10).join(lines)}
+{explain_text.strip()}
 ```
 """
 
@@ -179,7 +171,7 @@ Output a JSON array. If no pathologies match, output an empty array [].
         # Extract any reasoning text outside JSON
         non_json = response.replace(json_match.group(), "").strip() if json_match else response
         if non_json and len(non_json) > 10:
-            reasoning = non_json[:500]
+            reasoning = non_json
 
         return ClassificationResult(
             query_id=query_id,

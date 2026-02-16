@@ -1,6 +1,6 @@
 # QueryTorque V8 - Project Context
 
-> **AI Assistant Reference** - Modular architecture with 3 products
+> **AI Assistant Reference** - SQL Optimization Platform
 
 ---
 
@@ -11,7 +11,6 @@
 | **Benchmark Results** | `BENCHMARKS.md` |
 | **Shared Infrastructure** | `packages/qt-shared/` |
 | **SQL Product** | `packages/qt-sql/` |
-| **DAX Product** | `packages/qt-dax/` |
 | **Shared UI Components** | `packages/qt-ui-shared/` |
 | **Leaderboards** | `research/leaderboards/` |
 | **Research/Experiments** | `research/` |
@@ -41,15 +40,6 @@ QueryTorque_V8/
 │   │   ├── api/                # FastAPI backend
 │   │   └── web/                # React frontend (sql.querytorque.com)
 │   │
-│   ├── qt-dax/                 # DAX/Power BI Product
-│   │   ├── qt_dax/
-│   │   │   ├── analyzers/      # VPAX, DAX + Model rules
-│   │   │   ├── parsers/        # DAX parser
-│   │   │   └── templates/      # dax_report.html.j2
-│   │   ├── cli/                # qt-dax CLI
-│   │   ├── api/                # FastAPI backend
-│   │   └── web/                # React frontend (dax.querytorque.com)
-│   │
 │   └── qt-ui-shared/           # Shared React components
 │       ├── src/
 │       │   ├── components/     # ReportViewer, CodeEditor, DropZone
@@ -76,9 +66,9 @@ QueryTorque_V8/
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Shared code | Internal `qt-shared` package | Single source of truth |
-| Database | Single shared DB | Unified user/org/billing |
-| Auth | Single Auth0 tenant | SSO across both apps |
-| Web apps | Separate subdomains | Independent deployments |
+| Database | SQL DB | Unified user/org/billing |
+| Auth | Auth0 tenant | Secure access |
+| Web apps | subdomain | Independent deployment |
 
 ---
 
@@ -89,13 +79,6 @@ QueryTorque_V8/
 qt-sql audit <file.sql>              # Static analysis
 qt-sql optimize <file.sql>           # LLM-powered optimization
 qt-sql validate <orig.sql> <opt.sql> # Validate optimization
-```
-
-### qt-dax CLI
-```bash
-qt-dax audit <model.vpax>            # Analyze Power BI model
-qt-dax optimize <model.vpax>         # LLM-powered DAX optimization
-qt-dax connect                       # Connect to Power BI Desktop
 ```
 
 ---
@@ -112,14 +95,8 @@ docker compose up
 # SQL API (port 8002)
 cd packages/qt-sql && python -m uvicorn api.main:app --port 8002
 
-# DAX API (port 8003)
-cd packages/qt-dax && python -m uvicorn api.main:app --port 8003
-
 # SQL Web (port 5173)
 cd packages/qt-sql/web && npm run dev
-
-# DAX Web (port 5174)
-cd packages/qt-dax/web && npm run dev
 ```
 
 ---
@@ -153,14 +130,10 @@ QT_GROQ_API_KEY=xxx
 qt-shared (standalone)
     ↑
     ├── qt-sql (depends on qt-shared)
-    │
-    └── qt-dax (depends on qt-shared)
 
 qt-ui-shared (standalone React)
     ↑
     ├── qt-sql/web (depends on qt-ui-shared)
-    │
-    └── qt-dax/web (depends on qt-ui-shared)
 ```
 
 ---
@@ -173,9 +146,6 @@ cd packages/qt-shared && pytest tests/ -v
 
 # qt-sql tests
 cd packages/qt-sql && pytest tests/ -v
-
-# qt-dax tests
-cd packages/qt-dax && pytest tests/ -v
 ```
 
 ---
@@ -258,19 +228,19 @@ Examples:
                     ┌─────────────────────────────────────────┐
                     │            Cloudflare / CDN              │
                     └─────────────────────────────────────────┘
-                              │                   │
-              sql.querytorque.com        dax.querytorque.com
-                      │                           │
-              ┌───────┴────────┐         ┌───────┴────────┐
-              │   qt-sql Web   │         │   qt-dax Web   │
-              │   (React SPA)  │         │   (React SPA)  │
-              └───────┬────────┘         └───────┬────────┘
-                      │                           │
-              ┌───────┴────────┐         ┌───────┴────────┐
-              │  qt-sql API    │         │  qt-dax API    │
-              │  :8002         │         │  :8003         │
-              └───────┬────────┘         └───────┴────────┘
-                      │                           │
+                              │
+              sql.querytorque.com
+                      │
+              ┌───────┴────────┐
+              │   qt-sql Web   │
+              │   (React SPA)  │
+              └───────┬────────┘
+                      │
+              ┌───────┴────────┐
+              │  qt-sql API    │
+              │  :8002         │
+              └───────┬────────┘
+                      │
                       └─────────┬─────────────────┘
                                 │
                       ┌─────────┴─────────┐

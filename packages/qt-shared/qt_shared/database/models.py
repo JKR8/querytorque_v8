@@ -1,7 +1,6 @@
 """SQLAlchemy models for QueryTorque shared database.
 
-These models are used by both qt-sql and qt-dax products.
-The AnalysisJob model includes a 'product' column to distinguish between products.
+These models are used by the QueryTorque SQL optimization platform.
 """
 
 import uuid
@@ -201,10 +200,7 @@ class Workspace(Base):
 
 
 class AnalysisJob(Base):
-    """Analysis job model.
-
-    Supports both SQL and DAX analysis jobs via the 'product' column.
-    """
+    """Analysis job model for SQL optimization."""
 
     __tablename__ = "analysis_jobs"
 
@@ -223,9 +219,7 @@ class AnalysisJob(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
-    # Product identifier: 'sql' or 'dax'
-    product: Mapped[str] = mapped_column(String(10), nullable=False, default="sql")
-    file_type: Mapped[str] = mapped_column(String(20), nullable=False)  # 'vpax', 'sql'
+    file_type: Mapped[str] = mapped_column(String(20), nullable=False, default="sql")
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     torque_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -250,11 +244,10 @@ class AnalysisJob(Base):
         Index("idx_jobs_user", "user_id"),
         Index("idx_jobs_status", "status"),
         Index("idx_jobs_created", "created_at"),
-        Index("idx_jobs_product", "product"),
     )
 
     def __repr__(self) -> str:
-        return f"<AnalysisJob(id={self.id}, product='{self.product}', file='{self.file_name}', status='{self.status}')>"
+        return f"<AnalysisJob(id={self.id}, file='{self.file_name}', status='{self.status}')>"
 
 
 class Subscription(Base):

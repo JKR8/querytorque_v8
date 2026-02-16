@@ -1,6 +1,6 @@
 /**
  * CodeEditor Component
- * Monaco editor wrapper for SQL/DAX code editing with syntax highlighting
+ * Monaco editor wrapper for SQL code editing with syntax highlighting
  */
 
 import { useRef, useCallback } from 'react'
@@ -8,7 +8,7 @@ import Editor, { OnMount, OnChange } from '@monaco-editor/react'
 import type { editor } from 'monaco-editor'
 import '../theme/tokens.css'
 
-export type EditorLanguage = 'sql' | 'dax' | 'json' | 'javascript' | 'typescript'
+export type EditorLanguage = 'sql' | 'json' | 'javascript' | 'typescript'
 
 export interface CodeEditorProps {
   /** Current value of the editor */
@@ -42,28 +42,10 @@ export interface CodeEditorProps {
 // Map our language types to Monaco language IDs
 const languageMap: Record<EditorLanguage, string> = {
   sql: 'sql',
-  dax: 'powerquery', // Monaco doesn't have DAX, powerquery is closest
   json: 'json',
   javascript: 'javascript',
   typescript: 'typescript',
 }
-
-// Custom DAX keywords for registration
-const DAX_KEYWORDS = [
-  'CALCULATE', 'CALCULATETABLE', 'FILTER', 'ALL', 'ALLEXCEPT', 'ALLSELECTED',
-  'VALUES', 'DISTINCT', 'SUMMARIZE', 'SUMMARIZECOLUMNS', 'ADDCOLUMNS',
-  'SELECTCOLUMNS', 'TOPN', 'GENERATE', 'GENERATEALL', 'CROSSJOIN',
-  'UNION', 'INTERSECT', 'EXCEPT', 'NATURALINNERJOIN', 'NATURALLEFTOUTERJOIN',
-  'VAR', 'RETURN', 'IF', 'SWITCH', 'TRUE', 'FALSE', 'BLANK', 'ERROR',
-  'SUM', 'SUMX', 'COUNT', 'COUNTX', 'COUNTA', 'COUNTAX', 'COUNTROWS',
-  'AVERAGE', 'AVERAGEX', 'MIN', 'MINX', 'MAX', 'MAXX', 'DIVIDE',
-  'RELATED', 'RELATEDTABLE', 'LOOKUPVALUE', 'EARLIER', 'EARLIEST',
-  'USERELATIONSHIP', 'CROSSFILTER', 'TREATAS',
-  'DATEADD', 'DATESYTD', 'DATESMTD', 'DATESQTD', 'SAMEPERIODLASTYEAR',
-  'TOTALYTD', 'TOTALMTD', 'TOTALQTD', 'PREVIOUSYEAR', 'PREVIOUSMONTH',
-  'FORMAT', 'CONCATENATE', 'CONCATENATEX', 'LEFT', 'RIGHT', 'MID', 'LEN',
-  'ISBLANK', 'ISERROR', 'ISLOGICAL', 'ISNUMBER', 'ISTEXT',
-]
 
 const styles: Record<string, React.CSSProperties> = {
   container: {
@@ -111,49 +93,11 @@ export function CodeEditor({
   const handleMount: OnMount = useCallback((editor, monaco) => {
     editorRef.current = editor
 
-    // Register DAX language if not already registered
-    if (language === 'dax') {
-      const languages = monaco.languages.getLanguages()
-      const daxExists = languages.some((lang: { id: string }) => lang.id === 'dax')
-
-      if (!daxExists) {
-        // Register DAX as a custom language
-        monaco.languages.register({ id: 'dax' })
-
-        monaco.languages.setMonarchTokensProvider('dax', {
-          ignoreCase: true,
-          keywords: DAX_KEYWORDS,
-          tokenizer: {
-            root: [
-              [/[a-zA-Z_]\w*/, {
-                cases: {
-                  '@keywords': 'keyword',
-                  '@default': 'identifier',
-                }
-              }],
-              [/"[^"]*"/, 'string'],
-              [/'[^']*'/, 'string'],
-              [/\[[\w\s]+\]/, 'variable'], // Column references like [ColumnName]
-              [/\d+\.?\d*/, 'number'],
-              [/\/\/.*$/, 'comment'],
-              [/\/\*/, 'comment', '@comment'],
-              [/[-+*\/=<>!&|]+/, 'operator'],
-            ],
-            comment: [
-              [/[^/*]+/, 'comment'],
-              [/\*\//, 'comment', '@pop'],
-              [/[/*]/, 'comment'],
-            ],
-          },
-        })
-      }
-    }
-
     // Call user's onMount if provided
     if (onMount) {
       onMount(editor, monaco)
     }
-  }, [language, onMount])
+  }, [onMount])
 
   const handleChange: OnChange = useCallback((newValue) => {
     if (onChange && newValue !== undefined) {
@@ -161,7 +105,7 @@ export function CodeEditor({
     }
   }, [onChange])
 
-  const monacoLanguage = language === 'dax' ? 'dax' : languageMap[language]
+  const monacoLanguage = languageMap[language]
   const showPlaceholder = !value && placeholder
 
   return (
