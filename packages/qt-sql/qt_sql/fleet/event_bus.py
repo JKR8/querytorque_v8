@@ -21,6 +21,8 @@ class EventType(str, Enum):
     WORKER_UPDATE = "worker_update"
     EVENT_LOG = "event_log"
     FLEET_DONE = "fleet_done"
+    EDITOR_ITERATION = "editor_iteration"
+    EDITOR_COMPLETE = "editor_complete"
 
 
 @dataclass
@@ -69,6 +71,85 @@ class EventBus:
         return events
 
 
+def triage_to_fleet_c2(
+    triaged: List["TriageResult"],
+) -> List[Dict[str, Any]]:
+    """Map TriageResult list → fleet_c2.html QUERIES JSON format.
+
+    Lightweight alternative to forensic_to_fleet_c2 that uses survey data
+    directly without requiring the heavy dashboard collector pipeline.
+    """
+    # Compute cost context (rank, pct_of_total, cumulative_pct)
+    total_runtime = sum(
+        t.survey.runtime_ms for t in triaged if t.survey.runtime_ms > 0
+    )
+    # Sort by runtime descending for ranking
+    by_runtime = sorted(triaged, key=lambda t: -t.survey.runtime_ms)
+
+    rank_map: Dict[str, int] = {}
+    pct_map: Dict[str, float] = {}
+    cum_map: Dict[str, float] = {}
+    cumulative = 0.0
+    for rank, t in enumerate(by_runtime, 1):
+        rank_map[t.query_id] = rank
+        pct = (t.survey.runtime_ms / total_runtime) if total_runtime > 0 else 0.0
+        pct_map[t.query_id] = round(pct, 4)
+        cumulative += pct
+        cum_map[t.query_id] = round(cumulative, 4)
+
+    result: List[Dict[str, Any]] = []
+    for t in triaged:
+        # Build transform matches from survey detection results
+        transforms = []
+        top_transform = ""
+        top_overlap = 0.0
+        for m in t.survey.matched_transforms:
+            tid = getattr(m, "id", getattr(m, "transform_id", ""))
+            overlap = getattr(m, "overlap_ratio", getattr(m, "overlap", 0.0))
+            gap = getattr(m, "gap", "")
+            family = getattr(m, "family", "")
+            transforms.append({
+                "id": tid,
+                "overlap": round(overlap, 2),
+                "gap": gap,
+                "family": family,
+            })
+            if not top_transform:
+                top_transform = tid
+                top_overlap = round(overlap, 2)
+
+        rt = t.survey.runtime_ms if t.survey.runtime_ms > 0 else 0
+        est_annual = round(rt * 12) if rt > 0 else 0
+
+        entry = {
+            "id": t.query_id,
+            "sql": t.sql,
+            "runtime_ms": rt,
+            "bucket": t.bucket,
+            "iters": t.max_iterations,
+            "transform": top_transform,
+            "overlap": top_overlap,
+            "est_annual": est_annual,
+            "outcome": None,
+            "speedup": None,
+            "out_transform": "",
+            "detail": {
+                "cost_rank": rank_map.get(t.query_id, 0),
+                "pct_of_total": pct_map.get(t.query_id, 0.0),
+                "cumulative_pct": cum_map.get(t.query_id, 0.0),
+                "structural_flags": [],
+                "transforms": transforms,
+                "qerror": None,
+                "explain": getattr(t.survey, "explain_text", ""),
+                "actual_rows": getattr(t.survey, "actual_rows", 0),
+                "timing_source": getattr(t.survey, "timing_source", ""),
+            },
+        }
+        result.append(entry)
+
+    return result
+
+
 def forensic_to_fleet_c2(
     forensic_queries: List["ForensicQuery"],
     triaged: List["TriageResult"],
@@ -112,6 +193,7 @@ def forensic_to_fleet_c2(
 
         entry = {
             "id": fq.query_id,
+            "sql": tr.sql if tr else "",
             "runtime_ms": fq.runtime_ms,
             "bucket": fq.bucket,
             "iters": iters,

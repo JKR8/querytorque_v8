@@ -97,6 +97,41 @@ class FleetWSServer:
                 self.pause_event.set()
                 logger.info("Fleet C2: Resumed by browser")
 
+        elif msg_type in ("editor_beam", "editor_strike"):
+            query_id = msg.get("query_id", "")
+            sql = msg.get("sql", "")
+            max_iters = msg.get("max_iterations", 1 if msg_type == "editor_strike" else 3)
+            logger.info("Fleet C2: %s on %s (%d iters)", msg_type, query_id, max_iters)
+            self._run_editor_session(query_id, sql, max_iters)
+
+    def _run_editor_session(
+        self, query_id: str, sql: str, max_iterations: int
+    ) -> None:
+        """Spawn a daemon thread to run single-query optimization for the editor."""
+        def _worker():
+            try:
+                from ..pipeline import Pipeline
+                pipeline = Pipeline()
+                pipeline.run_optimization_session(
+                    query_id=query_id,
+                    sql=sql,
+                    max_iterations=max_iterations,
+                    event_bus=self.event_bus,
+                )
+            except Exception as exc:
+                logger.error("Fleet C2: editor session failed: %s", exc)
+                self.event_bus.emit(
+                    EventType.EDITOR_COMPLETE,
+                    query_id=query_id,
+                    status="ERROR",
+                    speedup=None,
+                    best_sql="",
+                    error=str(exc),
+                )
+
+        t = threading.Thread(target=_worker, daemon=True, name=f"editor-{query_id}")
+        t.start()
+
     async def _broadcast_loop(self) -> None:
         """Async loop consuming EventBus and broadcasting to all WebSocket clients."""
         while True:
