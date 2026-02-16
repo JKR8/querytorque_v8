@@ -757,6 +757,9 @@ class BeamSession(OptimizationSession):
                 self._sequential_benchmark(sem_passed, db_path)
                 logger.info(f"[{self.query_id}] Benchmark lock released")
 
+            # Expose benchmarked patches for dashboard callbacks
+            self._current_patches = list(sem_passed)
+
             # Save benchmark results
             for p in sem_passed:
                 speedup_str = f"{p.speedup:.2f}x" if p.speedup else "N/A"

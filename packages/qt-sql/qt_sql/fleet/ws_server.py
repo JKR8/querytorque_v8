@@ -100,23 +100,64 @@ class FleetWSServer:
         elif msg_type in ("editor_beam", "editor_strike"):
             query_id = msg.get("query_id", "")
             sql = msg.get("sql", "")
+            strategy = msg.get("strategy", "")
             max_iters = msg.get("max_iterations", 1 if msg_type == "editor_strike" else 3)
-            logger.info("Fleet C2: %s on %s (%d iters)", msg_type, query_id, max_iters)
-            self._run_editor_session(query_id, sql, max_iters)
+            logger.info("Fleet C2: %s on %s (%d iters, strategy=%s)", msg_type, query_id, max_iters, strategy)
+            self._run_editor_session(query_id, sql, max_iters, strategy=strategy)
 
     def _run_editor_session(
-        self, query_id: str, sql: str, max_iterations: int
+        self, query_id: str, sql: str, max_iterations: int, strategy: str = ""
     ) -> None:
         """Spawn a daemon thread to run single-query optimization for the editor."""
         def _worker():
             try:
                 from ..pipeline import Pipeline
+                from ..sessions.beam_session import BeamSession
+
                 pipeline = Pipeline()
-                pipeline.run_optimization_session(
+                pipeline.config.tiered_patch_enabled = True
+                pipeline.config.benchmark_dsn = pipeline.config.db_path_or_dsn
+
+                session = BeamSession(
+                    pipeline=pipeline,
                     query_id=query_id,
-                    sql=sql,
+                    original_sql=sql,
+                    target_speedup=2.0,
                     max_iterations=max_iterations,
-                    event_bus=self.event_bus,
+                    patch=True,
+                )
+
+                def _on_phase(phase: str, iteration: int) -> None:
+                    if phase != "explain":
+                        return
+                    # "explain" fires after benchmark completes;
+                    # session._current_patches has speedup/status populated
+                    patches_data = []
+                    for p in getattr(session, '_current_patches', []):
+                        patches_data.append({
+                            "worker_id": getattr(p, 'patch_id', ''),
+                            "speedup": getattr(p, 'speedup', None),
+                            "status": getattr(p, 'status', 'PENDING'),
+                            "transform": getattr(p, 'transform', ''),
+                            "sql": getattr(p, 'output_sql', ''),
+                        })
+                    if patches_data:
+                        self.event_bus.emit(
+                            EventType.EDITOR_ITERATION,
+                            query_id=query_id,
+                            iteration=iteration + 1,
+                            patches=patches_data,
+                        )
+
+                session.on_phase_change = _on_phase
+                result = session.run()
+
+                self.event_bus.emit(
+                    EventType.EDITOR_COMPLETE,
+                    query_id=query_id,
+                    status=result.status,
+                    best_sql=result.best_sql,
+                    best_speedup=result.best_speedup,
                 )
             except Exception as exc:
                 logger.error("Fleet C2: editor session failed: %s", exc)
@@ -124,8 +165,8 @@ class FleetWSServer:
                     EventType.EDITOR_COMPLETE,
                     query_id=query_id,
                     status="ERROR",
-                    speedup=None,
                     best_sql="",
+                    best_speedup=0.0,
                     error=str(exc),
                 )
 
