@@ -1,0 +1,67 @@
+### Analysis of Optimization Families
+
+**Family A (Early Filtering)**: HIGH  
+The query applies late filters on dimension tables (date_dim, customer_demographics, household_demographics, customer_address). Pushing these filters into CTEs early would drastically reduce join cardinality before expensive nested loops. The execution plan shows sequential scans on large tables, indicating late filtering.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries exist in the query. The execution plan shows nested loops but no DELIM_SCAN patterns, eliminating decorrelation as a priority.
+
+**Family C (Aggregation Pushdown)**: LOW  
+The single aggregation occurs after all joins, but GROUP BY keys are absent (single-group aggregation). Intermediate result reduction isn't feasible since no partial aggregation keys align with join keys.
+
+**Family D (Set Operation Optimization)**: HIGH  
+Complex OR conditions force full scans of joined tables. Rewriting as UNION ALL branches enables per-branch predicate pushdown and eliminates redundant checks. The execution plan shows high row counts (16k+) before filtering.
+
+**Family E (Materialization/Prefetch)**: MEDIUM  
+Dimension tables (household_demographics, customer_demographics, customer_address) are scanned multiple times implicitly. Precomputing filtered versions would avoid repeated access, but UNION ALL rewrite offers higher gains.
+
+**Family F (Join Transform)**: HIGH  
+Implicit cross joins prevent optimal join ordering. Converting to explicit joins with filtered CTEs enables better join order selection. The nested loops in the execution plan indicate suboptimal join topology.
+
+**Chosen families**: A, D, E, F  
+**Confidence**: High
+
+---
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "D",
+    "transform": "union_all_rewrite",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "OR conditions force full scans across joined tables, preventing predicate pushdown. UNION ALL branches enable per-segment optimization and early filtering.",
+    "target_ir": "S0 [SELECT]\n  CTE: sales_segments (via Q1)\n    UNION ALL\n      Segment1:\n        FROM: store_sales, store, customer_demographics cd1, household_demographics hd1, customer_address ca1, date_dim\n        WHERE: s_store_sk = ss_store_sk\n          AND ss_sold_date_sk = d_date_sk AND d_year=2001\n          AND ss_hdemo_sk=hd1.hd_demo_sk\n          AND cd1.cd_demo_sk = ss_cdemo_sk\n          AND cd1.cd_marital_status='M' AND cd1.cd_education_status='2 yr Degree'\n          AND ss_sales_price BETWEEN 100.00 AND 150.00\n          AND hd1.hd_dep_count=3\n          AND ss_addr_sk=ca1.ca_address_sk\n          AND ca1.ca_country='United States' AND ca1.ca_state IN ('GA','KY','SD')\n          AND ss_net_profit BETWEEN 100 AND 200\n      \n      Segment2:\n        FROM: ... (same structure with condition variant 2)\n      \n      Segment3:\n        FROM: ... (same structure with condition variant 3)\n  MAIN QUERY (via Q0)\n    FROM: sales_segments\n    AGGREGATE: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)",
+    "recommended_examples": ["pg_union_all_rewrite", "pg_intersect_to_exists"]
+  },
+  {
+    "family": "A",
+    "transform": "predicate_pushdown_cte",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Dimension table filters (date_dim, customer_demographics) are applied late. Prefiltering in CTEs reduces join cardinality before nested loops.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_date (via Q_date)\n    FROM: date_dim\n    WHERE: d_year=2001\n  \n  CTE: filtered_store (via Q_store)\n    FROM: store\n  \n  CTE: filtered_hd (via Q_hd)\n    FROM: household_demographics\n    WHERE: hd_dep_count IN (1,3)\n  \n  CTE: filtered_cd (via Q_cd)\n    FROM: customer_demographics\n    WHERE: (cd_marital_status='M' AND cd_education_status='2 yr Degree')\n       OR (cd_marital_status='S' AND cd_education_status='Primary')\n       OR (cd_marital_status='W' AND cd_education_status='Primary')\n  \n  CTE: filtered_ca (via Q_ca)\n    FROM: customer_address\n    WHERE: ca_country='United States' \n      AND (\n        (ca_state IN ('GA','KY','SD'))\n        OR (ca_state IN ('AR','IN','VA'))\n        OR (ca_state IN ('KS','OH','SD'))\n      )\n  \n  MAIN QUERY (via Q0)\n    FROM: store_sales\n      JOIN filtered_date ON ss_sold_date_sk=d_date_sk\n      JOIN filtered_store ON s_store_sk=ss_store_sk\n      JOIN filtered_hd ON ss_hdemo_sk=hd_demo_sk\n      JOIN filtered_cd ON ss_cdemo_sk=cd_demo_sk\n      JOIN filtered_ca ON ss_addr_sk=ca_address_sk\n    WHERE: \n      ( /* Original OR conditions on fact columns */ )",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_reorder",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Implicit cross joins prevent optimal join ordering. Explicit JOINs with filtered CTEs enable better cardinality estimation and join sequence selection.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_date (via Q_date) ...\n  CTE: filtered_store (via Q_store) ...\n  CTE: filtered_hd (via Q_hd) ...\n  CTE: filtered_cd (via Q_cd) ...\n  CTE: filtered_ca (via Q_ca) ...\n  \n  MAIN QUERY (via Q0)\n    FROM: store_sales\n      INNER JOIN filtered_date ON ss_sold_date_sk=d_date_sk\n      INNER JOIN filtered_store ON s_store_sk=ss_store_sk\n      INNER JOIN filtered_hd ON ss_hdemo_sk=hd_demo_sk\n      INNER JOIN filtered_cd ON ss_cdemo_sk=cd_demo_sk\n      INNER JOIN filtered_ca ON ss_addr_sk=ca_address_sk\n    WHERE: \n      ( /* Fact column conditions */ )",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Repeated implicit scans of dimension tables (household_demographics scanned 3x in OR branches) waste resources. Materializing filtered versions avoids redundant work.",
+    "target_ir": "S0 [SELECT]\n  CTE: prefetched_hd (via Q_hd)\n    FROM: household_demographics\n    WHERE: hd_dep_count IN (1,3)\n  \n  CTE: prefetched_cd (via Q_cd)\n    FROM: customer_demographics\n    WHERE: ... (OR conditions)\n  \n  CTE: prefetched_ca (via Q_ca)\n    FROM: customer_address\n    WHERE: ... (state filters)\n  \n  MAIN QUERY (via Q0)\n    FROM: store_sales, store, prefetched_hd, prefetched_cd, prefetched_ca, date_dim\n    WHERE: s_store_sk=ss_store_sk\n      AND ss_sold_date_sk=d_date_sk AND d_year=2001\n      AND ss_hdemo_sk=hd_demo_sk\n      AND ss_cdemo_sk=cd_demo_sk\n      AND ss_addr_sk=ca_address_sk\n      AND ( /* Original OR groups */ )",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

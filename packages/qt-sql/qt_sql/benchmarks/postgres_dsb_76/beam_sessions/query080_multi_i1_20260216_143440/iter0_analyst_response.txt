@@ -1,0 +1,58 @@
+### Analysis of Optimization Families:
+
+**Family A (Early Filtering):** HIGH  
+Repeated dimension table scans (date_dim, promotion, item) with identical filters across all three CTEs. Pushing filters into precomputed CTEs would reduce redundant processing.
+
+**Family B (Decorrelation):** LOW  
+No correlated subqueries detected. All joins are explicit left/outer joins without per-row re-execution patterns.
+
+**Family C (Aggregation Pushdown):** LOW  
+GROUP BY keys (store_id, catalog_page_id, etc.) aren't subsets of join keys. Profit calculation requires post-join aggregation due to coalesce() logic.
+
+**Family D (Set Operation Optimization):** LOW  
+UNION ALL operations are already optimal (no duplicate elimination). No INTERSECT/EXCEPT patterns.
+
+**Family E (Materialization/Prefetch):** HIGH  
+Identical dimension filters (date range, promotion channels, item criteria) reapplied across all three CTEs. Precomputing these filtered dimensions is critical.
+
+**Family F (Join Transform):** MEDIUM  
+Comma-separated joins limit predicate pushdown control. Converting to explicit joins could improve join order flexibility.
+
+**Chosen families:** [E, A, F]  
+**Confidence:** High (E), High (A), Medium (F)
+
+---
+
+### Optimization Targets:
+
+```json
+[
+  {
+    "family": "E",
+    "transform": "multi_dimension_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Identical dimension filters (date_dim/promotion/item) scanned 3x independently. Precompute filtered dimensions once.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_date  (via CTE_filtered_date)\n    FROM: date_dim\n    WHERE: d_date BETWEEN CAST('1998-08-29' AS DATE) AND CAST('1998-08-29' AS DATE) + INTERVAL '30 day'\n  CTE: filtered_promo  (via CTE_filtered_promo)\n    FROM: promotion\n    WHERE: p_channel_email='N' AND p_channel_tv='N' AND p_channel_radio='N' AND p_channel_press='N' AND p_channel_event='N'\n  CTE: filtered_item  (via CTE_filtered_item)\n    FROM: item\n    WHERE: i_current_price > 50 AND i_category IN ('Children','Sports')\n  CTE: ssr  (via CTE_ssr)\n    FROM: store_sales\n          LEFT JOIN store_returns ON (ss_item_sk=sr_item_sk AND ss_ticket_number=sr_ticket_number)\n          INNER JOIN filtered_date ON (ss_sold_date_sk=d_date_sk)\n          INNER JOIN store ON (ss_store_sk=s_store_sk)\n          INNER JOIN filtered_item ON (ss_item_sk=i_item_sk)\n          INNER JOIN filtered_promo ON (ss_promo_sk=p_promo_sk)\n    WHERE: ss_wholesale_cost BETWEEN 23 AND 38\n    GROUP BY: s_store_id\n  ... (csr/wsr follow same pattern with catalog_sales/web_sales)",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "predicate_push_into_cte",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Fact table filters (ss_wholesale_cost etc.) applied late after joins. Push into CTEs to reduce join cardinality.",
+    "target_ir": "S0 [SELECT]\n  ... (precomputed dimensions from t1) ...\n  CTE: ssr  (via CTE_ssr)\n    FROM: store_sales\n          INNER JOIN filtered_date ON (ss_sold_date_sk=d_date_sk)\n          INNER JOIN filtered_item ON (ss_item_sk=i_item_sk)\n          INNER JOIN filtered_promo ON (ss_promo_sk=p_promo_sk)\n          LEFT JOIN store_returns ON (ss_item_sk=sr_item_sk AND ss_ticket_number=sr_ticket_number)\n    WHERE: ss_wholesale_cost BETWEEN 23 AND 38  -- PUSHED EARLY\n    GROUP BY: s_store_id\n  ... (csr/wsr with equivalent early fact filters)",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "comma_to_explicit_join",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Implicit comma joins prevent optimal join ordering. Convert to explicit INNER JOIN syntax.",
+    "target_ir": "S0 [SELECT]\n  ... (precomputed dimensions from t1) ...\n  CTE: ssr  (via CTE_ssr)\n    FROM: store_sales\n          INNER JOIN filtered_date ON (ss_sold_date_sk=d_date_sk)\n          INNER JOIN store ON (ss_store_sk=s_store_sk)\n          INNER JOIN filtered_item ON (ss_item_sk=i_item_sk)\n          INNER JOIN filtered_promo ON (ss_promo_sk=p_promo_sk)\n          LEFT JOIN store_returns ON (ss_item_sk=sr_item_sk AND ss_ticket_number=sr_ticket_number)\n    WHERE: ss_wholesale_cost BETWEEN 23 AND 38\n    GROUP BY: s_store_id\n  ... (explicit joins for csr/wsr)",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

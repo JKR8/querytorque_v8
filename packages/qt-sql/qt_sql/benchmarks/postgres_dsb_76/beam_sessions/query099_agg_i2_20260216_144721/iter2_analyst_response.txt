@@ -1,0 +1,85 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Failed Patches (t1 and t2):**
+- **t1 (F+C)**: Failed due to structural column mismatch. The pre-aggregation CTE (`preagg_catalog_sales`) omitted columns needed for date difference calculations (`cs_sold_date_sk`), causing semantic errors.
+- **t2 (C)**: Similarly failed from column mismatch. The pre-aggregation attempted to compute date-difference flags too early but missed join keys, breaking downstream joins.
+
+**Operator Impact (Hypothetical):**  
+Had these succeeded, we would expect reductions in:
+1. `Nested Loop (rows=25870)` due to pre-aggregation shrinking `catalog_sales` input.
+2. `Hash Join (rows=4948)` from early dimension filtering.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+The `Nested Loop (rows=25870, time=3895.617 ms)` dominates runtime. It scans `catalog_sales` 106 times per `date_dim` row due to index-driven nested looping.
+
+**Refined Targets**:  
+1. **Combination (A+F+C)**  
+   Layer pre-aggregation (C) onto the winning join restructuring (F) while adding early dimension filtering (A).  
+   - **Hypothesis**: Pre-aggregate `catalog_sales` *after* date filtering but *before* dimension joins, reducing the `Nested Loop`'s input rows (25870 → ~100s).  
+   - **Target**: `Nested Loop (rows=25870)`  
+   - **Rescue**: Fix t1's column omission by including `cs_sold_date_sk` in pre-aggregation.  
+
+2. **Refinement (A+E)**  
+   Materialize filtered dimensions to avoid repeated scans.  
+   - **Hypothesis**: The `Memoize (rows=1)` call_center scan runs 826 times. Pre-materializing dimensions as CTEs eliminates per-row lookups.  
+   - **Target**: `Memoize (rows=1)` called 826x  
+   - **Trigger**: `call_center` scan time (0.013 ms) × 826 rows = 10.7 ms saved.  
+
+3. **Rescue (C)**  
+   Fix pre-aggregation logic while preserving date joins.  
+   - **Hypothesis**: Compute date differences *after* joining `date_dim` but *before* other dimensions.  
+   - **Resolves**: t2’s error by retaining `cs_ship_date_sk` and `cs_sold_date_sk` for date math.  
+
+4. **Novel (A+B)**  
+   Push `warehouse`/`call_center` filters into semi-joins during pre-aggregation.  
+   - **Hypothesis**: Use `WHERE cs_warehouse_sk IN (SELECT ... FROM filtered_warehouse)` to reduce `catalog_sales` rows *before* grouping.  
+   - **Target**: `Index Scan on catalog_sales (rows=106)` per date row.  
+
+---
+
+### Final Targets
+
+```json
+[
+  {
+    "family": "A+F+C",
+    "transform": "preagg_after_date_join",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Pre-aggregate catalog_sales after date join but before other dimensions. Include cs_sold_date_sk to fix prior errors. Targets Nested Loop (25870 rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A+E",
+    "transform": "materialize_dims_early",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Materialize filtered dimensions in CTEs to eliminate 826 Memoize calls. Targets repeated Index Scan on call_center.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "preagg_with_date_math",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Rescue pre-aggregation: compute date differences in CTE after joining date_dim but before other dimensions. Fixes missing column errors.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A+B",
+    "transform": "semi_join_prefilter",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Push dimension filters into catalog_sales via semi-joins during pre-aggregation. Reduces input to Index Scan (106 rows/loop).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

@@ -1,0 +1,97 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of NEUTRAL Patches (0.99x):**
+The attempted decorrelation + prefetch (Family B+E) showed no improvement because:
+1. **New expensive operators:** The `Unique` operator (time=573.047ms, rows=1690) and `Sort` (time=572.969ms) became dominant in the CTE-based sales precomputation. These didn’t exist in the original plan.
+2. **CTE overhead:** Materializing `filtered_dates`/`filtered_items` as CTEs caused repeated scans (3x `CTE Scan` in the patched plan) and expensive sorts for deduplication.
+3. **Backfired optimization:** While decorrelation eliminated per-customer re-execution, the materialization of large intermediate sales sets (e.g., `Append` with rows=1369) and sorts outweighed gains. The original plan used efficient `Index Only Scan` on `store_sales` (time=7.92ms) and `Index Scan` on `web_sales`/`catalog_sales`, which were replaced by slower hash joins and sorts.
+
+**Most expensive operator in original plan:**  
+`Nested Loop` between `date_dim` and `store_sales` (rows=135,401, time=990.51ms).  
+**Structural cause:** Correlated subqueries forced re-execution per customer.
+
+---
+
+### Step 2 — Design Targets for Round 2
+
+**Primary Bottleneck:**  
+Correlated subquery execution (`Nested Loop` on `store_sales`, time=990.51ms) due to per-customer re-evaluation.
+
+**Refined Targets:**
+
+1. **Combination Target (A + B): Early Filtering + Decorrelation**  
+   - **Family:** A + B  
+   - **Transform:** `early_filter_then_decorrelate`  
+   - **Target ID:** `t1`  
+   - **Relevance Score:** 0.95  
+   - **Hypothesis:** Pre-filter customers (county, demographics, birth month) BEFORE decorrelation to shrink the customer set for sales subqueries. This reduces the input rows to the expensive `Nested Loop` (135,401 rows) by pushing filters earlier.  
+   - **Target IR:** `S0` (by_node_id)  
+   - **Recommended Examples:** `pg_date_cte_explicit_join` (A), `pg_shared_scan_decorrelate` (B)  
+
+2. **Refinement Target (F): Join Transform**  
+   - **Family:** F  
+   - **Transform:** `explicit_join_materialized`  
+   - **Target ID:** `t2`  
+   - **Relevance Score:** 0.85  
+   - **Hypothesis:** Convert comma joins to explicit `INNER JOIN` and enforce optimal join order (customer → address/demographics first). This avoids cross joins and leverages predicate pushdown to reduce rows early. Targets the `Nested Loop` on `customer_address` (time=0.018ms) which could filter counties sooner.  
+   - **Target IR:** `S0` (by_node_id)  
+   - **Recommended Examples:** `pg_explicit_join_materialized` (F)  
+
+3. **Rescue Target (B + E): Leaner Decorrelation**  
+   - **Family:** B + E  
+   - **Transform:** `decorrelate_without_union`  
+   - **Target ID:** `t3`  
+   - **Relevance Score:** 0.80  
+   - **Hypothesis:** Replace the `UNION` in `valid_web_or_catalog_sales` with two `EXISTS` clauses to avoid materializing and sorting the combined set (rows=1,369). Retain date/item prefetching but skip deduplication. Addresses the costly `Unique` (time=573.047ms) in the neutral patch.  
+   - **Target IR:** `S0` (by_node_id)  
+   - **Recommended Examples:** `shared_scan_decorrelate` (B), `multi_dimension_prefetch` (E)  
+
+4. **Novel Target (C): Aggregation Pushdown**  
+   - **Family:** C  
+   - **Transform:** `demographics_early_aggregate`  
+   - **Target ID:** `t4`  
+   - **Relevance Score:** 0.75  
+   - **Hypothesis:** Group customer demographics BEFORE joining with sales. Since `GROUP BY` keys are all from `customer_demographics`, aggregate early to reduce rows fed into the expensive sales subqueries. Targets the `Aggregate` operator (rows=1,690, time=1,998.385ms).  
+   - **Target IR:** `S0` (by_node_id)  
+   - **Recommended Examples:** `pg_materialized_dimension_fact_prefilter` (C)  
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-filter customers (county/demographics/birth month) before decorrelating sales subqueries to reduce the input rows (135,401) to the expensive Nested Loop on store_sales.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_materialized",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert comma joins to explicit INNER JOIN and enforce optimal join order (customer → address/demographics first) to push county/demographic filters earlier and avoid cross joins.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "B+E",
+    "transform": "decorrelate_without_union",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Retain date/item prefetching but replace the UNION in web/catalog sales with two EXISTS clauses to eliminate the costly Unique (573ms) and Sort (573ms) operators.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "demographics_early_aggregate",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Aggregate customer demographics before joining with sales to reduce rows fed into subqueries, targeting the expensive Aggregate (1,690 rows, 1,998ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

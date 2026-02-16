@@ -1,0 +1,71 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches failed with the same structural error (missing `inv_warehouse_sk`), so no winners exist to analyze. The failure occurred because rewritten queries omitted a required column during CTE materialization, breaking join conditions.  
+
+---
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: The `Seq Scan on web_sales` (362.566 ms, 482K rows) dominates runtime. Secondary issues:  
+- Large hash joins (`Hash Join (rows=43K, time=501 ms)`)  
+- Late filtering of `item`/`customer_address` (despite low row counts)  
+
+**Target Design Strategy**:  
+1. **Rescue Family A (Early Filtering)** with corrected column inclusion.  
+2. **Combine Family A + C (Early Filtering + Aggregation Pushdown)** to reduce `web_sales` scan size.  
+3. **Combine Family A + F (Early Filtering + Join Transform)** to optimize join topology.  
+4. **Novel Family E (Materialization)** for `date_dim` range join.  
+
+---
+
+### Targets (Prioritized)  
+
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filtering_rescue",
+    "target_id": "t1_rescue",
+    "relevance_score": 0.98,
+    "hypothesis": "Pre-filtering dimension tables (item, customer_address, date_dim) failed due to missing inv_warehouse_sk. Include all join columns in CTEs to fix structural error. Targets Seq Scan on web_sales (482K rows) by reducing joined rows early.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A+C",
+    "transform": "early_filter_agg_pushdown",
+    "target_id": "t2_agg",
+    "relevance_score": 0.90,
+    "hypothesis": "Pre-filter dimensions + pre-aggregate web_sales/store_sales before joining. GROUP BY keys (cd_gender, etc.) are supersets of customer join keys. Reduces Hash Join (43K rows) and Seq Scan on web_sales (482K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A+F",
+    "transform": "early_filter_explicit_join",
+    "target_id": "t3_join",
+    "relevance_score": 0.85,
+    "hypothesis": "Replace comma joins with explicit INNER JOIN + enforce optimal join order. Start with filtered date_dim/item to constrain web_sales early. Targets Seq Scan on web_sales by pushing filters into JOIN ON clauses.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "date_range_materialize",
+    "target_id": "t4_date",
+    "relevance_score": 0.80,
+    "hypothesis": "Materialize d2 date range (BETWEEN d1 AND d1+30) as a CTE to avoid repeated per-row calculations. Targets Nested Loop (rows=0, time=821ms) caused by correlated date conditions.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```  
+
+### Rationale  
+1. **Rescue (A)**: Highest confidence. Fixes prior column omission while pushing filters (e.g., `item` scan drops to 1.2K rows).  
+2. **A+C**: Targets hash join bottleneck. Pre-aggregating sales tables before joins aligns with Family C’s "reduce intermediate sizes" principle.  
+3. **A+F**: Addresses comma-join inefficiency. Explicit joins let the planner push `item`/`date_dim` filters into web_sales scans.  
+4. **Novel (E)**: Materializes date range to avoid recomputing `d2.d_date BETWEEN...` for 482K web_sales rows.  
+
+**Why not other families?**  
+- **B (Decorrelation)**: No correlated subqueries in the query.  
+- **D (Set Operations)**: No INTERSECT/UNION patterns.  
+- **Quality > Quantity**: Only 4 high-confidence targets based on plan operators.

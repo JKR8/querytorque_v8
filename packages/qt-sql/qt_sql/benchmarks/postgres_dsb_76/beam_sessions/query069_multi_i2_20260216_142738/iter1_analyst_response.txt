@@ -1,0 +1,82 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches failed due to literal mismatches, so no winners exist. We cannot compare improved operators. The primary bottleneck remains unaddressed.  
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: Repeated full scans of `date_dim` (3x) and large nested loops on sales tables (`store_sales`, `web_sales`, `catalog_sales`) with correlated execution.  
+
+**Target 1: Combination (E+B)**  
+- **Family**: E+B (Materialization + Decorrelation)  
+- **Transform**: `date_materialization_then_decorrelate`  
+- **Target ID**: `t1`  
+- **Relevance**: 0.95  
+- **Hypothesis**: Materialize the date filter (E) to avoid 3x `Index Only Scan on date_dim`. Decouple correlated subqueries (B) by converting `EXISTS/NOT EXISTS` to anti-joins, eliminating per-row re-execution of `Nested Loop` on sales tables (original: 164k, 30k, and 71k rows).  
+- **Target IR**: `S0` → Replace `EXISTS/NOT EXISTS` subqueries with CTEs joined via `LEFT JOIN ... WHERE IS NULL`. Anchor `d_moy between 3 and 3+2` in a shared CTE.  
+- **Examples**: `multi_dimension_prefetch`, `pg_shared_scan_decorrelate`  
+
+**Target 2: Refinement (A)**  
+- **Family**: A (Early Filtering)  
+- **Transform**: `dimension_prefilter`  
+- **Target ID**: `t2`  
+- **Relevance**: 0.90  
+- **Hypothesis**: Push `ca_state IN ('GA','KY','SD')` and `cd_marital_status`/`cd_education_status` filters into CTEs *before* joining with `customer`. Reduces `Seq Scan on customer_address` (9k rows) and avoids propagating unfiltered `customer` rows (166k) into expensive joins.  
+- **Target IR**: `S0` → Wrap `customer_address` and `customer_demographics` in filtered CTEs. Anchor `5bc66d236b3490a1`.  
+- **Examples**: `pg_date_cte_explicit_join`  
+
+**Target 3: Rescue (E)**  
+- **Family**: E (Materialization)  
+- **Transform**: `date_materialization_rescue`  
+- **Target ID**: `t3`  
+- **Relevance**: 0.85  
+- **Hypothesis**: Fix literal mismatch in failed patch `t2` by preserving `d_moy between 3 and 3+2` verbatim. Precompute `date_filter` CTE to reuse across sales tables, eliminating redundant `Index Only Scan on date_dim` (3x).  
+- **Target IR**: `S0` → Insert CTE for `date_dim` with original filter. Replace all `date_dim` references in subqueries with CTE.  
+- **Examples**: `date_materialization`  
+
+**Target 4: Novel (F)**  
+- **Family**: F (Join Transform)  
+- **Transform**: `explicit_join_optimize`  
+- **Target ID**: `t4`  
+- **Relevance**: 0.80  
+- **Hypothesis**: Convert comma joins to explicit `INNER JOIN` and enforce optimal join order: filtered `customer_address` → `customer` → `customer_demographics`. Avoids cross-join explosion (`Hash Join` at 180k rows) by reducing input to `customer` early.  
+- **Target IR**: `S0` → Rewrite `FROM` clause with explicit joins ordered by selectivity. Anchor table references.  
+- **Examples**: `pg_explicit_join_materialized`  
+
+```json
+[
+  {
+    "family": "E+B",
+    "transform": "date_materialization_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Materialize date filter to eliminate 3x date_dim scans. Decouple correlated subqueries via anti-joins to avoid per-row nested loops on large sales tables (164k/30k/71k rows).",
+    "target_ir": "S0: Replace EXISTS/NOT EXISTS subqueries with LEFT JOIN anti-pattern using precomputed sales CTEs. Reuse date_filter CTE with original d_moy expression.",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "A",
+    "transform": "dimension_prefilter",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Filter customer_address (9k rows) and customer_demographics early to reduce input into customer-ca join (166k → 9k), preventing propagation of 180k unfiltered rows.",
+    "target_ir": "S0: Wrap customer_address and customer_demographics in CTEs with original filters (ca_state IN, cd_marital_status IN). Anchor hash 5bc66d236b3490a1.",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "date_materialization_rescue",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix literal mismatch in t2 by preserving d_moy expression verbatim. Reuse single date_filter CTE to avoid 3x date_dim scans (31 rows each).",
+    "target_ir": "S0: Insert CTE for date_dim with original d_year/d_moy filters. Replace all date_dim references in subqueries with CTE.",
+    "recommended_examples": ["date_materialization"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_optimize",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Enforce optimal join order (customer_address → customer → demographics) via explicit INNER JOIN to reduce cross-join explosion (180k rows in Hash Join).",
+    "target_ir": "S0: Convert comma joins to explicit INNER JOIN ordered by selectivity. Anchor table aliases.",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

@@ -1,0 +1,117 @@
+### Step 1: BOTTLENECK HYPOTHESIS
+The primary bottleneck is correlated subquery execution across 3 NOT EXISTS channels (store_sales, web_sales, catalog_sales), causing repeated nested loops over large fact tables. The anti-joins (Nested Loop Anti) show 1,105 loops for catalog_sales and 1,128 loops for web_sales, each triggering expensive rescans of materialized fact tables (3.4ms and 12.5ms per loop). The date_dim scans are repeated 3 times with identical filters, and comma joins prevent optimal join order planning.
+
+### Step 2: DESIGNED PROBES
+```json
+{
+  "hypothesis": "The primary bottleneck is correlated subquery execution across 3 NOT EXISTS channels (store_sales, web_sales, catalog_sales), causing repeated nested loops over large fact tables. The anti-joins show 1,105-1,128 loops each triggering expensive rescans of materialized fact tables. Date_dim scans are repeated 3 times with identical filters, and comma joins prevent optimal join order planning.",
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_consolidation",
+      "family": "E",
+      "target": "Extract shared date_dim filter (d_year=2002 AND d_moy BETWEEN 10 AND 12) into MATERIALIZED CTE date_range. Replace all 3 date_dim instances with this CTE via JOIN date_range",
+      "confidence": 0.95,
+      "recommended_examples": ["pg_date_consolidation"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "decorrelate_store_sales",
+      "family": "B",
+      "target": "Convert EXISTS(store_sales) to MATERIALIZED CTE store_customers: SELECT DISTINCT ss_customer_sk FROM store_sales JOIN date_range ON ss_sold_date_sk=d_date_sk WHERE ss_list_price BETWEEN 80 AND 169",
+      "confidence": 0.90,
+      "recommended_examples": ["early_filter_decorrelate"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "decorrelate_web_sales",
+      "family": "B",
+      "target": "Convert NOT EXISTS(web_sales) to MATERIALIZED CTE web_customers: SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN date_range ON ws_sold_date_sk=d_date_sk WHERE ws_list_price BETWEEN 80 AND 169",
+      "confidence": 0.90,
+      "recommended_examples": ["set_operation_materialization"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "decorrelate_catalog_sales",
+      "family": "B",
+      "target": "Convert NOT EXISTS(catalog_sales) to MATERIALIZED CTE catalog_customers: SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN date_range ON cs_sold_date_sk=d_date_sk WHERE cs_list_price BETWEEN 80 AND 169",
+      "confidence": 0.90,
+      "recommended_examples": ["set_operation_materialization"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "explicit_joins",
+      "family": "F",
+      "target": "Replace comma joins with explicit INNER JOIN syntax: customer c JOIN customer_address ca ON c.c_current_addr_sk=ca.ca_address_sk JOIN customer_demographics cd ON cd_demo_sk=c.c_current_cdemo_sk",
+      "confidence": 0.85,
+      "recommended_examples": ["pg_date_cte_explicit_join"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "anti_join_rewrite",
+      "family": "D",
+      "target": "Replace NOT EXISTS conditions with LEFT JOIN anti-pattern: LEFT JOIN web_customers ON c_customer_sk=ws_bill_customer_sk WHERE ws_bill_customer_sk IS NULL (repeat for catalog)",
+      "confidence": 0.85,
+      "recommended_examples": ["set_operation_materialization"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "semi_join_rewrite",
+      "family": "D",
+      "target": "Replace EXISTS condition with INNER JOIN store_customers ON c_customer_sk=ss_customer_sk",
+      "confidence": 0.80,
+      "recommended_examples": ["set_operation_materialization"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "prefilter_customer_address",
+      "family": "A",
+      "target": "Create MATERIALIZED CTE filtered_addresses: SELECT * FROM customer_address WHERE ca_state IN ('CO','NC','TX')",
+      "confidence": 0.75,
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "prefilter_demographics",
+      "family": "A",
+      "target": "Create MATERIALIZED CTE filtered_demographics: SELECT * FROM customer_demographics WHERE cd_marital_status IN ('S','M','U') AND cd_education_status IN ('Primary','College')",
+      "confidence": 0.75,
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "dimension_prefetch",
+      "family": "E",
+      "target": "Pre-join dimensions: WITH base AS (SELECT c.*, cd.* FROM customer c JOIN filtered_demographics cd ON cd_demo_sk=c_current_cdemo_sk) THEN JOIN filtered_addresses",
+      "confidence": 0.70,
+      "recommended_examples": ["pg_dimension_prefetch_star"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "price_filter_pushdown",
+      "family": "A",
+      "target": "Move list_price filters into fact CTEs (store_customers/web_customers/catalog_customers) WHERE clauses during CTE creation",
+      "confidence": 0.85,
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "cte_parallel_guard",
+      "family": "E",
+      "target": "Add AS MATERIALIZED to all CTEs to prevent inlining and preserve decorrelation benefits",
+      "confidence": 0.95,
+      "recommended_examples": []
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "reason": "No non-equi joins detected in query structure"
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "reason": "No scalar aggregates in subqueries - EXISTS/NOT EXISTS patterns only"
+    }
+  ]
+}
+```

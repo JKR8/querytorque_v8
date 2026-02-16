@@ -1,0 +1,54 @@
+### Step 1 — Compare EXPLAIN Plans  
+**Analysis of Pending Patch (S0:45f976cc8e3ef038 - Family B):**  
+- **WIN** (assumed pending success):  
+  - **Improved operator**: Original correlated subquery (not shown) was replaced. The new plan shows `Aggregate` for thresholds (rows=2,367, time=48.485 ms) instead of per-row re-execution.  
+  - **Structural change**: Decorrelation converted the correlated subquery into a CTE (`item_thresholds`) with GROUP BY, eliminating nested-loop execution.  
+  - **Most expensive remaining operator**: `Aggregate` in `item_thresholds` (rows=2,367, time=48.485 ms).  
+
+**Analysis of Failed E+B Patches:**  
+- **FAIL**: All three E+B patches failed semantically.  
+- **Reason**: The LEFT JOIN + NULL check (`t.threshold IS NULL OR ...`) likely altered semantics. The original logic requires strict comparison `ws_ext_discount_amt > threshold`, but NULL thresholds (from items with no qualifying sales) would incorrectly pass the filter.  
+
+**Classification**:  
+- **REDUNDANT**: All E+B patches share the same flawed structure.  
+- **COMPLEMENTARY**: The B patch (decorrelation) is distinct from E+B (materialization + decorrelation).  
+
+---
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**:  
+The `Aggregate` in `item_thresholds` (48.485 ms) is the most expensive operator in the pending B patch. It processes 4,810 rows (CTE scan) to compute per-item thresholds.  
+
+**Targets**:  
+1. **Combination (A+B)**:  
+   - Layer early filtering (Family A) onto the B patch to reduce input rows to the expensive `Aggregate`.  
+   - **Hypothesis**: Pre-filter items (`i_manufact_id`/`i_category`) before computing thresholds. Currently, the `Aggregate` processes 4,810 rows. Pushing the item filter into `item_thresholds` reduces groups to only relevant items.  
+   - **Target**: `S0:45f976cc8e3ef038` (threshold computation).  
+
+2. **Refinement (A)**:  
+   - Apply early filtering to the `filtered_sales` CTE to reduce rows before joins.  
+   - **Hypothesis**: The `Hash Join` (68.582 ms) in the main query scans 33,972 rows (`filtered_sales`). Join `item` early to filter by `i_manufact_id`/`i_category` first.  
+   - **Target**: `S0:45f976cc8e3ef038` (main FROM clause).  
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "decorrelate_with_early_filter",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Push item filter (i_manufact_id/i_category) into item_thresholds CTE to reduce input rows for the expensive Aggregate (currently 4,810 rows).",
+    "target_ir": "S0:45f976cc8e3ef038",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filter_qualified_sales",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Filter web_sales by item conditions early in filtered_sales CTE to reduce Hash Join input (currently 33,972 rows).",
+    "target_ir": "S0:45f976cc8e3ef038",
+    "recommended_examples": ["date_cte_isolate", "multi_dimension_prefetch"]
+  }
+]
+```

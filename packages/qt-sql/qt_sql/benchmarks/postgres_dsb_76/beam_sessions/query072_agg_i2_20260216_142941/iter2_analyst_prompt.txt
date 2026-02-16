@@ -1,0 +1,331 @@
+## Role
+
+You are a SQL optimization analyst reviewing benchmark results. Analyze what worked, what failed, and design refined targets for the next round of workers.
+
+Identify the primary bottleneck. Only provide secondary targets if they are distinct and high-confidence. Quality > Quantity.
+
+You will see the original query, execution plan, IR structure, and detailed results from previous rounds.
+
+## Query: query072_agg_i2
+
+**Dialect**: POSTGRES
+
+```sql
+select  i_item_desc
+      ,w_warehouse_name
+      ,d1.d_week_seq
+      ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+      ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+      ,count(*) total_cnt
+from catalog_sales
+join inventory on (cs_item_sk = inv_item_sk)
+join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+join item on (i_item_sk = cs_item_sk)
+join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+left outer join promotion on (cs_promo_sk=p_promo_sk)
+left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and d3.d_date > d1.d_date + interval '3 day'
+  and hd_buy_potential = '>10000'
+  and d1.d_year = 1999
+  and cd_marital_status = 'S'
+  and cd_dep_count between 9 and 11
+  and i_category IN ('Men', 'Shoes', 'Sports')
+  and cs_wholesale_cost BETWEEN 76 AND 96
+group by i_item_desc,w_warehouse_name,d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+```
+
+
+## Current Execution Plan
+
+```
+Limit  (rows=0, time=431.445)
+  Sort  (rows=0, time=431.443)
+    Aggregate  (rows=0, time=431.427)
+      Nested Loop  (rows=0, time=431.425)
+        Gather Merge  (rows=0, time=431.423)
+          Sort  (rows=0, time=425.386)
+            Nested Loop  (rows=0, time=425.368)
+              Nested Loop  (rows=0, time=425.367)
+                Nested Loop  (rows=0, time=425.366)
+                  Nested Loop  (rows=0, time=425.365)
+                    Hash Join  (rows=0, time=425.363)
+                      Seq Scan on date_dim (d2)  (rows=0, time=0.0)
+                      Hash  (rows=0, time=425.291)
+                        Nested Loop  (rows=0, time=268.744)
+                          Hash Join  (rows=23847, time=184.234)
+                            Nested Loop  (rows=113468, time=174.846)
+                              Index Scan on date_dim (d1)  (rows=182, time=4.864)
+                              Index Scan on catalog_sales  (rows=622, time=0.895)
+                            Hash  (rows=1200, time=0.595)
+                              Seq Scan on household_demographics  (rows=1200, time=0.522)
+                          Index Scan on customer_demographics  (rows=0, time=0.003)
+                    Index Scan on inventory  (rows=0, time=0.0)
+                  Seq Scan on warehouse  (rows=0, time=0.0)
+                Index Scan on item  (rows=0, time=0.0)
+              Index Only Scan on promotion  (rows=0, time=0.0)
+        Index Scan on date_dim (d3)  (rows=0, time=0.0)
+```
+
+
+## IR Structure (for patch targeting)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: catalog_sales, inventory, warehouse, item, customer_demographics, household_demographics, date_dim d1, date_dim d2, date_dim d3, promotion, catalog_returns
+    WHERE [ece830e47c29a467]: d1.d_week_seq = d2.d_week_seq AND inv_quantity_on_hand < cs_quantity AND d3.d_date > d1.d_date + ...
+    GROUP BY: i_item_desc, w_warehouse_name, d1.d_week_seq
+    ORDER BY: total_cnt, i_item_desc, w_warehouse_name, d_week_seq
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
+
+
+## Optimization Families
+
+Review the 6 families below. Each has a proven gold example.
+
+Choose up to **4 most relevant families** for this query based on:
+- Query structure (CTEs, subqueries, joins, aggregations, set operations)
+- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)
+- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
+
+
+
+### Family A: Early Filtering (Predicate Pushback)
+**Description**: Push small filters into CTEs early, reduce row count before expensive operations
+**Speedup Range**: 1.3–4.0x (~35% of all wins)
+**Use When**:
+  1. Late WHERE filters on dimension tables
+  2. Cascading CTEs with filters applied downstream
+  3. Expensive joins after filters could be pushed earlier
+
+**Gold Example**: `pg_date_cte_explicit_join` (2.28x)
+
+
+
+### Family B: Decorrelation (Sets Over Loops)
+**Description**: Convert correlated subqueries to standalone CTEs with GROUP BY, eliminate per-row re-execution
+**Speedup Range**: 2.4–2.9x (~15% of all wins)
+**Use When**:
+  1. Correlated subqueries in WHERE clause
+  2. Scalar aggregates computed per outer row
+  3. DELIM_SCAN in execution plan (indicates correlation)
+
+**Gold Example**: `pg_shared_scan_decorrelate` (8043.91x (timeout rescue))
+
+
+
+### Family C: Aggregation Pushdown (Minimize Rows Touched)
+**Description**: Aggregate before expensive joins when GROUP BY keys ⊇ join keys, reduce intermediate sizes
+**Speedup Range**: 1.3–15.3x (~5% of all wins (high variance))
+**Use When**:
+  1. GROUP BY happens after large joins
+  2. GROUP BY keys are subset of join keys
+  3. Intermediate result size >> final result size
+
+**Gold Example**: `pg_materialized_dimension_fact_prefilter` (12.07x (V2 DSB SF10, was 2.68x in V1))
+
+
+
+### Family D: Set Operation Optimization (Sets Over Loops)
+**Description**: Replace INTERSECT/UNION-based patterns with EXISTS/NOT EXISTS, avoid full materialization
+**Speedup Range**: 1.7–2.7x (~8% of all wins)
+**Use When**:
+  1. INTERSECT patterns between large sets
+  2. UNION ALL with duplicate elimination
+  3. Set operations materializing full intermediate results
+
+**Gold Example**: `pg_intersect_to_exists` (1.78x)
+
+
+
+### Family E: Materialization / Prefetch (Don't Repeat Work)
+**Description**: Extract repeated scans or pre-compute intermediate results for reuse across multiple consumers
+**Speedup Range**: 1.3–6.2x (~18% of all wins)
+**Use When**:
+  1. Repeated scans of same table with different filters
+  2. Dimension filters applied independently multiple times
+  3. CTE referenced multiple times with implicit re-evaluation
+
+**Gold Example**: `multi_dimension_prefetch` (2.71x)
+
+
+
+### Family F: Join Transform (Right Shape First)
+**Description**: Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation
+**Speedup Range**: 1.8–8.6x (~19% of all wins)
+**Use When**:
+  1. Comma-separated joins (implicit cross joins) in FROM clause
+  2. Self-joins scanning same table multiple times
+  3. Dimension-fact join order suboptimal for predicate pushdown
+
+**Gold Example**: `pg_explicit_join_materialized` (8.56x)
+
+
+
+## Optimization History
+
+### History — All Prior Patches
+
+| Iter | Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Error (summary) |
+|------|-------|--------|-----------|---------|--------|---------|----------|-----------------|
+| 0 | t1 | A | predicate_pushback | 0.97x | NEUTRAL | 567 | 584 |  |
+| 0 | t3 | C | fact_agg_pushdown | — | FAIL | — | — | Tier-1 structural: COLUMN REF MISMATCH:  |
+| 0 | t2 | E+F | date_prefetch+join_restructure | 3.63x | WIN | 567 | 156 |  |
+| 0 | syn_w1 | A | early_filter | 1.20x | WIN | 567 | 472 |  |
+| 1 | t4 | E+F+A | prefetch_dates_plus_early_filter_dim | — | FAIL | — | — | Equivalence execution error: column "cs_ |
+| 1 | t5 | A | push_catalog_filters | — | FAIL | — | — | Equivalence execution error: current tra |
+| 1 | t6 | C | fixed_agg_pushdown | — | FAIL | — | — | Equivalence execution error: current tra |
+| 1 | t7 | E | prefetch_household_demo | — | FAIL | — | — | Equivalence execution error: current tra |
+
+
+
+### Latest Iteration 1 — Detailed Results
+
+#### Race Results
+
+| Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Semantic | Error |
+|-------|--------|-----------|---------|--------|---------|----------|----------|-------|
+| t4 | E+F+A | prefetch_dates_plus_early_filter_dim | — | FAIL | — | — | FAIL | Equivalence execution error: column "cs_bill_hdemo_sk" does not exist
+LINE 1: .. |
+| t5 | A | push_catalog_filters | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| t6 | C | fixed_agg_pushdown | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| t7 | E | prefetch_household_demo | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+
+#### Patched SQL
+
+**t4 (Family E+F+A, prefetch_dates_plus_early_filter_dim):**
+```sql
+WITH filtered_customer_demographics AS (SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'S' AND cd_dep_count BETWEEN 9 AND 11), filtered_dates_d1 AS (SELECT d_date_sk, d_week_seq, d_date FROM date_dim WHERE d_year = 1999), filtered_sales AS (SELECT cs_item_sk, cs_order_number, cs_promo_sk, cs_bill_cdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_quantity, cs_wholesale_cost FROM catalog_sales JOIN filtered_customer_demographics ON cs_bill_cdemo_sk = cd_demo_sk JOIN filtered_dates_d1 ON cs_sold_date_sk = d_date_sk WHERE cs_wholesale_cost BETWEEN 76 AND 96) SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN NOT p_promo_sk IS NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM filtered_sales JOIN inventory ON cs_item_sk = inv_item_sk JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk JOIN item ON cs_item_sk = i_item_sk JOIN household_demographics ON cs_bill_hdemo_sk = hd_demo_sk JOIN date_dim AS d2 ON inv_date_sk = d2.d_date_sk JOIN date_dim AS d3 ON cs_ship_date_sk = d3.d_date_sk LEFT JOIN promotion ON cs_promo_sk = p_promo_sk LEFT JOIN catalog_returns ON cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number WHERE d1.d_week_seq = d2.d_week_seq AND inv_quantity_on_hand < cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 DAY' AND hd_buy_potential = '>10000' AND i_category IN ('Men', 'Shoes', 'Sports') GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq LIMIT 100;
+```
+
+**t5 (Family A, push_catalog_filters):**
+```sql
+WITH filtered_catalog_sales AS (SELECT * FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 76 AND 96) SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN NOT p_promo_sk IS NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM filtered_catalog_sales JOIN inventory ON (cs_item_sk = inv_item_sk) JOIN warehouse ON (w_warehouse_sk = inv_warehouse_sk) JOIN item ON (i_item_sk = cs_item_sk) JOIN customer_demographics ON (cs_bill_cdemo_sk = cd_demo_sk) JOIN household_demographics ON (cs_bill_hdemo_sk = hd_demo_sk) JOIN date_dim AS d1 ON (cs_sold_date_sk = d1.d_date_sk) JOIN date_dim AS d2 ON (inv_date_sk = d2.d_date_sk) JOIN date_dim AS d3 ON (cs_ship_date_sk = d3.d_date_sk) LEFT OUTER JOIN promotion ON (cs_promo_sk = p_promo_sk) LEFT OUTER JOIN catalog_returns ON (cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number) WHERE d1.d_week_seq = d2.d_week_seq AND inv_quantity_on_hand < cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 DAY' AND hd_buy_potential = '>10000' AND d1.d_year = 1999 AND cd_marital_status = 'S' AND cd_dep_count BETWEEN 9 AND 11 AND i_category IN ('Men', 'Shoes', 'Sports') GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq LIMIT 100;
+```
+
+**t6 (Family C, fixed_agg_pushdown):**
+```sql
+WITH filtered_date AS (SELECT d_date_sk, d_week_seq FROM date_dim WHERE d_year = 1999), cs_filtered AS (SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost, cs_order_number FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 76 AND 96), preagg_inventory AS (SELECT inv_item_sk, inv_warehouse_sk, inv_date_sk, SUM(inv_quantity_on_hand) AS total_inv_qty FROM inventory GROUP BY inv_item_sk, inv_warehouse_sk, inv_date_sk) SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN NOT p_promo_sk IS NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM cs_filtered AS cs JOIN preagg_inventory AS inv ON cs.cs_item_sk = inv.inv_item_sk JOIN warehouse AS w ON w.w_warehouse_sk = inv.inv_warehouse_sk JOIN item AS i ON i.i_item_sk = cs.cs_item_sk JOIN customer_demographics AS cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk JOIN household_demographics AS hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk JOIN filtered_date AS d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN date_dim AS d2 ON inv.inv_date_sk = d2.d_date_sk JOIN date_dim AS d3 ON cs.cs_ship_date_sk = d3.d_date_sk LEFT OUTER JOIN promotion AS p ON cs.cs_promo_sk = p.p_promo_sk LEFT OUTER JOIN catalog_returns AS cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number WHERE d1.d_week_seq = d2.d_week_seq AND inv.total_inv_qty < cs.cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 DAY' AND hd.hd_buy_potential = '>10000' AND cd.cd_marital_status = 'S' AND cd.cd_dep_count BETWEEN 9 AND 11 AND i.i_category IN ('Men', 'Shoes', 'Sports') GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq LIMIT 100;
+```
+
+**t7 (Family E, prefetch_household_demo):**
+```sql
+WITH filtered_household_demographics AS (SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential = '>10000'), filtered_customer_demographics AS (SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'S' AND cd_dep_count BETWEEN 9 AND 11), filtered_items AS (SELECT i_item_sk, i_item_desc FROM item WHERE i_category IN ('Men', 'Shoes', 'Sports')) SELECT i_item_desc, w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN NOT p_promo_sk IS NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM catalog_sales JOIN inventory ON (cs_item_sk = inv_item_sk) JOIN warehouse ON (w_warehouse_sk = inv_warehouse_sk) JOIN filtered_items ON (i_item_sk = cs_item_sk) JOIN filtered_customer_demographics ON (cs_bill_cdemo_sk = cd_demo_sk) JOIN filtered_household_demographics ON (cs_bill_hdemo_sk = hd_demo_sk) JOIN date_dim AS d1 ON (cs_sold_date_sk = d1.d_date_sk) JOIN date_dim AS d2 ON (inv_date_sk = d2.d_date_sk) JOIN date_dim AS d3 ON (cs_ship_date_sk = d3.d_date_sk) LEFT OUTER JOIN promotion ON (cs_promo_sk = p_promo_sk) LEFT OUTER JOIN catalog_returns ON (cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number) WHERE d1.d_week_seq = d2.d_week_seq AND inv_quantity_on_hand < cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 DAY' AND d1.d_year = 1999 AND cs_wholesale_cost BETWEEN 76 AND 96 GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq LIMIT 100;
+```
+
+#### Execution Plans
+
+**Original EXPLAIN:**
+```
+Limit  (rows=0, time=431.445)
+  Sort  (rows=0, time=431.443)
+    Aggregate  (rows=0, time=431.427)
+      Nested Loop  (rows=0, time=431.425)
+        Gather Merge  (rows=0, time=431.423)
+          Sort  (rows=0, time=425.386)
+            Nested Loop  (rows=0, time=425.368)
+              Nested Loop  (rows=0, time=425.367)
+                Nested Loop  (rows=0, time=425.366)
+                  Nested Loop  (rows=0, time=425.365)
+                    Hash Join  (rows=0, time=425.363)
+                      Seq Scan on date_dim (d2)  (rows=0, time=0.0)
+                      Hash  (rows=0, time=425.291)
+                        Nested Loop  (rows=0, time=268.744)
+                          Hash Join  (rows=23847, time=184.234)
+                            Nested Loop  (rows=113468, time=174.846)
+                              Index Scan on date_dim (d1)  (rows=182, time=4.864)
+                              Index Scan on catalog_sales  (rows=622, time=0.895)
+                            Hash  (rows=1200, time=0.595)
+                              Seq Scan on household_demographics  (rows=1200, time=0.522)
+                          Index Scan on customer_demographics  (rows=0, time=0.003)
+                    Index Scan on inventory  (rows=0, time=0.0)
+                  Seq Scan on warehouse  (rows=0, time=0.0)
+                Index Scan on item  (rows=0, time=0.0)
+              Index Only Scan on promotion  (rows=0, time=0.0)
+        Index Scan on date_dim (d3)  (rows=0, time=0.0)
+```
+
+#### Error Details
+
+- **t4** (FAIL): Equivalence execution error: column "cs_bill_hdemo_sk" does not exist
+LINE 1: ...tem_sk = i_item_sk JOIN household_demographics ON cs_bill_hd...
+                                                             ^
+HINT:  Perhaps you meant to reference the column "filtered_sales.cs_bill_cdemo_sk".
+
+- **t5** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **t6** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **t7** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+
+
+## Your Task — Snipe Round 2
+
+
+Results from latest iteration: **4 FAIL**.
+
+Follow this protocol exactly.
+
+### Step 1 — Compare EXPLAIN Plans
+
+For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.
+
+For each **WIN**, answer:
+- QUOTE the operator line(s) from the original that got cheaper or were eliminated. Give the exact operator name, time, and row count from the plan text above.
+- What structural SQL change caused that operator improvement?
+- What is the **most expensive remaining operator** in this winner's plan? QUOTE its line (name, time, rows).
+
+For each **FAIL/NEUTRAL/REGRESSION**:
+- QUOTE the operator(s) that got MORE expensive vs the original.
+- Why did the structural change backfire?
+
+Then classify winners as REDUNDANT (same core structural change, same operators improved) or COMPLEMENTARY (different operators improved, different structural changes).
+
+### Step 2 — Design Targets by Combining Strategies
+
+Start from the **best winner's SQL** as your baseline.
+
+**CRITICAL**: Do NOT invent new hypotheses about row counts or selectivity. Every claim about rows, times, or costs MUST be a direct quote from an EXPLAIN plan above. If a number is not in the plans, you do not know it.
+
+**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites (UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce identical plans. Focus on changes that **eliminate operators** or **reduce input rows to expensive operators** as shown in the plans.
+
+Design up to 4 targets, prioritized:
+
+1. **Combination** (primary if complementary winners exist): Take the best winner's SQL. Layer on the structural change from a complementary winner that addresses a DIFFERENT expensive operator. Cite both operators by name from the EXPLAIN plans.
+2. **Refinement**: Take the best winner's SQL. Target its most expensive remaining operator (quoted in Step 1). Design a structural change that reduces input rows to that operator. CITE the operator and its current row count from the plan.
+3. **Rescue** (if a failed patch had a sound structural idea): Fix the implementation while preserving the best winner's gains.
+4. **Novel**: A new structural approach that targets the most expensive remaining operator. Cite the operator from the plan.
+
+**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F"). The worker will receive gold examples from ALL referenced families.
+
+Output up to 4 targets. Same JSON format:
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "...",
+    "target_ir": "...",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  }
+]
+```
+
+Output up to 4 targets. Fewer strong targets beat padding with weak ones.

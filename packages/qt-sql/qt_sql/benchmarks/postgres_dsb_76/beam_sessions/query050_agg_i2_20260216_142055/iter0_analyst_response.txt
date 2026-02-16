@@ -1,0 +1,54 @@
+```json
+[
+  {
+    "family": "C",
+    "transform": "aggregation_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Aggregation occurs after large joins with dimension table (store), carrying unnecessary columns. Push aggregation to store key before joining store attributes.",
+    "target_ir": "S0 [SELECT]\n  CTE: pre_agg (via Q1)\n    SELECT\n      ss_store_sk,\n      sum(case when (sr_returned_date_sk - ss_sold_date_sk <= 30) then 1 else 0 end) as \"30 days\",\n      sum(case when (sr_returned_date_sk - ss_sold_date_sk > 30 and sr_returned_date_sk - ss_sold_date_sk <= 60) then 1 else 0 end) as \"31-60 days\",\n      sum(case when (sr_returned_date_sk - ss_sold_date_sk > 60 and sr_returned_date_sk - ss_sold_date_sk <= 90) then 1 else 0 end) as \"61-90 days\",\n      sum(case when (sr_returned_date_sk - ss_sold_date_sk > 90 and sr_returned_date_sk - ss_sold_date_sk <= 120) then 1 else 0 end) as \"91-120 days\",\n      sum(case when (sr_returned_date_sk - ss_sold_date_sk > 120) then 1 else 0 end) as \">120 days\"\n    FROM store_sales\n    JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk\n    JOIN date_dim d1 ON ss_sold_date_sk = d1.d_date_sk\n    JOIN date_dim d2 ON sr_returned_date_sk = d2.d_date_sk\n    WHERE d2.d_year = 1999 AND d2.d_moy = 7\n      AND d1.d_date BETWEEN (d2.d_date - interval '120 day') AND d2.d_date\n    GROUP BY ss_store_sk\n  MAIN QUERY (via Q0)\n    SELECT \n      s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number,\n      s_city, s_county, s_state, s_zip,\n      \"30 days\", \"31-60 days\", \"61-90 days\", \"91-120 days\", \">120 days\"\n    FROM pre_agg\n    JOIN store ON ss_store_sk = s_store_sk\n    ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip\n    LIMIT 100",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filtering",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Date_dim d2 filter (d_year/d_moy) applied late. Prefilter d2 and propagate date range to d1 before joining facts.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_dates (via Q1)\n    SELECT \n      d2.d_date_sk as ret_date_sk,\n      d1.d_date_sk as sold_date_sk\n    FROM date_dim d2\n    JOIN date_dim d1 ON d1.d_date BETWEEN (d2.d_date - interval '120 day') AND d2.d_date\n    WHERE d2.d_year = 1999 AND d2.d_moy = 7\n  MAIN QUERY (via Q0)\n    SELECT \n      s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number,\n      s_city, s_county, s_state, s_zip,\n      sum(case when (sr_returned_date_sk - ss_sold_date_sk <= 30) then 1 else 0 end) as \"30 days\",\n      ... [other aggregates] ...\n    FROM store_sales\n    JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk\n    JOIN filtered_dates fd ON ss_sold_date_sk = fd.sold_date_sk AND sr_returned_date_sk = fd.ret_date_sk\n    JOIN store ON ss_store_sk = s_store_sk\n    GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip\n    ORDER BY ... [original order] ...\n    LIMIT 100",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "join_transform",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Comma-join obscures join dependencies. Convert to explicit JOINs with filtered dimension tables first.",
+    "target_ir": "S0 [SELECT]\n  MAIN QUERY (via Q0)\n    SELECT \n      s_store_name, s_company_id, ... [all store attributes] ...\n    FROM date_dim d2\n    JOIN store_returns ON sr_returned_date_sk = d2.d_date_sk\n    JOIN store_sales ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk\n    JOIN date_dim d1 ON ss_sold_date_sk = d1.d_date_sk\n    JOIN store ON ss_store_sk = s_store_sk\n    WHERE d2.d_year = 1999 AND d2.d_moy = 7\n      AND d1.d_date BETWEEN (d2.d_date - interval '120 day') AND d2.d_date\n    GROUP BY s_store_name, s_company_id, ... [all store attributes] ...\n    ORDER BY ... [original order] ...\n    LIMIT 100",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```
+
+## Analysis
+**Family A (Early Filtering)**: HIGH  
+The date_dim d2 filter (d_year/d_moy) is highly selective but applied late in the plan. Prefiltering d2 and propagating its date range to d1 before joining fact tables reduces join cardinality early.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries exist in the original query. All joins are explicit equality joins between tables.
+
+**Family C (Aggregation Pushdown)**: HIGH  
+Final aggregation uses only store attributes while intermediate joins carry date/fact columns. Pushing aggregation to store_key before joining store reduces data volume through the pipeline.
+
+**Family D (Set Operations)**: LOW  
+Query contains no UNION/INTERSECT operations. All logic is handled via conditional aggregates and joins.
+
+**Family E (Materialization)**: MEDIUM  
+Could benefit from materializing filtered date ranges (similar to Family A), but less impactful than aggregation pushdown for this workflow.
+
+**Family F (Join Transform)**: MEDIUM  
+Implicit comma-joins obscure join dependencies. Explicit joins with filtered dimensions first may improve planner choices.
+
+**Chosen families**: [C, A, F]  
+**Confidence**: High  
+Primary bottleneck is late aggregation carrying unnecessary columns (Family C). Secondary gains from early date filtering (Family A) and join structure clarification (Family F).

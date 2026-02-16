@@ -1,0 +1,130 @@
+### Step 1 — Compare EXPLAIN Plans  
+**No winners yet** (all prior patches FAILED). Analysis focuses on failure reasons and plan signals:  
+
+1. **t1/t2 FAIL**:  
+   - **Operator Degradation**: Entire plan failed due to structural rewrite errors. The original `Gather` (226.598 ms) and `Index Only Scan on date_dim (date_dim_2)` (4.445 ms) were replaced with invalid logic.  
+   - **Why Backfired**: Rewrote the main query (changed literals `100.0`/`3.0` and aggregation structure), violating semantic equivalence.  
+
+2. **syn_w1/syn_w2 FAIL**:  
+   - **Operator Degradation**: Patch application failed entirely (no plan generated).  
+   - **Why Backfired**: IR targeting errors—couldn’t locate anchor points for predicate pushdown (Family A) or decorrelation (Family B).  
+
+**Primary Bottleneck**:  
+- **`Gather` in `sr_items` CTE** (226.598 ms, processes 36524 rows from `Seq Scan on date_dim`).  
+- **Root Cause**: Repeated full scans of `date_dim` across all 3 CTEs due to uncorrelated subqueries.  
+
+**Most Expensive Remaining Operator**:  
+- **`Seq Scan on catalog_returns`** (83.313 ms, 176 rows) in `cr_items` CTE.  
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Original query (no prior winners).  
+**Hypothesis**: Precompute `date_dim` filters once (Family E) to avoid repeated scans.  
+
+#### Target 1: Rescue Materialization (Family E)  
+- **Rescue** `t1`'s core idea (precompute `date_dim`) but preserve main query structure.  
+- **Fix Literal Mismatch**: Retain `100.0`/`3.0` in main query.  
+- **Target IR**: `S0` (entire statement) + `43a1cae356b71ca0`/`e7bb6d054d52da05`/`c6536d60a94eb699` (subquery conditions).  
+```json
+{
+  "family": "E",
+  "transform": "prefilter_date_rescue",
+  "target_id": "t1",
+  "relevance_score": 0.95,
+  "hypothesis": "Precompute date_filter CTE to eliminate 3 repeated date_dim subqueries (original: 4.445 ms/scan). Rescue t1’s materialization idea but preserve main query literals and structure.",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch"]
+}
+```
+
+#### Target 2: Early Filtering + Materialization (Family E+A)  
+- **Combine** date materialization (E) with early item filtering (A).  
+- **Why**: Push `item` filters (`i_category`/`i_manager_id`) into a CTE to reduce `catalog_returns` scan (83.313 ms).  
+- **Target IR**: `S0` + `43a1cae356b71ca0` (WHERE subtree).  
+```json
+{
+  "family": "E+A",
+  "transform": "prefilter_date_and_item",
+  "target_id": "t2",
+  "relevance_score": 0.85,
+  "hypothesis": "Precompute date_filter + filtered_items CTEs. Push item filters early to reduce catalog_returns scan (83.313 ms) and reuse across CTEs.",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 3: Decorrelation + Materialization (Family B+E)  
+- **Decorrelate** `d_month_seq` subquery (Family B) + materialize results (Family E).  
+- **Why**: Eliminate nested `d_month_seq` scans (3.866 ms/aggregate).  
+- **Target IR**: `S0` + subqueries in `43a1cae356b71ca0`.  
+```json
+{
+  "family": "B+E",
+  "transform": "decorrelate_date_subquery",
+  "target_id": "t3",
+  "relevance_score": 0.80,
+  "hypothesis": "Convert d_month_seq subquery to standalone CTE with GROUP BY, then materialize. Targets nested Aggregate (3.866 ms) in date_dim scans.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+}
+```
+
+#### Target 4: Join Transform (Family F)  
+- **Restructure joins** to explicit `INNER JOIN` + push `item` filters early.  
+- **Why**: Optimize join order for predicate pushdown (avoids comma-join cross products).  
+```json
+{
+  "family": "F",
+  "transform": "explicit_join_item_pushdown",
+  "target_id": "t4",
+  "relevance_score": 0.75,
+  "hypothesis": "Replace comma-joins with explicit INNER JOIN and reorder to prioritize filtered item table. Targets Seq Scan on catalog_returns (83.313 ms).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_explicit_join_materialized"]
+}
+```
+
+---
+
+### Final Targets  
+```json
+[
+  {
+    "family": "E",
+    "transform": "prefilter_date_rescue",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Precompute date_filter CTE to eliminate 3 repeated date_dim subqueries (original: 4.445 ms/scan). Rescue t1’s materialization idea but preserve main query literals and structure.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "E+A",
+    "transform": "prefilter_date_and_item",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Precompute date_filter + filtered_items CTEs. Push item filters early to reduce catalog_returns scan (83.313 ms) and reuse across CTEs.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "B+E",
+    "transform": "decorrelate_date_subquery",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Convert d_month_seq subquery to standalone CTE with GROUP BY, then materialize. Targets nested Aggregate (3.866 ms) in date_dim scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_item_pushdown",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Replace comma-joins with explicit INNER JOIN and reorder to prioritize filtered item table. Targets Seq Scan on catalog_returns (83.313 ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

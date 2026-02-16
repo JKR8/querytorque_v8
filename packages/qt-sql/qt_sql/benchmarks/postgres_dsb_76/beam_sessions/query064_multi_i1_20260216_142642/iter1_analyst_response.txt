@@ -1,0 +1,60 @@
+### Step 1 — Compare EXPLAIN Plans  
+All prior patches failed with implementation errors (e.g., "No target found for repl"). There are no winners to analyze. The primary bottleneck remains the expensive `Hash Join` in the `cs_ui` CTE computation:  
+```  
+Hash Join  (rows=121974, time=2344.925)  
+  Seq Scan on catalog_sales  (rows=814012, time=1218.44)  
+  Hash  (rows=719420, time=847.914)  
+    Seq Scan on catalog_returns  (rows=719420, time=690.541)  
+```  
+This accounts for **~62% of total execution time** (2344ms/3784ms). The structural issue is the full sequential scan and hash join of massive tables (`catalog_sales` and `catalog_returns`) before aggregation and filtering.  
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: Expensive `Hash Join` between `catalog_sales` and `catalog_returns` (rows >700K, time >2.3s).  
+**High-Confidence Targets** (quality > quantity):  
+
+1. **Combination (Families A+C)**: Early filtering + aggregation pushdown for `cs_ui` CTE  
+   - **Hypothesis**: Push `cs_wholesale_cost BETWEEN 35 AND 55` into `catalog_sales` scan (Family A) and pre-aggregate before joining with `catalog_returns` (Family C). Reduces input rows to the hash join.  
+   - **Target**: `S0:3075520ff4da1039` (WHERE clause of `cs_ui` CTE)  
+   - **Examples**: `pg_date_cte_explicit_join` (A) + `pg_materialized_dimension_fact_prefilter` (C)  
+
+2. **Refinement (Family F)**: Restructure joins in `cross_sales` CTE  
+   - **Hypothesis**: Convert comma joins to explicit `INNER JOIN` and prioritize filtered tables (e.g., `ad2.ca_state IN ('IA','IL','TX')`). Reduces nested loops (current plan depth: 18 levels).  
+   - **Target**: `S0:d891204f0fa7deff` (FROM clause of `cross_sales` CTE)  
+   - **Examples**: `pg_explicit_join_materialized`  
+
+3. **Rescue (Family E)**: Materialize filtered dimension tables  
+   - **Hypothesis**: Precompute filtered dimensions (e.g., `ad2` with state filter) to avoid repeated index scans.  
+   - **Target**: `S0:d891204f0fa7deff` (WHERE clause of `cross_sales` CTE)  
+   - **Examples**: `multi_dimension_prefetch`  
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_agg_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Push cs_wholesale_cost filter into catalog_sales scan and pre-aggregate before joining catalog_returns. Reduces input rows to expensive Hash Join (2344ms) from 814K to filtered subset.",
+    "target_ir": "S0:3075520ff4da1039",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_restructure",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Restructure comma joins to explicit INNER JOIN and prioritize filtered dimension tables (e.g., ad2 with state filter). Reduces 18-layer nested loops in execution plan.",
+    "target_ir": "S0:d891204f0fa7deff",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E",
+    "transform": "filtered_dim_prefetch",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Materialize filtered dimension tables (e.g., ad2 with ca_state IN) to avoid repeated index scans. Targets nested loops on customer_address (ad2) in current plan.",
+    "target_ir": "S0:d891204f0fa7deff",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

@@ -1,0 +1,75 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (WIN - 1.18x)**
+- **Improved Operator**:  
+  `Aggregate  (rows=0, time=0.0) → Index Only Scan on date_dim (date_dim_2)` (original)  
+  Replaced with `CTE Scan (prefetched_dates)  (rows=0, time=0.0)` (t1).  
+  **Structural Change**: Prefetched `d_month_seq` via CTE (`prefetched_dates`), avoiding redundant `date_dim` scans for subqueries in `my_revenue`.  
+- **Most Expensive Remaining Operator**:  
+  `Nested Loop  (rows=18519, time=20.112)` (t1 plan).  
+  This involves the `Append` (union of `catalog_sales` and `web_sales`) and dominates runtime.
+
+**FAIL/NEUTRAL Patches**  
+- **t2 (FAIL)**: Failed due to targeting error. No plan comparison possible.  
+- **t4 (FAIL)**: Semantic error broke query structure. No valid plan generated.  
+- **t3 (FAIL)**: Syntax error prevented parsing. No valid plan generated.  
+
+**Classification**: t1 is **COMPLEMENTARY** to other strategies. Its improvement (eliminating redundant `date_dim` scans) is orthogonal to optimizations targeting the main bottleneck (`Nested Loop` with `Append`).
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop  (rows=18519, time=20.112)` in t1’s plan, driven by `Append` (union of `catalog_sales` and `web_sales`). Input rows (18,519) are high due to late filtering of `item`/`date_dim`.
+
+**Targets**:
+1. **Combination (E + A)**:  
+   Layer **Family A (Early Filtering)** onto t1’s SQL. Prefilter `item`/`date_dim` in `my_customers` CTE to reduce rows fed into `Append`. Targets the `Nested Loop` operator (18,519 rows).  
+2. **Refinement (A)**:  
+   Optimize t1’s `my_customers` CTE by pushing `item`/`date_dim` filters into union branches. Reduces input to `Append` (1,792 rows).  
+3. **Rescue (C)**:  
+   Fix t4’s preaggregation approach. Precompute sales aggregates *before* joins in `my_customers`, minimizing rows early.  
+4. **Novel (F)**:  
+   Restructure `my_customers` CTE with explicit joins to optimize filter pushdown. Targets `Nested Loop` operator.
+
+```json
+[
+  {
+    "family": "E+A",
+    "transform": "prefetch_and_early_filter",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Reduce input rows to the expensive Nested Loop (18,519 rows) by prefetching filtered item/date_dim and pushing them into union branches. Prefetched_dates (from t1) is retained for my_revenue.",
+    "target_ir": "S0:CTE_Q_S0_my_customers:from",
+    "recommended_examples": ["pg_date_cte_explicit_join", "push_into_union_branches"]
+  },
+  {
+    "family": "A",
+    "transform": "push_filters_into_union",
+    "target_id": "t1",
+    "relevance_score": 0.90,
+    "hypothesis": "Apply item/date_dim filters directly in catalog_sales/web_sales subqueries to shrink Append output (1,792 rows) before the Nested Loop.",
+    "target_ir": "S0:CTE_Q_S0_my_customers:39569bb4425260fb",
+    "recommended_examples": ["push_into_union_branches"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_sales_fixed",
+    "target_id": "t1",
+    "relevance_score": 0.85,
+    "hypothesis": "Rescue t4: Preaggregate sales by customer_sk/item_sk *before* joining item/date_dim. Minimizes rows early and avoids semantic error in t4.",
+    "target_ir": "S0:CTE_Q_S0_my_customers",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_chain",
+    "target_id": "t1",
+    "relevance_score": 0.80,
+    "hypothesis": "Restructure my_customers with explicit joins (not comma-separated) to enable optimal filter pushdown into union branches. Targets Nested Loop operator.",
+    "target_ir": "S0:CTE_Q_S0_my_customers:from",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

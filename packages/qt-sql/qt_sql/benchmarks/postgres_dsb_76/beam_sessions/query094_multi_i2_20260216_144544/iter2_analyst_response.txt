@@ -1,0 +1,94 @@
+### Step 1 — Compare EXPLAIN Plans  
+All prior patches failed, so there are no winners to analyze. The primary bottleneck remains the `Hash Join` (time=795.54 ms) and its child `Seq Scan on web_returns` (time=101.969 ms, rows=77,366). These operators dominate execution time due to:  
+1. Full scan of `web_returns` without pushing down `wr_reason_sk IN (8,18,20,23,41)`, causing unnecessary row processing.  
+2. High row count (4230) feeding the expensive `Hash Join`.  
+
+Failed patches backfired due to:  
+- **Ambiguous column references** (t1, t2): Poorly aliased CTEs caused column conflicts.  
+- **Expression targeting errors** (t3): IR anchor hashes mismatched during predicate replacement.  
+
+---
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: Unfiltered `Seq Scan on web_returns` feeding high-cost `Hash Join`.  
+**Hypothesis**: Prefilter `web_returns` and convert `NOT EXISTS` to anti-join while fixing prior syntax errors.  
+
+#### Target 1: Rescue Prefilter (Family A)  
+- **Family**: A  
+- **Transform**: `early_filter_web_returns_fixed`  
+- **Target ID**: `t1`  
+- **Relevance**: 0.95  
+- **Hypothesis**: Prefilter `web_returns` for `wr_reason_sk` in CTE to reduce `Seq Scan` rows (77,366 → ~10% via filter pushdown). Fix ambiguous columns via explicit aliasing.  
+- **Target IR**: `by_anchor_hash: [hash of NOT EXISTS subquery]`  
+- **Examples**: `pg_date_cte_explicit_join`  
+
+#### Target 2: Anti-Join Conversion (Family D)  
+- **Family**: D  
+- **Transform**: `not_exists_to_anti_join`  
+- **Target ID**: `t2`  
+- **Relevance**: 0.85  
+- **Hypothesis**: Convert `NOT EXISTS` to `LEFT JOIN ... WHERE NULL` to avoid full materialization. Targets `Hash Join` (4230 rows) by enabling hash table reuse.  
+- **Target IR**: `by_anchor_hash: [hash of NOT EXISTS subquery]`  
+- **Examples**: `pg_intersect_to_exists`  
+
+#### Target 3: Decorrelation + Prefilter (Family B+A)  
+- **Family**: B+A  
+- **Transform**: `decorrelate_exists_with_early_filter`  
+- **Target ID**: `t3`  
+- **Relevance**: 0.90  
+- **Hypothesis**: Precompute multi-warehouse orders in CTE (replacing `EXISTS`) and prefilter `web_returns`. Eliminates `Index Only Scan` (1185 loops × 0.227 ms = 269 ms) and `Seq Scan on web_returns`.  
+- **Target IR**: `by_anchor_hash: [hash of EXISTS subquery] + [hash of NOT EXISTS subquery]`  
+- **Examples**: `pg_shared_scan_decorrelate`, `pg_date_cte_explicit_join`  
+
+#### Target 4: Dimension Prefilter (Family A)  
+- **Family**: A  
+- **Transform**: `early_dimension_filters`  
+- **Target ID**: `t4`  
+- **Relevance**: 0.80  
+- **Hypothesis**: Push `ca_state` and `web_gmt_offset` filters into CTEs to reduce `Index Scan on customer_address` and `Seq Scan on web_site` input earlier.  
+- **Target IR**: `by_anchor_hash: [hash of ca_state/web_gmt_offset predicates]`  
+- **Examples**: `pg_date_cte_explicit_join`  
+
+---
+
+### Final Targets JSON  
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filter_web_returns_fixed",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefilter web_returns for wr_reason_sk in CTE to reduce Seq Scan rows (77,366 → estimated ~7,700). Fix ambiguous column references via explicit aliasing.",
+    "target_ir": "by_anchor_hash: [hash of NOT EXISTS subquery]",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "D",
+    "transform": "not_exists_to_anti_join",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert NOT EXISTS to LEFT JOIN ... WHERE NULL to avoid full materialization of web_returns. Enables hash table reuse for Hash Join (4230 rows).",
+    "target_ir": "by_anchor_hash: [hash of NOT EXISTS subquery]",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "B+A",
+    "transform": "decorrelate_exists_with_early_filter",
+    "target_id": "t3",
+    "relevance_score": 0.90,
+    "hypothesis": "Precompute multi-warehouse orders in CTE (replacing EXISTS) and prefilter web_returns. Eliminates Index Only Scan (1185 loops × 0.227 ms = 269 ms) and unfiltered Seq Scan.",
+    "target_ir": "by_anchor_hash: [hash of EXISTS subquery] + [hash of NOT EXISTS subquery]",
+    "recommended_examples": ["pg_shared_scan_decorrelate", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A",
+    "transform": "early_dimension_filters",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Push ca_state and web_gmt_offset filters into CTEs to reduce rows earlier for customer_address and web_site scans.",
+    "target_ir": "by_anchor_hash: [hash of ca_state/web_gmt_offset predicates]",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

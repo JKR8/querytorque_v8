@@ -1,0 +1,140 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (WIN) vs Original:**
+- **Improved Operator**:  
+  `Seq Scan on store_returns`  
+  Original: `(rows=517960, time=635.775)` → t1: `(rows=172653, time=225.088)`  
+  **Structural Change**: Pre-aggregating returns tables (`preagg_store_returns`, etc.) with early `cr_reason_sk` filtering reduced input rows to the join.  
+- **Most Expensive Remaining Operator**:  
+  `Seq Scan on store_returns` in t1: `(rows=172653, time=225.088)` remains the top cost despite 2.8x improvement.  
+
+**t2 (FAIL)**:  
+No plan generated. Failed during patch application due to missing anchor target.  
+
+**t3 (FAIL)**:  
+No valid plan. Syntax error (`conditional_sales` CTE undefined) prevented execution.  
+
+**Classification**:  
+t1 is **COMPLEMENTARY** to other families. It optimized returns tables but didn’t address repeated `item` scans or the self-join bottleneck.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: t1 (1.45x WIN) with pre-aggregated returns.  
+**Primary Bottleneck**: `store_returns` scan (172K rows, 225 ms).  
+**Secondary Bottleneck**: Repeated `item` scans (3x in original plan, 28.7 ms each).  
+
+**Targets**:
+
+1. **Combination (A+C+E)**:  
+   Layer **prefetch (E)** on t1 to eliminate repeated `item` scans.  
+   - **Hypothesis**: Prefetching 'Home' items into a CTE avoids 3x `item` scans. Original shows `item` scan 3x (20.2 ms each) → t1 still shows 28.7 ms scan.  
+   - **Target IR**: Insert CTE `home_items` at `S0` and replace all `item` scans in `all_sales` subqueries.  
+   ```json
+   {
+     "family": "A+C+E",
+     "transform": "preagg_returns_with_item_prefetch",
+     "target_id": "t1",
+     "relevance_score": 0.95,
+     "hypothesis": "Prefetch 'Home' items to avoid 3x sequential scans (28.7 ms each in t1). Combine with t1's preagg returns to attack both item and returns bottlenecks.",
+     "target_ir": "S0: insert_cte home_items (SELECT i_item_sk, ... FROM item WHERE i_category='Home'). Replace all item scans in sales_detail UNION branches with home_items CTE.",
+     "recommended_examples": ["multi_dimension_prefetch", "pg_materialized_dimension_fact_prefilter"]
+   }
+   ```
+
+2. **Refinement (A)**:  
+   Push `sales_price/list_price` filter earlier into sales tables.  
+   - **Hypothesis**: Filtering sales tables *before* joins reduces input to nested loops. t1’s `store_sales` index scan processes 0 rows (plan shows `rows=0`) due to late filtering.  
+   - **Target IR**: Push ratio filter into inline sales subqueries at `S0_all_sales` subquery branches.  
+   ```json
+   {
+     "family": "A",
+     "transform": "push_sales_ratio_filter",
+     "target_id": "t2",
+     "relevance_score": 0.85,
+     "hypothesis": "Filter sales_price/list_price ratio BEFORE joining to reduce nested loop input. t1 plan shows store_sales index scan processing 0 rows due to late filters.",
+     "target_ir": "S0_all_sales: In each sales_detail branch, move ratio filter (e.g., ss_sales_price/ss_list_price BETWEEN...) directly after FROM store_sales/catalog_sales/web_sales.",
+     "recommended_examples": ["pg_date_cte_explicit_join"]
+   }
+   ```
+
+3. **Rescue (F)**:  
+   Fix t3’s self-join elimination using t1’s gains.  
+   - **Hypothesis**: Replace the self-join (`all_sales curr_yr, prev_yr`) with conditional aggregation. Original self-join scans `all_sales` 2x (731 + 690 rows, 1217 ms).  
+   - **Target IR**: Convert `all_sales` to compute `prev_year` and `curr_year` in one pass via `CASE`.  
+   ```json
+   {
+     "family": "F",
+     "transform": "self_join_to_conditional_agg",
+     "target_id": "t3",
+     "relevance_score": 0.80,
+     "hypothesis": "Eliminate self-join by computing both years in one aggregation. Original scans all_sales twice (731+690 rows, 1217 ms). Retain t1's preagg returns gains.",
+     "target_ir": "S0: Replace main query with conditional aggregation (SUM(CASE WHEN d_year=1999...), GROUP BY i_brand_id,...). Remove CTE self-join.",
+     "recommended_examples": ["pg_explicit_join_materialized"]
+   }
+   ```
+
+4. **Novel (C)**:  
+   Pre-aggregate sales *before* joining returns.  
+   - **Hypothesis**: Aggregate sales by item/date *first* since `GROUP BY` keys ⊇ join keys. t1 still joins large sales/returns tables pre-aggregation.  
+   - **Target IR**: Precompute sales aggregates per channel, then join with preagg returns.  
+   ```json
+   {
+     "family": "C",
+     "transform": "preagg_sales_before_returns",
+     "target_id": "t4",
+     "relevance_score": 0.75,
+     "hypothesis": "Aggregate sales by item/date before joining returns to shrink intermediate rows. t1 still processes 172K store_returns rows pre-aggregation.",
+     "target_ir": "S0_all_sales: For each channel, replace inline subquery with pre-aggregated sales (e.g., SELECT d_year, i_brand_id,..., SUM(ss_quantity), ... FROM store_sales JOIN item... GROUP BY d_year, i_brand_id...). Then left join preagg returns.",
+     "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+   }
+   ```
+
+---
+
+### Summary
+- **Primary Target**: `t1` (A+C+E) combines t1’s returns optimization with item prefetch.  
+- **Secondary Targets**: Push sales filters (`t2`), rescue self-join fix (`t3`), and pre-aggregate sales (`t4`).  
+- **Avoided**: Decorrelation (B) and set operations (D) — no correlated subqueries or `INTERSECT` in plan.  
+
+```json
+[
+  {
+    "family": "A+C+E",
+    "transform": "preagg_returns_with_item_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefetch 'Home' items to avoid 3x sequential scans (28.7 ms each in t1). Combine with t1's preagg returns to attack both item and returns bottlenecks.",
+    "target_ir": "S0: insert_cte home_items (SELECT i_item_sk, ... FROM item WHERE i_category='Home'). Replace all item scans in sales_detail UNION branches with home_items CTE.",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A",
+    "transform": "push_sales_ratio_filter",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Filter sales_price/list_price ratio BEFORE joining to reduce nested loop input. t1 plan shows store_sales index scan processing 0 rows due to late filters.",
+    "target_ir": "S0_all_sales: In each sales_detail branch, move ratio filter (e.g., ss_sales_price/ss_list_price BETWEEN...) directly after FROM store_sales/catalog_sales/web_sales.",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "self_join_to_conditional_agg",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Eliminate self-join by computing both years in one aggregation. Original scans all_sales twice (731+690 rows, 1217 ms). Retain t1's preagg returns gains.",
+    "target_ir": "S0: Replace main query with conditional aggregation (SUM(CASE WHEN d_year=1999...), GROUP BY i_brand_id,...). Remove CTE self-join.",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "preagg_sales_before_returns",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Aggregate sales by item/date before joining returns to shrink intermediate rows. t1 still processes 172K store_returns rows pre-aggregation.",
+    "target_ir": "S0_all_sales: For each channel, replace inline subquery with pre-aggregated sales (e.g., SELECT d_year, i_brand_id,..., SUM(ss_quantity), ... FROM store_sales JOIN item... GROUP BY d_year, i_brand_id...). Then left join preagg returns.",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

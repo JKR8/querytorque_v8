@@ -1,0 +1,101 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (REGRESSION) vs Original**  
+- **Regressed operator**:  
+  `Sort (rows=52123, time=962.606)` in t1 vs `Gather Merge (rows=66690, time=3413.666)` + `Sort (rows=33345, time=2135.805)` in original.  
+- **Why**:  
+  Materialization via CTEs (`d2_dates`, `d1_date_bounds`) prevented parallel execution (`Gather Merge` eliminated) and forced a single-threaded sort on 52K rows. The structural change (CTE materialization) blocked parallelization opportunities.  
+- **Most expensive remaining operator in regression**:  
+  `Sort (rows=52123, time=962.606)`  
+
+**syn_w1/2/3 (FAILS)**  
+- **Failure cause**:  
+  All attempts incorrectly dropped `sr_returned_date_sk`/`ss_sold_date_sk` from CTEs, breaking column references in the main query. Syntax errors cascaded from missing key columns.  
+
+**Winner Classification**  
+No winners exist (all FAIL/REGRESSION). Proceed to Step 2 using original query as baseline.  
+
+### Step 2 — Design Targets by Combining Strategies  
+**Primary bottleneck**:  
+`Gather Merge (rows=66690, time=3413.666)` — Parallel merge of 66K rows dominates runtime.  
+
+**Target 1 (Combination: A + C)**  
+- **Family**: A + C  
+- **Transform**: `early_filter_agg_pushdown`  
+- **Target ID**: S0 (entire query)  
+- **Relevance**: 0.95  
+- **Hypothesis**:  
+  Push `d_year=2000`/`d_moy=8` into CTE (A) to reduce `date_dim` scans. Pre-aggregate sales/returns by `ss_store_sk` + date diff buckets (C) before joining to `store`, cutting `Gather Merge` input from 66K to ~72 rows (stores).  
+- **Target IR**: `S0` + `b621d655cfd44fb4` (WHERE)  
+- **Examples**: `pg_date_cte_explicit_join` (A), `pg_materialized_dimension_fact_prefilter` (C)  
+
+**Target 2 (Refinement: E)**  
+- **Family**: E  
+- **Transform**: `prefetch_dates`  
+- **Target ID**: S0  
+- **Relevance**: 0.90  
+- **Hypothesis**:  
+  Materialize filtered `d2_dates` (16 rows) and reuse for `d1` bounds calculation. Avoid repeated `date_dim` scans (current: 16 rows + 1 row). Targets `Nested Loop (rows=46104)` feeding into `Gather Merge`.  
+- **Target IR**: `S0`  
+- **Examples**: `multi_dimension_prefetch`  
+
+**Target 3 (Rescue: F fixed)**  
+- **Family**: F  
+- **Transform**: `explicit_join_no_materialize`  
+- **Target ID**: S0  
+- **Relevance**: 0.85  
+- **Hypothesis**:  
+  Convert comma joins to explicit `INNER JOIN` but skip CTE materialization. Use subqueries for date filters to preserve parallelization. Fixes t1’s regression by retaining `Gather Merge`.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_explicit_join_materialized`  
+
+**Target 4 (Novel: C)**  
+- **Family**: C  
+- **Transform**: `agg_store_key`  
+- **Target ID**: S0  
+- **Relevance**: 0.80  
+- **Hypothesis**:  
+  Aggregate by `ss_store_sk` + date buckets *before* joining to `store`. Reduces `Gather Merge` input to store count (72 rows) instead of 66K. Targets `Gather Merge (rows=66690)`.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_agg_pushdown",
+    "target_id": "S0",
+    "relevance_score": 0.95,
+    "hypothesis": "Push date filters into CTE (A) and pre-aggregate sales/returns by store key + date buckets (C) before joining to store. Reduces Gather Merge input from 66K to ~72 rows.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_dates",
+    "target_id": "S0",
+    "relevance_score": 0.90,
+    "hypothesis": "Materialize d2_dates (16 rows) and reuse for d1 bounds. Avoids repeated date_dim scans and reduces input to Nested Loop (46K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_no_materialize",
+    "target_id": "S0",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert to explicit joins without CTE materialization. Preserves parallel execution (Gather Merge) and avoids t1's 52K-row sort.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_store_key",
+    "target_id": "S0",
+    "relevance_score": 0.80,
+    "hypothesis": "Aggregate by store key + date buckets before joining to store. Cuts Gather Merge input from 66K to 72 rows (stores).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

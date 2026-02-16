@@ -1,0 +1,95 @@
+### Step 1 — Compare EXPLAIN Plans
+All patches failed with identical errors (LITERAL MISMATCH), so there are no winners to analyze. The core issue is structural: all rewrites altered the original filter expression `BETWEEN 21 * 0.01 AND 41 * 0.01` to `BETWEEN 0.21 AND 0.41`, violating literal preservation requirements. No execution plans are available for comparison since all patches failed semantic validation.
+
+### Step 2 — Design Targets
+**Primary Bottleneck**: Correlated subquery re-executed per row for threshold calculation.  
+**Key Insight**: Failed patches prove the structural approach (decorrelation + prefetching) is valid but requires literal preservation.  
+
+**Target 1 (Combination Rescue)**  
+- **Family**: B+E (Decorrelation + Materialization)  
+- **Transform**: `decorrelate_with_prefetch_fixed`  
+- **Target ID**: t1_rescue  
+- **Relevance**: 0.95  
+- **Hypothesis**: Fix literal mismatch in t1’s threshold CTE while preserving decorrelation gains. Precompute date/item filters to reduce catalog_sales scans.  
+- **Target IR**:  
+  - `insert_cte` at S0: Add CTEs for `date_filter`, `item_filter`, and `threshold`  
+  - `replace_where_predicate` at [46ed3cc4a4ef22ce]: Replace subquery with `cs_ext_discount_amt > threshold.threshold`  
+  - `replace_from` at S0: Change FROM to explicit joins between `catalog_sales`, `item_filter`, `date_filter`, and `threshold`  
+- **Recommended Examples**: `shared_scan_decorrelate`, `multi_dimension_prefetch`  
+
+**Target 2 (Refinement)**  
+- **Family**: B+E (Decorrelation + Materialization)  
+- **Transform**: `base_sales_prefetch`  
+- **Target ID**: t2_refined  
+- **Relevance**: 0.90  
+- **Hypothesis**: Reuse base_sales CTE (date-filtered) in main query and threshold CTE to avoid duplicate catalog_sales scans. Preserve literals in ratio filter.  
+- **Target IR**:  
+  - `insert_cte` at S0: Add `base_sales` (catalog_sales + date_dim join) and `item_filter`  
+  - `replace_expr_subtree` in threshold: Use `base_sales` instead of raw catalog_sales  
+  - `replace_from` at S0: Join `base_sales` with `item_filter`  
+- **Recommended Examples**: `multi_dimension_prefetch`, `pg_explicit_join_materialized`  
+
+**Target 3 (Novel)**  
+- **Family**: A+B (Early Filtering + Decorrelation)  
+- **Transform**: `early_filter_decorrelate`  
+- **Target ID**: t3_novel  
+- **Relevance**: 0.85  
+- **Hypothesis**: Push item/date filters into CTEs before decorrelation. Pre-aggregate thresholds per item to eliminate per-row subqueries.  
+- **Target IR**:  
+  - `insert_cte` at S0: Add `item_filter`, `date_filter`, and `threshold` (with literal-preserving ratio)  
+  - `delete_expr_subtree`: Remove original WHERE subquery  
+  - `replace_where_predicate` at [46ed3cc4a4ef22ce]: Simple threshold comparison  
+- **Recommended Examples**: `pg_date_cte_explicit_join`, `pg_shared_scan_decorrelate`  
+
+**Target 4 (Fallback)**  
+- **Family**: B (Decorrelation Only)  
+- **Transform**: `decorrelate_minimal`  
+- **Target ID**: t4_fallback  
+- **Relevance**: 0.80  
+- **Hypothesis**: Minimal decorrelation fix for t1. Compute threshold per item in CTE but preserve all literals verbatim.  
+- **Target IR**:  
+  - `insert_cte` at S0: Add `threshold` CTE with original ratio expression (`BETWEEN 21*0.01 AND 41*0.01`)  
+  - `replace_where_predicate` at [46ed3cc4a4ef22ce]: Replace subquery with threshold join condition  
+- **Recommended Examples**: `pg_shared_scan_decorrelate`  
+
+### Final Targets (JSON)
+```json
+[
+  {
+    "family": "B+E",
+    "transform": "decorrelate_with_prefetch_fixed",
+    "target_id": "t1_rescue",
+    "relevance_score": 0.95,
+    "hypothesis": "Fix literal mismatch in t1 while preserving decorrelation. Precompute date/item filters to reduce catalog_sales scans and avoid per-row subqueries.",
+    "target_ir": "insert_cte@S0 (date_filter, item_filter, threshold); replace_where_predicate@46ed3cc4a4ef22ce; replace_from@S0",
+    "recommended_examples": ["shared_scan_decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "B+E",
+    "transform": "base_sales_prefetch",
+    "target_id": "t2_refined",
+    "relevance_score": 0.90,
+    "hypothesis": "Reuse base_sales CTE (date-filtered) in main query and threshold CTE to avoid duplicate catalog_sales scans. Preserve literals in ratio filter.",
+    "target_ir": "insert_cte@S0 (base_sales, item_filter); replace_expr_subtree in threshold CTE; replace_from@S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A+B",
+    "transform": "early_filter_decorrelate",
+    "target_id": "t3_novel",
+    "relevance_score": 0.85,
+    "hypothesis": "Push item/date filters into CTEs before decorrelation. Pre-aggregate thresholds per item to eliminate per-row subqueries while preserving literals.",
+    "target_ir": "insert_cte@S0 (item_filter, date_filter, threshold); delete_expr_subtree (original subquery); replace_where_predicate@46ed3cc4a4ef22ce",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_minimal",
+    "target_id": "t4_fallback",
+    "relevance_score": 0.80,
+    "hypothesis": "Minimal fix for t1: preserve literals verbatim in threshold CTE while decorrelating subquery.",
+    "target_ir": "insert_cte@S0 (threshold); replace_where_predicate@46ed3cc4a4ef22ce",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

@@ -1,0 +1,63 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t1 (A+E) Regression (0.78x):**
+- **Expensive Operator in t1 Plan**: 
+  `Nested Loop (rows=84, time=357.996)` in sr_items computation. This is 51% slower than the original sr_items operator (236.985 ms → 357.996 ms).
+- **Why Backfired**: 
+  The CTE for `filtered_dates` changed join order, forcing nested loops instead of hash joins. The plan shows:
+  ```
+  Nested Loop (rows=84, time=357.996)
+    CTE Scan (filtered_dates) (rows=122, time=4.686)
+    Index Scan on store_returns (rows=1, time=2.894)
+  ```
+  This nested loop processed store_returns row-by-row (84 rows × 2.894 ms ≈ 243 ms), while the original used an efficient hash join (11.117 ms total).
+
+**Winner Classification (t2 from Iteration 0):**
+- **t2 (Family A)**: Not executed in Iteration 1, but 1.26x win in Iteration 0. Structural change pushed date filters earlier.  
+- **Complementary to t1 (A+E)**: t2 improved date filtering (Family A), while t1 attempted but failed at dimension reuse (Family E).
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+Expensive nested loops in `store_returns` join (357.996 ms in t1 plan). Caused by loss of hash join optimization.
+
+**Refined Targets**:
+
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "prefilter_dates_explicit_join",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Restore hash join by converting comma joins to explicit INNER JOINs while keeping date prefetching. Targets the Nested Loop (357.996 ms) by forcing set-based joins.",
+    "target_ir": "CTE_Q_S0_sr_items: replace_from to 'store_returns INNER JOIN filtered_dates ON ... INNER JOIN item ON ...'",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "aggregate_store_returns_first",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Pre-aggregate store_returns before joining dimensions. Reduces input rows to the expensive Nested Loop (84 rows currently).",
+    "target_ir": "CTE_Q_S0_sr_items: replace_expr_subtree to aggregate store_returns by sr_item_sk before joining item/dates.",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_date_subquery",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Eliminate correlated subqueries in date filter to avoid repeated scans. Targets Index Only Scan (5.28 ms) executed multiple times.",
+    "target_ir": "S0: replace_expr_subtree at date subquery anchor_hash to standalone CTE with d_month_seq GROUP BY.",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```
+
+**Reasoning**:
+1. **Combination (A+F)**: Merges the winning date prefetch (A) with join topology fixes (F). Explicit joins prevent nested loops (357.996 ms bottleneck).
+2. **Refinement (C)**: Aggregates `store_returns` early to reduce rows fed into joins (84 rows in current plan).
+3. **Rescue (B)**: Fixes date subquery correlation seen in original plan (`Aggregate (rows=4, time=5.28 ms)` executed 3x).

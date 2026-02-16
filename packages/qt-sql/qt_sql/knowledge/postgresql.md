@@ -4,7 +4,7 @@
 ## ENGINE STRENGTHS — do NOT rewrite these patterns
 
 1. **BITMAP_OR_SCAN**: Multi-branch ORs on indexed columns handled via bitmap combination in one scan. Splitting ORs to UNION ALL is lethal (0.21x observed).
-2. **EXISTS semi-join**: Uses early termination. Converting to materializing CTEs caused 0.50x, 0.75x — semi-join destroyed. **Never materialize EXISTS.**
+2. **EXISTS semi-join**: Uses early termination. Converting a single EXISTS to a materializing CTE caused 0.50x, 0.75x — semi-join destroyed. **Exception**: When 3+ correlated NOT EXISTS channels scan different fact tables (e.g., Q069 17.48x), pre-materializing each channel into DISTINCT CTEs with LEFT JOIN IS NULL anti-pattern eliminates repeated Materialize node re-scans.
 3. **INNER JOIN reordering**: Freely reorders INNER JOINs by selectivity estimates. Do NOT manually restructure INNER JOIN order.
 4. **Index-only scan**: Reads only index when covering all requested columns. Small dimension lookups may not need CTEs.
 5. **Parallel query execution**: Large scans and aggregations parallelized across workers. CTEs block parallelism (materialization is single-threaded).
@@ -13,7 +13,7 @@
 ## GLOBAL GUARDS
 
 1. OR conditions on indexed columns → never split to UNION ALL (0.21x observed)
-2. EXISTS/NOT EXISTS → never materialize into CTEs (0.50x, 0.75x — semi-join destroyed)
+2. Single EXISTS → never materialize into CTE (0.50x, 0.75x — semi-join destroyed). Exception: 3+ NOT EXISTS channels → pre-materialize each into DISTINCT CTE + LEFT JOIN IS NULL (17.48x observed)
 3. INNER JOIN order → never restructure (optimizer handles reordering)
 4. Small dimensions (< 10K rows) → index-only scan may be faster than CTE
 5. Baseline < 100ms → skip CTE-based rewrites (overhead exceeds savings)

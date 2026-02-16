@@ -1,0 +1,114 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**WIN: t1_plus_A (7.76x)**  
+- **Improved operator**:  
+  Original: `Hash Join (rows=0, time=434.22)` and `Nested Loop (rows=163368, time=188.502)`  
+  Patch: Eliminated entirely  
+- **Structural change**: Prefiltered dates and demographics via CTEs (`filtered_dates`, `filtered_customer_demographics`, `filtered_household_demographics`), reducing input rows to expensive joins.  
+- **Most expensive remaining operator**:  
+  `Gather (rows=0, time=42.288)` → `Seq Scan on customer_demographics (rows=0, time=35.533)`  
+
+**WIN: t1_fixed_t3 (7.75x)**  
+- **Improved operator**:  
+  Original: `Hash Join (rows=0, time=434.22)` and `Nested Loop (rows=163368, time=188.502)`  
+  Patch: Eliminated entirely  
+- **Structural change**: Prefiltered dates via CTE (`filtered_dates`), reducing date_dim scans.  
+- **Most expensive remaining operator**:  
+  `Gather (rows=0, time=37.883)` → `Seq Scan on customer_demographics (rows=0, time=32.751)`  
+
+**Classification**:  
+Both winners are **REDUNDANT**. They target the same bottleneck (large date_dim joins) with similar structural changes (date prefiltering CTEs), improving identical operators. The remaining bottleneck is the sequential scan on `customer_demographics`.
+
+**NEUTRAL: t1_cd_filter (0.97x)**  
+- **Regressed operator**:  
+  Original: `Hash Join (rows=0, time=434.22)`  
+  Patch: `Hash Join (rows=0, time=456.79)` (slower by 22.57ms)  
+- **Why backfired**: Prefiltering only `customer_demographics` failed to reduce the large date_dim joins, so the core bottleneck persisted.
+
+**FAIL: t1_agg_pushdown**  
+- **Error**: Column `cs_bill_cdemo_sk` missing in aggregation CTE.  
+- **Why failed**: Aggregation pushdown removed columns needed for downstream joins (e.g., `cs_bill_cdemo_sk`), breaking query semantics.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: `t1_fixed_t3` (best winner, 37.94ms).  
+**Primary bottleneck**: `Seq Scan on customer_demographics (time=32.751ms)`.
+
+#### Target 1: Combination (A+E)  
+- **Family**: A+E  
+- **Transform**: `prefilter_demographics_and_item`  
+- **Target ID**: `t2_1`  
+- **Relevance**: 0.95  
+- **Hypothesis**: Layer `customer_demographics` and `item` prefiltering (Family A) onto `t1_fixed_t3` to reduce the sequential scan bottleneck. The `customer_demographics` scan consumes 86% of the total time (32.751ms/37.94ms). Prefiltering these dimensions will reduce input rows to the scan and subsequent joins.  
+- **Target IR**: `S0` (main query)  
+- **Recommended Examples**: `pg_date_cte_explicit_join` (A), `multi_dimension_prefetch` (E)  
+
+#### Target 2: Refinement (E)  
+- **Family**: E  
+- **Transform**: `demographics_materialize`  
+- **Target ID**: `t2_2`  
+- **Relevance**: 0.85  
+- **Hypothesis**: Materialize filtered `customer_demographics` (using `cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11`) to avoid repeated scans. The current scan is executed in a `Gather` node (parallel), but materialization may reduce I/O and CPU costs.  
+- **Target IR**: `S0` (main query)  
+- **Recommended Examples**: `multi_dimension_prefetch` (E)  
+
+#### Target 3: Rescue (C)  
+- **Family**: C  
+- **Transform**: `agg_pushdown_after_dims`  
+- **Target ID**: `t2_3`  
+- **Relevance**: 0.75  
+- **Hypothesis**: Fix `t1_agg_pushdown` by aggregating *after* joining `catalog_sales` with prefiltered dimensions (dates, demographics, item). This retains necessary join columns (e.g., `cs_bill_cdemo_sk`) while reducing rows before expensive joins with `inventory` and `warehouse`.  
+- **Target IR**: `S0` (main query)  
+- **Recommended Examples**: `pg_materialized_dimension_fact_prefilter` (C)  
+
+#### Target 4: Novel (B)  
+- **Family**: B  
+- **Transform**: `decorrelate_demographics`  
+- **Target ID**: `t2_4`  
+- **Relevance**: 0.65  
+- **Hypothesis**: Convert the `customer_demographics` scan to a decorrelated CTE. Though no explicit correlation exists, the sequential scan may benefit from set-based evaluation. Targets the `Seq Scan on customer_demographics` bottleneck.  
+- **Target IR**: `S0` (main query)  
+- **Recommended Examples**: `pg_shared_scan_decorrelate` (B)  
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "prefilter_demographics_and_item",
+    "target_id": "t2_1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefilter customer_demographics and item to reduce the sequential scan bottleneck (32.751ms in t1_fixed_t3). Combines date filtering (F) with dimension prefiltering (A+E).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "demographics_materialize",
+    "target_id": "t2_2",
+    "relevance_score": 0.85,
+    "hypothesis": "Materialize filtered customer_demographics to avoid repeated sequential scans (32.751ms in t1_fixed_t3).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown_after_dims",
+    "target_id": "t2_3",
+    "relevance_score": 0.75,
+    "hypothesis": "Rescue aggregation pushdown by joining catalog_sales with prefiltered dimensions first, then aggregating. Retains necessary columns (cs_bill_cdemo_sk) while reducing rows.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_demographics",
+    "target_id": "t2_4",
+    "relevance_score": 0.65,
+    "hypothesis": "Decorrelate customer_demographics scan to optimize the bottleneck operator (32.751ms in t1_fixed_t3) using set-based evaluation.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

@@ -1,0 +1,56 @@
+### Analysis of Optimization Families
+
+**Family A (Early Filtering)**: HIGH  
+The date_dim subquery is executed repeatedly in each CTE. Pushing the date filter into a reusable CTE would prevent redundant computation and reduce row counts early.
+
+**Family B (Decorrelation)**: MEDIUM  
+The date_dim subquery is uncorrelated but executed multiple times. Decorrelation isn't the primary issue, but materialization solves the repetition problem.
+
+**Family C (Aggregation Pushdown)**: LOW  
+Aggregations already happen after necessary joins (require item_id from joins). No opportunity to push aggregations earlier.
+
+**Family D (Set Operations)**: LOW  
+No INTERSECT/UNION operations exist. The main bottleneck is repeated scans, not set operations.
+
+**Family E (Materialization/Prefetch)**: HIGH  
+Critical for eliminating repeated identical subqueries on date_dim. Precomputing date_sk and item filters yields significant reuse.
+
+**Family F (Join Transform)**: MEDIUM  
+Implicit comma joins could be converted to explicit JOINs, but this is secondary to materialization gains.
+
+**Chosen Families**: E (primary), A (secondary), F (tertiary)  
+**Confidence**: High (structural repetition is clear)
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "E",
+    "transform": "multi_dimension_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Identical date_dim subquery executed 3x (once per CTE). Precompute date_sk once for reuse.",
+    "target_ir": "S0 [SELECT]\n  CTE: date_sk_filter  (via CTE_Q_S0_dates)\n    FROM: date_dim\n    WHERE: d_month_seq IN (SELECT d_month_seq FROM date_dim WHERE d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18'))\n  CTE: sr_items  (via CTE_Q_S0_sr_items)\n    FROM: store_returns, item, date_sk_filter\n    WHERE: sr_item_sk = i_item_sk AND sr_returned_date_sk = date_sk_filter.d_date_sk AND i_category IN ('Home','Men') AND i_manager_id BETWEEN 8 AND 17 AND sr_return_amt/sr_return_quantity BETWEEN 237 AND 266 AND sr_reason_sk IN (6,7,25,45,51)\n    GROUP BY: i_item_id\n  CTE: cr_items  (via CTE_Q_S0_cr_items)\n    FROM: catalog_returns, item, date_sk_filter\n    WHERE: cr_item_sk = i_item_sk AND cr_returned_date_sk = date_sk_filter.d_date_sk AND ... [identical condition structure]\n    GROUP BY: i_item_id\n  CTE: wr_items  (via CTE_Q_S0_wr_items)\n    FROM: web_returns, item, date_sk_filter\n    WHERE: wr_item_sk = i_item_sk AND wr_returned_date_sk = date_sk_filter.d_date_sk AND ... [identical condition structure]\n    GROUP BY: i_item_id\n  MAIN QUERY: unchanged",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefilter",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Same item filters (category/manager_id) applied 3x. Prefilter items once for reuse.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_items  (via CTE_Q_S0_items)\n    FROM: item\n    WHERE: i_category IN ('Home','Men') AND i_manager_id BETWEEN 8 AND 17\n  CTE: date_sk_filter  ... [from t1]\n  CTE: sr_items  (via CTE_Q_S0_sr_items)\n    FROM: store_returns, filtered_items, date_sk_filter\n    WHERE: sr_item_sk = filtered_items.i_item_sk AND ... [other conditions]\n    GROUP BY: filtered_items.i_item_id\n  ... [parallel changes for cr_items/wr_items]\n  MAIN QUERY: unchanged",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join",
+    "target_id": "t3",
+    "relevance_score": 0.65,
+    "hypothesis": "Implicit comma joins in CTEs obscure join relationships. Convert to explicit INNER JOIN.",
+    "target_ir": "S0 [SELECT]\n  ... [CTEs from t1/t2]\n  CTE: sr_items  (via CTE_Q_S0_sr_items)\n    FROM: store_returns\n    INNER JOIN filtered_items ON sr_item_sk = filtered_items.i_item_sk\n    INNER JOIN date_sk_filter ON sr_returned_date_sk = date_sk_filter.d_date_sk\n    WHERE: ... [conditions]\n    GROUP BY: ...\n  ... [parallel changes for cr_items/wr_items]\n  MAIN QUERY: \n    FROM sr_items\n    INNER JOIN cr_items ON sr_items.item_id = cr_items.item_id\n    INNER JOIN wr_items ON sr_items.item_id = wr_items.item_id",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

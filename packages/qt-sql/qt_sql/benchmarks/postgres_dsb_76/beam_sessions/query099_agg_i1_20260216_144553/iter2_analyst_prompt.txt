@@ -1,0 +1,313 @@
+## Role
+
+You are a SQL optimization analyst reviewing benchmark results. Analyze what worked, what failed, and design refined targets for the next round of workers.
+
+Identify the primary bottleneck. Only provide secondary targets if they are distinct and high-confidence. Quality > Quantity.
+
+You will see the original query, execution plan, IR structure, and detailed results from previous rounds.
+
+## Query: query099_agg_i1
+
+**Dialect**: POSTGRES
+
+```sql
+select 
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   catalog_sales
+  ,warehouse
+  ,ship_mode
+  ,call_center
+  ,date_dim
+where
+d_month_seq between 1192 and 1192 + 23
+and cs_ship_date_sk   = d_date_sk
+and cs_warehouse_sk   = w_warehouse_sk
+and cs_ship_mode_sk   = sm_ship_mode_sk
+and cs_call_center_sk = cc_call_center_sk
+and cs_list_price between 86 and 115
+and sm_type = 'EXPRESS'
+and cc_class = 'small'
+and w_gmt_offset = -5
+group by
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+order by substring(w_warehouse_name,1,20)
+        ,sm_type
+        ,cc_name
+limit 100;
+```
+
+
+## Current Execution Plan
+
+```
+Limit  (rows=4, time=375.67)
+  Aggregate  (rows=4, time=375.614)
+    Gather Merge  (rows=10, time=375.603)
+      Aggregate  (rows=3, time=301.609)
+        Sort  (rows=767, time=301.453)
+          Nested Loop  (rows=767, time=300.424)
+            Index Only Scan on date_dim  (rows=244, time=3.075)
+            Nested Loop  (rows=3, time=1.217)
+              Seq Scan on call_center  (rows=3, time=0.005)
+              Nested Loop  (rows=1, time=0.403)
+                Seq Scan on warehouse  (rows=2, time=0.002)
+                Nested Loop  (rows=1, time=0.199)
+                  Seq Scan on ship_mode  (rows=4, time=0.003)
+                  Index Scan on catalog_sales  (rows=0, time=0.049)
+```
+
+
+## IR Structure (for patch targeting)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: catalog_sales, warehouse, ship_mode, call_center, date_dim
+    WHERE [ad865b09a0de0f7f]: d_month_seq BETWEEN 1192 AND 1192 + 23 AND cs_ship_date_sk = d_date_sk AND cs_warehouse_sk = w_wa...
+    GROUP BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name
+    ORDER BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
+
+
+## Optimization Families
+
+Review the 6 families below. Each has a proven gold example.
+
+Choose up to **4 most relevant families** for this query based on:
+- Query structure (CTEs, subqueries, joins, aggregations, set operations)
+- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)
+- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
+
+
+
+### Family A: Early Filtering (Predicate Pushback)
+**Description**: Push small filters into CTEs early, reduce row count before expensive operations
+**Speedup Range**: 1.3–4.0x (~35% of all wins)
+**Use When**:
+  1. Late WHERE filters on dimension tables
+  2. Cascading CTEs with filters applied downstream
+  3. Expensive joins after filters could be pushed earlier
+
+**Gold Example**: `pg_date_cte_explicit_join` (2.28x)
+
+
+
+### Family B: Decorrelation (Sets Over Loops)
+**Description**: Convert correlated subqueries to standalone CTEs with GROUP BY, eliminate per-row re-execution
+**Speedup Range**: 2.4–2.9x (~15% of all wins)
+**Use When**:
+  1. Correlated subqueries in WHERE clause
+  2. Scalar aggregates computed per outer row
+  3. DELIM_SCAN in execution plan (indicates correlation)
+
+**Gold Example**: `pg_shared_scan_decorrelate` (8043.91x (timeout rescue))
+
+
+
+### Family C: Aggregation Pushdown (Minimize Rows Touched)
+**Description**: Aggregate before expensive joins when GROUP BY keys ⊇ join keys, reduce intermediate sizes
+**Speedup Range**: 1.3–15.3x (~5% of all wins (high variance))
+**Use When**:
+  1. GROUP BY happens after large joins
+  2. GROUP BY keys are subset of join keys
+  3. Intermediate result size >> final result size
+
+**Gold Example**: `pg_materialized_dimension_fact_prefilter` (12.07x (V2 DSB SF10, was 2.68x in V1))
+
+
+
+### Family D: Set Operation Optimization (Sets Over Loops)
+**Description**: Replace INTERSECT/UNION-based patterns with EXISTS/NOT EXISTS, avoid full materialization
+**Speedup Range**: 1.7–2.7x (~8% of all wins)
+**Use When**:
+  1. INTERSECT patterns between large sets
+  2. UNION ALL with duplicate elimination
+  3. Set operations materializing full intermediate results
+
+**Gold Example**: `pg_intersect_to_exists` (1.78x)
+
+
+
+### Family E: Materialization / Prefetch (Don't Repeat Work)
+**Description**: Extract repeated scans or pre-compute intermediate results for reuse across multiple consumers
+**Speedup Range**: 1.3–6.2x (~18% of all wins)
+**Use When**:
+  1. Repeated scans of same table with different filters
+  2. Dimension filters applied independently multiple times
+  3. CTE referenced multiple times with implicit re-evaluation
+
+**Gold Example**: `multi_dimension_prefetch` (2.71x)
+
+
+
+### Family F: Join Transform (Right Shape First)
+**Description**: Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation
+**Speedup Range**: 1.8–8.6x (~19% of all wins)
+**Use When**:
+  1. Comma-separated joins (implicit cross joins) in FROM clause
+  2. Self-joins scanning same table multiple times
+  3. Dimension-fact join order suboptimal for predicate pushdown
+
+**Gold Example**: `pg_explicit_join_materialized` (8.56x)
+
+
+
+## Optimization History
+
+### History — All Prior Patches
+
+| Iter | Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Error (summary) |
+|------|-------|--------|-----------|---------|--------|---------|----------|-----------------|
+| 0 | t1 | F | explicit_join_materialized | — | FAIL | — | — | Equivalence execution error: column "w_w |
+| 0 | t2 | A | date_cte_explicit_join | — | FAIL | — | — | Equivalence execution error: current tra |
+| 0 | t4 | C | materialized_dimension_fact_prefilter | — | FAIL | — | — | Tier-1 structural: LITERAL MISMATCH: Ori |
+| 0 | t3 | E | multi_dimension_prefetch | — | FAIL | — | — | Tier-1 structural: LITERAL MISMATCH: Ori |
+| 1 | t5 | A+E+F | prefilter_dimensions_explicit_join | — | FAIL | — | — | Equivalence execution error: column "w_w |
+| 1 | t6 | A+E | date_dimension_prefetch | — | FAIL | — | — | Equivalence execution error: current tra |
+| 1 | t7 | C | fact_prefilter_rescue | — | FAIL | — | — | Equivalence execution error: current tra |
+| 1 | t8 | F | explicit_join_rescue | — | FAIL | — | — | Equivalence execution error: current tra |
+
+
+
+### Latest Iteration 1 — Detailed Results
+
+#### Race Results
+
+| Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Semantic | Error |
+|-------|--------|-----------|---------|--------|---------|----------|----------|-------|
+| t5 | A+E+F | prefilter_dimensions_explicit_join | — | FAIL | — | — | FAIL | Equivalence execution error: column "w_warehouse_name" does not exist
+LINE 1: .. |
+| t6 | A+E | date_dimension_prefetch | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| t7 | C | fact_prefilter_rescue | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| t8 | F | explicit_join_rescue | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+
+#### Patched SQL
+
+**t5 (Family A+E+F, prefilter_dimensions_explicit_join):**
+```sql
+WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1192 AND 1192 + 23), filtered_warehouse AS (SELECT w_warehouse_sk FROM warehouse WHERE w_gmt_offset = -5), filtered_ship_mode AS (SELECT sm_ship_mode_sk, sm_type FROM ship_mode WHERE sm_type = 'EXPRESS'), filtered_call_center AS (SELECT cc_call_center_sk, cc_name FROM call_center WHERE cc_class = 'small') SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 30) AND (cs_ship_date_sk - cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 60) AND (cs_ship_date_sk - cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 90) AND (cs_ship_date_sk - cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN filtered_warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN filtered_ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN filtered_call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 86 AND 115 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name LIMIT 100;
+```
+
+**t6 (Family A+E, date_dimension_prefetch):**
+```sql
+WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1192 AND 1192 + 23), filtered_warehouse AS (SELECT w_warehouse_sk, w_warehouse_name FROM warehouse WHERE w_gmt_offset = -5), filtered_ship_mode AS (SELECT sm_ship_mode_sk, sm_type FROM ship_mode WHERE sm_type = 'EXPRESS'), filtered_call_center AS (SELECT cc_call_center_sk, cc_name FROM call_center WHERE cc_class = 'small') SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 30) AND (cs_ship_date_sk - cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 60) AND (cs_ship_date_sk - cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 90) AND (cs_ship_date_sk - cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN filtered_warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN filtered_ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN filtered_call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 86 AND 115 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name LIMIT 100;
+```
+
+**t7 (Family C, fact_prefilter_rescue):**
+```sql
+WITH filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1192 AND 1192 + 23), cs_filtered AS (SELECT cs_ship_date_sk, cs_sold_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk FROM catalog_sales WHERE cs_list_price BETWEEN 86 AND 115) SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 30) AND (cs_ship_date_sk - cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 60) AND (cs_ship_date_sk - cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 90) AND (cs_ship_date_sk - cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM cs_filtered AS cs JOIN filtered_date AS d ON cs.cs_ship_date_sk = d.d_date_sk JOIN warehouse AS w ON cs.cs_warehouse_sk = w.w_warehouse_sk JOIN ship_mode AS sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk JOIN call_center AS cc ON cs.cs_call_center_sk = cc.cc_call_center_sk WHERE sm.sm_type = 'EXPRESS' AND cc.cc_class = 'small' AND w.w_gmt_offset = -5 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name LIMIT 100;
+```
+
+**t8 (Family F, explicit_join_rescue):**
+```sql
+WITH filtered_date_dim AS (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1192 AND 1192 + 23), filtered_warehouse AS (SELECT w_warehouse_sk, w_warehouse_name FROM warehouse WHERE w_gmt_offset = -5), filtered_ship_mode AS (SELECT sm_ship_mode_sk, sm_type FROM ship_mode WHERE sm_type = 'EXPRESS'), filtered_call_center AS (SELECT cc_call_center_sk, cc_name FROM call_center WHERE cc_class = 'small') SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 30) AND (cs_ship_date_sk - cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 60) AND (cs_ship_date_sk - cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 90) AND (cs_ship_date_sk - cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM catalog_sales INNER JOIN filtered_date_dim ON cs_ship_date_sk = d_date_sk INNER JOIN filtered_warehouse ON cs_warehouse_sk = w_warehouse_sk INNER JOIN filtered_ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk INNER JOIN filtered_call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 86 AND 115 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name LIMIT 100;
+```
+
+#### Execution Plans
+
+**Original EXPLAIN:**
+```
+Limit  (rows=4, time=375.67)
+  Aggregate  (rows=4, time=375.614)
+    Gather Merge  (rows=10, time=375.603)
+      Aggregate  (rows=3, time=301.609)
+        Sort  (rows=767, time=301.453)
+          Nested Loop  (rows=767, time=300.424)
+            Index Only Scan on date_dim  (rows=244, time=3.075)
+            Nested Loop  (rows=3, time=1.217)
+              Seq Scan on call_center  (rows=3, time=0.005)
+              Nested Loop  (rows=1, time=0.403)
+                Seq Scan on warehouse  (rows=2, time=0.002)
+                Nested Loop  (rows=1, time=0.199)
+                  Seq Scan on ship_mode  (rows=4, time=0.003)
+                  Index Scan on catalog_sales  (rows=0, time=0.049)
+```
+
+#### Error Details
+
+- **t5** (FAIL): Equivalence execution error: column "w_warehouse_name" does not exist
+LINE 1: ...center WHERE cc_class = 'small') SELECT SUBSTRING(w_warehous...
+                                                             ^
+
+- **t6** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **t7** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **t8** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+
+
+## Your Task — Snipe Round 2
+
+
+Results from latest iteration: **4 FAIL**.
+
+Follow this protocol exactly.
+
+### Step 1 — Compare EXPLAIN Plans
+
+For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.
+
+For each **WIN**, answer:
+- QUOTE the operator line(s) from the original that got cheaper or were eliminated. Give the exact operator name, time, and row count from the plan text above.
+- What structural SQL change caused that operator improvement?
+- What is the **most expensive remaining operator** in this winner's plan? QUOTE its line (name, time, rows).
+
+For each **FAIL/NEUTRAL/REGRESSION**:
+- QUOTE the operator(s) that got MORE expensive vs the original.
+- Why did the structural change backfire?
+
+Then classify winners as REDUNDANT (same core structural change, same operators improved) or COMPLEMENTARY (different operators improved, different structural changes).
+
+### Step 2 — Design Targets by Combining Strategies
+
+Start from the **best winner's SQL** as your baseline.
+
+**CRITICAL**: Do NOT invent new hypotheses about row counts or selectivity. Every claim about rows, times, or costs MUST be a direct quote from an EXPLAIN plan above. If a number is not in the plans, you do not know it.
+
+**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites (UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce identical plans. Focus on changes that **eliminate operators** or **reduce input rows to expensive operators** as shown in the plans.
+
+Design up to 4 targets, prioritized:
+
+1. **Combination** (primary if complementary winners exist): Take the best winner's SQL. Layer on the structural change from a complementary winner that addresses a DIFFERENT expensive operator. Cite both operators by name from the EXPLAIN plans.
+2. **Refinement**: Take the best winner's SQL. Target its most expensive remaining operator (quoted in Step 1). Design a structural change that reduces input rows to that operator. CITE the operator and its current row count from the plan.
+3. **Rescue** (if a failed patch had a sound structural idea): Fix the implementation while preserving the best winner's gains.
+4. **Novel**: A new structural approach that targets the most expensive remaining operator. Cite the operator from the plan.
+
+**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F"). The worker will receive gold examples from ALL referenced families.
+
+Output up to 4 targets. Same JSON format:
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "...",
+    "target_ir": "...",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  }
+]
+```
+
+Output up to 4 targets. Fewer strong targets beat padding with weak ones.

@@ -1,0 +1,96 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Failed Patches**  
+All patches failed due to implementation errors (semantic/equivalence issues), so no EXPLAIN plans are available for comparison. The core structural changes were not validated in execution. However, based on optimization families and plan signals:
+
+1. **t1 (Family F: Join Transform)**  
+   - *Structural Change*: Converted implicit joins to explicit syntax + moved `cr_reason_sk` to LEFT JOIN condition.  
+   - *Why Failed*: Semantic error turned LEFT JOIN into effective INNER JOIN (row count mismatch).  
+   - *Potential*: Could reduce `catalog_returns` scan rows (original: 0.128ms per row) if implemented correctly.
+
+2. **t2 (Family A: Early Filtering)**  
+   - *Structural Change*: Pushed `item`/`date_dim` filters into CTEs.  
+   - *Why Failed*: Missing `i_item_id` in CTE projection (syntax error).  
+   - *Potential*: Could reduce `item` scan rows (original: 0.003ms per row) and avoid late filtering.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop` (rows=15,172, time=45.51ms) between `date_dim` and `catalog_sales`. Caused by late filtering on `item`/`date_dim` and comma-join preventing predicate pushdown.
+
+**Target Design**:
+
+1. **Combination Target (A+F)**:  
+   - **Family**: A + F  
+   - **Transform**: `early_filter_explicit_join`  
+   - **Target ID**: `t1`  
+   - **Hypothesis**: Push `item`/`date_dim` filters into CTEs (A) + use explicit LEFT JOIN with `cr_reason_sk` in ON clause (F). Reduces `Nested Loop` input rows (15,172 → ~497) by filtering dimensions early and optimizing join topology.  
+   - **Target IR**: `S0:by_anchor_hash(c09d05bd2ddec999)` (WHERE clause)  
+   - **Examples**: `pg_date_cte_explicit_join` (A), `pg_explicit_join_materialized` (F)  
+
+2. **Refinement Target (C)**:  
+   - **Family**: C  
+   - **Transform**: `preaggregate_fact`  
+   - **Target ID**: `t2`  
+   - **Hypothesis**: Pre-aggregate `catalog_sales` by `cs_item_sk`, `cs_warehouse_sk`, `cs_sold_date_sk` before joining to dimensions. Targets residual `Aggregate` operator (197.486ms) by reducing input rows via early aggregation.  
+   - **Target IR**: `S0:by_node_id(S0)` (main query)  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter` (C)  
+
+3. **Rescue Target (A Fixed)**:  
+   - **Family**: A  
+   - **Transform**: `early_filter_fixed_columns`  
+   - **Target ID**: `t3`  
+   - **Hypothesis**: Fix `t2` by including `i_item_id` in `filtered_item` CTE. Reduces `item` scan rows early (original: 0.003ms/row) without semantic errors.  
+   - **Target IR**: `S0:by_anchor_hash(c09d05bd2ddec999)` (WHERE clause)  
+   - **Examples**: `pg_date_cte_explicit_join` (A)  
+
+4. **Novel Target (E+A)**:  
+   - **Family**: E + A  
+   - **Transform**: `materialize_dims_prejoin`  
+   - **Target ID**: `t4`  
+   - **Hypothesis**: Materialize filtered `item`/`date_dim` in CTEs (A) and pre-join with `catalog_sales` in a CTE (E). Avoids repeated dimension scans in nested loops. Targets `Nested Loop` (45.51ms).  
+   - **Target IR**: `S0:by_node_id(S0)` (main query)  
+   - **Examples**: `multi_dimension_prefetch` (E), `pg_date_cte_explicit_join` (A)  
+
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "early_filter_explicit_join",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Push item/date_dim filters into CTEs (A) + explicit LEFT JOIN with cr_reason_sk in ON clause (F). Reduces Nested Loop input rows (15,172) by filtering early and optimizing joins.",
+    "target_ir": "S0:by_anchor_hash(c09d05bd2ddec999)",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_fact",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-aggregate catalog_sales by cs_item_sk/cs_warehouse_sk before joining dimensions. Reduces input rows to expensive Aggregate operator (197.486ms).",
+    "target_ir": "S0:by_node_id(S0)",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filter_fixed_columns",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Rescue t2 by including i_item_id in filtered_item CTE. Reduces item scan rows (0.003ms/row) without semantic errors.",
+    "target_ir": "S0:by_anchor_hash(c09d05bd2ddec999)",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E+A",
+    "transform": "materialize_dims_prejoin",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Materialize filtered dimensions (A) and pre-join with catalog_sales in CTE (E). Avoids repeated scans in Nested Loop (45.51ms).",
+    "target_ir": "S0:by_node_id(S0)",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  }
+]
+```

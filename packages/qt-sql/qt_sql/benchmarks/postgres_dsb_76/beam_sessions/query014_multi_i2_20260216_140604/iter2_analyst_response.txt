@@ -1,0 +1,94 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**WIN: t2 (Family E, cte_materialize_avg_sales)**
+- **Improved operator**:  
+  `CTE Scan (cross_items)  (rows=4735, time=2962.134 ms)`  
+  vs original:  
+  `CTE Scan (cross_items)  (rows=4735, time=6646.541 ms)`
+- **Structural change**: Materializing the `avg_sales` CTE reduced recomputation overhead. The `avg_sales` CTE scan time dropped from 2044.705 ms to 1809.429 ms, indirectly reducing pressure on correlated operators.
+- **Most expensive remaining operator**:  
+  `Sort  (rows=751, time=5095.34 ms)`  
+  This is the final sort for the main query's ORDER BY, now the primary bottleneck.
+
+**FAILED PATCHES (t1, t3, t4)**
+- **Failed due to literal mismatch**: All three patches changed literals (e.g., `'store'` → `'store'` was dropped) and numeric constants (e.g., `12` → `12.0`), causing structural validation failures. The rewrites altered filter values instead of preserving them.
+
+**Classification**:  
+t2 is **COMPLEMENTARY** to other strategies. It optimized the `avg_sales` CTE materialization but did not address the expensive `cross_items` SetOp or final Sort.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: Best winner's SQL (t2).  
+**Primary bottleneck**: Final `Sort` operator (5095.34 ms).  
+**Secondary bottleneck**: `cross_items` SetOp (2941.851 ms).
+
+#### Target 1: Combination (D + F)
+- **Family**: D + F  
+- **Transform**: `setop_to_exists_with_merge_join`  
+- **Hypothesis**: Replace `INTERSECT` in `cross_items` with `EXISTS` (Family D) to avoid materializing large intermediates. Then, sort `this_year`/`last_year` outputs by join keys to enable merge join (Family F), eliminating the final Sort.  
+- **Target IR**: `S0: cross_items CTE` (for EXISTS) + `S0: MAIN QUERY (Q_S0)` (for merge join)  
+- **Examples**: `pg_intersect_to_exists`, `pg_explicit_join_materialized`
+
+#### Target 2: Refinement (F)
+- **Family**: F  
+- **Transform**: `merge_join_avoid_sort`  
+- **Hypothesis**: Sort `this_year` and `last_year` subqueries by `(i_brand_id, i_class_id, i_category_id)`. This enables a merge join and leverages the join order for the final ORDER BY, eliminating the 5095 ms Sort.  
+- **Target IR**: `S0: MAIN QUERY (Q_S0) → this_year/last_year subqueries`  
+- **Examples**: `pg_explicit_join_materialized`
+
+#### Target 3: Rescue (D)
+- **Family**: D  
+- **Transform**: `intersect_to_exists_preserve_literals`  
+- **Hypothesis**: Fix prior literal mismatch in the `INTERSECT` → `EXISTS` rewrite. Preserve `'store'` and `12` exactly to avoid validation failure while reducing SetOp time (2941 ms).  
+- **Target IR**: `S0: cross_items CTE`  
+- **Examples**: `pg_intersect_to_exists`
+
+#### Target 4: Novel (A)
+- **Family**: A  
+- **Transform**: `remove_redundant_filter`  
+- **Hypothesis**: Remove redundant filters `i_category IN (...)` and `i_manager_id BETWEEN ...` from `cross_items`'s outer WHERE clause. These are already enforced in inner subqueries (confirmed via brand/class/category_id joins), saving ~10% of its runtime.  
+- **Target IR**: `S0: cross_items CTE → WHERE clause [888d3c332566b19b]`  
+- **Examples**: `pg_date_cte_explicit_join`
+
+```json
+[
+  {
+    "family": "D+F",
+    "transform": "setop_to_exists_with_merge_join",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Replace INTERSECT with EXISTS in cross_items CTE to avoid materializing large sets. Sort this_year/last_year outputs by join keys to enable merge join and eliminate final Sort (5095 ms).",
+    "target_ir": "S0: cross_items CTE; S0: MAIN QUERY (Q_S0)",
+    "recommended_examples": ["pg_intersect_to_exists", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "F",
+    "transform": "merge_join_avoid_sort",
+    "target_id": "t2",
+    "relevance_score": 0.9,
+    "hypothesis": "Sort this_year and last_year subqueries by (i_brand_id, i_class_id, i_category_id) to enable merge join. Leverage join order for final ORDER BY, eliminating 5095 ms Sort.",
+    "target_ir": "S0: MAIN QUERY (Q_S0) → this_year/last_year subqueries",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "D",
+    "transform": "intersect_to_exists_preserve_literals",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix literal mismatch in INTERSECT→EXISTS rewrite. Preserve 'store' and 12 exactly to reduce SetOp time (2941 ms) without validation failure.",
+    "target_ir": "S0: cross_items CTE",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "A",
+    "transform": "remove_redundant_filter",
+    "target_id": "t4",
+    "relevance_score": 0.8,
+    "hypothesis": "Remove redundant i_category/i_manager_id filters from cross_items's outer WHERE clause. Inner subqueries already enforce these via brand/class/category_id joins.",
+    "target_ir": "S0: cross_items CTE → WHERE clause [888d3c332566b19b]",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

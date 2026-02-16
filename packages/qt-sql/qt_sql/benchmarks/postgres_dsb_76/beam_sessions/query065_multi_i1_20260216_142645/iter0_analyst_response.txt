@@ -1,0 +1,65 @@
+### Analysis of Optimization Families
+
+**Family A (Early Filtering)**: MEDIUM  
+The query has dimension table filters (`i_manager_id`, `s_state`) applied late. Pushing these into the CTEs could reduce intermediate data, but the primary bottleneck is repeated fact table scans.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries exist. All subqueries are standalone aggregations without outer references.
+
+**Family C (Aggregation Pushdown)**: MEDIUM  
+The nested aggregation in `sb` (avg over sum) could be optimized, but the bigger issue is redundant computation of the same base aggregation in `sb` and `sc`.
+
+**Family D (Set Operations)**: LOW  
+No INTERSECT/UNION operations are present in the query.
+
+**Family E (Materialization/Prefetch)**: HIGH  
+The same `store_sales` scan with identical filters is executed twice for `sb` and `sc` – the primary bottleneck.
+
+**Family F (Join Transform)**: MEDIUM  
+Comma-separated joins could be converted to explicit joins for better optimization, but this is secondary to redundant scans.
+
+**Chosen Families**: E, A, C, F  
+**Confidence**: High (E), Medium (A, C, F)
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "E",
+    "transform": "multi_scan_materialization",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Identical store_sales scans repeated for sb and sc CTEs. Materialize base aggregation once for shared reuse.",
+    "target_ir": "S0 [SELECT]\n  CTE: base_sales  (via Q1)\n    FROM: store_sales, date_dim\n    WHERE: [d_date_seq] d_month_seq between 1195 and 1195+11\n           AND [price_ratio] ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.48\n    GROUP BY: ss_store_sk, ss_item_sk\n    SELECT: ss_store_sk, ss_item_sk, sum(ss_sales_price) AS revenue\n  CTE: sb  (via Q2)\n    FROM: base_sales\n    GROUP BY: ss_store_sk\n    SELECT: ss_store_sk, avg(revenue) AS ave\n  CTE: sc  (via Q3)\n    FROM: base_sales\n    SELECT: ss_store_sk, ss_item_sk, revenue\n  MAIN QUERY (via Q0)\n    FROM: store, item, sb, sc\n    WHERE: [77f67ba857e1627b] sb.ss_store_sk = sc.ss_store_sk \n           AND sc.revenue <= 0.1 * sb.ave\n           AND s_store_sk = sc.ss_store_sk\n           AND i_item_sk = sc.ss_item_sk\n           AND i_manager_id BETWEEN 80 AND 84\n           AND s_state IN ('IA','IL','NC')\n    ORDER BY: s_store_name, i_item_desc\n    LIMIT: 100",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "dimension_predicate_pushdown",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Store and item filters applied late after expensive joins. Push s_state/i_manager_id filters into sc CTE.",
+    "target_ir": "S0 [SELECT]\n  ... (base_sales/sb CTEs unchanged from t1) ...\n  CTE: sc  (via Q3)\n    FROM: base_sales\n      INNER JOIN store ON base_sales.ss_store_sk = store.s_store_sk\n      INNER JOIN item ON base_sales.ss_item_sk = item.i_item_sk\n    WHERE: store.s_state IN ('IA','IL','NC')\n           AND item.i_manager_id BETWEEN 80 AND 84\n    SELECT: base_sales.ss_store_sk, base_sales.ss_item_sk, base_sales.revenue\n  MAIN QUERY (via Q0)\n    FROM: sb, sc\n    WHERE: [77f67ba857e1627b] sb.ss_store_sk = sc.ss_store_sk \n           AND sc.revenue <= 0.1 * sb.ave\n    ORDER BY: store.s_store_name, item.i_item_desc\n    LIMIT: 100",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "flatten_double_aggregation",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Nested aggregation in sb (avg over sum) can be flattened to single-pass computation.",
+    "target_ir": "S0 [SELECT]\n  CTE: base_sales  (via Q1)  ... (unchanged) ...\n  CTE: sb  (via Q2)\n    FROM: base_sales\n    GROUP BY: ss_store_sk\n    SELECT: ss_store_sk, \n            sum(revenue) / count(*) AS ave  -- Single-pass avg\n  ... (sc and main query unchanged from t1) ...",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_cascade",
+    "target_id": "t4",
+    "relevance_score": 0.65,
+    "hypothesis": "Comma joins prevent join order optimization. Convert to explicit INNER JOIN sequence.",
+    "target_ir": "S0 [SELECT]\n  ... (CTEs unchanged) ...\n  MAIN QUERY (via Q0)\n    FROM: sb\n    INNER JOIN sc ON sb.ss_store_sk = sc.ss_store_sk\n    INNER JOIN store ON sc.ss_store_sk = store.s_store_sk\n    INNER JOIN item ON sc.ss_item_sk = item.i_item_sk\n    WHERE: sc.revenue <= 0.1 * sb.ave\n           AND store.s_state IN ('IA','IL','NC')\n           AND item.i_manager_id BETWEEN 80 AND 84\n    ORDER BY: store.s_store_name, item.i_item_desc\n    LIMIT: 100",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

@@ -1,0 +1,40 @@
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filtering",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "CTE 'inv' aggregates entire year 2002 data but main query only uses d_moy=2 and d_moy=3. Pushing month filter into CTE reduces aggregation workload.",
+    "target_ir": "S0 [SELECT]\n  CTE: inv  (via CTE_Q_S0_inv)\n    FROM: (subquery) foo\n      FROM: inventory, item, warehouse, date_dim\n      WHERE: inv_item_sk = i_item_sk AND inv_warehouse_sk = w_warehouse_sk AND inv_date_sk = d_date_sk AND d_year=2002 AND i_category IN ('Jewelry','Men') AND i_manager_id BETWEEN 81 AND 100 AND inv_quantity_on_hand BETWEEN 0 AND 200 AND d_moy IN (2,3)\n      GROUP BY: w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy\n    WHERE [ceb681f4fee117f7]: CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1\n  MAIN QUERY (via Q_S0)\n    FROM: inv inv1, inv inv2\n    WHERE [7c17a3840cbbb8b9]: inv1.i_item_sk = inv2.i_item_sk AND inv1.w_warehouse_sk = inv2.w_warehouse_sk AND inv1.d_moy=2 AND inv2.d_moy=3\n    ORDER BY: inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean,inv1.cov,inv2.d_moy,inv2.mean,inv2.cov",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "self_join_elimination",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Self-join on CTE 'inv' for consecutive months forces double materialization. Single-pass aggregation with conditional columns avoids join.",
+    "target_ir": "S0 [SELECT]\n  CTE: monthly_data  (via CTE_Q_S0_inv)\n    FROM: (subquery)\n      FROM: inventory, item, warehouse, date_dim\n      WHERE: ... (same filters) ... AND d_moy IN (2,3)\n      GROUP BY: w_warehouse_sk,i_item_sk\n    SELECT: w_warehouse_sk,i_item_sk,\n      AVG(CASE WHEN d_moy=2 THEN inv_quantity_on_hand END) AS mean_2,\n      STDDEV_SAMP(CASE WHEN d_moy=2 THEN inv_quantity_on_hand END) AS stdev_2,\n      ... (repeat for d_moy=3)\n    WHERE: (stdev_2/NULLIF(mean_2,0))>1 AND (stdev_3/NULLIF(mean_3,0))>1\n  MAIN QUERY (via Q_S0)\n    FROM: monthly_data\n    SELECT: w_warehouse_sk,i_item_sk,2,mean_2,stdev_2/NULLIF(mean_2,0),\n            w_warehouse_sk,i_item_sk,3,mean_3,stdev_3/NULLIF(mean_3,0)\n    WHERE: ... (S1 adds cov_2>1.5 here)\n    ORDER BY: w_warehouse_sk,i_item_sk,2,mean_2,...",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E",
+    "transform": "cte_materialization",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "CTE 'inv' referenced twice forces full re-execution. Materialize filtered monthly aggregates before self-join.",
+    "target_ir": "S0 [SELECT]\n  MATERIALIZED CTE: inv  (via CTE_Q_S0_inv)\n    ... (with d_moy IN (2,3) as in t1) ...\n  MAIN QUERY (via Q_S0)\n    FROM: inv inv1, inv inv2\n    ... (rest unchanged) ...",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```
+
+## Analysis
+**Family A**: HIGH - Critical month filter (d_moy) applied too late after full-year aggregation. Pushing to base tables reduces aggregation cardinality by 6x (12 months → 2 months).  
+**Family F**: HIGH - Self-join on large CTE forces double materialization scan. Single-pass conditional aggregation eliminates join.  
+**Family E**: MEDIUM - Materializing filtered CTE reduces re-computation cost for dual scans, though less impactful than structural changes.  
+**Family B/C/D**: LOW - No correlated subqueries, set operations, or pre-join aggregation opportunities.  
+
+**Chosen families**: A, F, E  
+**Confidence**: High (A/F), Medium (E) - IR structure clearly shows expensive aggregation before filtering and unnecessary self-join pattern.

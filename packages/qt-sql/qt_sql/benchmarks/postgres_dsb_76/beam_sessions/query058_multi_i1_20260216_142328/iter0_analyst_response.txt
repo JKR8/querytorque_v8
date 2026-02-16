@@ -1,0 +1,65 @@
+### Analysis of Optimization Families
+
+**A: Early Filtering (Predicate Pushback)**  
+HIGH - The date_dim subquery is repeated identically in all 3 CTEs. Pushing this filter into a shared CTE would reduce redundant computation and allow earlier row reduction.
+
+**B: Decorrelation (Sets Over Loops)**  
+MEDIUM - The date_dim subqueries are uncorrelated but executed repeatedly. While not classic correlation, decorrelation techniques can still optimize the repeated scalar subquery.
+
+**C: Aggregation Pushdown**  
+LOW - Grouping happens after joins with dimension tables (item/customer) where filters are applied. No clear opportunity to push aggregation earlier since group keys depend on joined columns.
+
+**D: Set Operation Optimization**  
+LOW - The main query uses revenue comparisons rather than set operations. No INTERSECT/UNION patterns exist.
+
+**E: Materialization/Prefetch**  
+HIGH - The date_dim subquery for month_seq is executed 9 times (3 CTEs × 3 scans each). Materializing this would prevent repeated computation.
+
+**F: Join Transform**  
+MEDIUM - Implicit comma joins in CTEs prevent optimal join ordering. Converting to explicit JOINs could improve predicate pushdown.
+
+**Chosen families**: [A, E, B, F]  
+**Confidence**: High
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "E",
+    "transform": "date_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Repeated date_dim subquery for month_seq causes 9 full scans. Materializing this scalar first eliminates redundant work.",
+    "target_ir": "S0 [SELECT]\n  CTE: month_seq  (via Q_month_seq)\n    FROM: date_dim\n    WHERE: d_date = '1998-05-19'\n  CTE: date_filter  (via Q_date_filter)\n    FROM: date_dim\n    WHERE: d_month_seq = (SELECT d_month_seq FROM month_seq)\n  CTE: ss_items  (via CTE_Q_S0_ss_items)\n    FROM: store_sales, item, customer, date_filter\n    WHERE: ss_item_sk = i_item_sk\n      AND ss_sold_date_sk = date_filter.d_date_sk\n      AND ... [other conditions]\n    GROUP BY: i_item_id, c_birth_year\n  ... [cs_items/ws_items similarly reference date_filter]",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "predicate_push_into_cte",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Date filter applied late in CTEs after large joins. Pushing date_filter join earlier reduces intermediate rows.",
+    "target_ir": "S0 [SELECT]\n  ... [month_seq and date_filter same as t1]\n  CTE: ss_items  (via CTE_Q_S0_ss_items)\n    FROM: store_sales\n    JOIN date_filter ON ss_sold_date_sk = date_filter.d_date_sk\n    JOIN item ON ss_item_sk = i_item_sk\n    JOIN customer ON ss_customer_sk = c_customer_sk\n    WHERE: ... [conditions on item/customer]\n    GROUP BY: i_item_id, c_birth_year",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_date_subquery",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Scalar subquery for d_month_seq re-executed per row in date scans. Decorrelation via CTE avoids per-row recomputation.",
+    "target_ir": "S0 [SELECT]\n  CTE: month_seq  (via Q_month_seq)\n    FROM: date_dim\n    WHERE: d_date = '1998-05-19'\n  CTE: ss_items  (via CTE_Q_S0_ss_items)\n    FROM: store_sales, item, customer\n    JOIN date_dim ON ss_sold_date_sk = d_date_sk\n    WHERE: d_month_seq = (SELECT d_month_seq FROM month_seq)\n      AND ... [other conditions]\n    GROUP BY: i_item_id, c_birth_year\n  ... [cs_items/ws_items use same month_seq]",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_syntax",
+    "target_id": "t4",
+    "relevance_score": 0.65,
+    "hypothesis": "Implicit joins prevent optimal join ordering. Explicit syntax enables better predicate pushdown to sales tables.",
+    "target_ir": "S0 [SELECT]\n  ... [existing CTEs]\n  CTE: ss_items  (via CTE_Q_S0_ss_items)\n    FROM: store_sales\n    INNER JOIN item ON ss_item_sk = i_item_sk\n    INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk\n    INNER JOIN customer ON ss_customer_sk = c_customer_sk\n    WHERE: ... [conditions]\n    GROUP BY: i_item_id, c_birth_year",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

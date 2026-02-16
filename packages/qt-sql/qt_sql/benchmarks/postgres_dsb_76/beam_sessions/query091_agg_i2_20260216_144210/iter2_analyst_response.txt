@@ -1,0 +1,138 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches in the last round failed with the same semantic error: `cd_marital_status` was not available in the GROUP BY clause. This occurred because the CTE-based rewrite (`prefetch_dims_fixed_columns`) didn’t propagate `customer_demographics` columns to the outer query. Since no patches succeeded, we analyze the **original plan**:  
+
+**Primary Bottleneck**:  
+The `Seq Scan on catalog_returns` (719,420 rows, 48.723 ms) feeds into expensive `Hash Join` and `Nested Loop` operators. The largest cost driver is processing 719k fact rows before applying dimension filters.  
+
+**Expensive Operators**:  
+1. `Nested Loop (rows=10409, time=132.566)` – Processes 10k+ rows due to late filtering of `customer`/`household_demographics`.  
+2. `Hash Join (rows=10720, time=76.772)` – Joins unfiltered `catalog_returns` with `date_dim`/`call_center`.  
+
+**Why Family E (Materialization) Failed**:  
+The patch tried to pre-filter dimensions but omitted `cd_marital_status`/`cd_education_status` from the final GROUP BY scope. Structural intent was sound (early filtering), but implementation violated SQL scoping rules.  
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Original query (no successful patches).  
+**Primary Target**: Reduce rows fed into the `Seq Scan on catalog_returns` (719k rows) and subsequent `Hash Join`.  
+
+#### Target 1: Early Filtering + Aggregation Pushdown (A+C)  
+**Hypothesis**: Pre-filter `date_dim` and `call_center` (Family A) to reduce `catalog_returns` rows early. Then push aggregation to `catalog_returns` *before* joining dimensions (Family C), since final GROUP BY keys include join keys (`cc_call_center_sk`).  
+**Target IR**:  
+- `S0` + `1320388869737ae6` (main WHERE clause)  
+**Mechanism**:  
+```sql
+WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_year=2001 AND d_moy=12),
+     filtered_cc AS (SELECT cc_call_center_sk, cc_call_center_id, cc_name, cc_manager 
+                     FROM call_center),
+     pre_agg_returns AS (
+         SELECT cr_call_center_sk, cr_returning_customer_sk, SUM(cr_net_loss) AS sum_loss
+         FROM catalog_returns
+         JOIN filtered_dates ON cr_returned_date_sk = d_date_sk
+         JOIN filtered_cc ON cr_call_center_sk = cc_call_center_sk
+         GROUP BY 1, 2  -- Keys ⊇ join keys for later dimensions
+     )
+-- Then join pre_agg_returns with filtered dimensions...
+```  
+**Why**: Targets `Seq Scan on catalog_returns` (719k rows → ~10k after date/cc filters) and avoids repeating `cr_net_loss` summation in later joins.  
+**Examples**: `pg_date_cte_explicit_join` (A) + `pg_materialized_dimension_fact_prefilter` (C).  
+
+#### Target 2: Rescue Materialization (E) with Fixed Columns  
+**Hypothesis**: Fix Family E’s error by propagating `cd_marital_status`/`cd_education_status` through CTEs to the outer GROUP BY.  
+**Target IR**: `S0` (replace entire FROM clause)  
+**Mechanism**:  
+```sql
+WITH filtered_dims AS (
+    SELECT cd_demo_sk, hd_demo_sk, ca_address_sk, 
+           cd_marital_status, cd_education_status  -- CRITICAL: Include these
+    FROM customer_demographics, household_demographics, customer_address
+    WHERE (cd_marital_status='M' AND cd_education_status='Unknown')
+       OR (cd_marital_status='W' AND cd_education_status='Advanced Degree')
+      AND hd_buy_potential LIKE '>10000%'
+      AND ca_gmt_offset=-6
+),
+... -- Rest of Family E’s CTEs, ensuring columns reach outer query
+```  
+**Why**: Directly reduces nested loops on dimensions (`Index Scan on household_demographics`, `customer_demographics` in original plan) by pre-filtering.  
+**Examples**: `multi_dimension_prefetch` (E).  
+
+#### Target 3: Join Reordering + Explicit Joins (F)  
+**Hypothesis**: Convert comma joins to explicit `INNER JOIN` and reorder to prioritize highly filtered tables (`date_dim`, `call_center`) first.  
+**Target IR**: `1320388869737ae6` (WHERE clause)  
+**Mechanism**:  
+```sql
+FROM catalog_returns
+INNER JOIN date_dim ON cr_returned_date_sk = d_date_sk AND d_year=2001 AND d_moy=12
+INNER JOIN call_center ON cr_call_center_sk = cc_call_center_sk
+INNER JOIN customer ON cr_returning_customer_sk = c_customer_sk
+... -- Then join other dimensions
+```  
+**Why**: Forces optimizer to process `date_dim` (31 rows) and `call_center` (24 rows) *before* larger tables, reducing input to `Hash Join`.  
+**Examples**: `pg_explicit_join_materialized` (F).  
+
+#### Target 4: Aggregation Pushdown Only (C)  
+**Hypothesis**: Push aggregation to `catalog_returns` immediately after joining with `date_dim`/`call_center`, skipping late-stage dimensions until after aggregation.  
+**Target IR**: `S0` (GROUP BY clause)  
+**Mechanism**:  
+```sql
+SELECT cc_call_center_id, cc_name, cc_manager, 
+       SUM(sub.sum_loss) AS Returns_Loss  -- Sum pre-aggregated losses
+FROM (
+    SELECT cc_call_center_id, cc_name, cc_manager, cr_returning_customer_sk,
+           SUM(cr_net_loss) AS sum_loss  -- Pre-aggregate
+    FROM catalog_returns, date_dim, call_center
+    WHERE cr_returned_date_sk = d_date_sk 
+      AND cr_call_center_sk = cc_call_center_sk
+      AND d_year=2001 AND d_moy=12
+    GROUP BY 1,2,3,4
+) sub
+JOIN customer ON sub.cr_returning_customer_sk = c_customer_sk
+... -- Then join other dimensions
+```  
+**Why**: Reduces rows *before* expensive `Nested Loop` with `customer` (10k rows → ~157 after aggregation).  
+**Examples**: `pg_materialized_dimension_fact_prefilter` (C).  
+
+---
+
+### Final Target JSON  
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_and_agg_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-filter date_dim/call_center to shrink catalog_returns scan, then aggregate early to reduce rows fed into nested loops (10409 rows, 132ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_dims_with_propagated_columns",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix failed patch: propagate cd_marital_status/education_status to outer query to enable GROUP BY while pre-filtering dimensions (eliminates Index Scans on household_demographics/customer_demographics).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_reordering",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Force join order: process filtered date_dim (31 rows) and call_center (24 rows) before catalog_returns to reduce Hash Join input (719k rows, 48ms).",
+    "target_ir": "1320388869737ae6",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown_after_fact_joins",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Aggregate catalog_returns after joining with date_dim/call_center to shrink Nested Loop input (10409 rows → ~157 rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

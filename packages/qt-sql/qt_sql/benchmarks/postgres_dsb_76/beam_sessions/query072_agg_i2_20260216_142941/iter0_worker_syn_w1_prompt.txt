@@ -1,0 +1,158 @@
+## Role
+
+You are **W1 "Reducer"** — Cardinality reduction — WHERE filters, set operations, early pruning. Reduce row counts early: push predicates into CTEs, convert set operations to EXISTS/NOT EXISTS, apply early filtering before expensive joins.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: A — early_filter
+**Hypothesis**: Synthetic target for Reducer: Cardinality reduction — WHERE filters, set operations, early pruning. Apply early_filter patterns to the query.
+
+## Original SQL
+
+```sql
+select  i_item_desc
+      ,w_warehouse_name
+      ,d1.d_week_seq
+      ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+      ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+      ,count(*) total_cnt
+from catalog_sales
+join inventory on (cs_item_sk = inv_item_sk)
+join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+join item on (i_item_sk = cs_item_sk)
+join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+left outer join promotion on (cs_promo_sk=p_promo_sk)
+left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and d3.d_date > d1.d_date + interval '3 day'
+  and hd_buy_potential = '>10000'
+  and d1.d_year = 1999
+  and cd_marital_status = 'S'
+  and cd_dep_count between 9 and 11
+  and i_category IN ('Men', 'Shoes', 'Sports')
+  and cs_wholesale_cost BETWEEN 76 AND 96
+group by i_item_desc,w_warehouse_name,d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: catalog_sales, inventory, warehouse, item, customer_demographics, household_demographics, date_dim d1, date_dim d2, date_dim d3, promotion, catalog_returns
+    WHERE [ece830e47c29a467]: d1.d_week_seq = d2.d_week_seq AND inv_quantity_on_hand < cs_quantity AND d3.d_date > d1.d_date + ...
+    GROUP BY: i_item_desc, w_warehouse_name, d1.d_week_seq
+    ORDER BY: total_cnt, i_item_desc, w_warehouse_name, d_week_seq
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  CTE: filtered_item (via Q1)
+    FROM: item
+    WHERE: i_category IN ('Men','Shoes','Sports')
+  CTE: filtered_cd (via Q2)
+    FROM: customer_demographics
+    WHERE: cd_marital_status='S' AND cd_dep_count BETWEEN 9 AND 11
+  CTE: filtered_hd (via Q3)
+    FROM: household_demographics
+    WHERE: hd_buy_potential='>10000'
+  MAIN QUERY (via Q0)
+    FROM: catalog_sales
+    JOIN inventory ON (cs_item_sk=inv_item_sk)
+    JOIN warehouse ON (inv_warehouse_sk=w_warehouse_sk)
+    JOIN filtered_item ON (i_item_sk=cs_item_sk)
+    JOIN filtered_cd ON (cs_bill_cdemo_sk=cd_demo_sk)
+    JOIN filtered_hd ON (cs_bill_hdemo_sk=hd_demo_sk)
+    ... [rest unchanged]
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_date_cte_explicit_join",
+  "dialect": "postgres",
+  "description": "Isolate a selective date_dim filter into a CTE AND convert all comma-separated joins to explicit JOIN syntax. The combination is key on PostgreSQL - the CTE alone can hurt, but CTE + explicit JOINs together enable better hash join planning with a tiny probe table.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_dates",
+        "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1193 + 23"
+      },
+      "description": "Insert CTE 'filtered_dates' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "c20744375cf92d6b"
+      },
+      "payload": {
+        "expr_sql": "cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5"
+      },
+      "description": "Replace WHERE predicate with optimized version"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

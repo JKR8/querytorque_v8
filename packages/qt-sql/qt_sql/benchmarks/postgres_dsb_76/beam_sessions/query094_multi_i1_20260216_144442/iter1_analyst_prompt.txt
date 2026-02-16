@@ -1,0 +1,308 @@
+## Role
+
+You are a SQL optimization analyst reviewing benchmark results. Analyze what worked, what failed, and design refined targets for the next round of workers.
+
+Identify the primary bottleneck. Only provide secondary targets if they are distinct and high-confidence. Quality > Quantity.
+
+You will see the original query, execution plan, IR structure, and detailed results from previous rounds.
+
+## Query: query094_multi_i1
+
+**Dialect**: POSTGRES
+
+```sql
+select 
+   count(distinct ws_order_number) as "order count"
+  ,sum(ws_ext_ship_cost) as "total shipping cost"
+  ,sum(ws_net_profit) as "total net profit"
+from
+   web_sales ws1
+  ,date_dim
+  ,customer_address
+  ,web_site
+where
+    d_date between '2002-9-01' and
+           cast('2002-9-01' as date) + interval '60 day'
+and ws1.ws_ship_date_sk = d_date_sk
+and ws1.ws_ship_addr_sk = ca_address_sk
+and ca_state in ('CA','MI','OH'
+            ,'SD' ,'TX' ,'VA')
+and ws1.ws_web_site_sk = web_site_sk
+and web_gmt_offset >= -5
+and ws1.ws_list_price between 237 and 266
+and exists (select *
+            from web_sales ws2
+            where ws1.ws_order_number = ws2.ws_order_number
+              and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+and not exists(select *
+               from web_returns wr1
+               where ws1.ws_order_number = wr1.wr_order_number
+               and wr1.wr_reason_sk in (7, 25, 26, 52, 69)
+               )
+order by count(distinct ws_order_number)
+limit 100;
+```
+
+
+## Current Execution Plan
+
+```
+Limit  (rows=1, time=390.36)
+  Sort  (rows=1, time=390.358)
+    Aggregate  (rows=1, time=390.334)
+      Nested Loop  (rows=753, time=389.678)
+        Nested Loop  (rows=753, time=293.95)
+          Gather  (rows=944, time=292.385)
+            Nested Loop  (rows=472, time=237.856)
+              Hash Join  (rows=2140, time=221.796)
+                Nested Loop  (rows=2532, time=130.779)
+                  Seq Scan on date_dim  (rows=30, time=3.551)
+                  Index Scan on web_sales (ws1)  (rows=83, time=4.155)
+                Hash  (rows=50992, time=88.44)
+                  Seq Scan on web_returns (wr1)  (rows=50992, time=77.957)
+              Index Scan on customer_address  (rows=0, time=0.007)
+          Materialize  (rows=19, time=0.001)
+            Seq Scan on web_site  (rows=22, time=0.024)
+        Index Only Scan on web_sales (ws2)  (rows=1, time=0.126)
+```
+
+
+## IR Structure (for patch targeting)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: web_sales ws1, date_dim, customer_address, web_site
+    WHERE [74c14ff27ffaa6c7]: d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY' AND ws1.ws_ship_date...
+    ORDER BY: COUNT(DISTINCT ws_order_number)
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
+
+
+## Optimization Families
+
+Review the 6 families below. Each has a proven gold example.
+
+Choose up to **4 most relevant families** for this query based on:
+- Query structure (CTEs, subqueries, joins, aggregations, set operations)
+- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)
+- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
+
+
+
+### Family A: Early Filtering (Predicate Pushback)
+**Description**: Push small filters into CTEs early, reduce row count before expensive operations
+**Speedup Range**: 1.3–4.0x (~35% of all wins)
+**Use When**:
+  1. Late WHERE filters on dimension tables
+  2. Cascading CTEs with filters applied downstream
+  3. Expensive joins after filters could be pushed earlier
+
+**Gold Example**: `pg_date_cte_explicit_join` (2.28x)
+
+
+
+### Family B: Decorrelation (Sets Over Loops)
+**Description**: Convert correlated subqueries to standalone CTEs with GROUP BY, eliminate per-row re-execution
+**Speedup Range**: 2.4–2.9x (~15% of all wins)
+**Use When**:
+  1. Correlated subqueries in WHERE clause
+  2. Scalar aggregates computed per outer row
+  3. DELIM_SCAN in execution plan (indicates correlation)
+
+**Gold Example**: `pg_shared_scan_decorrelate` (8043.91x (timeout rescue))
+
+
+
+### Family C: Aggregation Pushdown (Minimize Rows Touched)
+**Description**: Aggregate before expensive joins when GROUP BY keys ⊇ join keys, reduce intermediate sizes
+**Speedup Range**: 1.3–15.3x (~5% of all wins (high variance))
+**Use When**:
+  1. GROUP BY happens after large joins
+  2. GROUP BY keys are subset of join keys
+  3. Intermediate result size >> final result size
+
+**Gold Example**: `pg_materialized_dimension_fact_prefilter` (12.07x (V2 DSB SF10, was 2.68x in V1))
+
+
+
+### Family D: Set Operation Optimization (Sets Over Loops)
+**Description**: Replace INTERSECT/UNION-based patterns with EXISTS/NOT EXISTS, avoid full materialization
+**Speedup Range**: 1.7–2.7x (~8% of all wins)
+**Use When**:
+  1. INTERSECT patterns between large sets
+  2. UNION ALL with duplicate elimination
+  3. Set operations materializing full intermediate results
+
+**Gold Example**: `pg_intersect_to_exists` (1.78x)
+
+
+
+### Family E: Materialization / Prefetch (Don't Repeat Work)
+**Description**: Extract repeated scans or pre-compute intermediate results for reuse across multiple consumers
+**Speedup Range**: 1.3–6.2x (~18% of all wins)
+**Use When**:
+  1. Repeated scans of same table with different filters
+  2. Dimension filters applied independently multiple times
+  3. CTE referenced multiple times with implicit re-evaluation
+
+**Gold Example**: `multi_dimension_prefetch` (2.71x)
+
+
+
+### Family F: Join Transform (Right Shape First)
+**Description**: Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation
+**Speedup Range**: 1.8–8.6x (~19% of all wins)
+**Use When**:
+  1. Comma-separated joins (implicit cross joins) in FROM clause
+  2. Self-joins scanning same table multiple times
+  3. Dimension-fact join order suboptimal for predicate pushdown
+
+**Gold Example**: `pg_explicit_join_materialized` (8.56x)
+
+
+
+## Optimization History
+
+### History — All Prior Patches
+
+| Iter | Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Error (summary) |
+|------|-------|--------|-----------|---------|--------|---------|----------|-----------------|
+| 0 | t1 | B | exists_to_join | — | FAIL | — | — | Equivalence execution error: column refe |
+| 0 | t2 | F+E | explicit_join_restructure+prefiltered_sales_cte | — | FAIL | — | — | Equivalence execution error: current tra |
+| 0 | syn_w1 | A | early_filter | — | FAIL | — | — | Equivalence execution error: current tra |
+| 0 | syn_w2 | B | decorrelate | — | FAIL | — | — | Equivalence execution error: current tra |
+
+
+
+### Latest Iteration 0 — Detailed Results
+
+#### Race Results
+
+| Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Semantic | Error |
+|-------|--------|-----------|---------|--------|---------|----------|----------|-------|
+| t1 | B | exists_to_join | — | FAIL | — | — | FAIL | Equivalence execution error: column reference "ws_order_number" is ambiguous
+LIN |
+| t2 | F+E | explicit_join_restructure+prefiltered_sales_cte | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| syn_w1 | A | early_filter | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| syn_w2 | B | decorrelate | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+
+#### Patched SQL
+
+**t1 (Family B, exists_to_join):**
+```sql
+WITH multi_warehouse_orders AS (SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1) SELECT COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit" FROM web_sales AS ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site_sk INNER JOIN multi_warehouse_orders AS mwo ON ws1.ws_order_number = mwo.ws_order_number WHERE d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY' AND ca_state IN ('CA', 'MI', 'OH', 'SD', 'TX', 'VA') AND web_gmt_offset >= -5 AND ws1.ws_list_price BETWEEN 237 AND 266 AND NOT EXISTS(SELECT * FROM web_returns AS wr1 WHERE ws1.ws_order_number = wr1.wr_order_number AND wr1.wr_reason_sk IN (7, 25, 26, 52, 69)) ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100;
+```
+
+**t2 (Family F+E, explicit_join_restructure+prefiltered_sales_cte):**
+```sql
+WITH filtered_sales AS (SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk FROM web_sales AS ws INNER JOIN date_dim ON ws_ship_date_sk = d_date_sk INNER JOIN customer_address ON ws_ship_addr_sk = ca_address_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk WHERE d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY' AND ca_state IN ('CA', 'MI', 'OH', 'SD', 'TX', 'VA') AND web_gmt_offset >= -5 AND ws_list_price BETWEEN 237 AND 266) SELECT COUNT(DISTINCT fs1.ws_order_number) AS "order count", SUM(fs1.ws_ext_ship_cost) AS "total shipping cost", SUM(fs1.ws_net_profit) AS "total net profit" FROM filtered_sales AS fs1 WHERE EXISTS(SELECT 1 FROM filtered_sales AS fs2 WHERE fs1.ws_order_number = fs2.ws_order_number AND fs1.ws_warehouse_sk <> fs2.ws_warehouse_sk) AND NOT EXISTS(SELECT 1 FROM web_returns AS wr1 WHERE fs1.ws_order_number = wr1.wr_order_number AND wr1.wr_reason_sk IN (7, 25, 26, 52, 69)) ORDER BY COUNT(DISTINCT fs1.ws_order_number) LIMIT 100;
+```
+
+**syn_w1 (Family A, early_filter):**
+```sql
+WITH multi_warehouse_orders AS (SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1) SELECT COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit" FROM web_sales AS ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site_sk INNER JOIN multi_warehouse_orders AS mwo ON ws1.ws_order_number = mwo.ws_order_number WHERE d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY' AND ca_state IN ('CA', 'MI', 'OH', 'SD', 'TX', 'VA') AND web_gmt_offset >= -5 AND ws1.ws_list_price BETWEEN 237 AND 266 AND NOT EXISTS(SELECT * FROM web_returns AS wr1 WHERE ws1.ws_order_number = wr1.wr_order_number AND wr1.wr_reason_sk IN (7, 25, 26, 52, 69)) ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100;
+```
+
+**syn_w2 (Family B, decorrelate):**
+```sql
+WITH multi_warehouse_orders AS (SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1) SELECT COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit" FROM web_sales AS ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site_sk INNER JOIN multi_warehouse_orders AS mwo ON ws1.ws_order_number = mwo.ws_order_number WHERE d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY' AND ca_state IN ('CA', 'MI', 'OH', 'SD', 'TX', 'VA') AND web_gmt_offset >= -5 AND ws1.ws_list_price BETWEEN 237 AND 266 AND NOT EXISTS(SELECT * FROM web_returns AS wr1 WHERE ws1.ws_order_number = wr1.wr_order_number AND wr1.wr_reason_sk IN (7, 25, 26, 52, 69)) ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100;
+```
+
+#### Execution Plans
+
+**Original EXPLAIN:**
+```
+Limit  (rows=1, time=390.36)
+  Sort  (rows=1, time=390.358)
+    Aggregate  (rows=1, time=390.334)
+      Nested Loop  (rows=753, time=389.678)
+        Nested Loop  (rows=753, time=293.95)
+          Gather  (rows=944, time=292.385)
+            Nested Loop  (rows=472, time=237.856)
+              Hash Join  (rows=2140, time=221.796)
+                Nested Loop  (rows=2532, time=130.779)
+                  Seq Scan on date_dim  (rows=30, time=3.551)
+                  Index Scan on web_sales (ws1)  (rows=83, time=4.155)
+                Hash  (rows=50992, time=88.44)
+                  Seq Scan on web_returns (wr1)  (rows=50992, time=77.957)
+              Index Scan on customer_address  (rows=0, time=0.007)
+          Materialize  (rows=19, time=0.001)
+            Seq Scan on web_site  (rows=22, time=0.024)
+        Index Only Scan on web_sales (ws2)  (rows=1, time=0.126)
+```
+
+#### Error Details
+
+- **t1** (FAIL): Equivalence execution error: column reference "ws_order_number" is ambiguous
+LINE 1: ...TINCT ws_warehouse_sk) > 1) SELECT COUNT(DISTINCT ws_order_n...
+                                                             ^
+
+- **t2** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **syn_w1** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **syn_w2** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+
+
+## Your Task — Snipe Round 1
+
+
+Results from latest iteration: **4 FAIL**.
+
+Follow this protocol exactly.
+
+### Step 1 — Compare EXPLAIN Plans
+
+For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.
+
+For each **WIN**, answer:
+- QUOTE the operator line(s) from the original that got cheaper or were eliminated. Give the exact operator name, time, and row count from the plan text above.
+- What structural SQL change caused that operator improvement?
+- What is the **most expensive remaining operator** in this winner's plan? QUOTE its line (name, time, rows).
+
+For each **FAIL/NEUTRAL/REGRESSION**:
+- QUOTE the operator(s) that got MORE expensive vs the original.
+- Why did the structural change backfire?
+
+Then classify winners as REDUNDANT (same core structural change, same operators improved) or COMPLEMENTARY (different operators improved, different structural changes).
+
+### Step 2 — Design Targets by Combining Strategies
+
+Start from the **best winner's SQL** as your baseline.
+
+**CRITICAL**: Do NOT invent new hypotheses about row counts or selectivity. Every claim about rows, times, or costs MUST be a direct quote from an EXPLAIN plan above. If a number is not in the plans, you do not know it.
+
+**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites (UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce identical plans. Focus on changes that **eliminate operators** or **reduce input rows to expensive operators** as shown in the plans.
+
+Design up to 4 targets, prioritized:
+
+1. **Combination** (primary if complementary winners exist): Take the best winner's SQL. Layer on the structural change from a complementary winner that addresses a DIFFERENT expensive operator. Cite both operators by name from the EXPLAIN plans.
+2. **Refinement**: Take the best winner's SQL. Target its most expensive remaining operator (quoted in Step 1). Design a structural change that reduces input rows to that operator. CITE the operator and its current row count from the plan.
+3. **Rescue** (if a failed patch had a sound structural idea): Fix the implementation while preserving the best winner's gains.
+4. **Novel**: A new structural approach that targets the most expensive remaining operator. Cite the operator from the plan.
+
+**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F"). The worker will receive gold examples from ALL referenced families.
+
+Output up to 4 targets. Same JSON format:
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "...",
+    "target_ir": "...",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  }
+]
+```
+
+Output up to 4 targets. Fewer strong targets beat padding with weak ones.

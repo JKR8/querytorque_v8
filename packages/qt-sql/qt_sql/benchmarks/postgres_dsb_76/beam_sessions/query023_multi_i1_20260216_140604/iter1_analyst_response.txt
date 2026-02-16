@@ -1,0 +1,128 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (NEUTRAL) Analysis**  
+- **Original expensive operator improved**:  
+  `CTE Scan (best_ss_customer) (rows=24387, time=4168.67 ms)` → `CTE Scan (best_ss_customer) (rows=24387, time=1167.42 ms)`  
+  **Change**: Materialization reduced recomputation cost.  
+  **Cause**: CTE materialization avoided redundant re-scans.  
+- **Most expensive remaining operator**:  
+  `CTE Scan (best_ss_customer) (rows=24387, time=1167.42 ms)`  
+  **Why still expensive**: High row count (24K) hashed in main query joins.  
+
+**FAILED Patches Analysis**  
+- **t2 (FAIL)**: Literal mismatch broke predicate pushdown.  
+- **t4 (FAIL)**: IR targeting error prevented aggregation pushdown.  
+- **t3 (FAIL)**: Syntax error disrupted join reordering.  
+
+**Classification**:  
+- t1 is **COMPLEMENTARY** to other families (e.g., A, B, F) since it targets CTE reuse, while others optimize computation within CTEs.
+
+---
+
+### Step 2 — Design Targets
+
+#### **Target 1: Combination (F + E)**  
+Addresses `best_ss_customer` CTE's nested loop (2633 ms) and leverages t1’s materialization gains.  
+```json
+{
+  "family": "F+E",
+  "transform": "explicit_join_then_materialize",
+  "target_id": "CTE_Q_S0_best_ss_customer",
+  "relevance_score": 0.95,
+  "hypothesis": "Restructure best_ss_customer with explicit JOINs to replace nested loops (2633 ms) with hash joins, then materialize for reuse in main query. Targets 24K-row scan.",
+  "target_ir": "CTE_Q_S0_best_ss_customer",
+  "recommended_examples": ["pg_explicit_join_materialized", "multi_dimension_prefetch"]
+}
+```
+
+#### **Target 2: Refinement (A)**  
+Reduces input rows to `frequent_ss_items` CTE (452K-row nested loop, 525 ms).  
+```json
+{
+  "family": "A",
+  "transform": "push_item_filters_early",
+  "target_id": "89fc2fb260a938e8",  // WHERE anchor for frequent_ss_items
+  "relevance_score": 0.85,
+  "hypothesis": "Push i_manager_id and i_category filters into item scan (6872 rows → 3436 rows) to shrink nested loop input. Targets 452K-row operator.",
+  "target_ir": "89fc2fb260a938e8",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+#### **Target 3: Rescue (C)**  
+Fixes t4’s preaggregation failure for `max_store_sales` CTE (135K-row sort, 2770 ms).  
+```json
+{
+  "family": "C",
+  "transform": "preaggregate_store_sales",
+  "target_id": "CTE_Q_S0_max_store_sales",
+  "relevance_score": 0.8,
+  "hypothesis": "Aggregate store_sales by c_customer_sk *before* joining customer and date_dim to reduce sort input from 135K rows.",
+  "target_ir": "CTE_Q_S0_max_store_sales",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+#### **Target 4: Novel (B)**  
+Converts scalar subquery in `best_ss_customer` to a cross join to avoid repeated access.  
+```json
+{
+  "family": "B",
+  "transform": "decorrelate_scalar_subquery",
+  "target_id": "CTE_Q_S0_best_ss_customer",
+  "relevance_score": 0.75,
+  "hypothesis": "Replace scalar subquery (SELECT * FROM max_store_sales) with a cross join to compute threshold once, avoiding per-group re-access.",
+  "target_ir": "CTE_Q_S0_best_ss_customer",
+  "recommended_examples": ["pg_shared_scan_decorrelate"]
+}
+```
+
+### Key Rationale
+1. **Primary bottleneck**: `best_ss_customer` CTE (24K rows, 4168 ms) due to nested loops and scalar subquery.  
+2. **Complementarity**:  
+   - Target 1 combines F (join restructuring) and E (materialization) to attack the CTE’s plan shape and reuse.  
+   - Target 2 (A) and Target 3 (C) address upstream operators feeding into CTEs.  
+3. **Rescue**: Target 3 fixes t4’s aggregation pushdown using IR anchors.  
+4. **Novel**: Target 4 eliminates scalar subquery overhead via decorrelation.  
+
+**Output**:  
+```json
+[
+  {
+    "family": "F+E",
+    "transform": "explicit_join_then_materialize",
+    "target_id": "CTE_Q_S0_best_ss_customer",
+    "relevance_score": 0.95,
+    "hypothesis": "Restructure best_ss_customer with explicit JOINs to replace nested loops (2633 ms) with hash joins, then materialize for reuse in main query. Targets 24K-row scan.",
+    "target_ir": "CTE_Q_S0_best_ss_customer",
+    "recommended_examples": ["pg_explicit_join_materialized", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "push_item_filters_early",
+    "target_id": "89fc2fb260a938e8",
+    "relevance_score": 0.85,
+    "hypothesis": "Push i_manager_id and i_category filters into item scan (6872 rows → 3436 rows) to shrink nested loop input. Targets 452K-row operator.",
+    "target_ir": "89fc2fb260a938e8",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_store_sales",
+    "target_id": "CTE_Q_S0_max_store_sales",
+    "relevance_score": 0.8,
+    "hypothesis": "Aggregate store_sales by c_customer_sk *before* joining customer and date_dim to reduce sort input from 135K rows.",
+    "target_ir": "CTE_Q_S0_max_store_sales",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_scalar_subquery",
+    "target_id": "CTE_Q_S0_best_ss_customer",
+    "relevance_score": 0.75,
+    "hypothesis": "Replace scalar subquery (SELECT * FROM max_store_sales) with a cross join to compute threshold once, avoiding per-group re-access.",
+    "target_ir": "CTE_Q_S0_best_ss_customer",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

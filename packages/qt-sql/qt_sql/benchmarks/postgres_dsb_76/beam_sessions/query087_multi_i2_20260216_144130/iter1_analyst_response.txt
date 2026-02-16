@@ -1,0 +1,55 @@
+Based on the analysis, the primary bottleneck is the **repeated full scans of dimension tables (date_dim and customer) across three subqueries**, consuming ~50% of total execution time. This is evidenced by:
+- Three sequential scans on `date_dim` (rows=182, time=3.258ms, 2.898ms, 3.181ms)
+- Three index scans on `customer` (rows=0, time=0.005ms, 0.006ms, 0.005ms)
+- Nested loops multiplying row counts (27680 rows in store_sales path)
+
+All prior patches failed due to literal mismatch (replaced `1213+11` with 1224). The refined targets preserve literals while combining optimization families:
+
+```json
+[
+  {
+    "family": "E+D",
+    "transform": "prefetch_dimensions_and_convert_to_anti_join",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Combine dimension prefetching (E) with set operation conversion (D) to eliminate repeated dimension scans and avoid materializing large intermediate sets. Targets Seq Scan on date_dim (3x) and SetOp (rows=7948).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_intersect_to_exists"]
+  },
+  {
+    "family": "E+C",
+    "transform": "prefetch_dimensions_and_aggregate_sales",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Prefetch dimensions (E) then pre-aggregate sales tables by (customer_sk, date_sk) before joining (C). Targets Nested Loop on store_sales (rows=27680) by reducing input rows before distinct.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_dimensions_only",
+    "target_id": "t3",
+    "relevance_score": 0.8,
+    "hypothesis": "Isolated dimension prefetching to eliminate repeated scans. Directly targets Seq Scan on date_dim (3x) and Index Scan on customer (3x).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "D",
+    "transform": "convert_except_to_not_exists",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Replace EXCEPT with NOT EXISTS to avoid materializing large sets. Targets SetOp (rows=7948) and Unique (rows=6528).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  }
+]
+```
+
+**Rationale**:
+1. **E+D (t1)** is highest priority: Combines elimination of dimension scans (E) with set operation materialization (D). Both bottlenecks are independently expensive.
+2. **E+C (t2)** addresses the same dimension scans while adding aggregation pushdown to reduce rows before the expensive nested loop.
+3. **E (t3)** is a simpler rescue of the failed materialization approach, now preserving literals.
+4. **D (t4)** provides a fallback option if dimension prefetching proves problematic.
+
+**Critical Implementation Note**: All rewrites MUST preserve `1213+11` verbatim to avoid literal mismatch errors.

@@ -1,0 +1,75 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t3 (REGRESSION) vs Original:**
+- **Operator(s) that regressed**: 
+  - `Seq Scan on store_returns`: 808.719 ms (vs 616.018 ms) → +192.7 ms
+  - `Hash` on item: 31.983 ms (vs 22.779 ms) → +9.2 ms
+  - `CTE Scan (curr_yr)`: 1929.963 ms (vs 1668.688 ms) → +261.275 ms
+- **Why backfired**: The `precompute_filtered_items` transformation added a redundant CTE (`filtered_items`) that was never used. This confused the planner, increasing row counts in returns tables (e.g., `catalog_returns` from 79,462 to 119,194 rows) and bloating hash table builds.
+
+**Failed Patches (t1, t2, syn_w2)**:  
+All failed due to implementation errors in locating/replacing expressions. No plan changes observed.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop` self-join on `all_sales` (1966.84 ms, 198 rows) due to O(n²) processing of CTE scans.
+
+**Secondary Bottleneck**:  
+`Hash Join` on `store_returns` (759.088 ms, 90,761 rows) from unoptimized fact table scans.
+
+#### Targets:
+
+```json
+[
+  {
+    "family": "F",
+    "transform": "self_join_to_window",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Replace O(n²) self-join with LAG window function to compute prev_yr metrics in a single pass. Targets Nested Loop (1966.84 ms) in main query.",
+    "target_ir": "Q_S0",
+    "recommended_examples": ["pg_explicit_join_materialized", "self_join_to_window"]
+  },
+  {
+    "family": "A+E",
+    "transform": "push_returns_filter_and_precompute_items",
+    "target_id": "t2",
+    "relevance_score": 0.95,
+    "hypothesis": "Precompute filtered items (E) and push returns reason_sk filter into returns scans (A). Targets Hash Join (759.088 ms) and Seq Scan on store_returns (782,272 rows).",
+    "target_ir": "CTE_Q_S0_all_sales",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "comma_to_inner_join",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert comma join to explicit INNER JOIN + materialize CTE to hint better join order. Fallback if window transform fails.",
+    "target_ir": "Q_S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "push_ratio_filter",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Push sales_ratio filter into sales table scans. Minimalist backup for fact table reduction.",
+    "target_ir": "CTE_Q_S0_all_sales",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```
+
+### Rationale:
+1. **t1 (F: self_join_to_window)**: Highest impact. Eliminates 1966.84 ms bottleneck via window functions.  
+2. **t2 (A+E: push_returns_filter_and_precompute_items)**: Attacks 759.088 ms Hash Join by combining item precomputation (E) and early returns filtering (A).  
+3. **t3 (F: comma_to_inner_join)**: Fallback for join restructuring if window transform fails.  
+4. **t4 (A: push_ratio_filter)**: Isolated filter pushdown for fact tables if combined A+E fails.  
+
+**Why not other families**:  
+- **B** (Decorrelation): No correlated subqueries.  
+- **C** (Agg Pushdown): Group keys ≠ join keys.  
+- **D** (Set Op): UNION ALL already optimal.

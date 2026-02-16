@@ -1,0 +1,79 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Winners (t1, syn_w2, syn_w3):**
+All winners share the same core structural change: materializing the UNION ALL in a CTE (`main_sales`) and applying filters once instead of twice. This eliminated redundant scans of CTEs in the original plan.
+
+**Operator Improvements:**
+1. **Original Expensive Operator Eliminated:**  
+   `CTE Scan (best_ss_customer)  (rows=5504, time=4167.417)`  
+   **Structural Change:** Materializing `catalog_sales` and `web_sales` in `main_sales` CTE allowed a single scan of `best_ss_customer` instead of two separate scans (`best_ss_customer` and `best_ss_customer_1`).  
+   **Most Expensive Remaining Operator in Winner (t1):**  
+   `Hash  (rows=2, time=159.346)` (computing `frequent_ss_items`)
+
+**Redundancy Classification:**  
+All winners are **REDUNDANT**. They implement the same core optimization (Family E materialization) and improve the same operators (eliminate duplicate CTE scans).
+
+**Analysis of Failed Patch (t2):**  
+- **Failure Reason:** Syntax/targeting error (`No target found for replace_body step s1`). The predicate pushback idea (Family A) wasn’t structurally invalid but failed due to implementation issues.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline:** Best winner is **t1** (8.97x speedup).  
+**Primary Bottleneck:** `frequent_ss_items` computation (160 ms, 312k input rows).  
+**Secondary Target:** `best_ss_customer` CTE (not visible in winner plans but historically expensive).
+
+**Target 1 (Combination: A+C) — High-Confidence**  
+- **Hypothesis:** Pre-aggregate `store_sales` in `frequent_ss_items` *before* joining to dimension tables to reduce input rows (312k → ~46k). Apply early filtering by removing unused columns.  
+- **Target IR:** `S0:CTE_Q_S0_frequent_ss_items`  
+```json
+{
+  "family": "A+C",
+  "transform": "preagg_early_filter",
+  "target_id": "t1",
+  "relevance_score": 0.95,
+  "hypothesis": "Pre-aggregate store_sales by item/date before joining to dimensions (cuts input rows from 312k to 46k) and remove unused substring/d_date columns. Targets the most expensive operator (Hash) in t1 winner's plan.",
+  "target_ir": "S0:CTE_Q_S0_frequent_ss_items",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+}
+```
+
+**Target 2 (Refinement: C) — High-Confidence**  
+- **Hypothesis:** Pre-aggregate `store_sales` in `best_ss_customer` to reduce rows *before* joining to `customer`. Historically took 4167 ms in original plan.  
+- **Target IR:** `S0:CTE_Q_S0_best_ss_customer`  
+```json
+{
+  "family": "C",
+  "transform": "preagg_best_customer",
+  "target_id": "t2",
+  "relevance_score": 0.85,
+  "hypothesis": "Pre-aggregate store_sales by customer_sk before joining to customer. Historically took 4167 ms in original plan and is likely still expensive in winners.",
+  "target_ir": "S0:CTE_Q_S0_best_ss_customer",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+**Target 3 (Rescue: A) — Medium-Confidence**  
+- **Hypothesis:** Push `d_year=1999` into `best_ss_customer` (if logically valid) to reduce rows early. Fixes t2’s failed predicate pushback.  
+- **Target IR:** `S0:e2efc842d5bebfd9` (WHERE hash for `best_ss_customer`)  
+```json
+{
+  "family": "A",
+  "transform": "push_year_filter",
+  "target_id": "t3",
+  "relevance_score": 0.75,
+  "hypothesis": "Push d_year=1999 into best_ss_customer's WHERE clause if logically valid. Fixes t2's failed predicate pushback while preserving t1's gains.",
+  "target_ir": "S0:e2efc842d5bebfd9",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+---
+
+### Summary of Targets
+1. **A+C for `frequent_ss_items`** (pre-aggregate + early filtering)  
+2. **C for `best_ss_customer`** (pre-aggregation)  
+3. **A for `best_ss_customer`** (predicate pushback rescue)  
+
+All targets directly address bottlenecks quoted from EXPLAIN plans. No novel targets proposed since existing families cover the critical paths.

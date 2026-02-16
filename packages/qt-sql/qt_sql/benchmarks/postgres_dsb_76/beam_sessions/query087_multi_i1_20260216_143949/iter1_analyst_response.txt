@@ -1,0 +1,96 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (Family E) Regression Analysis**  
+- **Regression Cause**:  
+  - Original: `Nested Loop` with `Index Only Scan on store_sales` (time=2.929 ms)  
+  - t1: Replaced with expensive `Merge Join` + `Sort` (time=1072.199 ms)  
+  - **Why**: Materializing CTEs (`filtered_date`/`filtered_customer`) forced merge joins and sorts. The CTE scans (`rows=47,740`) became large inputs to sorts, overwhelming gains from reuse.  
+  - **Most Expensive Operator in t1**: `Sort` (time=1072.219 ms) for `store_sales` branch.  
+
+**t2 (Family D) Failure Analysis**  
+- **Failure Cause**: Syntax error (missing `d`/`c` alias scope in subqueries). Structural idea was sound but implementation flawed.  
+
+**t3 (Family C) & syn_w3 (Family E) Failures**  
+- Transaction aborts due to unresolved errors in transformations.  
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Sort` operator in `store_sales` branch (time=539.185 ms) due to large input rows from nested loops.  
+
+**Target 1: Combination (Families C+D)**  
+- **Family**: C+D  
+- **Transform**: `distinct_pushdown_then_except_to_exists`  
+- **Target ID**: `t1_comb`  
+- **Relevance**: 0.95  
+- **Hypothesis**: Push down `DISTINCT` to fact tables (C) to reduce rows *before* joins, then rewrite `EXCEPT` as `NOT EXISTS` (D) to avoid materializing full intermediate sets. Targets both `Sort` (rows↓) and `SetOp` (materialization↓).  
+- **Target IR**: `S0` (main query)  
+- **Examples**: `pg_materialized_dimension_fact_prefilter` (C), `pg_intersect_to_exists` (D)  
+
+**Target 2: Refinement (Family C)**  
+- **Family**: C  
+- **Transform**: `distinct_pushdown_corrected`  
+- **Target ID**: `t2_refine`  
+- **Relevance**: 0.90  
+- **Hypothesis**: Pre-aggregate fact tables (`store_sales`/`catalog_sales`/`web_sales`) on join keys *before* dimension joins. Reduces input to expensive `Nested Loop` (rows=0 in plan) and downstream `Sort`.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+**Target 3: Rescue (Family D)**  
+- **Family**: D  
+- **Transform**: `except_to_exists_corrected`  
+- **Target ID**: `t3_rescue`  
+- **Relevance**: 0.85  
+- **Hypothesis**: Fix scoping in `NOT EXISTS` subqueries to eliminate `SetOp` materialization. Targets `SetOp` (time=1061.88 ms) by avoiding full intermediate results.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_intersect_to_exists`  
+
+**Target 4: Novel (Family A+E)**  
+- **Family**: A+E  
+- **Transform**: `prefilter_dimensions_materialize`  
+- **Target ID**: `t4_novel`  
+- **Relevance**: 0.80  
+- **Hypothesis**: Pre-filter small dimensions (`date_dim`/`customer`) *and* materialize them (E) but force nested loops (not merge joins). Targets `Seq Scan on date_dim` (rows=182) reused 3x.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_date_cte_explicit_join` (A), `multi_dimension_prefetch` (E)  
+
+```json
+[
+  {
+    "family": "C+D",
+    "transform": "distinct_pushdown_then_except_to_exists",
+    "target_id": "t1_comb",
+    "relevance_score": 0.95,
+    "hypothesis": "Reduce fact table rows via DISTINCT pushdown before joins (C) and avoid materializing EXCEPT intermediates via NOT EXISTS rewrite (D). Targets expensive Sort (539 ms) and SetOp (1061 ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_intersect_to_exists"]
+  },
+  {
+    "family": "C",
+    "transform": "distinct_pushdown_corrected",
+    "target_id": "t2_refine",
+    "relevance_score": 0.90,
+    "hypothesis": "Pre-aggregate fact tables on join keys to reduce input rows to Nested Loop (0-row scan in plan) and downstream Sort operators.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "D",
+    "transform": "except_to_exists_corrected",
+    "target_id": "t3_rescue",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix scoping in NOT EXISTS subqueries to eliminate SetOp materialization (1061 ms) while preserving semantics.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "A+E",
+    "transform": "prefilter_dimensions_materialize",
+    "target_id": "t4_novel",
+    "relevance_score": 0.80,
+    "hypothesis": "Prefilter and reuse small dimensions (date_dim rows=182) via nested loops (not merge joins) to avoid sort backfire.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  }
+]
+```

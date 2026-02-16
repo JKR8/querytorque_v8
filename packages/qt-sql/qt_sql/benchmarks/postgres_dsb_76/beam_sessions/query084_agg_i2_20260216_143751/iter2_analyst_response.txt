@@ -1,0 +1,60 @@
+Based on the analysis of the query, execution plan, and failed optimizations, here's the refined strategy:
+
+### Step 1: Plan Comparison & Bottleneck Analysis
+**Primary Bottleneck**: Full sequential scan on `customer` (250K rows, 22.8ms) followed by hash join. All patches failed due to implementation errors, but structural analysis shows:
+- Original plan wastes 22.8ms scanning irrelevant `customer` rows
+- Failed patches attempted early filtering but introduced scope/column reference errors
+- Most expensive operator remains: `Seq Scan on customer (rows=250000, time=22.844)`
+
+### Step 2: Target Design (Prioritized)
+
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filter_fixed",
+    "target_id": "S0",
+    "relevance_score": 0.98,
+    "hypothesis": "Pre-filter customer_address and income_band in CTEs to reduce customer scan rows. Anchor: WHERE clause hash 902641332ecd3fb0. Original scan shows 250K customer rows, but only 148 relevant addresses exist. Should eliminate 99.9% of customer scan.",
+    "target_ir": "S0:902641332ecd3fb0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_customer_demographics",
+    "target_id": "S0",
+    "relevance_score": 0.85,
+    "hypothesis": "Materialize customer-demographics join early to avoid repeated index scans (5 rows/loop * 57 loops = 285 scans). Original Index Only Scan on store_returns takes 0.381ms/row.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A+E",
+    "transform": "combined_early_filter_prefetch",
+    "target_id": "t1_rescue",
+    "relevance_score": 0.92,
+    "hypothesis": "Combine CTE pre-filtering with materialized customer-demographics join. Fixes t1's column reference error while targeting both customer scan (250K rows) and store_returns index scans (285 loops).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  }
+]
+```
+
+### Rationale
+1. **Primary Target (A)**: Directly attacks the 250K-row customer scan by pushing `customer_address` filter into CTE. Fixes previous syntax errors by maintaining column scope integrity.
+2. **Secondary Target (E)**: Addresses the nested loop penalty (57 loops * 5 rows) on `store_returns` by pre-joining demographics.
+3. **Combo Rescue (A+E)**: Combines both approaches using t1's structural foundation while fixing its column reference error. High confidence from complementary operator targeting.
+
+### Key Evidence from Plan
+- `Seq Scan on customer (rows=250000, time=22.844)` is 30% of total time
+- `Index Only Scan on store_returns (rows=5, time=0.381)` scales with outer loop (57 iterations)
+- `customer_address` scan reduces to 148 rows when filtered early
+
+### Optimization Families Selected
+| Family | Relevance | Why |
+|--------|-----------|-----|
+| A      | ★★★★☆     | Solves 250K-row customer scan |
+| E      | ★★★☆☆     | Reduces 57-loop index scan penalty |
+| A+E    | ★★★★☆     | Combines row reduction + loop elimination |
+
+**Why not others**: No aggregations (C), no set ops (D), no correlation (B). F partially addressed via explicit joins in A+E combo.

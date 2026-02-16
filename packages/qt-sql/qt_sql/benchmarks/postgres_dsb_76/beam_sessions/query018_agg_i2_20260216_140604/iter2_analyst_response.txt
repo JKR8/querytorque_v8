@@ -1,0 +1,76 @@
+### Step 1 — Compare EXPLAIN Plans  
+No WINs in latest iteration (all patches FAILED). Only NEUTRAL/FAIL results exist.  
+
+**FAIL Analysis** (t1 patches):  
+- **Operator Degradation**: N/A (no execution plan generated)  
+- **Failure Cause**: Semantic error in SQL structure. Aggregated columns (`agg1`, `agg2`, etc.) were referenced in outer query without being in `GROUP BY` or re-aggregated. The patch violated SQL scoping rules by assuming CTE aggregates could be directly reused in a coarser `ROLLUP`.  
+
+**NEUTRAL Analysis** (Iteration 0):  
+- **t1 (Family F)**: Explicit join restructuring didn't change plan shape.  
+- **t2 (Family A)**: Predicate pushdown likely didn't reduce row counts enough to impact expensive operators.  
+- **t3 (Family E)**: Dimension prefetch ineffective since no repeated dimension scans exist.  
+
+---
+
+### Step 2 — Design Targets for Round 2  
+**Primary Bottleneck**:  
+`Nested Loop (rows=135580, time=865.647)` joining `date_dim` → `catalog_sales`. High row count dominates runtime.  
+
+**Target 1: Aggregation Pushdown Rescue (Family C)**  
+- **Family**: C  
+- **Transform**: `agg_pushdown_sum_count` (fix semantic error)  
+- **Target ID**: t1  
+- **Relevance**: 0.95  
+- **Hypothesis**: Pre-aggregate `catalog_sales` with SUM/COUNT (not AVG) before joining dimensions. Recompute AVG after joins using `SUM(agg)/COUNT(agg)`. Targets the 135K-row nested loop by reducing input rows.  
+- **Target IR**: `S0` (replace entire FROM/WHERE)  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+**Target 2: Early Filtering + Join Restructure (Family A+F)**  
+- **Family**: A+F  
+- **Transform**: `early_filter_explicit_join`  
+- **Target ID**: t2  
+- **Relevance**: 0.90  
+- **Hypothesis**: Filter dimensions early via CTEs, then explicit JOINs. Reduces rows feeding into the 135K-row nested loop.  
+- **Target IR**: `S0` (insert CTEs + replace FROM)  
+- **Examples**: `pg_date_cte_explicit_join`, `pg_explicit_join_materialized`  
+
+**Target 3: Decorrelation Rescue (Family B)**  
+- **Family**: B  
+- **Transform**: `decorrelate_fact_scan`  
+- **Target ID**: t3  
+- **Relevance**: 0.80  
+- **Hypothesis**: Convert nested loop to hash join by isolating `catalog_sales` scan with precomputed dimension keys. Eliminates per-row dimension lookups.  
+- **Target IR**: `S0` (replace FROM)  
+- **Examples**: `pg_shared_scan_decorrelate`  
+
+```json
+[
+  {
+    "family": "C",
+    "transform": "agg_pushdown_sum_count",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-aggregate catalog_sales with SUM/COUNT before joins to reduce 135K-row nested loop input. Recompute AVG after joins using SUM(agg)/COUNT(agg) to avoid semantic error.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A+F",
+    "transform": "early_filter_explicit_join",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Filter dimensions (date_dim, item, etc.) in CTEs before joining to reduce rows feeding into 135K-row nested loop. Use explicit JOIN syntax for better optimization.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_fact_scan",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Convert nested loop to hash join by precomputing dimension keys (d_date_sk, i_item_sk) and scanning catalog_sales in a single pass.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

@@ -1,0 +1,190 @@
+## Role
+
+You are **W2 "Unnester"** — Logic simplification — decorrelation, aggregation pushdown. Eliminate per-row re-execution: convert correlated subqueries to GROUP BY CTEs, push aggregation before joins when GROUP BY keys ⊇ join keys.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: B — decorrelate_fact_joins
+**Hypothesis**: Decouple store_returns → catalog_sales join into set-based operation to replace nested loop (rows=63) with hash join, avoiding per-row iteration.
+
+## Original SQL
+
+```sql
+select 
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ ,stddev_samp(ss_net_profit) as store_sales_profit
+ ,stddev_samp(sr_net_loss) as store_returns_loss
+ ,stddev_samp(cs_net_profit) as catalog_sales_profit
+ from
+ store_sales
+ ,store_returns
+ ,catalog_sales
+ ,date_dim d1
+ ,date_dim d2
+ ,date_dim d3
+ ,store
+ ,item
+ where
+ d1.d_moy = 2
+ and d1.d_year = 2000
+ and d1.d_date_sk = ss_sold_date_sk
+ and i_item_sk = ss_item_sk
+ and s_store_sk = ss_store_sk
+ and ss_customer_sk = sr_customer_sk
+ and ss_item_sk = sr_item_sk
+ and ss_ticket_number = sr_ticket_number
+ and sr_returned_date_sk = d2.d_date_sk
+ and d2.d_moy               between 2 and  2 + 2
+ and d2.d_year              = 2000
+ and sr_customer_sk = cs_bill_customer_sk
+ and sr_item_sk = cs_item_sk
+ and cs_sold_date_sk = d3.d_date_sk
+ and d3.d_moy               between 2 and  2 + 2
+ and d3.d_year              = 2000
+ group by
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ order by
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, store_returns, catalog_sales, date_dim d1, date_dim d2, date_dim d3, store, item
+    WHERE [b0b26a1f74d8058a]: d1.d_moy = 2 AND d1.d_year = 2000 AND d1.d_date_sk = ss_sold_date_sk AND i_item_sk = ss_item_sk A...
+    GROUP BY: i_item_id, i_item_desc, s_store_id, s_store_name
+    ORDER BY: i_item_id, i_item_desc, s_store_id, s_store_name
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_shared_scan_decorrelate",
+  "dialect": "postgres",
+  "description": "When a correlated subquery re-scans the same fact table as the outer query, extract the common scan into a shared CTE, then derive both the threshold computation and the outer rows from a single materialized result. Eliminates O(N*M) re-execution of the fact+date join.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "common_scan",
+        "cte_query_sql": "SELECT ws_item_sk, ws_ext_discount_amt, ws_sales_price, ws_list_price FROM web_sales INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk WHERE d_date BETWEEN '1998-03-13' AND CAST('1998-03-13' AS DATE) + INTERVAL '90 DAY' AND ws_wholesale_cost BETWEEN 26 AND 46"
+      },
+      "description": "Insert CTE 'common_scan' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "threshold_computation",
+        "cte_query_sql": "SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold FROM common_scan WHERE ws_sales_price / ws_list_price BETWEEN 34 * 0.01 AND 49 * 0.01 GROUP BY ws_item_sk"
+      },
+      "description": "Insert CTE 'threshold_computation' for pre-aggregated computation"
+    },
+    {
+      "step_id": "s3",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "outer_rows",
+        "cte_query_sql": "SELECT cs.ws_item_sk, cs.ws_ext_discount_amt FROM common_scan AS cs INNER JOIN item ON i_item_sk = cs.ws_item_sk WHERE i_manufact_id BETWEEN 341 AND 540 OR i_category IN ('Home', 'Men', 'Music')"
+      },
+      "description": "Insert CTE 'outer_rows' for pre-filtered join"
+    },
+    {
+      "step_id": "s4",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "join_filter",
+        "cte_query_sql": "SELECT o.ws_ext_discount_amt FROM outer_rows AS o INNER JOIN threshold_computation AS t ON o.ws_item_sk = t.ws_item_sk WHERE o.ws_ext_discount_amt > t.threshold"
+      },
+      "description": "Insert CTE 'join_filter' for pre-filtered join"
+    },
+    {
+      "step_id": "s5",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "join_filter"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s6",
+      "op": "delete_expr_subtree",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "0ef6ffe2461512ae"
+      },
+      "description": "Remove WHERE clause (conditions moved to CTEs)"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

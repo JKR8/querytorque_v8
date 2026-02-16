@@ -1,0 +1,72 @@
+Based on the analysis of the query, execution plan, and prior optimization attempts, I've identified the primary bottleneck and designed high-confidence targets for the next round. The key insights are:
+
+### Step 1: Plan Comparison & Bottleneck Analysis
+**Primary Bottleneck**: The `Nested Loop` joining `date_dim` (244 rows) with subsequent dimension tables forces 244 * 3 * 2 * 4 = 5,856 probes into `catalog_sales` (0.049ms/probe → 287ms total). This dominates execution time (300.424ms).
+
+**Failed Patch Analysis**:
+- **t5-t8 failures** were implementation errors (missing columns in CTEs, transaction cascades). The core structural ideas remain sound.
+- **All patches** targeted reducing dimension table sizes but failed to address the critical path: the nested loop access pattern on `catalog_sales`.
+
+### Step 2: Target Design (High-Confidence)
+**Primary Target (Combination: A+C+E)**  
+```json
+{
+  "family": "A+C+E",
+  "transform": "prefilter_join_hybrid",
+  "target_id": "t9",
+  "relevance_score": 0.98,
+  "hypothesis": "Reduce dimension rows via CTEs (A,E) while pushing date join into fact prefilter (C) to collapse the nested loop. Targets 244-row date_dim scan and catalog_sales index probe.",
+  "target_ir": "S0",
+  "recommended_examples": ["date_cte_explicit_join", "materialized_dimension_fact_prefilter", "multi_dimension_prefetch"]
+}
+```
+**SQL Sketch**:
+```sql
+WITH 
+  filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1192 AND 1215),
+  filtered_cs AS (
+    SELECT cs_sold_date_sk, cs_ship_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk
+    FROM catalog_sales
+    JOIN filtered_dates ON cs_ship_date_sk = d_date_sk  -- Collapse date join early
+    WHERE cs_list_price BETWEEN 86 AND 115
+  )
+SELECT ... 
+FROM filtered_cs
+JOIN (SELECT w_warehouse_sk, w_warehouse_name FROM warehouse WHERE w_gmt_offset = -5) w ...
+JOIN (SELECT sm_ship_mode_sk, sm_type FROM ship_mode WHERE sm_type = 'EXPRESS') sm ...
+JOIN (SELECT cc_call_center_sk, cc_name FROM call_center WHERE cc_class = 'small') cc ...
+-- Rest unchanged
+```
+
+**Secondary Target (Rescue: F)**  
+```json
+{
+  "family": "F",
+  "transform": "explicit_join_rescue_fixed",
+  "target_id": "t10",
+  "relevance_score": 0.90,
+  "hypothesis": "Fix CTE column references from t8 to enable explicit joins. Eliminates comma-join ambiguity and may improve join order for dimension tables.",
+  "target_ir": "S0",
+  "recommended_examples": ["explicit_join_materialized"]
+}
+```
+
+**Tertiary Target (Refinement: C)**  
+```json
+{
+  "family": "C",
+  "transform": "fact_aggr_pushdown",
+  "target_id": "t11",
+  "relevance_score": 0.85,
+  "hypothesis": "Pre-aggregate fact table by foreign keys before joining dimensions. Reduces rows fed into expensive sort (767 rows, 301ms).",
+  "target_ir": "S0",
+  "recommended_examples": ["materialized_dimension_fact_prefilter"]
+}
+```
+
+### Rationale
+1. **Primary Target (A+C+E)**: Combines dimension filtering (A,E) with fact-date join collapse (C). Directly attacks the 244-row `date_dim` scan and nested loop probe. Gold examples prove 2.28-12.07x speedups for similar patterns.
+2. **Secondary Target (F)**: Rescues sound explicit join transform from t8 after fixing column references. May improve join order.
+3. **Tertiary Target (C)**: Addresses the next bottleneck (Sort, 301ms) by reducing rows before grouping. High variance but proven 15.3x wins.
+
+All targets preserve structural equivalence and focus on observed plan operators. Avoided low-value changes (e.g., decorrelation/set-ops not present).

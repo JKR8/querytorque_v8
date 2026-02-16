@@ -1,0 +1,321 @@
+## Role
+
+You are a SQL optimization analyst reviewing benchmark results. Analyze what worked, what failed, and design refined targets for the next round of workers.
+
+Identify the primary bottleneck. Only provide secondary targets if they are distinct and high-confidence. Quality > Quantity.
+
+You will see the original query, execution plan, IR structure, and detailed results from previous rounds.
+
+## Query: query013_spj_i1
+
+**Dialect**: POSTGRES
+
+```sql
+select min(ss_quantity)
+       ,min(ss_ext_sales_price)
+       ,min(ss_ext_wholesale_cost)
+       ,min(ss_ext_wholesale_cost)
+ from store_sales
+     ,store
+     ,customer_demographics
+     ,household_demographics
+     ,customer_address
+     ,date_dim
+ where s_store_sk = ss_store_sk
+ and  ss_sold_date_sk = d_date_sk and d_year = 2001
+ and((ss_hdemo_sk=hd_demo_sk
+  and cd_demo_sk = ss_cdemo_sk
+  and cd_marital_status = 'M'
+  and cd_education_status = '2 yr Degree'
+  and ss_sales_price between 100.00 and 150.00
+  and hd_dep_count = 3
+     )or
+     (ss_hdemo_sk=hd_demo_sk
+  and cd_demo_sk = ss_cdemo_sk
+  and cd_marital_status = 'U'
+  and cd_education_status = 'College'
+  and ss_sales_price between 50.00 and 100.00
+  and hd_dep_count = 1
+     ) or
+     (ss_hdemo_sk=hd_demo_sk
+  and cd_demo_sk = ss_cdemo_sk
+  and cd_marital_status = 'S'
+  and cd_education_status = 'Unknown'
+  and ss_sales_price between 150.00 and 200.00
+  and hd_dep_count = 1
+     ))
+ and((ss_addr_sk = ca_address_sk
+  and ca_country = 'United States'
+  and ca_state in ('CO', 'NC', 'TX')
+  and ss_net_profit between 100 and 200
+     ) or
+     (ss_addr_sk = ca_address_sk
+  and ca_country = 'United States'
+  and ca_state in ('AR', 'NY', 'TX')
+  and ss_net_profit between 150 and 300
+     ) or
+     (ss_addr_sk = ca_address_sk
+  and ca_country = 'United States'
+  and ca_state in ('IA', 'IL', 'NC')
+  and ss_net_profit between 50 and 250
+     ))
+;
+```
+
+
+## Current Execution Plan
+
+```
+Aggregate  (rows=1, time=2254.353)
+  Gather  (rows=1, time=2254.341)
+    Aggregate  (rows=1, time=2253.861)
+      Nested Loop  (rows=85, time=2253.349)
+        Nested Loop  (rows=3238, time=2174.71)
+          Hash Join  (rows=18741, time=1857.799)
+            Hash Join  (rows=18795, time=1849.057)
+              Nested Loop  (rows=168134, time=1782.541)
+                Index Only Scan on date_dim  (rows=365, time=4.406)
+                Index Only Scan on store_sales  (rows=461, time=4.833)
+              Hash  (rows=1440, time=1.0)
+                Seq Scan on household_demographics  (rows=1440, time=0.822)
+            Hash  (rows=102, time=0.028)
+              Seq Scan on store  (rows=102, time=0.02)
+          Index Scan on customer_address  (rows=0, time=0.016)
+        Index Scan on customer_demographics  (rows=0, time=0.023)
+```
+
+
+## IR Structure (for patch targeting)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, store, customer_demographics, household_demographics, customer_address, date_dim
+    WHERE [73f355482e5a7264]: s_store_sk = ss_store_sk AND ss_sold_date_sk = d_date_sk AND d_year = 2001 AND ((ss_hdemo_sk = hd...
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
+
+
+## Optimization Families
+
+Review the 6 families below. Each has a proven gold example.
+
+Choose up to **4 most relevant families** for this query based on:
+- Query structure (CTEs, subqueries, joins, aggregations, set operations)
+- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)
+- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
+
+
+
+### Family A: Early Filtering (Predicate Pushback)
+**Description**: Push small filters into CTEs early, reduce row count before expensive operations
+**Speedup Range**: 1.3–4.0x (~35% of all wins)
+**Use When**:
+  1. Late WHERE filters on dimension tables
+  2. Cascading CTEs with filters applied downstream
+  3. Expensive joins after filters could be pushed earlier
+
+**Gold Example**: `pg_date_cte_explicit_join` (2.28x)
+
+
+
+### Family B: Decorrelation (Sets Over Loops)
+**Description**: Convert correlated subqueries to standalone CTEs with GROUP BY, eliminate per-row re-execution
+**Speedup Range**: 2.4–2.9x (~15% of all wins)
+**Use When**:
+  1. Correlated subqueries in WHERE clause
+  2. Scalar aggregates computed per outer row
+  3. DELIM_SCAN in execution plan (indicates correlation)
+
+**Gold Example**: `pg_shared_scan_decorrelate` (8043.91x (timeout rescue))
+
+
+
+### Family C: Aggregation Pushdown (Minimize Rows Touched)
+**Description**: Aggregate before expensive joins when GROUP BY keys ⊇ join keys, reduce intermediate sizes
+**Speedup Range**: 1.3–15.3x (~5% of all wins (high variance))
+**Use When**:
+  1. GROUP BY happens after large joins
+  2. GROUP BY keys are subset of join keys
+  3. Intermediate result size >> final result size
+
+**Gold Example**: `pg_materialized_dimension_fact_prefilter` (12.07x (V2 DSB SF10, was 2.68x in V1))
+
+
+
+### Family D: Set Operation Optimization (Sets Over Loops)
+**Description**: Replace INTERSECT/UNION-based patterns with EXISTS/NOT EXISTS, avoid full materialization
+**Speedup Range**: 1.7–2.7x (~8% of all wins)
+**Use When**:
+  1. INTERSECT patterns between large sets
+  2. UNION ALL with duplicate elimination
+  3. Set operations materializing full intermediate results
+
+**Gold Example**: `pg_intersect_to_exists` (1.78x)
+
+
+
+### Family E: Materialization / Prefetch (Don't Repeat Work)
+**Description**: Extract repeated scans or pre-compute intermediate results for reuse across multiple consumers
+**Speedup Range**: 1.3–6.2x (~18% of all wins)
+**Use When**:
+  1. Repeated scans of same table with different filters
+  2. Dimension filters applied independently multiple times
+  3. CTE referenced multiple times with implicit re-evaluation
+
+**Gold Example**: `multi_dimension_prefetch` (2.71x)
+
+
+
+### Family F: Join Transform (Right Shape First)
+**Description**: Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation
+**Speedup Range**: 1.8–8.6x (~19% of all wins)
+**Use When**:
+  1. Comma-separated joins (implicit cross joins) in FROM clause
+  2. Self-joins scanning same table multiple times
+  3. Dimension-fact join order suboptimal for predicate pushdown
+
+**Gold Example**: `pg_explicit_join_materialized` (8.56x)
+
+
+
+## Optimization History
+
+### History — All Prior Patches
+
+| Iter | Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Error (summary) |
+|------|-------|--------|-----------|---------|--------|---------|----------|-----------------|
+| 0 | t1 | F | join_restructure_explicit | — | FAIL | — | — | Tier-1 structural: LITERAL MISMATCH: Ori |
+| 0 | t2 | A+D | predicate_push_into_cte+or_to_union | — | FAIL | — | — | Equivalence retry execution error: each  |
+| 0 | t3 | E | dimension_prefetch | — | FAIL | — | — | Equivalence execution error: current tra |
+| 0 | syn_w2 | B | decorrelate | — | FAIL | — | — | Tier-1 structural: LITERAL MISMATCH: Ori |
+
+
+
+### Latest Iteration 0 — Detailed Results
+
+#### Race Results
+
+| Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Semantic | Error |
+|-------|--------|-----------|---------|--------|---------|----------|----------|-------|
+| t1 | F | join_restructure_explicit | — | FAIL | — | — | FAIL | Tier-1 structural: LITERAL MISMATCH: Original literals missing from rewrite — nu |
+| t2 | A+D | predicate_push_into_cte+or_to_union | — | FAIL | — | — | FAIL | Equivalence retry execution error: each UNION query must have the same number of |
+| t3 | E | dimension_prefetch | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| syn_w2 | B | decorrelate | — | FAIL | — | — | FAIL | Tier-1 structural: LITERAL MISMATCH: Original literals missing from rewrite — nu |
+
+#### Patched SQL
+
+**t1 (Family F, join_restructure_explicit):**
+```sql
+WITH filtered_store AS (SELECT * FROM store), filtered_date AS (SELECT * FROM date_dim WHERE d_year = 2001), filtered_hd_cd AS (SELECT * FROM household_demographics, customer_demographics WHERE (hd_dep_count = 3 AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree') OR (hd_dep_count = 1 AND cd_marital_status = 'U' AND cd_education_status = 'College') OR (hd_dep_count = 1 AND cd_marital_status = 'S' AND cd_education_status = 'Unknown')), filtered_ca AS (SELECT * FROM customer_address WHERE (ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX')) OR (ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX')) OR (ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC'))) SELECT MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost) FROM store_sales INNER JOIN filtered_store ON s_store_sk = ss_store_sk INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk INNER JOIN filtered_hd_cd ON ss_hdemo_sk = hd_demo_sk AND ss_cdemo_sk = cd_demo_sk INNER JOIN filtered_ca ON ss_addr_sk = ca_address_sk WHERE (ss_sales_price BETWEEN 50.00 AND 200.00) AND (ss_net_profit BETWEEN 50 AND 300);
+```
+
+**t2 (Family A+D, predicate_push_into_cte+or_to_union):**
+```sql
+WITH prefiltered_ca AS (SELECT ca_address_sk, ca_state FROM customer_address WHERE ca_country = 'United States' AND (ca_state IN ('CO', 'NC', 'TX') OR ca_state IN ('AR', 'NY', 'TX') OR ca_state IN ('IA', 'IL', 'NC'))), prefiltered_hd AS (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count IN (1, 3)), prefiltered_cd AS (SELECT cd_demo_sk, cd_marital_status FROM customer_demographics WHERE (cd_marital_status = 'M' AND cd_education_status = '2 yr Degree') OR (cd_marital_status = 'U' AND cd_education_status = 'College') OR (cd_marital_status = 'S' AND cd_education_status = 'Unknown')) SELECT MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost) FROM store_sales INNER JOIN store ON s_store_sk = ss_store_sk INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001 INNER JOIN prefiltered_hd ON ss_hdemo_sk = hd_demo_sk INNER JOIN prefiltered_cd ON ss_cdemo_sk = cd_demo_sk INNER JOIN prefiltered_ca ON ss_addr_sk = ca_address_sk WHERE ((cd_marital_status = 'M' AND ss_sales_price BETWEEN 100.00 AND 150.00) OR (cd_marital_status = 'U' AND ss_sales_price BETWEEN 50.00 AND 100.00) OR (cd_marital_status = 'S' AND ss_sales_price BETWEEN 150.00 AND 200.00)) AND ((ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250));
+```
+
+**t3 (Family E, dimension_prefetch):**
+```sql
+WITH valid_demo_keys AS (SELECT hd_demo_sk, cd_demo_sk, CASE WHEN cd_marital_status = 'M' THEN 1 WHEN cd_marital_status = 'U' THEN 2 WHEN cd_marital_status = 'S' THEN 3 END AS cond_id FROM customer_demographics, household_demographics WHERE (cd_marital_status = 'M' AND cd_education_status = '2 yr Degree' AND hd_dep_count = 3) OR (cd_marital_status = 'U' AND cd_education_status = 'College' AND hd_dep_count = 1) OR (cd_marital_status = 'S' AND cd_education_status = 'Unknown' AND hd_dep_count = 1)) SELECT MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost) FROM store_sales INNER JOIN store ON s_store_sk = ss_store_sk INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001 INNER JOIN valid_demo_keys ON ss_hdemo_sk = hd_demo_sk AND ss_cdemo_sk = cd_demo_sk INNER JOIN customer_address ON ss_addr_sk = ca_address_sk WHERE (cond_id = 1 AND ss_sales_price BETWEEN 100.00 AND 150.00) OR (cond_id = 2 AND ss_sales_price BETWEEN 50.00 AND 100.00) OR (cond_id = 3 AND ss_sales_price BETWEEN 150.00 AND 200.00) AND ((ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250));
+```
+
+**syn_w2 (Family B, decorrelate):**
+```sql
+WITH filtered_store AS (SELECT s_store_sk FROM store), filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2001), filtered_hd_cd AS (SELECT hd_demo_sk, cd_demo_sk FROM household_demographics, customer_demographics WHERE (hd_dep_count = 3 AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree') OR (hd_dep_count = 1 AND cd_marital_status = 'U' AND cd_education_status = 'College') OR (hd_dep_count = 1 AND cd_marital_status = 'S' AND cd_education_status = 'Unknown')), filtered_ca AS (SELECT ca_address_sk FROM customer_address WHERE (ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX')) OR (ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX')) OR (ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC'))) SELECT MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost) FROM store_sales INNER JOIN filtered_store ON s_store_sk = ss_store_sk INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk INNER JOIN filtered_hd_cd ON ss_hdemo_sk = hd_demo_sk AND ss_cdemo_sk = cd_demo_sk INNER JOIN filtered_ca ON ss_addr_sk = ca_address_sk WHERE (ss_sales_price BETWEEN 50.00 AND 200.00) AND (ss_net_profit BETWEEN 50 AND 300);
+```
+
+#### Execution Plans
+
+**Original EXPLAIN:**
+```
+Aggregate  (rows=1, time=2254.353)
+  Gather  (rows=1, time=2254.341)
+    Aggregate  (rows=1, time=2253.861)
+      Nested Loop  (rows=85, time=2253.349)
+        Nested Loop  (rows=3238, time=2174.71)
+          Hash Join  (rows=18741, time=1857.799)
+            Hash Join  (rows=18795, time=1849.057)
+              Nested Loop  (rows=168134, time=1782.541)
+                Index Only Scan on date_dim  (rows=365, time=4.406)
+                Index Only Scan on store_sales  (rows=461, time=4.833)
+              Hash  (rows=1440, time=1.0)
+                Seq Scan on household_demographics  (rows=1440, time=0.822)
+            Hash  (rows=102, time=0.028)
+              Seq Scan on store  (rows=102, time=0.02)
+          Index Scan on customer_address  (rows=0, time=0.016)
+        Index Scan on customer_demographics  (rows=0, time=0.023)
+```
+
+#### Error Details
+
+- **t1** (FAIL): Tier-1 structural: LITERAL MISMATCH: Original literals missing from rewrite — numbers: ['100.0', '150.0', '250.0']. The rewrite changed filter values instead of preserving them.
+- **t2** (FAIL): Equivalence retry execution error: each UNION query must have the same number of columns
+LINE 1: ..._net_profit BETWEEN 50 AND 250)) UNION ALL SELECT ss_quantit...
+                                                             ^
+
+- **t3** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **syn_w2** (FAIL): Tier-1 structural: LITERAL MISMATCH: Original literals missing from rewrite — numbers: ['100.0', '150.0', '250.0']. The rewrite changed filter values instead of preserving them.
+
+
+## Your Task — Snipe Round 1
+
+
+Results from latest iteration: **4 FAIL**.
+
+Follow this protocol exactly.
+
+### Step 1 — Compare EXPLAIN Plans
+
+For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.
+
+For each **WIN**, answer:
+- QUOTE the operator line(s) from the original that got cheaper or were eliminated. Give the exact operator name, time, and row count from the plan text above.
+- What structural SQL change caused that operator improvement?
+- What is the **most expensive remaining operator** in this winner's plan? QUOTE its line (name, time, rows).
+
+For each **FAIL/NEUTRAL/REGRESSION**:
+- QUOTE the operator(s) that got MORE expensive vs the original.
+- Why did the structural change backfire?
+
+Then classify winners as REDUNDANT (same core structural change, same operators improved) or COMPLEMENTARY (different operators improved, different structural changes).
+
+### Step 2 — Design Targets by Combining Strategies
+
+Start from the **best winner's SQL** as your baseline.
+
+**CRITICAL**: Do NOT invent new hypotheses about row counts or selectivity. Every claim about rows, times, or costs MUST be a direct quote from an EXPLAIN plan above. If a number is not in the plans, you do not know it.
+
+**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites (UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce identical plans. Focus on changes that **eliminate operators** or **reduce input rows to expensive operators** as shown in the plans.
+
+Design up to 4 targets, prioritized:
+
+1. **Combination** (primary if complementary winners exist): Take the best winner's SQL. Layer on the structural change from a complementary winner that addresses a DIFFERENT expensive operator. Cite both operators by name from the EXPLAIN plans.
+2. **Refinement**: Take the best winner's SQL. Target its most expensive remaining operator (quoted in Step 1). Design a structural change that reduces input rows to that operator. CITE the operator and its current row count from the plan.
+3. **Rescue** (if a failed patch had a sound structural idea): Fix the implementation while preserving the best winner's gains.
+4. **Novel**: A new structural approach that targets the most expensive remaining operator. Cite the operator from the plan.
+
+**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F"). The worker will receive gold examples from ALL referenced families.
+
+Output up to 4 targets. Same JSON format:
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "...",
+    "target_ir": "...",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  }
+]
+```
+
+Output up to 4 targets. Fewer strong targets beat padding with weak ones.

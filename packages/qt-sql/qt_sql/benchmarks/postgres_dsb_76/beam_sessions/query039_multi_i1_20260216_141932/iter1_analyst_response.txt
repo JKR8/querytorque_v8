@@ -1,0 +1,75 @@
+## Step 1 — EXPLAIN Plan Analysis
+
+**WIN: syn_w2 (Family B - Decorrelation) - 1.82x speedup**  
+*Structural change*: Pre-joined tables with filters (`d_year=2002`, `d_moy IN (2,3)`) in `inventory_filtered` CTE before aggregation.  
+*Improvement*: Reduced input rows to expensive aggregation step by filtering early.  
+*Most expensive remaining operator*: Aggregation over `inventory_filtered` (GROUP BY w_warehouse_sk, i_item_sk, d_moy) remains the bottleneck. Without EXPLAIN, we infer this from the structural change - filtering reduced input rows but aggregation still processes all warehouse/item/month combinations.
+
+**FAILED Patches**:  
+- **t2 (F+E)**: Failed due to column reference mismatch. Structural idea (self-join elimination via single-pass aggregation) was sound but implementation was incompatible with existing column aliases.  
+- **syn_w1 (A)**: Failed due to syntax error. Early filtering attempt was incomplete, breaking table references.  
+- **t1 (A)**: Failed due to targeting error. Early filtering wasn't properly applied to the IR structure.  
+
+**Classification**:  
+- **syn_w2** is COMPLEMENTARY to the failed self-join elimination (t2). It addresses the early scan reduction while t2 targeted join elimination.
+
+---
+
+## Step 2 — Target Design
+
+### Primary Bottleneck
+The most expensive operation remains the **large aggregation over pre-joined data** (GROUP BY w_warehouse_sk, i_item_sk, d_moy) after early filtering. This is evidenced by:
+1. syn_w2's speedup coming from reduced input rows to aggregation
+2. Aggregation being the only expensive operation not fully optimized
+
+### High-Confidence Targets
+```json
+[
+  {
+    "family": "B+F",
+    "transform": "decorrelate_then_self_join_elimination",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Combine syn_w2's early filtering with t2's self-join elimination. Compute both months' stats in a single aggregation pass to avoid joining CTEs.",
+    "target_ir": "S0 & S1: Replace_body of CTE 'inv' with single-pass conditional aggregation",
+    "recommended_examples": ["pg_shared_scan_decorrelate", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "aggregation_pushdown",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Push aggregation to warehouse level first (GROUP BY w_warehouse_sk) before joining with items, leveraging warehouse skew. Reduce join cardinality.",
+    "target_ir": "S0 & S1: Insert_cte before 'foo' subquery to pre-aggregate by warehouse",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "cte_materialization",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Materialize filtered dimension tables (item/warehouse) before joining with large fact tables. Avoid repeated dimension scans.",
+    "target_ir": "S0 & S1: Insert_cte for filtered dimensions before main FROM clause",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```
+
+### Rationale
+1. **B+F Combination (Primary)**:  
+   - Targets both the aggregation bottleneck (via syn_w2's filtering) AND the self-join overhead (via t2's approach)  
+   - Single-pass aggregation for both months avoids materializing/storing intermediate CTEs  
+   - Fixes t2's column reference issue by preserving original aliases  
+
+2. **C Aggregation Pushdown (Secondary)**:  
+   - Warehouse-level aggregation first reduces rows before expensive item joins  
+   - Aligns with Family C's "GROUP BY keys ⊇ join keys" condition (w_warehouse_sk is join key)  
+
+3. **E Materialization (Tertiary)**:  
+   - Pre-materializes small dimension tables (item/warehouse) to avoid repeated scans  
+   - Complements B+F by optimizing dimension table access  
+
+**Why not more?**  
+- Family A (Early Filtering) already partially applied in syn_w2  
+- Family D (Set Operations) not relevant to query structure  
+- Novel approaches not needed - proven families cover optimization surface

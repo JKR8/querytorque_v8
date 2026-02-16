@@ -1,0 +1,82 @@
+### Step 1 — Compare EXPLAIN Plans
+
+All prior patches failed, so there are no winners to analyze. The failures were due to:
+1. **t1/t2**: Changed literals (`100.0`, `3.0`) in the main query, violating semantic equivalence.
+2. **syn_w1/w2**: Rewrite engine couldn't locate the target expressions for replacement.
+
+---
+
+### Step 2 — Design Targets by Combining Strategies
+
+**Primary Bottleneck**: Repeated full scans of `date_dim` across all three CTEs (evidenced by `Seq Scan on date_dim` taking 4.521 ms with 36,524 rows in `sr_items` and similar patterns in other CTEs). This dominates execution time.
+
+**High-Confidence Secondary**: Early filtering on `item` (Family A) to reduce rows before expensive joins. The plan shows `Index Scan on item` with 0 rows due to late filtering.
+
+#### Target 1: Combine E + A (Materialization + Early Filtering)
+```json
+{
+  "family": "E+A",
+  "transform": "prefilter_date_and_item",
+  "target_id": "S0",
+  "relevance_score": 0.95,
+  "hypothesis": "Precompute filtered date_dim (E) and item (A) to eliminate repeated scans and reduce join rows. Original shows 36k date_dim scans and late item filtering (0 rows).",
+  "target_ir": "Insert CTEs: [filtered_date, filtered_item]. Replace FROM in sr_items/cr_items/wr_items CTEs. Anchor: WHERE [43a1cae356b71ca0], [e7bb6d054d52da05], [c6536d60a94eb699].",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+}
+```
+**Why**: 
+- Eliminates 3x `Seq Scan on date_dim` (36k rows, 4.5 ms each).
+- Fixes `Index Scan on item` (0 rows) by pushing filters early.
+
+#### Target 2: Family B (Decorrelation)
+```json
+{
+  "family": "B",
+  "transform": "decorrelate_date_subquery",
+  "target_id": "S0",
+  "relevance_score": 0.85,
+  "hypothesis": "Convert nested date_dim subqueries to a JOIN. Plan shows correlated execution (Nested Loop at 4.491 ms).",
+  "target_ir": "Replace WHERE subquery in sr_items/cr_items/wr_items CTEs with JOIN. Anchor: WHERE [43a1cae356b71ca0], [e7bb6d054d52da05], [c6536d60a94eb699].",
+  "recommended_examples": ["pg_shared_scan_decorrelate"]
+}
+```
+**Why**: 
+- Targets `Nested Loop` (4.491 ms) from correlated subquery execution.
+
+#### Target 3: Combine E + F (Materialization + Join Transform)
+```json
+{
+  "family": "E+F",
+  "transform": "prefilter_date_explicit_join",
+  "target_id": "S0",
+  "relevance_score": 0.80,
+  "hypothesis": "Materialize date_dim and convert comma joins to explicit INNER JOIN. Plan shows inefficient comma joins (Hash Join at 10.932 ms).",
+  "target_ir": "Insert CTE: filtered_date. Replace FROM in sr_items/cr_items/wr_items with explicit JOIN. Anchor: WHERE [43a1cae356b71ca0], [e7bb6d054d52da05], [c6536d60a94eb699].",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+}
+```
+**Why**: 
+- Optimizes `Hash Join` (10.932 ms) by defining join order.
+
+#### Target 4: Rescue t1/t2 (Fix Literal Preservation)
+```json
+{
+  "family": "E",
+  "transform": "prefilter_date_rescue",
+  "target_id": "t1",
+  "relevance_score": 0.75,
+  "hypothesis": "Reapply materialization (E) while preserving literals. Original t1 failed due to literal changes in main query.",
+  "target_ir": "Insert CTE: filtered_date. Keep main query unchanged. Anchor: WHERE [43a1cae356b71ca0], [e7bb6d054d52da05], [c6536d60a94eb699].",
+  "recommended_examples": ["multi_dimension_prefetch"]
+}
+```
+**Why**: 
+- Rescues the sound idea from t1/t2 (materialization) while avoiding literal changes.
+
+---
+
+### Key Evidence from Plan
+1. **`Seq Scan on date_dim`**: Scans 36,524 rows (4.521 ms) per CTE → Target with E.
+2. **`Nested Loop`**: Correlated execution of date subquery (4.491 ms) → Target with B.
+3. **`Index Scan on item`**: Returns 0 rows due to late filtering → Target with A.
+4. **`Hash Join`**: Inefficient comma join (10.932 ms) → Target with F.

@@ -1,0 +1,84 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**novel_1 (Family E, NEUTRAL 1.03x)**  
+- **Improved operator**:  
+  `SetOp (rows=371, time=3834.075)` vs original `SetOp (rows=383, time=7061.102)`  
+  Structural change: Explicit JOIN syntax in `cross_items` CTE enabled better join order optimization.  
+- **Most expensive remaining operator**:  
+  `Aggregate (rows=150, time=8988.663)` in `this_year` subquery. This is the main bottleneck.  
+- **Why limited gain**:  
+  Materialization didn't reduce input rows to expensive downstream aggregations (271K rows in `Nested Loop`).
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Aggregate (rows=150, time=8988.663)` in `this_year` subquery, caused by joining 263K rows from `cross_items` before aggregation.
+
+**Target 1: Combination (E + C)**  
+- **Family**: E + C  
+- **Transform**: `materialize_cte_then_aggregation_pushdown`  
+- **Hypothesis**: Push aggregation into `this_year`/`last_year` subqueries *before* joining with `item`. Pre-aggregate `store_sales` by `ss_item_sk` using the `cross_items` filter, reducing input rows to the 263K-row `Nested Loop`.  
+- **Target IR**: `S0:Q_S0` (main query)  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`, `pg_shared_scan_decorrelate`
+
+**Target 2: Refinement (C)**  
+- **Family**: C  
+- **Transform**: `push_aggregation_into_cross_items`  
+- **Hypothesis**: Pre-aggregate `store_sales`/`catalog_sales`/`web_sales` in `cross_items` CTE by `(i_brand_id, i_class_id, i_category_id)` since these are the final GROUP BY keys. Reduces rows fed into INTERSECT (currently 384K).  
+- **Target IR**: `S0:CTE_Q_S0_cross_items`  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`
+
+**Target 3: Rescue (D)**  
+- **Family**: D  
+- **Transform**: `fixed_setop_to_exists`  
+- **Hypothesis**: Replace INTERSECT with EXISTS in `cross_items` while preserving `brand_id`/`class_id`/`category_id` columns. Avoids materializing 384K intermediate rows.  
+- **Target IR**: `S0:CTE_Q_S0_cross_items`  
+- **Examples**: `pg_intersect_to_exists`
+
+**Target 4: Novel (A)**  
+- **Family**: A  
+- **Transform**: `push_week_filter_into_cte`  
+- **Hypothesis**: Move `d_week_seq` filter into `cross_items` CTE. Currently, date filters are applied late in `this_year`/`last_year`, forcing full scans.  
+- **Target IR**: `S0:CTE_Q_S0_cross_items`  
+- **Examples**: `pg_date_cte_explicit_join`
+
+```json
+[
+  {
+    "family": "E+C",
+    "transform": "materialize_cte_then_aggregation_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-aggregate store_sales by ss_item_sk in this_year/last_year subqueries before joining with item, reducing input rows to the 271K-row Nested Loop (time=8988ms in novel_1 plan).",
+    "target_ir": "S0:Q_S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "C",
+    "transform": "push_aggregation_into_cross_items",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-aggregate sales tables in cross_items CTE by (i_brand_id, i_class_id, i_category_id) to reduce INTERSECT input from 384K rows.",
+    "target_ir": "S0:CTE_Q_S0_cross_items",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "D",
+    "transform": "fixed_setop_to_exists",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Replace INTERSECT with EXISTS in cross_items while preserving column references to avoid materializing 384K rows.",
+    "target_ir": "S0:CTE_Q_S0_cross_items",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "A",
+    "transform": "push_week_filter_into_cte",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Move d_week_seq filter into cross_items CTE to avoid full scans of sales tables in main query.",
+    "target_ir": "S0:CTE_Q_S0_cross_items",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

@@ -1,0 +1,137 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (Family F - WINNER - 1.06x IMPROVED)**  
+- **Improved operator**:  
+  `Nested Loop (rows=69937, time=196.728 ms → 115.708 ms)`  
+  - **Cause**: Explicit INNER JOINs with filter pushdown (`cr_reason_sk=33` moved to JOIN condition) allowed earlier filtering.  
+- **Most expensive remaining operator**:  
+  `Nested Loop (rows=69937, time=115.708 ms)` (between `date_dim` and `catalog_sales`)  
+
+**t2 (Family A - FAIL)**  
+- **Failure cause**: Syntax error in CTE (`cs_item_sk` not in scope during `item` filtering). No plan generated.  
+
+**syn_w2 (Family B - FAIL)**  
+- **Failure cause**: Transaction aborted (likely semantic error in decorrelation CTE structure). No plan generated.  
+
+**syn_w3 (Family E - FAIL)**  
+- **Failure cause**: Transaction aborted (likely error in materialized CTE definition). No plan generated.  
+
+**Classification**: Only 1 winner (t1). No redundant/complementary winners.  
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop (rows=69,937, time=115.7 ms)` between `date_dim` and `catalog_sales` in t1's plan.  
+
+**Target 1: Refinement (Family A)**  
+- **Hypothesis**: Push `item` filter (`i_category='Jewelry'`, `i_manager_id BETWEEN 61 AND 100`) into a CTE to reduce `catalog_sales` rows *before* joining with `date_dim`. Current nested loop scans 69,937 rows.  
+- **Target Operator**: `Nested Loop (rows=69,937)`  
+- **Mechanism**: Filter `item` first, then join with `catalog_sales` to restrict `cs_item_sk` early.  
+
+```json
+{
+  "family": "A",
+  "transform": "early_filter_item",
+  "target_id": "S0:90046ef2acd680cd",
+  "relevance_score": 0.97,
+  "hypothesis": "Pre-filter item (i_category='Jewelry', i_manager_id 61-100) to reduce catalog_sales rows before joining date_dim. Targets Nested Loop (69,937 rows) in t1's plan.",
+  "target_ir": "S0:90046ef2acd680cd",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+**Target 2: Combination (Family A + E)**  
+- **Hypothesis**: Materialize filtered `item` and `date_dim` in CTEs, then join with `catalog_sales`. Combines early filtering (A) and materialization (E) to shrink input to the expensive loop.  
+- **Target Operator**: `Nested Loop (rows=69,937)`  
+- **Mechanism**: Precompute small dimension sets to minimize probe rows in `catalog_sales`.  
+
+```json
+{
+  "family": "A+E",
+  "transform": "materialize_dims_then_join",
+  "target_id": "S0",
+  "relevance_score": 0.93,
+  "hypothesis": "Materialize filtered item/date_dim in CTEs to reduce catalog_sales scan. Combines early filtering (A) and reuse (E). Targets Nested Loop (69,937 rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+}
+```
+
+**Target 3: Rescue (Family A - Fix t2)**  
+- **Hypothesis**: Fix t2’s CTE error by isolating `item` filtering without premature joins. Apply to t1’s explicit join structure.  
+- **Mechanism**: Corrected CTE: `filtered_item` selects only `i_item_sk`, `i_item_id` (no join to `warehouse`).  
+
+```json
+{
+  "family": "A",
+  "transform": "early_filter_item_fixed",
+  "target_id": "S0:90046ef2acd680cd",
+  "relevance_score": 0.90,
+  "hypothesis": "Rescue t2: Filter item in CTE (no joins) to avoid scope errors. Apply to t1's join structure. Targets Nested Loop (69,937 rows).",
+  "target_ir": "S0:90046ef2acd680cd",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+**Target 4: Novel (Family C)**  
+- **Hypothesis**: Push partial aggregation to `catalog_sales` *after* joining with `item` but *before* joining `date_dim`. Group by `cs_item_sk`, `cs_warehouse_sk` (keys ⊇ join keys) to shrink row count early.  
+- **Target Operator**: `Nested Loop (rows=69,937)`  
+- **Mechanism**: Aggregate sales/refunds per item/warehouse before date join.  
+
+```json
+{
+  "family": "C",
+  "transform": "preaggregate_sales",
+  "target_id": "S0:90046ef2acd680cd",
+  "relevance_score": 0.85,
+  "hypothesis": "Aggregate catalog_sales by cs_item_sk/cs_warehouse_sk after item join but before date_dim. Reduces rows fed into Nested Loop (69,937 rows).",
+  "target_ir": "S0:90046ef2acd680cd",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+---
+
+### Final Targets
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filter_item",
+    "target_id": "S0:90046ef2acd680cd",
+    "relevance_score": 0.97,
+    "hypothesis": "Pre-filter item (i_category='Jewelry', i_manager_id 61-100) to reduce catalog_sales rows before joining date_dim. Targets Nested Loop (69,937 rows) in t1's plan.",
+    "target_ir": "S0:90046ef2acd680cd",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A+E",
+    "transform": "materialize_dims_then_join",
+    "target_id": "S0",
+    "relevance_score": 0.93,
+    "hypothesis": "Materialize filtered item/date_dim in CTEs to reduce catalog_sales scan. Combines early filtering (A) and reuse (E). Targets Nested Loop (69,937 rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filter_item_fixed",
+    "target_id": "S0:90046ef2acd680cd",
+    "relevance_score": 0.90,
+    "hypothesis": "Rescue t2: Filter item in CTE (no joins) to avoid scope errors. Apply to t1's join structure. Targets Nested Loop (69,937 rows).",
+    "target_ir": "S0:90046ef2acd680cd",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_sales",
+    "target_id": "S0:90046ef2acd680cd",
+    "relevance_score": 0.85,
+    "hypothesis": "Aggregate catalog_sales by cs_item_sk/cs_warehouse_sk after item join but before date_dim. Reduces rows fed into Nested Loop (69,937 rows).",
+    "target_ir": "S0:90046ef2acd680cd",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

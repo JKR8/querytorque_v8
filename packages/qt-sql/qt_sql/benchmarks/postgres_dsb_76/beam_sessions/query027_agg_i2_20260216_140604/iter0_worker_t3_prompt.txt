@@ -1,0 +1,151 @@
+## Role
+
+You are **W1 "Reducer"** — Cardinality reduction — WHERE filters, set operations, early pruning. Reduce row counts early: push predicates into CTEs, convert set operations to EXISTS/NOT EXISTS, apply early filtering before expensive joins.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: A — dimension_filter_ctes
+**Hypothesis**: Filters on dimension tables (store, item) are applied late. Materializing them as CTEs allows early reduction of store_sales rows via foreign key joins.
+
+## Original SQL
+
+```sql
+select  i_item_id,
+        s_state, grouping(s_state) g_state,
+        avg(ss_quantity) agg1,
+        avg(ss_list_price) agg2,
+        avg(ss_coupon_amt) agg3,
+        avg(ss_sales_price) agg4
+from store_sales, customer_demographics, date_dim, store, item
+where ss_sold_date_sk = d_date_sk and
+      ss_item_sk = i_item_sk and
+      ss_store_sk = s_store_sk and
+      ss_cdemo_sk = cd_demo_sk and
+      cd_gender = 'M' and
+      cd_marital_status = 'W' and
+      cd_education_status = 'Secondary' and
+      d_year = 1999 and
+      s_state = 'OH' and
+     i_category  = 'Music'
+ group by rollup (i_item_id, s_state)
+ order by i_item_id
+         ,s_state
+ limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, customer_demographics, date_dim, store, item
+    WHERE [67958869346fab14]: ss_sold_date_sk = d_date_sk AND ss_item_sk = i_item_sk AND ss_store_sk = s_store_sk AND ss_cdemo_...
+    ORDER BY: i_item_id, s_state
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  CTE: filtered_store  (via Q1)
+    FROM: store
+    WHERE: s_state = 'OH'
+  CTE: filtered_item  (via Q2)
+    FROM: item
+    WHERE: i_category = 'Music'
+  MAIN QUERY (via Q0)
+    FROM: store_sales
+    JOIN: filtered_store ON ss_store_sk = s_store_sk
+    JOIN: filtered_item ON ss_item_sk = i_item_sk
+    JOIN: date_dim ON ss_sold_date_sk = d_date_sk
+    JOIN: customer_demographics ON ss_cdemo_sk = cd_demo_sk
+    WHERE: d_year = 1999
+      AND cd_gender = 'M'
+      AND cd_marital_status = 'W'
+      AND cd_education_status = 'Secondary'
+    GROUP BY: ROLLUP (i_item_id, s_state)
+    ORDER BY: i_item_id, s_state
+    LIMIT: 100
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_date_cte_explicit_join",
+  "dialect": "postgres",
+  "description": "Isolate a selective date_dim filter into a CTE AND convert all comma-separated joins to explicit JOIN syntax. The combination is key on PostgreSQL - the CTE alone can hurt, but CTE + explicit JOINs together enable better hash join planning with a tiny probe table.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_dates",
+        "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1193 + 23"
+      },
+      "description": "Insert CTE 'filtered_dates' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "c20744375cf92d6b"
+      },
+      "payload": {
+        "expr_sql": "cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5"
+      },
+      "description": "Replace WHERE predicate with optimized version"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

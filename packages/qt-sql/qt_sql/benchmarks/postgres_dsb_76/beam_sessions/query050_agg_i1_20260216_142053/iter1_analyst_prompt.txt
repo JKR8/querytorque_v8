@@ -1,0 +1,347 @@
+## Role
+
+You are a SQL optimization analyst reviewing benchmark results. Analyze what worked, what failed, and design refined targets for the next round of workers.
+
+Identify the primary bottleneck. Only provide secondary targets if they are distinct and high-confidence. Quality > Quantity.
+
+You will see the original query, execution plan, IR structure, and detailed results from previous rounds.
+
+## Query: query050_agg_i1
+
+**Dialect**: POSTGRES
+
+```sql
+select 
+   s_store_name
+  ,s_company_id
+  ,s_street_number
+  ,s_street_name
+  ,s_street_type
+  ,s_suite_number
+  ,s_city
+  ,s_county
+  ,s_state
+  ,s_zip
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 30) and
+                 (sr_returned_date_sk - ss_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 60) and
+                 (sr_returned_date_sk - ss_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 90) and
+                 (sr_returned_date_sk - ss_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   store_sales
+  ,store_returns
+  ,store
+  ,date_dim d1
+  ,date_dim d2
+where
+    d2.d_year = 2000
+and d2.d_moy  = 8
+and ss_ticket_number = sr_ticket_number
+and ss_item_sk = sr_item_sk
+and ss_sold_date_sk   = d1.d_date_sk
+and sr_returned_date_sk   = d2.d_date_sk
+and ss_customer_sk = sr_customer_sk
+and ss_store_sk = s_store_sk
+and d1.d_date between (d2.d_date - interval '120 day')
+               and d2.d_date
+group by
+   s_store_name
+  ,s_company_id
+  ,s_street_number
+  ,s_street_name
+  ,s_street_type
+  ,s_suite_number
+  ,s_city
+  ,s_county
+  ,s_state
+  ,s_zip
+order by s_store_name
+        ,s_company_id
+        ,s_street_number
+        ,s_street_name
+        ,s_street_type
+        ,s_suite_number
+        ,s_city
+        ,s_county
+        ,s_state
+        ,s_zip
+limit 100;
+```
+
+
+## Current Execution Plan
+
+```
+Limit  (rows=30, time=3470.519)
+  Aggregate  (rows=30, time=3470.511)
+    Nested Loop  (rows=52123, time=3457.727)
+      Gather Merge  (rows=66690, time=3413.666)
+        Sort  (rows=33345, time=2135.805)
+          Nested Loop  (rows=33345, time=2084.437)
+            Nested Loop  (rows=34150, time=2045.157)
+              Nested Loop  (rows=46104, time=15.261)
+                Seq Scan on date_dim (d2)  (rows=16, time=3.525)
+                Index Only Scan on store_returns  (rows=2974, time=0.425)
+              Index Only Scan on store_sales  (rows=1, time=0.044)
+            Index Scan on store  (rows=1, time=0.001)
+      Index Scan on date_dim (d1)  (rows=1, time=0.0)
+```
+
+
+## IR Structure (for patch targeting)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, store_returns, store, date_dim d1, date_dim d2
+    WHERE [b621d655cfd44fb4]: d2.d_year = 2000 AND d2.d_moy = 8 AND ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_ite...
+    GROUP BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    ORDER BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
+
+
+## Optimization Families
+
+Review the 6 families below. Each has a proven gold example.
+
+Choose up to **4 most relevant families** for this query based on:
+- Query structure (CTEs, subqueries, joins, aggregations, set operations)
+- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)
+- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
+
+
+
+### Family A: Early Filtering (Predicate Pushback)
+**Description**: Push small filters into CTEs early, reduce row count before expensive operations
+**Speedup Range**: 1.3–4.0x (~35% of all wins)
+**Use When**:
+  1. Late WHERE filters on dimension tables
+  2. Cascading CTEs with filters applied downstream
+  3. Expensive joins after filters could be pushed earlier
+
+**Gold Example**: `pg_date_cte_explicit_join` (2.28x)
+
+
+
+### Family B: Decorrelation (Sets Over Loops)
+**Description**: Convert correlated subqueries to standalone CTEs with GROUP BY, eliminate per-row re-execution
+**Speedup Range**: 2.4–2.9x (~15% of all wins)
+**Use When**:
+  1. Correlated subqueries in WHERE clause
+  2. Scalar aggregates computed per outer row
+  3. DELIM_SCAN in execution plan (indicates correlation)
+
+**Gold Example**: `pg_shared_scan_decorrelate` (8043.91x (timeout rescue))
+
+
+
+### Family C: Aggregation Pushdown (Minimize Rows Touched)
+**Description**: Aggregate before expensive joins when GROUP BY keys ⊇ join keys, reduce intermediate sizes
+**Speedup Range**: 1.3–15.3x (~5% of all wins (high variance))
+**Use When**:
+  1. GROUP BY happens after large joins
+  2. GROUP BY keys are subset of join keys
+  3. Intermediate result size >> final result size
+
+**Gold Example**: `pg_materialized_dimension_fact_prefilter` (12.07x (V2 DSB SF10, was 2.68x in V1))
+
+
+
+### Family D: Set Operation Optimization (Sets Over Loops)
+**Description**: Replace INTERSECT/UNION-based patterns with EXISTS/NOT EXISTS, avoid full materialization
+**Speedup Range**: 1.7–2.7x (~8% of all wins)
+**Use When**:
+  1. INTERSECT patterns between large sets
+  2. UNION ALL with duplicate elimination
+  3. Set operations materializing full intermediate results
+
+**Gold Example**: `pg_intersect_to_exists` (1.78x)
+
+
+
+### Family E: Materialization / Prefetch (Don't Repeat Work)
+**Description**: Extract repeated scans or pre-compute intermediate results for reuse across multiple consumers
+**Speedup Range**: 1.3–6.2x (~18% of all wins)
+**Use When**:
+  1. Repeated scans of same table with different filters
+  2. Dimension filters applied independently multiple times
+  3. CTE referenced multiple times with implicit re-evaluation
+
+**Gold Example**: `multi_dimension_prefetch` (2.71x)
+
+
+
+### Family F: Join Transform (Right Shape First)
+**Description**: Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation
+**Speedup Range**: 1.8–8.6x (~19% of all wins)
+**Use When**:
+  1. Comma-separated joins (implicit cross joins) in FROM clause
+  2. Self-joins scanning same table multiple times
+  3. Dimension-fact join order suboptimal for predicate pushdown
+
+**Gold Example**: `pg_explicit_join_materialized` (8.56x)
+
+
+
+## Optimization History
+
+### History — All Prior Patches
+
+| Iter | Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Error (summary) |
+|------|-------|--------|-----------|---------|--------|---------|----------|-----------------|
+| 0 | t1 | F | explicit_join_materialized | 0.74x | REGRESSION | 486 | 657 |  |
+| 0 | syn_w1 | A | early_filter | — | FAIL | — | — | Equivalence execution error: column "sr_ |
+| 0 | syn_w2 | B | decorrelate | — | FAIL | — | — | Equivalence execution error: current tra |
+| 0 | syn_w3 | E | materialize_cte | — | FAIL | — | — | Equivalence execution error: current tra |
+
+
+
+### Latest Iteration 0 — Detailed Results
+
+#### Race Results
+
+| Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Semantic | Error |
+|-------|--------|-----------|---------|--------|---------|----------|----------|-------|
+| t1 | F | explicit_join_materialized | 0.74x | REGRESSION | 486 | 657 | PASS |  |
+| syn_w1 | A | early_filter | — | FAIL | — | — | FAIL | Equivalence execution error: column "sr_returned_date_sk" does not exist
+LINE 1: |
+| syn_w2 | B | decorrelate | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| syn_w3 | E | materialize_cte | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+
+#### Patched SQL
+
+**t1 (Family F, explicit_join_materialized) — 0.74x REGRESSION:**
+```sql
+WITH d2_dates AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2000 AND d_moy = 8), d1_date_bounds AS (SELECT MIN(d_date) AS min_d2_date, MAX(d_date) AS max_d2_date FROM d2_dates), d1_dates AS (SELECT d_date_sk, d_date FROM date_dim, d1_date_bounds WHERE d_date BETWEEN (min_d2_date - INTERVAL '120 DAY') AND max_d2_date), filtered_sales AS (SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, d1_dates.d_date AS sold_date, ss_sold_date_sk FROM store_sales INNER JOIN d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk), filtered_returns AS (SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, d2_dates.d_date AS return_date, sr_returned_date_sk FROM store_returns INNER JOIN d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk) SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM filtered_sales INNER JOIN filtered_returns ON filtered_sales.ss_ticket_number = filtered_returns.sr_ticket_number AND filtered_sales.ss_item_sk = filtered_returns.sr_item_sk AND filtered_sales.ss_customer_sk = filtered_returns.sr_customer_sk INNER JOIN store ON filtered_sales.ss_store_sk = store.s_store_sk WHERE filtered_sales.sold_date BETWEEN (filtered_returns.return_date - INTERVAL '120 DAY') AND filtered_returns.return_date GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100;
+```
+
+**syn_w1 (Family A, early_filter):**
+```sql
+WITH d2_dates AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2000 AND d_moy = 8), d1_date_bounds AS (SELECT MIN(d_date) AS min_d2_date, MAX(d_date) AS max_d2_date FROM d2_dates), d1_dates AS (SELECT d_date_sk, d_date FROM date_dim, d1_date_bounds WHERE d_date BETWEEN (min_d2_date - INTERVAL '120 DAY') AND max_d2_date), filtered_sales AS (SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, d1_dates.d_date AS sold_date, d1_dates.d_date_sk AS sold_date_sk FROM store_sales INNER JOIN d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk), filtered_returns AS (SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, d2_dates.d_date AS return_date, d2_dates.d_date_sk AS return_date_sk FROM store_returns INNER JOIN d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk) SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM filtered_sales INNER JOIN filtered_returns ON filtered_sales.ss_ticket_number = filtered_returns.sr_ticket_number AND filtered_sales.ss_item_sk = filtered_returns.sr_item_sk AND filtered_sales.ss_customer_sk = filtered_returns.sr_customer_sk INNER JOIN store ON filtered_sales.ss_store_sk = store.s_store_sk WHERE filtered_sales.sold_date BETWEEN (filtered_returns.return_date - INTERVAL '120 DAY') AND filtered_returns.return_date GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100;
+```
+
+**syn_w2 (Family B, decorrelate):**
+```sql
+WITH d2_dates AS (SELECT * FROM date_dim WHERE d_year = 2000 AND d_moy = 8), d1_date_bounds AS (SELECT MIN(d_date) AS min_d2_date, MAX(d_date) AS max_d2_date FROM d2_dates), d1_dates AS (SELECT * FROM date_dim WHERE d_date BETWEEN (SELECT min_d2_date - INTERVAL '120 DAY' FROM d1_date_bounds) AND (SELECT max_d2_date FROM d1_date_bounds)), filtered_sales AS (SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, d1_dates.d_date AS sold_date FROM store_sales INNER JOIN d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk), filtered_returns AS (SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, d2_dates.d_date AS return_date FROM store_returns INNER JOIN d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk) SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM filtered_sales INNER JOIN filtered_returns ON filtered_sales.ss_ticket_number = filtered_returns.sr_ticket_number AND filtered_sales.ss_item_sk = filtered_returns.sr_item_sk AND filtered_sales.ss_customer_sk = filtered_returns.sr_customer_sk INNER JOIN store ON filtered_sales.ss_store_sk = store.s_store_sk WHERE filtered_sales.sold_date BETWEEN (filtered_returns.return_date - INTERVAL '120 DAY') AND filtered_returns.return_date GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100;
+```
+
+**syn_w3 (Family E, materialize_cte):**
+```sql
+WITH d2_dates AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2000 AND d_moy = 8), d1_date_bounds AS (SELECT MIN(d_date) AS min_d2_date, MAX(d_date) AS max_d2_date FROM d2_dates), d1_dates AS (SELECT d_date_sk, d_date FROM date_dim, d1_date_bounds WHERE d_date BETWEEN (min_d2_date - INTERVAL '120 DAY') AND max_d2_date), filtered_sales AS (SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, d1_dates.d_date AS sold_date FROM store_sales INNER JOIN d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk), filtered_returns AS (SELECT sr_ticket_number, sr_item_sk, sr_customer_sk FROM store_returns INNER JOIN d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk) SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM filtered_sales INNER JOIN filtered_returns ON filtered_sales.ss_ticket_number = filtered_returns.sr_ticket_number AND filtered_sales.ss_item_sk = filtered_returns.sr_item_sk AND filtered_sales.ss_customer_sk = filtered_returns.sr_customer_sk INNER JOIN store ON filtered_sales.ss_store_sk = store.s_store_sk WHERE filtered_sales.sold_date BETWEEN (filtered_returns.return_date - INTERVAL '120 DAY') AND filtered_returns.return_date GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100;
+```
+
+#### Execution Plans
+
+**Original EXPLAIN:**
+```
+Limit  (rows=30, time=3470.519)
+  Aggregate  (rows=30, time=3470.511)
+    Nested Loop  (rows=52123, time=3457.727)
+      Gather Merge  (rows=66690, time=3413.666)
+        Sort  (rows=33345, time=2135.805)
+          Nested Loop  (rows=33345, time=2084.437)
+            Nested Loop  (rows=34150, time=2045.157)
+              Nested Loop  (rows=46104, time=15.261)
+                Seq Scan on date_dim (d2)  (rows=16, time=3.525)
+                Index Only Scan on store_returns  (rows=2974, time=0.425)
+              Index Only Scan on store_sales  (rows=1, time=0.044)
+            Index Scan on store  (rows=1, time=0.001)
+      Index Scan on date_dim (d1)  (rows=1, time=0.0)
+```
+
+**t1 (0.74x REGRESSION) EXPLAIN:**
+```
+Limit  (rows=30, time=981.499)
+  Index Scan on date_dim (date_dim_1)  (rows=31, time=0.037)
+  Aggregate  (rows=30, time=981.49)
+    Sort  (rows=52123, time=962.606)
+      Nested Loop  (rows=52123, time=884.962)
+        Nested Loop  (rows=52750, time=602.244)
+          Nested Loop  (rows=52750, time=472.555)
+            Nested Loop  (rows=68299, time=419.025)
+              Nested Loop  (rows=92208, time=13.802)
+                CTE Scan (d2_dates)  (rows=31, time=0.041)
+                Index Only Scan on store_returns  (rows=2974, time=0.261)
+              Index Only Scan on store_sales  (rows=1, time=0.004)
+            Index Scan on date_dim  (rows=1, time=0.001)
+          Aggregate  (rows=1, time=0.002)
+            CTE Scan (d2_dates_1)  (rows=31, time=0.001)
+        Seq Scan on store  (rows=72, time=0.003)
+```
+
+#### Error Details
+
+- **syn_w1** (FAIL): Equivalence execution error: column "sr_returned_date_sk" does not exist
+LINE 1: ... s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returne...
+                                                             ^
+
+- **syn_w2** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **syn_w3** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+
+
+## Your Task — Snipe Round 1
+
+
+Results from latest iteration: **3 FAIL, 1 REGRESSION**.
+
+Follow this protocol exactly.
+
+### Step 1 — Compare EXPLAIN Plans
+
+For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.
+
+For each **WIN**, answer:
+- QUOTE the operator line(s) from the original that got cheaper or were eliminated. Give the exact operator name, time, and row count from the plan text above.
+- What structural SQL change caused that operator improvement?
+- What is the **most expensive remaining operator** in this winner's plan? QUOTE its line (name, time, rows).
+
+For each **FAIL/NEUTRAL/REGRESSION**:
+- QUOTE the operator(s) that got MORE expensive vs the original.
+- Why did the structural change backfire?
+
+Then classify winners as REDUNDANT (same core structural change, same operators improved) or COMPLEMENTARY (different operators improved, different structural changes).
+
+### Step 2 — Design Targets by Combining Strategies
+
+Start from the **best winner's SQL** as your baseline.
+
+**CRITICAL**: Do NOT invent new hypotheses about row counts or selectivity. Every claim about rows, times, or costs MUST be a direct quote from an EXPLAIN plan above. If a number is not in the plans, you do not know it.
+
+**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites (UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce identical plans. Focus on changes that **eliminate operators** or **reduce input rows to expensive operators** as shown in the plans.
+
+Design up to 4 targets, prioritized:
+
+1. **Combination** (primary if complementary winners exist): Take the best winner's SQL. Layer on the structural change from a complementary winner that addresses a DIFFERENT expensive operator. Cite both operators by name from the EXPLAIN plans.
+2. **Refinement**: Take the best winner's SQL. Target its most expensive remaining operator (quoted in Step 1). Design a structural change that reduces input rows to that operator. CITE the operator and its current row count from the plan.
+3. **Rescue** (if a failed patch had a sound structural idea): Fix the implementation while preserving the best winner's gains.
+4. **Novel**: A new structural approach that targets the most expensive remaining operator. Cite the operator from the plan.
+
+**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F"). The worker will receive gold examples from ALL referenced families.
+
+Output up to 4 targets. Same JSON format:
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "...",
+    "target_ir": "...",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  }
+]
+```
+
+Output up to 4 targets. Fewer strong targets beat padding with weak ones.

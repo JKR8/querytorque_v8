@@ -1,0 +1,90 @@
+### Step 1 — Compare EXPLAIN Plans  
+**All prior patches FAILED** due to literal mismatches in the price ratio filter (`35 * 0.01` → `0.35`). No execution plans exist for comparison. The core issue is structural: the rewrite altered literal expressions instead of preserving them.  
+
+**Primary bottleneck**: The `Gather Merge` (2367 ms) and its child `Sort` (874 ms) dominate runtime. These operators process large intermediate results from:  
+1. `Hash Join` (117k rows, 119 ms)  
+2. `Nested Loop` (296k rows, 47 ms) between `date_dim d1` and `store_returns`  
+
+**Root cause**: Late filtering forces expensive joins on unfiltered data. Dimension filters (`item`, `customer`, `household_demographics`) are applied *after* fact-table joins, bloating intermediate results.  
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Best structural idea was **Family A+E** (early filtering + date materialization), but failed due to literal mismatch.  
+
+**Target 1: Rescue A+E with Literal Fix**  
+- **Family**: A+E  
+- **Transform**: `early_filter_then_date_materialization_fixed`  
+- **Target ID**: `t1`  
+- **Relevance**: 0.95 (directly addresses primary bottleneck)  
+- **Hypothesis**: Prefilter dimensions (`item`, `customer`+`customer_address`+`household_demographics`) and precompute date pairs to shrink input to `Hash Join` (117k rows) and `Nested Loop` (296k rows). Preserve literals verbatim in price ratio filter.  
+- **Target IR**: `S0:267a8f8c05e058f0` (replace entire FROM/WHERE)  
+- **Examples**: `date_cte_isolate`, `multi_dimension_prefetch`  
+
+**Target 2: Aggregation Pushdown (C) + Early Filtering (A)**  
+- **Family**: C+A  
+- **Transform**: `prefilter_agg_pushdown`  
+- **Target ID**: `t2`  
+- **Relevance**: 0.85 (targets expensive Sort/Gather Merge)  
+- **Hypothesis**: Prefilter dimensions (A), then aggregate fact tables *before* joining to customer. Reduces rows flowing into `Sort` (77 rows pre-sort) and `Gather Merge` (231 rows).  
+- **Target IR**: `S0` (replace GROUP BY/aggregation)  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+**Target 3: Join Restructure (F) + Date Precomputation (E)**  
+- **Family**: F+E  
+- **Transform**: `explicit_join_date_materialization`  
+- **Target ID**: `t3`  
+- **Relevance**: 0.80 (optimizes join topology)  
+- **Hypothesis**: Convert comma joins to explicit INNER JOINs, enforce optimal dimension-fact order, and reuse precomputed date pairs (E). Targets `Nested Loop` (296k rows) and `Bitmap Heap Scan` on `web_sales`.  
+- **Target IR**: `S0:267a8f8c05e058f0` (replace FROM clause)  
+- **Examples**: `pg_explicit_join_materialized`, `pg_date_cte_explicit_join`  
+
+**Target 4: Literal-Safe Decorrelation (B) for Date Pairs**  
+- **Family**: B  
+- **Transform**: `date_pair_decorrelation`  
+- **Target ID**: `t4`  
+- **Relevance**: 0.75 (novel approach for date correlation)  
+- **Hypothesis**: Eliminate correlated date scan (`d2` indexed scan) by converting to a non-correlated CTE with `d1`/`d2` join. Preserve literals.  
+- **Target IR**: `S0` (replace WHERE clause date conditions)  
+- **Examples**: `pg_shared_scan_decorrelate`  
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "early_filter_then_date_materialization_fixed",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefilter dimensions (item, customer+address+hd) and precompute date pairs to shrink input to expensive Hash Join (117k rows) and Nested Loop (296k rows). Preserve original literals in price ratio filter.",
+    "target_ir": "S0:267a8f8c05e058f0",
+    "recommended_examples": ["date_cte_isolate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C+A",
+    "transform": "prefilter_agg_pushdown",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Prefilter dimensions (A), then aggregate fact tables by customer_sk before joining to customer. Reduces rows flowing into Sort (77 rows) and Gather Merge (231 rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F+E",
+    "transform": "explicit_join_date_materialization",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Restructure joins explicitly (F) with precomputed date pairs (E) to optimize join order and eliminate redundant scans. Targets Nested Loop (296k rows) and Bitmap Heap Scan on web_sales.",
+    "target_ir": "S0:267a8f8c05e058f0",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "B",
+    "transform": "date_pair_decorrelation",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Decorrelate date_dim scans by converting d2 lookup to standalone CTE with d1 join. Eliminates per-row indexed scan on d2 (0.0 ms in plan but potentially costly at scale).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

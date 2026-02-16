@@ -1,0 +1,164 @@
+## Role
+
+You are **W3 "Builder"** — Structural optimization — join restructuring, materialization. Restructure join topology and materialize repeated work: convert comma joins to explicit INNER JOIN, extract shared scans into CTEs, prefetch dimension tables.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: E — dimension_prefetch
+**Hypothesis**: Small dimension tables ('income_band', 'customer_address') are scanned multiple times in nested loops. Materializing them first improves statistics estimation and avoids re-scans.
+
+## Original SQL
+
+```sql
+select  c_customer_id as customer_id
+       , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername
+ from customer
+     ,customer_address
+     ,customer_demographics
+     ,household_demographics
+     ,income_band
+     ,store_returns
+ where ca_city	        =  'Jackson'
+   and c_current_addr_sk = ca_address_sk
+   and ib_lower_bound   >=  23567
+   and ib_upper_bound   <=  23567 + 50000
+   and ib_income_band_sk = hd_income_band_sk
+   and cd_demo_sk = c_current_cdemo_sk
+   and hd_demo_sk = c_current_hdemo_sk
+   and sr_cdemo_sk = cd_demo_sk
+ order by c_customer_id
+ limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: customer, customer_address, customer_demographics, household_demographics, income_band, store_returns
+    WHERE [bfc6729fe553d3e9]: ca_city = 'Jackson' AND c_current_addr_sk = ca_address_sk AND ib_lower_bound >= 23567 AND ib_uppe...
+    ORDER BY: c_customer_id
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  CTE: prefetch_address (via Q1)
+    FROM: customer_address
+    WHERE: ca_city = 'Jackson'
+  CTE: prefetch_income (via Q2)
+    FROM: income_band
+    WHERE: ib_lower_bound >= 23567 AND ib_upper_bound <= 73567
+  MAIN QUERY (via Q_S0)
+    FROM: prefetch_address
+      INNER JOIN customer ON c_current_addr_sk = ca_address_sk
+      INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk
+      INNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk
+      INNER JOIN prefetch_income ON ib_income_band_sk = hd_income_band_sk
+      INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk
+    ORDER BY: c_customer_id
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_duckdb_multi_dimension_prefetch",
+  "dialect": "duckdb",
+  "description": "Pre-filter multiple dimension tables (date + store) into separate CTEs before joining with fact table",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_dates",
+        "cte_query_sql": "SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000"
+      },
+      "description": "Insert CTE 'filtered_dates' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_stores",
+        "cte_query_sql": "SELECT s_store_sk, s_store_id, s_store_name FROM store WHERE s_gmt_offset = -5"
+      },
+      "description": "Insert CTE 'filtered_stores'"
+    },
+    {
+      "step_id": "s3",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_sales",
+        "cte_query_sql": "SELECT ss_sales_price, d_day_name, s_store_id, s_store_name FROM store_sales JOIN filtered_dates ON d_date_sk = ss_sold_date_sk JOIN filtered_stores ON s_store_sk = ss_store_sk"
+      },
+      "description": "Insert CTE 'filtered_sales' for date dimension filtering"
+    },
+    {
+      "step_id": "s4",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "filtered_sales"
+      },
+      "description": "Replace FROM clause with optimized version"
+    },
+    {
+      "step_id": "s5",
+      "op": "delete_expr_subtree",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "834e9c75d01a8fa3"
+      },
+      "description": "Remove WHERE clause (conditions moved to CTEs)"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

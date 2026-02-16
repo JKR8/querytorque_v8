@@ -1,0 +1,47 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**WIN (t2 - Family A: dimension_prefilter)**
+- **Improved Operator**: Original `Nested Loop` in `sr_items` branch (rows=42, time=221.212) was replaced with a more efficient `Hash Join` (rows=61, time=10.395) and `CTE Scan` (rows=3140, time=34.003).  
+- **Structural Change**: Prefiltering `item` into `filtered_items` CTE reduced row processing in `store_returns` and `catalog_returns` joins.  
+- **Most Expensive Remaining Operator**: `Aggregate` for `sr_items` (time=532.455). This dominates the plan despite the win.  
+
+**REGRESSION (t3 - Family F: explicit_join)**  
+- **Regressed Operator**: `Aggregate` for `sr_items` ballooned from 236.985 ms to 833.627 ms.  
+- **Why Backfired**: Materializing `date_subquery_cte` added overhead, and explicit joins disrupted the optimal join order. The plan shows expensive `Nested Loop` (time=832.048) and redundant `CTE Scan` operations.  
+
+**FAILED (t1/syn_w2)**  
+Both failed due to IR targeting issues (`replace_body` couldn't anchor). The structural ideas (materialization/decorrelation) weren't applied.  
+
+**Classification**:  
+- **t2 (A)** and **t3 (F)** are **COMPLEMENTARY**. t2 optimized item filtering, while t3 targeted date subqueries (but regressed).  
+- **REDUNDANT** patches not observed.  
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: Start with **t2 SQL** (1.26x WIN).  
+**Primary Bottleneck**: `Aggregate` for `sr_items` (532 ms).  
+**Hypothesis**: Precompute the repeated date subquery (Family E) to reduce input rows to the expensive `Aggregate`.  
+
+#### Target 1: Combine A+E (Early Filtering + Materialization)  
+- **Family**: A+E  
+- **Transform**: `prefilter_items_and_date`  
+- **Target IR**: `S0: anchor_hash=0e71803ec565a4ea` (date subquery in `sr_items`), `dcf6f614885a6be3` (cr_items), `00b551846eee9598` (wr_items)  
+- **Hypothesis**: Precompute `date_filter` CTE to avoid 3 repeated subqueries. Current `sr_items` `Aggregate` processes 61 rows after joins. Materializing the date subquery (122 rows) once will reduce re-execution costs.  
+- **Confidence**: High (date subquery is identical in all CTEs and scanned 3x in t2 plan).  
+- **Examples**: `multi_dimension_prefetch`, `date_cte_isolate`  
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "prefilter_items_and_date",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefiltering items (A) reduced item scans, but date subqueries are still executed 3 times. Materializing the date filter (E) will eliminate redundant subquery executions and reduce input rows to the expensive sr_items Aggregate (532 ms).",
+    "target_ir": "S0: anchor_hash=0e71803ec565a4ea, dcf6f614885a6be3, 00b551846eee9598. Replace date subqueries with CTE reference.",
+    "recommended_examples": ["multi_dimension_prefetch", "date_cte_isolate"]
+  }
+]
+```

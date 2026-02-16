@@ -1,0 +1,88 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Winners (All 4 are REDUNDANT):**
+All winning patches (t1, t2, syn_w1, syn_w2) share the **same core structural change**: decorrelating the subquery using Family B. They eliminate the correlated execution pattern by precomputing store averages in a standalone CTE (`store_avg_return`/`avg_return_by_store`). This resolves the primary bottleneck.
+
+**Original bottleneck operator (eliminated in all winners):**  
+```
+CTE Scan (ctr1)  (rows=2902, time=34350.649)
+  Aggregate  (rows=1, time=3.362)
+    CTE Scan (ctr2)  (rows=2394, time=3.23)
+```  
+**Improvement:** The correlated subquery (executed per row of `ctr1`) is replaced with a single-pass hash join against precomputed averages. Time drops from **34,350 ms → ~600 ms**.
+
+**Most expensive remaining operator in winners (consistent across all):**  
+```
+Hash  (rows=8823, time=591.542)   // t1 example
+  CTE Scan (ctr1)  (rows=8834, time=590.688)
+```  
+The scan and hashing of the large CTE `customer_total_return` (93k rows) dominates execution time in all optimized plans.
+
+---
+
+### Step 2 — Design Targets for Next Round
+
+**Baseline:** Best winner `t2` (61.86x speedup, explicit joins).  
+**Primary bottleneck:** CTE scan/hash of `customer_total_return` (~590 ms, 88k rows).  
+**Strategy:** Reduce input rows to this operator via early filtering.
+
+**Target 1 (Combination: B + A)**  
+```json
+{
+  "family": "B+A",
+  "transform": "decorrelate_then_early_filter",
+  "target_id": "t1",
+  "relevance_score": 0.95,
+  "hypothesis": "Push ctr_reason_sk filter into CTE to reduce customer_total_return rows before aggregation/scan. Current CTE outputs 93k rows, but main query only needs reason_sk 17-20 (2.9k rows in original).",
+  "target_ir": "S0:70b678372a29c55c",
+  "recommended_examples": ["shared_scan_decorrelate", "pg_date_cte_explicit_join"]
+}
+```
+
+**Target 2 (Refinement: A)**  
+```json
+{
+  "family": "A",
+  "transform": "push_store_state_to_cte",
+  "target_id": "t2",
+  "relevance_score": 0.85,
+  "hypothesis": "Join store table early in CTE and filter by s_state. Current CTE scans 93k rows, but store filter reduces main query store rows to 8. Avoids passing irrelevant stores through CTE.",
+  "target_ir": "S0:70b678372a29c55c",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+**Target 3 (Novel: E)**  
+```json
+{
+  "family": "E",
+  "transform": "precompute_filtered_cte",
+  "target_id": "t3",
+  "relevance_score": 0.80,
+  "hypothesis": "Materialize a pre-filtered version of customer_total_return (with store+reason filters) to avoid scanning full 93k rows twice (for store_avg and main query).",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch"]
+}
+```
+
+**Target 4 (Combination: B + A + F)**  
+```json
+{
+  "family": "B+A+F",
+  "transform": "full_dimension_pushdown",
+  "target_id": "t4",
+  "relevance_score": 0.75,
+  "hypothesis": "Push all applicable dimension filters (store_state, reason_sk, customer demographics) into CTE via joins. Most aggressive row reduction targeting the 93k-row CTE scan.",
+  "target_ir": "S0:70b678372a29c55c",
+  "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+}
+```
+
+### Key Rationale
+1. **Primary Focus**: All winners share the same residual bottleneck (large CTE scan). Targets 1-4 systematically attack this via early filtering (A), materialization (E), and join restructuring (F).
+2. **Evidence-Driven**: 
+   - CTE scan dominates time in all winning plans (`Hash (time=591.542)`).
+   - Original plan showed extreme selectivity for `ctr_reason_sk` (2.9k rows vs 93k).
+   - Store filter reduces stores to 8 rows (per original plan: `Seq Scan on store (rows=8)`).
+3. **Low-Risk Complements**: Family A (filter pushdown) naturally complements the decorrelation (B) in the baseline. Family E (materialization) offers an orthogonal approach to reuse filtered subsets.
+4. **Progressive Aggression**: Targets escalate from single-filter push (Target 1) to full dimension integration (Target 4) based on confidence.

@@ -1,0 +1,97 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t4 (1.08x IMPROVED - Family A)**  
+- **Improved operator**:  
+  `Hash Join (rows=150624, time=184.257) → Original: 342.324 ms`  
+  Structural change: Pushed `cd_marital_status`/`cd_education_status` filters into a CTE (`filtered_cd`), reducing rows scanned in `customer_demographics` before joining with `store_sales`.  
+- **Most expensive remaining operator**:  
+  `Materialize (rows=310812, time=204.044)`  
+  (Driven by `catalog_sales` subquery in `NOT EXISTS` clause)  
+
+**Analysis of FAILED patches (t1, t2, syn_w2)**  
+All failed due to **LITERAL MISMATCH** (replaced `10+2` with `12`).  
+- **t1/syn_w2 (Family B)**: Backfired because the rewrite altered literal expressions (`10+2` → `12`), violating semantic equivalence.  
+- **t2 (Family E+F)**: Same literal mismatch issue, but also showed potential in:  
+  `Nested Loop (rows=332456, time=204.044) → Original: 257.998 ms`  
+  Materializing `date_filter` CTE improved `catalog_sales` scan time (2.069 ms vs 2.629 ms) but was offset by literal errors.  
+
+**Classification**:  
+- **t4 (Family A)** and **t2 (Family E+F)** are **COMPLEMENTARY**:  
+  - t4 optimized `customer_demographics` + `store_sales` (184 ms vs 342 ms).  
+  - t2 optimized `date_dim` reuse across subqueries (reduced `catalog_sales` scan time).  
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Materialize (rows=310812, time=204.044)` for `catalog_sales` subquery (slowest in t4 plan).  
+
+**Target 1: Combination (A + B)**  
+- **Family**: A+B  
+- **Transform**: `early_filter_then_decorrelate`  
+- **Hypothesis**: Layer decorrelation (Family B) on t4’s early-filtered CTE. Convert `EXISTS`/`NOT EXISTS` to anti-joins using precomputed sets, eliminating per-row subquery execution. Targets the `Materialize (rows=310812)` bottleneck.  
+- **Target IR**: `S0:WHERE[dae945277e160f9b]`  
+- **Examples**: `demographics_filter_push`, `pg_shared_scan_decorrelate`  
+
+**Target 2: Refinement (A + E)**  
+- **Family**: A+E  
+- **Transform**: `early_filter_and_date_prefetch`  
+- **Hypothesis**: Add `date_dim` CTE (Family E) to t4’s baseline. Precompute date keys once (reused in 3 subqueries), reducing repeated scans. Targets `Nested Loop` in `catalog_sales` (rows=332,456).  
+- **Target IR**: `S0:WHERE[dae945277e160f9b]`  
+- **Examples**: `demographics_filter_push`, `multi_dimension_prefetch`  
+
+**Target 3: Rescue (E + F)**  
+- **Family**: E+F  
+- **Transform**: `date_prefetch_explicit_join_fixed`  
+- **Hypothesis**: Fix t2’s literal mismatch (`10+2` preserved) and layer on t4’s `filtered_cd` CTE. Materialize `date_filter` + explicit joins reduce `catalog_sales` scan time (2.629 ms → 2.069 ms in t2).  
+- **Target IR**: `S0:FROM`  
+- **Examples**: `pg_explicit_join_materialized`, `multi_dimension_prefetch`  
+
+**Target 4: Novel (C)**  
+- **Family**: C  
+- **Transform**: `preaggregate_customer`  
+- **Hypothesis**: Pre-aggregate `customer` + `customer_demographics` before joining with subqueries. Since `GROUP BY` keys ⊇ join keys (`cd_demo_sk`), this reduces rows fed into expensive `NOT EXISTS` checks.  
+- **Target IR**: `S0:FROM`  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1_fixed",
+    "relevance_score": 0.95,
+    "hypothesis": "Eliminate per-row subquery execution by converting EXISTS/NOT EXISTS to anti-joins with precomputed sets, targeting the Materialize (rows=310812) bottleneck in catalog_sales.",
+    "target_ir": "S0:WHERE[dae945277e160f9b]",
+    "recommended_examples": ["demographics_filter_push", "pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "A+E",
+    "transform": "early_filter_and_date_prefetch",
+    "target_id": "t2_fixed",
+    "relevance_score": 0.85,
+    "hypothesis": "Reuse materialized date_dim CTE across subqueries to avoid repeated scans, reducing Nested Loop (rows=332,456) cost in catalog_sales.",
+    "target_ir": "S0:WHERE[dae945277e160f9b]",
+    "recommended_examples": ["demographics_filter_push", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "E+F",
+    "transform": "date_prefetch_explicit_join_fixed",
+    "target_id": "t3_rescue",
+    "relevance_score": 0.80,
+    "hypothesis": "Fix literal mismatch in t2 while preserving its date_dim CTE and explicit join structure, leveraging reduced catalog_sales scan time (2.629ms → 2.069ms).",
+    "target_ir": "S0:FROM",
+    "recommended_examples": ["pg_explicit_join_materialized", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_customer",
+    "target_id": "novel1",
+    "relevance_score": 0.75,
+    "hypothesis": "Pre-aggregate customer and demographics before subquery joins to shrink row count fed into NOT EXISTS operators (GROUP BY keys ⊇ join keys).",
+    "target_ir": "S0:FROM",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

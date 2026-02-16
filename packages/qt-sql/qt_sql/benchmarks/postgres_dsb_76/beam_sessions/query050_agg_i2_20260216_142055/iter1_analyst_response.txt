@@ -1,0 +1,50 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**WIN (t2 - Early Filtering):**
+- **Operator Improvement**:  
+  `Sort  (rows=40756, time=1225.854 → 368.68)`  
+  The structural change (pre-joining `d1`/`d2` in a CTE) reduced the sort time by 70% by filtering date ranges earlier.  
+- **Most Expensive Remaining Operator**:  
+  `Gather Merge  (rows=81513, time=498.078)`  
+  Parallel processing of 81k rows remains the bottleneck.
+
+**FAIL Patches (t1, t3, syn_w2):**
+- **t1/syn_w2 (Aggregation Pushdown/Decorrelate)**: Failed due to transaction errors (likely syntax/ambiguity in CTEs).  
+- **t3 (Join Transform)**: Ambiguous column `d_date_sk` due to CTE design flaws.
+
+**Classification**:  
+t2 is **COMPLEMENTARY** to other families. Its gains came from reducing date-filtering overhead, but didn’t address the large `Gather Merge`.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Gather Merge` (81k rows) dominates runtime in the winning plan (t2). This parallel merge step processes excessive rows from the `store_sales`/`store_returns` join.
+
+**High-Confidence Target**:  
+**Combination (A+C)**: Layer aggregation pushdown (C) onto t2 to shrink input to `Gather Merge`.  
+- **Hypothesis**: Pre-aggregate metrics by `ss_store_sk` *before* joining to `store`, reducing `Gather Merge` input from 81k rows to ~1k (distinct stores).  
+- **Mechanism**: Use t2’s filtered date CTE, then aggregate in `store_sales`/`store_returns` before joining to `store`.  
+- **Target IR**: `S0` (replace entire query structure).  
+- **Confidence**: 0.95 (plan shows 81k → 30 rows post-aggregate; pushing this upstream avoids materializing large intermediates).
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_then_aggregate_by_store_sk",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-aggregate sales/returns by store_sk after date filtering. Reduces Gather Merge input from 81k rows to ~1k (distinct stores), cutting sort/merge overhead.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```
+
+**Why Only One Target?**  
+- The `Gather Merge` dominates runtime (71% of t2’s plan time).  
+- Other families (B, D, E, F) lack signals: No correlation (B), set ops (D), repeated scans (E), or comma joins (F).  
+- Failed patches require syntax fixes, but A+C structurally addresses the core bottleneck.  
+- **Quality > Quantity**: One high-impact target beats speculative changes.

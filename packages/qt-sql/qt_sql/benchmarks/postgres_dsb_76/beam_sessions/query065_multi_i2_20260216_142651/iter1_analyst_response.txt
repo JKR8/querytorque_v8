@@ -1,0 +1,104 @@
+### Analysis of Prior Patches
+
+All patches failed due to a **Tier-1 structural error**: rewriting literals (`79 * 0.01` → `0.79`) instead of preserving original values. This caused semantic mismatches. No successful optimizations exist to compare plans. The primary bottleneck remains:
+
+**Primary Bottleneck**: Repeated full scans of `store_sales` and `date_dim` (2 instances of `Nested Loop` with `Index Only Scan` at 484ms and 407ms). This dominates runtime (891ms total).
+
+---
+
+### Optimization Targets for Next Round
+
+**Target 1 (Combination: E+A)**  
+**Family**: E + A  
+**Transform**: `materialize_common_base_with_early_filters`  
+**Target ID**: `t1`  
+**Relevance Score**: 0.95  
+**Hypothesis**:  
+1. **Family E**: Materialize the common base scan of `store_sales`/`date_dim` to avoid duplicate work (targets both `Nested Loop` scans at 484ms/407ms).  
+2. **Family A**: Push `store.s_state` and `item.i_manager_id` filters into the base CTE to reduce rows before aggregation (targets `Aggregate` at 931ms).  
+**Target IR**: `S0` (replace entire FROM structure)  
+**Recommended Examples**: `multi_dimension_prefetch`, `pg_date_cte_explicit_join`  
+
+**Target 2 (Refinement: E + Aggregation Pushdown)**  
+**Family**: E + C  
+**Transform**: `materialized_base_agg_combine`  
+**Target ID**: `t2`  
+**Relevance Score**: 0.85  
+**Hypothesis**:  
+1. **Family E**: Materialize base scan to eliminate duplicate `store_sales`/`date_dim` scans.  
+2. **Family C**: Combine `sb` and `sc` aggregations into a single CTE (keys: `ss_store_sk, ss_item_sk`), computing `AVG()` and `SUM()` in one pass. Reduces input rows to downstream `Aggregate` (6666 rows → smaller).  
+**Target IR**: `S0` (anchor hash for `sb` and `sc` subqueries)  
+**Recommended Examples**: `multi_dimension_prefetch`, `pg_materialized_dimension_fact_prefilter`  
+
+**Target 3 (Rescue: Explicit Join Restructure)**  
+**Family**: F  
+**Transform**: `explicit_join_preserve_literals`  
+**Target ID**: `t3`  
+**Relevance Score**: 0.80  
+**Hypothesis**:  
+Convert comma joins to explicit `INNER JOIN` syntax (e.g., `store_sales, date_dim` → `store_sales INNER JOIN date_dim`) while preserving original literals. Enables better join order optimization by the planner (targets `Merge Join` at 1751ms).  
+**Target IR**: `S0` (anchor hash for FROM clauses)  
+**Recommended Examples**: `pg_explicit_join_materialized`  
+
+**Target 4 (Novel: Semi-Join Filter Pushdown)**  
+**Family**: A  
+**Transform**: `push_filters_with_semijoins`  
+**Target ID**: `t4`  
+**Relevance Score**: 0.75  
+**Hypothesis**:  
+Use `EXISTS` to push `store`/`item` filters into the base scan *without* early joins (avoids bloating the CTE). Targets high-row operators:  
+```sql
+WHERE EXISTS (SELECT 1 FROM store WHERE s_store_sk = ss_store_sk AND s_state IN (...))
+AND EXISTS (SELECT 1 FROM item WHERE i_item_sk = ss_item_sk AND i_manager_id BETWEEN ...)
+```  
+**Target IR**: `S0` (anchor hash for `store` and `item` filters)  
+**Recommended Examples**: `pg_date_cte_explicit_join`  
+
+---
+
+### Key Rationale
+1. **Primary Focus**: Eliminate repeated scans (Family E) and reduce aggregation input (Family A/C).  
+2. **Literal Preservation**: All targets retain original literals (`79 * 0.01`).  
+3. **Plan Evidence**: Targets operators with highest observed times (`Nested Loop`, `Aggregate`, `Merge Join`).  
+4. **Complementarity**: Combines reuse (E), filter pushdown (A), and aggregation efficiency (C) for multiplicative gains.  
+
+```json
+[
+  {
+    "family": "E+A",
+    "transform": "materialize_common_base_with_early_filters",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Materialize common base scan (E) to avoid duplicate store_sales/date_dim nested loops (484ms/407ms). Push store.s_state and item.i_manager_id filters into base CTE (A) to reduce rows before aggregation (931ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E+C",
+    "transform": "materialized_base_agg_combine",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Materialize base scan (E) to eliminate duplicate scans. Combine sb (AVG) and sc (SUM) aggregations into a single CTE (C) to reduce input rows (6666) to downstream operators.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_preserve_literals",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Restructure comma joins to explicit INNER JOIN syntax to enable better join order optimization (targets Merge Join at 1751ms) while preserving original literals.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "push_filters_with_semijoins",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Push store/item filters into base scan using EXISTS semi-joins to reduce rows early without expanding CTE size (targets Nested Loop scans).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

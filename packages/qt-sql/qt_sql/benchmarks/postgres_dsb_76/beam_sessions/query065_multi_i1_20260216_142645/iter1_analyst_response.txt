@@ -1,0 +1,100 @@
+## Step 1 — Compare EXPLAIN Plans
+
+All patches in Iteration 0 failed. There are no winners to analyze. The primary bottleneck remains the **double scan** of `store_sales` and `date_dim` seen in the original plan:
+
+```
+Nested Loop  (rows=145949, time=507.114)   [Base for sb]
+Nested Loop  (rows=145949, time=448.19)    [Base for sc]
+```
+
+Both operations scan the same 145K rows with identical filters (`d_month_seq` and price ratio), consuming ~90% of the total runtime. The failures were caused by:
+- **t1**: Literal mismatch (changed filter expressions)
+- **t2**: Column reference error (lost `s_store_name`)
+- **t3/t4**: Transaction errors (likely syntax issues)
+
+No operator improvements were observed. The repeated scans remain the critical bottleneck.
+
+## Step 2 — Design Targets
+
+### Primary Bottleneck
+**Double full scan of store_sales/date_dim** (145K rows each) for subqueries `sb` and `sc`. Confirmed by:
+- Identical `Nested Loop` operators in both branches
+- Matching row counts (145,949) and filters
+- 90% of total runtime spent on these scans
+
+### Target 1: Rescue Family E + Fix Literals
+- **Family**: E (Materialization)
+- **Transform**: `base_sales_rescue`
+- **Target ID**: t1
+- **Relevance**: 0.98
+- **Hypothesis**: Materializing the common base scan (store_sales + date_dim) will eliminate the repeated 145K-row scan. Fix literal mismatch by preserving original expressions.
+- **Target IR**: `S0` (entire query)
+- **Recommended Examples**: `multi_dimension_prefetch`
+
+### Target 2: Combine Family E + Family A
+- **Family**: E+A
+- **Transform**: `base_sales_plus_early_filter`
+- **Target ID**: t2
+- **Relevance**: 0.90
+- **Hypothesis**: After materializing base_sales, push `store`/`item` filters into `sc` CTE to reduce its output before joining with `sb`. Targets 18-row `Aggregate` in `sc` branch.
+- **Target IR**: `S0` + `77f67ba857e1627b` (WHERE clause)
+- **Recommended Examples**: `multi_dimension_prefetch`, `pg_date_cte_explicit_join`
+
+### Target 3: Family F + Family E
+- **Family**: F+E
+- **Transform**: `explicit_join_with_materialization`
+- **Target ID**: t4
+- **Relevance**: 0.85
+- **Hypothesis**: Convert comma joins to explicit INNER JOINs while reusing materialized base_sales. Optimizes join order and avoids redundant scans.
+- **Target IR**: `S0`
+- **Recommended Examples**: `pg_explicit_join_materialized`, `multi_dimension_prefetch`
+
+### Target 4: Rescue Family A + Fix Columns
+- **Family**: A (Early Filtering)
+- **Transform**: `pushdown_fix_projection`
+- **Target ID**: t3
+- **Relevance**: 0.80
+- **Hypothesis**: Push `store`/`item` filters into `sc` while preserving output columns (`s_store_name`, `i_item_desc`) to avoid reference errors.
+- **Target IR**: `S0` + `77f67ba857e1627b`
+- **Recommended Examples**: `pg_date_cte_explicit_join`
+
+```json
+[
+  {
+    "family": "E",
+    "transform": "base_sales_rescue",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Materialize common base scan (store_sales+date_dim) to eliminate repeated 145K-row Nested Loop. Preserve original literal expressions to avoid mismatch.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "E+A",
+    "transform": "base_sales_plus_early_filter",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "After materializing base_sales, push store/item filters into sc CTE to reduce its 78K-row Aggregate before joining with sb.",
+    "target_ir": "S0:77f67ba857e1627b",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F+E",
+    "transform": "explicit_join_with_materialization",
+    "target_id": "t4",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert comma joins to explicit INNER JOINs while reusing materialized base_sales. Optimizes join order and eliminates redundant scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "pushdown_fix_projection",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Push store/item filters into sc CTE while preserving output columns (s_store_name, i_item_desc) to avoid reference errors.",
+    "target_ir": "S0:77f67ba857e1627b",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

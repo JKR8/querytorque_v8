@@ -1,0 +1,54 @@
+### Step 1 — Compare EXPLAIN Plans
+
+All patches failed, so there are no winners to analyze. The failures were primarily due to:
+- **Ambiguous column references** (t1) causing syntax errors
+- **Transaction aborts** (t2, t3, t4) from cascading errors in test environment
+
+No operator improvements were observed. The core bottleneck remains the **Hash Join (221.796 ms)** building a hash table from a full Seq Scan on `web_returns` (50K rows), as seen in the original plan.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+Hash Join building a 50K-row hash table from `web_returns` (Seq Scan: 77.957 ms).  
+**Hypothesis**: Prefilter `web_returns` for `wr_reason_sk IN (7,25,26,52,69)` to reduce rows before the join.
+
+**Refined Targets**:
+
+```json
+[
+  {
+    "family": "A",
+    "transform": "prefiltered_returns_cte",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Prefilter web_returns for wr_reason_sk early to shrink the 50K-row Seq Scan (77.957 ms) before the Hash Join (221.796 ms). Targets S0:WHERE:NOT_EXISTS.",
+    "target_ir": "S0:WHERE:NOT_EXISTS",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A+B",
+    "transform": "prefiltered_returns_decorrelated_exists",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Combine prefiltered web_returns (A) with decorrelated EXISTS for multi-warehouse (B). Fixes t1's ambiguity by qualifying ws_order_number. Targets both S0:WHERE:EXISTS and S0:WHERE:NOT_EXISTS.",
+    "target_ir": "S0:WHERE:EXISTS+S0:WHERE:NOT_EXISTS",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "A+F",
+    "transform": "prefilter_dimensions_and_returns",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Prefilter dimension tables (date_dim, customer_address, web_site) and web_returns. Reduces input to the Nested Loop (130.779 ms) and Hash Join (221.796 ms).",
+    "target_ir": "S0:FROM",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  }
+]
+```
+
+### Rationale
+1. **Target 1 (Family A)**: Highest confidence. Directly attacks the 50K-row `web_returns` scan (77.957 ms) by pushing the `wr_reason_sk` filter early. Minimal change, high impact potential.
+2. **Target 2 (Family A+B)**: Rescues t1 by fixing column ambiguity. Combines prefiltered returns (A) with decorrelated EXISTS (B) to optimize both subqueries.
+3. **Target 3 (Family A+F)**: Novel combination. Prefilters dimensions (F) to reduce fact table rows early, while prefiltering returns (A) tackles the Hash Join bottleneck. Uses CTEs for all filters.

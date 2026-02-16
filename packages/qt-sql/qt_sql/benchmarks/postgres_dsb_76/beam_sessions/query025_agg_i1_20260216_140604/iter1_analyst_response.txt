@@ -1,0 +1,95 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches failed due to literal mismatch (replaced `3+2` with `5`), so no winners exist. We must rescue sound structural ideas while preserving literals.  
+
+**Common Failure Root Cause**:  
+All rewrites replaced expression `3+2` with literal `5`, causing semantic mismatch. The structural changes (CTEs, prefetch, pre-aggregation) were valid but implementation broke literal equivalence.  
+
+**Bottleneck Identification**:  
+Primary bottleneck is the `Nested Loop (rows=329585, time=90.441)` between `date_dim (d2)` and `store_returns`. This drives:  
+- High row count (329K) into downstream `catalog_sales` join  
+- Cascades into expensive `Hash Join (time=2320.148)`  
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Original query (fix literal handling in all rewrites).  
+**Primary Target**: Rescue Family A+E (Early Filtering + Prefetch) – most direct path to bottleneck.  
+
+**Targets**:  
+
+1. **Rescue Family E (Prefetch) + Literal Fix**  
+   - **Family**: E  
+   - **Transform**: `prefetch_literal_fix`  
+   - **Target ID**: `t2_rescue`  
+   - **Relevance**: 0.98  
+   - **Hypothesis**: "Reuse prefetched date_range CTE for d2/d3 to reduce `Nested Loop (rows=329585)` input. Preserves `3+2` expression."  
+   - **Target IR**: `S0` (anchor hash: `d2.d_moy BETWEEN 3 AND 3+2` and `d3.d_moy BETWEEN 3 AND 3+2`)  
+   - **Examples**: `multi_dimension_prefetch`  
+
+2. **Rescue Family A (Early Filtering) + Literal Fix**  
+   - **Family**: A  
+   - **Transform**: `early_filter_literal_fix`  
+   - **Target ID**: `syn_w1_rescue`  
+   - **Relevance**: 0.95  
+   - **Hypothesis**: "Push date filters into CTEs early to shrink `store_returns` scan before the 329K-row nested loop."  
+   - **Target IR**: `S0` (anchor hash: `d1.d_moy=3`, `d2.d_moy BETWEEN...`)  
+   - **Examples**: `pg_date_cte_explicit_join`  
+
+3. **Novel: Family A+E (Prefetch + Early Aggregation)**  
+   - **Family**: A+E  
+   - **Transform**: `prefetch_agg_pushdown`  
+   - **Target ID**: `combo_ae`  
+   - **Relevance**: 0.90  
+   - **Hypothesis**: "After prefetching dates, pre-aggregate `store_returns` in CTE by `(sr_item_sk, sr_customer_sk, sr_ticket_number)` to reduce nested loop rows."  
+   - **Target IR**: `S0` (anchor hash: `store_returns` scan)  
+   - **Examples**: `multi_dimension_prefetch`, `pg_materialized_dimension_fact_prefilter`  
+
+4. **Rescue Family C (Pre-aggregation) + Literal Fix**  
+   - **Family**: C  
+   - **Transform**: `preagg_literal_fix`  
+   - **Target ID**: `t3_rescue`  
+   - **Relevance**: 0.85  
+   - **Hypothesis**: "Pre-aggregate `store_returns` before joins to collapse 329K-row input to downstream operators."  
+   - **Target IR**: `S0` (anchor hash: `store_returns` scan)  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+```json
+[
+  {
+    "family": "E",
+    "transform": "prefetch_literal_fix",
+    "target_id": "t2_rescue",
+    "relevance_score": 0.98,
+    "hypothesis": "Reuse prefetched date_range CTE for d2/d3 to reduce Nested Loop (rows=329585) input while preserving 3+2 expression.",
+    "target_ir": "S0 (d2.d_moy BETWEEN 3 AND 3+2, d3.d_moy BETWEEN 3 AND 3+2)",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filter_literal_fix",
+    "target_id": "syn_w1_rescue",
+    "relevance_score": 0.95,
+    "hypothesis": "Push date filters into CTEs early to shrink store_returns scan before the 329K-row nested loop, preserving literal expressions.",
+    "target_ir": "S0 (d1.d_moy=3, d2.d_moy BETWEEN 3 AND 3+2)",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A+E",
+    "transform": "prefetch_agg_pushdown",
+    "target_id": "combo_ae",
+    "relevance_score": 0.90,
+    "hypothesis": "Combine date prefetch (E) with store_returns pre-aggregation (A) to attack the 329K-row nested loop from two angles.",
+    "target_ir": "S0 (store_returns scan)",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "C",
+    "transform": "preagg_literal_fix",
+    "target_id": "t3_rescue",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-aggregate store_returns before joins to collapse 329K-row input, preserving literal 3+2 in date filter.",
+    "target_ir": "S0 (store_returns scan)",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

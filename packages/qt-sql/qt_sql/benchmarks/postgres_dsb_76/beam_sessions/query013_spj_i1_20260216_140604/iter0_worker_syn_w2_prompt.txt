@@ -1,0 +1,218 @@
+## Role
+
+You are **W2 "Unnester"** — Logic simplification — decorrelation, aggregation pushdown. Eliminate per-row re-execution: convert correlated subqueries to GROUP BY CTEs, push aggregation before joins when GROUP BY keys ⊇ join keys.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: B — decorrelate
+**Hypothesis**: Synthetic target for Unnester: Logic simplification — decorrelation, aggregation pushdown. Apply decorrelate patterns to the query.
+
+## Original SQL
+
+```sql
+select min(ss_quantity)
+       ,min(ss_ext_sales_price)
+       ,min(ss_ext_wholesale_cost)
+       ,min(ss_ext_wholesale_cost)
+ from store_sales
+     ,store
+     ,customer_demographics
+     ,household_demographics
+     ,customer_address
+     ,date_dim
+ where s_store_sk = ss_store_sk
+ and  ss_sold_date_sk = d_date_sk and d_year = 2001
+ and((ss_hdemo_sk=hd_demo_sk
+  and cd_demo_sk = ss_cdemo_sk
+  and cd_marital_status = 'M'
+  and cd_education_status = '2 yr Degree'
+  and ss_sales_price between 100.00 and 150.00
+  and hd_dep_count = 3
+     )or
+     (ss_hdemo_sk=hd_demo_sk
+  and cd_demo_sk = ss_cdemo_sk
+  and cd_marital_status = 'U'
+  and cd_education_status = 'College'
+  and ss_sales_price between 50.00 and 100.00
+  and hd_dep_count = 1
+     ) or
+     (ss_hdemo_sk=hd_demo_sk
+  and cd_demo_sk = ss_cdemo_sk
+  and cd_marital_status = 'S'
+  and cd_education_status = 'Unknown'
+  and ss_sales_price between 150.00 and 200.00
+  and hd_dep_count = 1
+     ))
+ and((ss_addr_sk = ca_address_sk
+  and ca_country = 'United States'
+  and ca_state in ('CO', 'NC', 'TX')
+  and ss_net_profit between 100 and 200
+     ) or
+     (ss_addr_sk = ca_address_sk
+  and ca_country = 'United States'
+  and ca_state in ('AR', 'NY', 'TX')
+  and ss_net_profit between 150 and 300
+     ) or
+     (ss_addr_sk = ca_address_sk
+  and ca_country = 'United States'
+  and ca_state in ('IA', 'IL', 'NC')
+  and ss_net_profit between 50 and 250
+     ))
+;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, store, customer_demographics, household_demographics, customer_address, date_dim
+    WHERE [73f355482e5a7264]: s_store_sk = ss_store_sk AND ss_sold_date_sk = d_date_sk AND d_year = 2001 AND ((ss_hdemo_sk = hd...
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  CTE: filtered_store (via Q1)
+    FROM: store
+  CTE: filtered_date (via Q2)
+    FROM: date_dim
+    WHERE: d_year = 2001
+  CTE: filtered_hd_cd (via Q3)
+    FROM: household_demographics, customer_demographics
+    WHERE: 
+      (hd_dep_count = 3 AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree')
+      OR (hd_dep_count = 1 AND cd_marital_status = 'U' AND cd_education_status = 'College')
+      OR (hd_dep_count = 1 AND cd_marital_status = 'S' AND cd_education_status = 'Unknown')
+  CTE: filtered_ca (via Q4)
+    FROM: customer_address
+    WHERE: 
+      (ca_country = 'United States' AND ca_state IN ('CO','NC','TX'))
+      OR (ca_country = 'United States' AND ca_state IN ('AR','NY','TX'))
+      OR (ca_country = 'United States' AND ca_state IN ('IA','IL','NC'))
+  MAIN QUERY (via Q0)
+    FROM: store_sales
+    INNER JOIN filtered_store ON s_store_sk = ss_store_sk
+    INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    INNER JOIN filtered_hd_cd ON ss_hdemo_sk = hd_demo_sk AND ss_cdemo_sk = cd_demo_sk
+    INNER JOIN filtered_ca ON ss_addr_sk = ca_address_sk
+    WHERE: 
+      (ss_sales_price BETWEEN 50.00 AND 200.00) 
+      AND (ss_net_profit BETWEEN 50 AND 300)
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_shared_scan_decorrelate",
+  "dialect": "postgres",
+  "description": "When a correlated subquery re-scans the same fact table as the outer query, extract the common scan into a shared CTE, then derive both the threshold computation and the outer rows from a single materialized result. Eliminates O(N*M) re-execution of the fact+date join.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "common_scan",
+        "cte_query_sql": "SELECT ws_item_sk, ws_ext_discount_amt, ws_sales_price, ws_list_price FROM web_sales INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk WHERE d_date BETWEEN '1998-03-13' AND CAST('1998-03-13' AS DATE) + INTERVAL '90 DAY' AND ws_wholesale_cost BETWEEN 26 AND 46"
+      },
+      "description": "Insert CTE 'common_scan' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "threshold_computation",
+        "cte_query_sql": "SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold FROM common_scan WHERE ws_sales_price / ws_list_price BETWEEN 34 * 0.01 AND 49 * 0.01 GROUP BY ws_item_sk"
+      },
+      "description": "Insert CTE 'threshold_computation' for pre-aggregated computation"
+    },
+    {
+      "step_id": "s3",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "outer_rows",
+        "cte_query_sql": "SELECT cs.ws_item_sk, cs.ws_ext_discount_amt FROM common_scan AS cs INNER JOIN item ON i_item_sk = cs.ws_item_sk WHERE i_manufact_id BETWEEN 341 AND 540 OR i_category IN ('Home', 'Men', 'Music')"
+      },
+      "description": "Insert CTE 'outer_rows' for pre-filtered join"
+    },
+    {
+      "step_id": "s4",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "join_filter",
+        "cte_query_sql": "SELECT o.ws_ext_discount_amt FROM outer_rows AS o INNER JOIN threshold_computation AS t ON o.ws_item_sk = t.ws_item_sk WHERE o.ws_ext_discount_amt > t.threshold"
+      },
+      "description": "Insert CTE 'join_filter' for pre-filtered join"
+    },
+    {
+      "step_id": "s5",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "join_filter"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s6",
+      "op": "delete_expr_subtree",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "0ef6ffe2461512ae"
+      },
+      "description": "Remove WHERE clause (conditions moved to CTEs)"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

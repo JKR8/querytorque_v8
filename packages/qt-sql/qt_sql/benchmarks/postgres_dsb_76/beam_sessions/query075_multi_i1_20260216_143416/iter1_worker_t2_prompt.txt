@@ -1,0 +1,188 @@
+## Role
+
+You are **W1 "Reducer"** — Cardinality reduction — WHERE filters, set operations, early pruning. Reduce row counts early: push predicates into CTEs, convert set operations to EXISTS/NOT EXISTS, apply early filtering before expensive joins.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: A — push_reason_filter
+**Hypothesis**: Isolate reason_sk filter directly on returns tables before joins. Targets Seq Scan on store_returns (517K rows, 635ms) by reducing input rows.
+
+## Original SQL
+
+```sql
+WITH all_sales AS (
+ SELECT d_year
+       ,i_brand_id
+       ,i_class_id
+       ,i_category_id
+       ,i_manufact_id
+       ,SUM(sales_cnt) AS sales_cnt
+       ,SUM(sales_amt) AS sales_amt
+ FROM (SELECT d_year
+             ,i_brand_id
+             ,i_class_id
+             ,i_category_id
+             ,i_manufact_id
+             ,cs_quantity - COALESCE(cr_return_quantity,0) AS sales_cnt
+             ,cs_ext_sales_price - COALESCE(cr_return_amount,0.0) AS sales_amt
+       FROM catalog_sales JOIN item ON i_item_sk=cs_item_sk
+                          JOIN date_dim ON d_date_sk=cs_sold_date_sk
+                          LEFT JOIN catalog_returns ON (cs_order_number=cr_order_number
+                                                    AND cs_item_sk=cr_item_sk)
+       WHERE i_category='Home'
+       and cs_sales_price / cs_list_price BETWEEN 34 * 0.01 AND 54 * 0.01
+       and cr_reason_sk in (7, 25, 26, 52, 69)
+       UNION
+       SELECT d_year
+             ,i_brand_id
+             ,i_class_id
+             ,i_category_id
+             ,i_manufact_id
+             ,ss_quantity - COALESCE(sr_return_quantity,0) AS sales_cnt
+             ,ss_ext_sales_price - COALESCE(sr_return_amt,0.0) AS sales_amt
+       FROM store_sales JOIN item ON i_item_sk=ss_item_sk
+                        JOIN date_dim ON d_date_sk=ss_sold_date_sk
+                        LEFT JOIN store_returns ON (ss_ticket_number=sr_ticket_number
+                                                AND ss_item_sk=sr_item_sk)
+       WHERE i_category='Home'
+       and ss_sales_price / ss_list_price BETWEEN 34 * 0.01 AND 54 * 0.01
+       and sr_reason_sk in (7, 25, 26, 52, 69)
+       UNION
+       SELECT d_year
+             ,i_brand_id
+             ,i_class_id
+             ,i_category_id
+             ,i_manufact_id
+             ,ws_quantity - COALESCE(wr_return_quantity,0) AS sales_cnt
+             ,ws_ext_sales_price - COALESCE(wr_return_amt,0.0) AS sales_amt
+       FROM web_sales JOIN item ON i_item_sk=ws_item_sk
+                      JOIN date_dim ON d_date_sk=ws_sold_date_sk
+                      LEFT JOIN web_returns ON (ws_order_number=wr_order_number
+                                            AND ws_item_sk=wr_item_sk)
+       WHERE i_category='Home'
+       and ws_sales_price / ws_list_price BETWEEN 34 * 0.01 AND 54 * 0.01
+       and wr_reason_sk in (7, 25, 26, 52, 69)) sales_detail
+GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id)
+ SELECT  prev_yr.d_year AS prev_year
+                          ,curr_yr.d_year AS year
+                          ,curr_yr.i_brand_id
+                          ,curr_yr.i_class_id
+                          ,curr_yr.i_category_id
+                          ,curr_yr.i_manufact_id
+                          ,prev_yr.sales_cnt AS prev_yr_cnt
+                          ,curr_yr.sales_cnt AS curr_yr_cnt
+                          ,curr_yr.sales_cnt-prev_yr.sales_cnt AS sales_cnt_diff
+                          ,curr_yr.sales_amt-prev_yr.sales_amt AS sales_amt_diff
+ FROM all_sales curr_yr, all_sales prev_yr
+ WHERE curr_yr.i_brand_id=prev_yr.i_brand_id
+   AND curr_yr.i_class_id=prev_yr.i_class_id
+   AND curr_yr.i_category_id=prev_yr.i_category_id
+   AND curr_yr.i_manufact_id=prev_yr.i_manufact_id
+   AND curr_yr.d_year=1999
+   AND prev_yr.d_year=1999-1
+   AND prev_yr.sales_cnt > 0
+   AND CAST(curr_yr.sales_cnt AS DECIMAL(17,2))/CAST(prev_yr.sales_cnt AS DECIMAL(17,2))<0.9
+ ORDER BY sales_cnt_diff,sales_amt_diff
+ limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  CTE: all_sales  (via CTE_Q_S0_all_sales)
+    FROM: (subquery) sales_detail
+    GROUP BY: d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id
+  MAIN QUERY (via Q_S0)
+    FROM: all_sales curr_yr, all_sales prev_yr
+    WHERE [5a1a0e9548e5ef4e]: curr_yr.i_brand_id = prev_yr.i_brand_id AND curr_yr.i_class_id = prev_yr.i_class_id AND curr_yr.i...
+    ORDER BY: sales_cnt_diff, sales_amt_diff
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0: Anchor [WHERE clause] → Move cr/sr/wr_reason_sk filters into dedicated returns-table subqueries.
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_date_cte_explicit_join",
+  "dialect": "postgres",
+  "description": "Isolate a selective date_dim filter into a CTE AND convert all comma-separated joins to explicit JOIN syntax. The combination is key on PostgreSQL - the CTE alone can hurt, but CTE + explicit JOINs together enable better hash join planning with a tiny probe table.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_dates",
+        "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1193 + 23"
+      },
+      "description": "Insert CTE 'filtered_dates' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "c20744375cf92d6b"
+      },
+      "payload": {
+        "expr_sql": "cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5"
+      },
+      "description": "Replace WHERE predicate with optimized version"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

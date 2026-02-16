@@ -1,0 +1,336 @@
+## Role
+
+You are a SQL optimization analyst reviewing benchmark results. Analyze what worked, what failed, and design refined targets for the next round of workers.
+
+Identify the primary bottleneck. Only provide secondary targets if they are distinct and high-confidence. Quality > Quantity.
+
+You will see the original query, execution plan, IR structure, and detailed results from previous rounds.
+
+## Query: query038_multi_i2
+
+**Dialect**: POSTGRES
+
+```sql
+select  count(*) from (
+    select distinct c_last_name, c_first_name, d_date
+    from store_sales, date_dim, customer
+          where store_sales.ss_sold_date_sk = date_dim.d_date_sk
+      and store_sales.ss_customer_sk = customer.c_customer_sk
+      and d_month_seq between 1207 and 1207 + 11
+      and c_birth_month in (2, 3, 4, 10)
+      and ss_list_price between 241 and 300
+      and ss_wholesale_cost BETWEEN 76 AND 96
+  intersect
+    select distinct c_last_name, c_first_name, d_date
+    from catalog_sales, date_dim, customer
+          where catalog_sales.cs_sold_date_sk = date_dim.d_date_sk
+      and catalog_sales.cs_bill_customer_sk = customer.c_customer_sk
+      and d_month_seq between 1207 and 1207 + 11
+      and c_birth_month in (2, 3, 4, 10)
+      and cs_list_price between 241 and 300
+      and cs_wholesale_cost BETWEEN 76 AND 96
+  intersect
+    select distinct c_last_name, c_first_name, d_date
+    from web_sales, date_dim, customer
+          where web_sales.ws_sold_date_sk = date_dim.d_date_sk
+      and web_sales.ws_bill_customer_sk = customer.c_customer_sk
+      and d_month_seq between 1207 and 1207 + 11
+      and c_birth_month in (2, 3, 4, 10)
+      and ws_list_price between 241 and 300
+      and ws_wholesale_cost BETWEEN 76 AND 96
+) hot_cust
+limit 100;
+```
+
+
+## Current Execution Plan
+
+```
+Limit  (rows=1, time=2103.737)
+  Aggregate  (rows=1, time=2103.734)
+    Subquery Scan (hot_cust)  (rows=45, time=2103.722)
+      SetOp  (rows=45, time=2103.716)
+        Append  (rows=21988, time=2094.962)
+          Subquery Scan (*SELECT* 3)  (rows=21773, time=419.061)
+            Unique  (rows=21773, time=417.783)
+              Gather Merge  (rows=27322, time=415.594)
+                Sort  (rows=13661, time=375.231)
+                  Nested Loop  (rows=13661, time=357.985)
+                    Nested Loop  (rows=29521, time=176.06)
+                      Seq Scan on date_dim  (rows=182, time=4.171)
+                      Index Scan on web_sales  (rows=162, time=0.928)
+                    Index Scan on customer  (rows=0, time=0.006)
+          Result  (rows=215, time=1675.052)
+            SetOp  (rows=215, time=1675.013)
+              Append  (rows=82642, time=1661.35)
+                Subquery Scan (*SELECT* 2)  (rows=20799, time=459.987)
+                  Unique  (rows=20799, time=458.875)
+                    Gather Merge  (rows=22867, time=457.251)
+                      Sort  (rows=11434, time=434.728)
+                        Nested Loop  (rows=11434, time=420.433)
+                          Nested Loop  (rows=24561, time=254.505)
+                            Seq Scan on date_dim (date_dim_1)  (rows=182, time=3.359)
+                            Index Scan on catalog_sales  (rows=135, time=1.363)
+                          Index Scan on customer (customer_1)  (rows=0, time=0.007)
+                Subquery Scan (*SELECT* 1)  (rows=61843, time=1197.913)
+                  Unique  (rows=61843, time=1194.526)
+                    Gather Merge  (rows=69808, time=1189.294)
+                      Sort  (rows=34904, time=1124.802)
+                        Nested Loop  (rows=34904, time=1076.816)
+                          Nested Loop  (rows=75280, time=593.666)
+                            Seq Scan on date_dim (date_dim_2)  (rows=182, time=5.061)
+                            Index Only Scan on store_sales  (rows=412, time=3.193)
+                          Index Scan on customer (customer_2)  (rows=0, time=0.006)
+```
+
+
+## IR Structure (for patch targeting)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: (subquery) hot_cust
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
+
+
+## Optimization Families
+
+Review the 6 families below. Each has a proven gold example.
+
+Choose up to **4 most relevant families** for this query based on:
+- Query structure (CTEs, subqueries, joins, aggregations, set operations)
+- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)
+- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
+
+
+
+### Family A: Early Filtering (Predicate Pushback)
+**Description**: Push small filters into CTEs early, reduce row count before expensive operations
+**Speedup Range**: 1.3–4.0x (~35% of all wins)
+**Use When**:
+  1. Late WHERE filters on dimension tables
+  2. Cascading CTEs with filters applied downstream
+  3. Expensive joins after filters could be pushed earlier
+
+**Gold Example**: `pg_date_cte_explicit_join` (2.28x)
+
+
+
+### Family B: Decorrelation (Sets Over Loops)
+**Description**: Convert correlated subqueries to standalone CTEs with GROUP BY, eliminate per-row re-execution
+**Speedup Range**: 2.4–2.9x (~15% of all wins)
+**Use When**:
+  1. Correlated subqueries in WHERE clause
+  2. Scalar aggregates computed per outer row
+  3. DELIM_SCAN in execution plan (indicates correlation)
+
+**Gold Example**: `pg_shared_scan_decorrelate` (8043.91x (timeout rescue))
+
+
+
+### Family C: Aggregation Pushdown (Minimize Rows Touched)
+**Description**: Aggregate before expensive joins when GROUP BY keys ⊇ join keys, reduce intermediate sizes
+**Speedup Range**: 1.3–15.3x (~5% of all wins (high variance))
+**Use When**:
+  1. GROUP BY happens after large joins
+  2. GROUP BY keys are subset of join keys
+  3. Intermediate result size >> final result size
+
+**Gold Example**: `pg_materialized_dimension_fact_prefilter` (12.07x (V2 DSB SF10, was 2.68x in V1))
+
+
+
+### Family D: Set Operation Optimization (Sets Over Loops)
+**Description**: Replace INTERSECT/UNION-based patterns with EXISTS/NOT EXISTS, avoid full materialization
+**Speedup Range**: 1.7–2.7x (~8% of all wins)
+**Use When**:
+  1. INTERSECT patterns between large sets
+  2. UNION ALL with duplicate elimination
+  3. Set operations materializing full intermediate results
+
+**Gold Example**: `pg_intersect_to_exists` (1.78x)
+
+
+
+### Family E: Materialization / Prefetch (Don't Repeat Work)
+**Description**: Extract repeated scans or pre-compute intermediate results for reuse across multiple consumers
+**Speedup Range**: 1.3–6.2x (~18% of all wins)
+**Use When**:
+  1. Repeated scans of same table with different filters
+  2. Dimension filters applied independently multiple times
+  3. CTE referenced multiple times with implicit re-evaluation
+
+**Gold Example**: `multi_dimension_prefetch` (2.71x)
+
+
+
+### Family F: Join Transform (Right Shape First)
+**Description**: Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation
+**Speedup Range**: 1.8–8.6x (~19% of all wins)
+**Use When**:
+  1. Comma-separated joins (implicit cross joins) in FROM clause
+  2. Self-joins scanning same table multiple times
+  3. Dimension-fact join order suboptimal for predicate pushdown
+
+**Gold Example**: `pg_explicit_join_materialized` (8.56x)
+
+
+
+## Optimization History
+
+### History — All Prior Patches
+
+| Iter | Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Error (summary) |
+|------|-------|--------|-----------|---------|--------|---------|----------|-----------------|
+| 0 | t1 | D | intersect_to_exists | — | FAIL | — | — | Equivalence (after retry): checksum 2374 |
+| 0 | t3 | A | predicate_pushback | 1.04x | NEUTRAL | 1625 | 1563 |  |
+| 0 | t2 | E+F | multi_dimension_prefetch+explicit_join_order | — | FAIL | — | — | Tier-1 structural: LITERAL MISMATCH: Ori |
+| 0 | syn_w2 | B | decorrelate | — | FAIL | — | — | Tier-1 structural: LITERAL MISMATCH: Ori |
+| 1 | t1_combine | A+E+F | prefetch_dimensions_explicit_join | — | FAIL | — | — | Equivalence execution error: column "c_l |
+| 1 | t2_refine | D | intersect_to_exists | — | FAIL | — | — | Equivalence execution error: current tra |
+| 1 | t3_rescue | E+F | prefetch_dimensions_fixed | — | FAIL | — | — | Equivalence execution error: current tra |
+
+
+
+### Latest Iteration 1 — Detailed Results
+
+#### Race Results
+
+| Patch | Family | Transform | Speedup | Status | Orig ms | Patch ms | Semantic | Error |
+|-------|--------|-----------|---------|--------|---------|----------|----------|-------|
+| t1_combine | A+E+F | prefetch_dimensions_explicit_join | — | FAIL | — | — | FAIL | Equivalence execution error: column "c_last_name" does not exist
+LINE 1: ... 76  |
+| t2_refine | D | intersect_to_exists | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+| t3_rescue | E+F | prefetch_dimensions_fixed | — | FAIL | — | — | FAIL | Equivalence execution error: current transaction is aborted, commands ignored un |
+
+#### Patched SQL
+
+**t1_combine (Family A+E+F, prefetch_dimensions_explicit_join):**
+```sql
+WITH filtered_dates AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1207 + 11), filtered_customers AS (SELECT c_customer_sk, c_first_name, c_last_name FROM customer WHERE c_birth_month IN (2, 3, 4, 10)), store_sales_filtered AS (SELECT ss_customer_sk, ss_sold_date_sk, d_date FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_customers ON ss_customer_sk = c_customer_sk WHERE ss_list_price BETWEEN 241 AND 300 AND ss_wholesale_cost BETWEEN 76 AND 96), catalog_sales_filtered AS (SELECT cs_bill_customer_sk, cs_sold_date_sk, d_date FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN filtered_customers ON cs_bill_customer_sk = c_customer_sk WHERE cs_list_price BETWEEN 241 AND 300 AND cs_wholesale_cost BETWEEN 76 AND 96), web_sales_filtered AS (SELECT ws_bill_customer_sk, ws_sold_date_sk, d_date FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk JOIN filtered_customers ON ws_bill_customer_sk = c_customer_sk WHERE ws_list_price BETWEEN 241 AND 300 AND ws_wholesale_cost BETWEEN 76 AND 96) SELECT COUNT(*) FROM (SELECT DISTINCT c_last_name, c_first_name, d_date FROM store_sales_filtered INTERSECT SELECT DISTINCT c_last_name, c_first_name, d_date FROM catalog_sales_filtered INTERSECT SELECT DISTINCT c_last_name, c_first_name, d_date FROM web_sales_filtered) AS hot_cust LIMIT 100;
+```
+
+**t2_refine (Family D, intersect_to_exists):**
+```sql
+WITH store_sales_base AS (SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM store_sales AS ss INNER JOIN date_dim AS d ON ss.ss_sold_date_sk = d.d_date_sk INNER JOIN customer AS c ON ss.ss_customer_sk = c.c_customer_sk WHERE d.d_month_seq BETWEEN 1207 AND 1207 + 11 AND c.c_birth_month IN (2, 3, 4, 10) AND ss.ss_list_price BETWEEN 241 AND 300 AND ss.ss_wholesale_cost BETWEEN 76 AND 96) SELECT COUNT(*) FROM store_sales_base AS ssb WHERE EXISTS(SELECT 1 FROM catalog_sales AS cs INNER JOIN date_dim AS d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN customer AS c ON cs.cs_bill_customer_sk = c.c_customer_sk WHERE d.d_month_seq BETWEEN 1207 AND 1207 + 11 AND c.c_birth_month IN (2, 3, 4, 10) AND cs.cs_list_price BETWEEN 241 AND 300 AND cs.cs_wholesale_cost BETWEEN 76 AND 96 AND c.c_last_name = ssb.c_last_name AND c.c_first_name = ssb.c_first_name AND d.d_date = ssb.d_date) AND EXISTS(SELECT 1 FROM web_sales AS ws INNER JOIN date_dim AS d ON ws.ws_sold_date_sk = d.d_date_sk INNER JOIN customer AS c ON ws.ws_bill_customer_sk = c.c_customer_sk WHERE d.d_month_seq BETWEEN 1207 AND 1207 + 11 AND c.c_birth_month IN (2, 3, 4, 10) AND ws.ws_list_price BETWEEN 241 AND 300 AND ws.ws_wholesale_cost BETWEEN 76 AND 96 AND c.c_last_name = ssb.c_last_name AND c.c_first_name = ssb.c_first_name AND d.d_date = ssb.d_date) LIMIT 100;
+```
+
+**t3_rescue (Family E+F, prefetch_dimensions_fixed):**
+```sql
+WITH filtered_dates AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1207 + 11), filtered_customers AS (SELECT c_customer_sk, c_last_name, c_first_name, c_birth_month FROM customer WHERE c_birth_month IN (2, 3, 4, 10)) SELECT COUNT(*) FROM (SELECT DISTINCT c_last_name, c_first_name, d_date FROM store_sales INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk INNER JOIN filtered_customers ON ss_customer_sk = c_customer_sk WHERE ss_list_price BETWEEN 241 AND 300 AND ss_wholesale_cost BETWEEN 76 AND 96 INTERSECT SELECT DISTINCT c_last_name, c_first_name, d_date FROM catalog_sales INNER JOIN filtered_dates ON cs_sold_date_sk = d_date_sk INNER JOIN filtered_customers ON cs_bill_customer_sk = c_customer_sk WHERE cs_list_price BETWEEN 241 AND 300 AND cs_wholesale_cost BETWEEN 76 AND 96 INTERSECT SELECT DISTINCT c_last_name, c_first_name, d_date FROM web_sales INNER JOIN filtered_dates ON ws_sold_date_sk = d_date_sk INNER JOIN filtered_customers ON ws_bill_customer_sk = c_customer_sk WHERE ws_list_price BETWEEN 241 AND 300 AND ws_wholesale_cost BETWEEN 76 AND 96) AS hot_cust LIMIT 100;
+```
+
+#### Execution Plans
+
+**Original EXPLAIN:**
+```
+Limit  (rows=1, time=2103.737)
+  Aggregate  (rows=1, time=2103.734)
+    Subquery Scan (hot_cust)  (rows=45, time=2103.722)
+      SetOp  (rows=45, time=2103.716)
+        Append  (rows=21988, time=2094.962)
+          Subquery Scan (*SELECT* 3)  (rows=21773, time=419.061)
+            Unique  (rows=21773, time=417.783)
+              Gather Merge  (rows=27322, time=415.594)
+                Sort  (rows=13661, time=375.231)
+                  Nested Loop  (rows=13661, time=357.985)
+                    Nested Loop  (rows=29521, time=176.06)
+                      Seq Scan on date_dim  (rows=182, time=4.171)
+                      Index Scan on web_sales  (rows=162, time=0.928)
+                    Index Scan on customer  (rows=0, time=0.006)
+          Result  (rows=215, time=1675.052)
+            SetOp  (rows=215, time=1675.013)
+              Append  (rows=82642, time=1661.35)
+                Subquery Scan (*SELECT* 2)  (rows=20799, time=459.987)
+                  Unique  (rows=20799, time=458.875)
+                    Gather Merge  (rows=22867, time=457.251)
+                      Sort  (rows=11434, time=434.728)
+                        Nested Loop  (rows=11434, time=420.433)
+                          Nested Loop  (rows=24561, time=254.505)
+                            Seq Scan on date_dim (date_dim_1)  (rows=182, time=3.359)
+                            Index Scan on catalog_sales  (rows=135, time=1.363)
+                          Index Scan on customer (customer_1)  (rows=0, time=0.007)
+                Subquery Scan (*SELECT* 1)  (rows=61843, time=1197.913)
+                  Unique  (rows=61843, time=1194.526)
+                    Gather Merge  (rows=69808, time=1189.294)
+                      Sort  (rows=34904, time=1124.802)
+                        Nested Loop  (rows=34904, time=1076.816)
+                          Nested Loop  (rows=75280, time=593.666)
+                            Seq Scan on date_dim (date_dim_2)  (rows=182, time=5.061)
+                            Index Only Scan on store_sales  (rows=412, time=3.193)
+                          Index Scan on customer (customer_2)  (rows=0, time=0.006)
+```
+
+#### Error Details
+
+- **t1_combine** (FAIL): Equivalence execution error: column "c_last_name" does not exist
+LINE 1: ... 76 AND 96) SELECT COUNT(*) FROM (SELECT DISTINCT c_last_nam...
+                                                             ^
+
+- **t2_refine** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+- **t3_rescue** (FAIL): Equivalence execution error: current transaction is aborted, commands ignored until end of transaction block
+
+
+
+## Your Task — Snipe Round 2
+
+
+Results from latest iteration: **3 FAIL**.
+
+Follow this protocol exactly.
+
+### Step 1 — Compare EXPLAIN Plans
+
+For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.
+
+For each **WIN**, answer:
+- QUOTE the operator line(s) from the original that got cheaper or were eliminated. Give the exact operator name, time, and row count from the plan text above.
+- What structural SQL change caused that operator improvement?
+- What is the **most expensive remaining operator** in this winner's plan? QUOTE its line (name, time, rows).
+
+For each **FAIL/NEUTRAL/REGRESSION**:
+- QUOTE the operator(s) that got MORE expensive vs the original.
+- Why did the structural change backfire?
+
+Then classify winners as REDUNDANT (same core structural change, same operators improved) or COMPLEMENTARY (different operators improved, different structural changes).
+
+### Step 2 — Design Targets by Combining Strategies
+
+Start from the **best winner's SQL** as your baseline.
+
+**CRITICAL**: Do NOT invent new hypotheses about row counts or selectivity. Every claim about rows, times, or costs MUST be a direct quote from an EXPLAIN plan above. If a number is not in the plans, you do not know it.
+
+**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites (UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce identical plans. Focus on changes that **eliminate operators** or **reduce input rows to expensive operators** as shown in the plans.
+
+Design up to 4 targets, prioritized:
+
+1. **Combination** (primary if complementary winners exist): Take the best winner's SQL. Layer on the structural change from a complementary winner that addresses a DIFFERENT expensive operator. Cite both operators by name from the EXPLAIN plans.
+2. **Refinement**: Take the best winner's SQL. Target its most expensive remaining operator (quoted in Step 1). Design a structural change that reduces input rows to that operator. CITE the operator and its current row count from the plan.
+3. **Rescue** (if a failed patch had a sound structural idea): Fix the implementation while preserving the best winner's gains.
+4. **Novel**: A new structural approach that targets the most expensive remaining operator. Cite the operator from the plan.
+
+**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F"). The worker will receive gold examples from ALL referenced families.
+
+Output up to 4 targets. Same JSON format:
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "...",
+    "target_ir": "...",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  }
+]
+```
+
+Output up to 4 targets. Fewer strong targets beat padding with weak ones.

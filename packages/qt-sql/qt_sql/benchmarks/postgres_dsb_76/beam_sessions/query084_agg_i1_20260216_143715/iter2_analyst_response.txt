@@ -1,0 +1,117 @@
+### Step 1 — Compare EXPLAIN Plans  
+All prior patches failed, so there are no winners to compare. The analysis focuses on why the patches failed and identifies the primary bottleneck from the original plan.
+
+**Primary Bottleneck**:  
+The `Hash Join` between `customer` (250,000 rows, 23.23 ms) and `customer_address` (49 rows, 12.173 ms) dominates execution time (48.415 ms). This is caused by a full sequential scan of `customer` when only 96 rows (0.04% of customers) are needed for Jackson addresses. The filter `ca_city = 'Jackson'` isn't pushed early enough to restrict the `customer` scan.
+
+**Failed Patch Analysis**:  
+- **tA_fixed**: Failed due to missing `c_current_cdemo_sk` in CTE. Structural change (early address filtering) was sound but implementation omitted a required column.  
+- **tE_fixed**: Failed due to literal mismatch (changed `50000` to `73567`). The core idea (prefetching filtered tables) was valid but violated equivalence.  
+- **tAE_combined**: Failed due to transaction errors (likely cascading from prior errors), but the combined early filtering approach was viable.
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Start with corrected **Family A (Early Filtering)** from `tA_fixed`, fixing missing columns. Layer complementary strategies to address the primary bottleneck and secondary issues.
+
+#### 1. **Combination (A+F)**  
+- **Family**: A + F  
+- **Transform**: `early_filter_explicit_join`  
+- **Hypothesis**: Push `customer_address` filter into a CTE to avoid full `customer` scans (A). Restructure joins explicitly (F) to enforce optimal join order (small tables first). Targets the `Hash Join` (48.415 ms, 96 rows) and `Seq Scan on customer` (250K rows).  
+- **Target IR**: `S0` (insert CTE + replace FROM clause)  
+- **Examples**: `pg_date_cte_explicit_join`, `pg_explicit_join_materialized`  
+- **SQL Sketch**:  
+  ```sql
+  WITH filtered_addresses AS (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Jackson'),
+       filtered_income AS (SELECT ib_income_band_sk FROM income_band 
+                           WHERE ib_lower_bound >= 23567 AND ib_upper_bound <= 23567 + 50000)
+  SELECT c_customer_id, ... 
+  FROM filtered_addresses
+  JOIN customer ON c_current_addr_sk = ca_address_sk
+  JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk
+  ... -- Explicit JOIN order
+  ```
+
+#### 2. **Refinement (A+E)**  
+- **Family**: A + E  
+- **Transform**: `prefetch_high_selectivity`  
+- **Hypothesis**: After early address filtering, prefetch `store_returns` aggregated by `sr_cdemo_sk` (E) to reduce nested loops. The `Index Only Scan on store_returns` (0.45 ms/row) runs 18 times (total ~8.1 ms). Pre-aggregation minimizes row processing.  
+- **Target IR**: `S0` (insert CTE + replace `store_returns` access)  
+- **Examples**: `multi_dimension_prefetch`  
+- **SQL Sketch**:  
+  ```sql
+  WITH ...,
+       sr_agg AS (SELECT sr_cdemo_sk, COUNT(*) AS cnt FROM store_returns GROUP BY sr_cdemo_sk)
+  SELECT ...
+  JOIN sr_agg ON sr_cdemo_sk = cd_demo_sk  -- Replaces direct scan
+  ```
+
+#### 3. **Rescue (E Fixed)**  
+- **Family**: E  
+- **Transform**: `literal_preserve_prefetch`  
+- **Hypothesis**: Reimplement `tE_fixed` (prefetch filtered tables) but preserve literals exactly. Prefilters `income_band` and `address` to shrink join inputs. Fixes literal mismatch (50000 → 73567) while retaining row reduction.  
+- **Target IR**: `S0` (insert CTE)  
+- **Examples**: `multi_dimension_prefetch`  
+- **SQL Sketch**:  
+  ```sql
+  WITH filtered_income_band AS (SELECT ... WHERE ib_upper_bound <= 23567 + 50000), -- Exact literal
+       filtered_ca AS (SELECT ... WHERE ca_city = 'Jackson')
+  ... -- Join with CTEs
+  ```
+
+#### 4. **Novel (B)**  
+- **Family**: B  
+- **Transform**: `decorrelate_optional_scan`  
+- **Hypothesis**: Convert the `store_returns` scan from a nested loop to a left join. Though not a true correlation, this avoids per-row scans (18 iterations). The `Index Only Scan` is cheap per row but runs repeatedly.  
+- **Target IR**: `S0` (replace FROM/WHERE)  
+- **Examples**: `pg_shared_scan_decorrelate`  
+- **SQL Sketch**:  
+  ```sql
+  SELECT ...
+  LEFT JOIN store_returns ON sr_cdemo_sk = cd_demo_sk  -- Decouple from loop
+  WHERE ... 
+  ```
+
+---
+
+### Final Targets  
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "early_filter_explicit_join",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Eliminate full customer scan (250K rows, 23.23ms) by pushing address filter early via CTE. Explicit joins enforce optimal order (small tables first). Targets Hash Join (48.415ms) and Seq Scan on customer.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A+E",
+    "transform": "prefetch_high_selectivity",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-aggregate store_returns by sr_cdemo_sk to avoid 18 per-row Index Scans (0.45ms/row). Complements early filtering by minimizing nested loops.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "literal_preserve_prefetch",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Prefetch filtered income_band and address tables (as in tE_fixed) but preserve exact literals. Shrinks join inputs without structural errors.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_optional_scan",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Convert store_returns scan to left join to avoid 18 iterative Index Scans (0.45ms/row), even without true correlation.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

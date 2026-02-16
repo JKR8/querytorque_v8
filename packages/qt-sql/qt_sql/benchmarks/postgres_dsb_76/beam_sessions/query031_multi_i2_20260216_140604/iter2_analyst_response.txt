@@ -1,0 +1,118 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Winners (Family A: Early Filtering - 2.4x speedup):**  
+- **Improved Operator:**  
+  `Seq Scan on store_sales (rows=415237, time=4627.233)` → Reduced time significantly.  
+  **Structural Change:** Pushed `item` and `customer_address` filters (`i_color`, `i_manager_id`, `ca_state`) into the CTE joins earlier. This reduced rows fed into the `Hash Join` and `Aggregate` operators.  
+- **Most Expensive Remaining Operator:**  
+  `Aggregate (rows=98, time=4828.61)` remains the bottleneck. The CTE aggregation still processes 415k+ rows after early filtering.  
+
+**Analysis of Failed Patches (Family C):**  
+- **Failure Reason:** The `aggregate_before_join` transform attempted aggregation on `store_sales` before joining dimensions. This backfired because:  
+  1. Grouping keys (`ca_county`, `d_qoy`, `d_year`) require joined dimension data.  
+  2. Forcing aggregation before joins broke join semantics, causing semantic errors.  
+
+**Classification:**  
+- **REDUNDANT:** Iteration 0's `syn_w1` (Family A) is identical to `t1` (same structural change).  
+- **COMPLEMENTARY:** None yet (only one successful family).  
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline:** Start with the best winner (Family A: `t1`/`syn_w1` SQL).  
+**Primary Bottleneck:** `Aggregate` operator (4828 ms) due to large input from `store_sales` (415k rows).  
+**Hypothesis:** Pre-aggregate `store_sales`/`web_sales` *before* joining dimensions, but only where grouping keys align with join keys.  
+
+#### Target 1: Aggregation Pushdown + Early Filtering (C+A)  
+**Family:** C + A  
+**Transform:** `aggregate_before_join_with_dimension_keys`  
+**Target ID:** `t1`  
+**Relevance Score:** 0.93  
+**Hypothesis:**  
+> Group `store_sales`/`web_sales` by `ss_item_sk`, `ss_addr_sk`, `ss_sold_date_sk` *before* joining dimensions. Since these keys map directly to `item`, `customer_address`, and `date_dim`, we reduce intermediate rows by 10-100x (per gold example). The expensive `Aggregate` operator will then process 4k rows instead of 415k.  
+**Target IR:**  
+- Anchor: `CTE_Q_S0_ss` (hash `f55d9959a55a5f8c`)  
+- Operation: `replace_from` to restructure joins.  
+**Recommended Examples:** `pg_materialized_dimension_fact_prefilter`, `pg_date_cte_explicit_join`  
+
+#### Target 2: Dimension Prefetch (E)  
+**Family:** E  
+**Transform:** `reuse_filtered_dimensions`  
+**Target ID:** `t2`  
+**Relevance Score:** 0.85  
+**Hypothesis:**  
+> Precompute filtered `item` and `customer_address` as CTEs. Reuse them in both `ss` and `ws` CTEs. This avoids redundant `Bitmap Heap Scan on item` (39.369 ms) and `Index Scan on customer_address` (0.028 ms/row) seen in the plan.  
+**Target IR:**  
+- Anchor: `S0`  
+- Operation: `insert_cte` for shared dimensions.  
+**Recommended Examples:** `multi_dimension_prefetch`  
+
+#### Target 3: Join Order Optimization (F)  
+**Family:** F  
+**Transform:** `explicit_join_order`  
+**Target ID:** `t3`  
+**Relevance Score:** 0.80  
+**Hypothesis:**  
+> Convert comma joins to `INNER JOIN` with optimal order: `item` → `store_sales` → `customer_address` → `date_dim`. Place most selective tables (`item`: 815 rows) first to reduce hash sizes.  
+**Target IR:**  
+- Anchor: `CTE_Q_S0_ss` (hash `f55d9959a55a5f8c`)  
+- Operation: `replace_from` with explicit joins.  
+**Recommended Examples:** `pg_explicit_join_materialized`  
+
+#### Target 4: Main Query Pivot (F)  
+**Family:** F  
+**Transform:** `pivot_quarters_eliminate_self_join`  
+**Target ID:** `t4`  
+**Relevance Score:** 0.75  
+**Hypothesis:**  
+> Replace the 6-way self-join in the main query with a single CTE pivoting quarters (Q1/Q2/Q3). This eliminates `Nested Loop` joins over CTEs (4828 ms) by computing ratios via conditional aggregation.  
+**Target IR:**  
+- Anchor: `Q_S0` (hash `e3d013ee216110fe`)  
+- Operation: `replace_from` + `replace_expr_subtree`.  
+**Recommended Examples:** `pg_explicit_join_materialized`  
+
+---
+
+### Final Target JSON
+
+```json
+[
+  {
+    "family": "C+A",
+    "transform": "aggregate_before_join_with_dimension_keys",
+    "target_id": "t1",
+    "relevance_score": 0.93,
+    "hypothesis": "Pre-aggregate store_sales/web_sales by join keys (ss_item_sk, ss_addr_sk, ss_sold_date_sk) before joining dimensions. This reduces input to the expensive Aggregate operator from 415k rows to ~4k rows.",
+    "target_ir": "CTE_Q_S0_ss (f55d9959a55a5f8c): replace_from",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "reuse_filtered_dimensions",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Prefetch filtered dimension tables (item, customer_address) as CTEs and reuse them in both ss and ws CTEs. Avoids redundant Bitmap Heap Scan (39 ms) and Index Scans (0.028 ms/row).",
+    "target_ir": "S0: insert_cte",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_order",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Restructure CTE joins as explicit INNER JOINs with optimal order: item → store_sales → customer_address → date_dim. Leverages selectivity of item (815 rows) to minimize hash sizes early.",
+    "target_ir": "CTE_Q_S0_ss (f55d9959a55a5f8c): replace_from",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "F",
+    "transform": "pivot_quarters_eliminate_self_join",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Replace 6-way self-join with pivoted CTE (quarters as columns). Eliminates Nested Loop over CTE scans (4828 ms) by computing ratios via conditional aggregation in one pass.",
+    "target_ir": "Q_S0 (e3d013ee216110fe): replace_from + replace_expr_subtree",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

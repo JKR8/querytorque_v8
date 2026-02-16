@@ -1,0 +1,56 @@
+## Analysis of Optimization Families
+
+**Family A: Early Filtering (Predicate Pushback)**  
+MEDIUM relevance. The CTE already filters `d_year=2002`, but the main query's `ca_state='OH'` filter could potentially be pushed earlier. However, the state in the CTE (`ctr_state`) comes from the *returning* address, while the main query's filter is on the *current* address state, making pushdown invalid.
+
+**Family B: Decorrelation (Sets Over Loops)**  
+HIGH relevance. The correlated subquery `(SELECT avg(ctr_total_return)... WHERE ctr1.ctr_state=ctr2.ctr_state)` forces per-row re-execution. This is the primary bottleneck.
+
+**Family C: Aggregation Pushdown**  
+LOW relevance. The CTE already aggregates before joins, and no downstream aggregation exists.
+
+**Family D: Set Operation Optimization**  
+LOW relevance. No set operations (UNION/INTERSECT) exist in the query.
+
+**Family E: Materialization/Prefetch**  
+MEDIUM relevance. The CTE is referenced twice (main query + subquery), but PostgreSQL materializes CTEs by default. The decorrelation solution inherently addresses reuse.
+
+**Family F: Join Transform**  
+MEDIUM relevance. Comma joins could be converted to explicit INNER JOINs for better optimizer control.
+
+**Chosen families**: [B, F, E]  
+**Confidence**: High (B), Medium (F, E)
+
+---
+
+```json
+[
+  {
+    "family": "B",
+    "transform": "shared_scan_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Correlated subquery re-executes per row to compute state averages. Precomputing state-level aggregates eliminates the nested loop.",
+    "target_ir": "S0 [SELECT]\n  CTE: customer_total_return  (via CTE_Q_S0_customer_total_return)\n    FROM: catalog_returns, date_dim, customer_address\n    WHERE [dd1f5e0759584a73]: cr_returned_date_sk = d_date_sk AND d_year = 2002 AND cr_returning_addr_sk = ca_address_sk\n    GROUP BY: cr_returning_customer_sk, ca_state\n  CTE: state_avg  (new)\n    FROM: customer_total_return\n    GROUP BY: ctr_state\n  MAIN QUERY (via Q_S0)\n    FROM: customer_total_return ctr1, customer_address, customer, state_avg\n    WHERE [dff2117ecbdb3fa4]: ctr1.ctr_total_return > state_avg.avg * 1.2 \n      AND state_avg.ctr_state = ctr1.ctr_state\n      AND ca_address_sk = c_current_addr_sk\n      AND ca_state = 'OH'\n      AND ctr1.ctr_customer_sk = c_customer_sk\n    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_restructure",
+    "target_id": "t2",
+    "relevance_score": 0.75,
+    "hypothesis": "Implicit comma joins prevent optimal join ordering. Explicit joins allow better predicate pushdown and join sequencing.",
+    "target_ir": "S0 [SELECT]\n  ... (CTEs identical to t1)\n  MAIN QUERY (via Q_S0)\n    FROM: customer_total_return ctr1\n      INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk\n      INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk\n      INNER JOIN state_avg ON state_avg.ctr_state = ctr1.ctr_state\n    WHERE: ctr1.ctr_total_return > state_avg.avg * 1.2\n      AND ca_state = 'OH'\n    ORDER BY: ... (identical to original)",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E",
+    "transform": "cte_materialization_lock",
+    "target_id": "t3",
+    "relevance_score": 0.65,
+    "hypothesis": "Ensure CTE materialization to prevent re-scanning base tables for both main query and state_avg CTE.",
+    "target_ir": "S0 [SELECT]\n  CTE: customer_total_return  (MATERIALIZED)\n    ... (identical to original CTE)\n  CTE: state_avg  (MATERIALIZED)\n    ... (identical to t1)\n  MAIN QUERY: ... (identical to t1)",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

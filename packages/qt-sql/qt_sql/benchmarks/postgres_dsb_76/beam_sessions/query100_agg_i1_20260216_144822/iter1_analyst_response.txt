@@ -1,0 +1,87 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Winners (IMPROVED):**
+
+1. **t3 (Family A - predicate_pushdown_items) - 1.08x IMPROVED**  
+   - **Improved Operator**:  
+     `Index Only Scan on item (rows=25326, time=4.251 vs original 5.676 ms)`  
+   - **Structural Change**: Pushed `item.i_category` filter into a CTE (`filtered_item1`), reducing item scan time.  
+   - **Most Expensive Remaining Operator**:  
+     `Sort (rows=218145, time=654.864 ms)` in the Merge Join.  
+
+2. **t2 (Family F - join_order_restructure) - 1.07x IMPROVED**  
+   - **Improved Operator**:  
+     `Merge Join Sort (rows=218145, time=601.247 vs original 659.774 ms)`  
+   - **Structural Change**: Restructured joins and pushed `date_dim.d_year` filter early via CTE, reducing sort cost.  
+   - **Most Expensive Remaining Operator**:  
+     `Sort (rows=218145, time=601.247 ms)` in the Merge Join.  
+
+**Classification**:  
+- **COMPLEMENTARY**: t2 and t3 improved **different operators** (t3 optimized item scans; t2 reduced sort cost in Merge Join).  
+
+**FAILs**:  
+1. **t1 (Family E - multi_dimension_prefetch)**  
+   - **Failure Cause**: Row count mismatch (294 vs 304). The CTE `prefetched_sales` reused for `s1`/`s2` altered join semantics, likely due to materialization changing row visibility.  
+   - **Backfired Operator**: Entire plan failed equivalence.  
+
+2. **syn_w2 (Family B - decorrelate)**  
+   - **Failure Cause**: Same row count mismatch (294 vs 304). Similar CTE approach as t1 caused incorrect results.  
+
+---
+
+### Step 2 — Design Targets for Round 1
+
+**Baseline**: Start with **t3 (1.08x winner)** as it has the highest speedup.  
+
+**Target 1: Combination (A+F)**  
+- **Hypothesis**: Layer t2’s date_dim early filter onto t3’s item filters to reduce the Merge Join’s sort input (218145 rows). The original Merge Join sort took 659 ms; t2 reduced it to 601 ms. Combining these should amplify gains.  
+- **Target IR**: `S0` (main query)  
+- **Families**: A (Early Filtering) + F (Join Transform)  
+- **Transform**: `early_filter_date_and_items`  
+- **Examples**: `pg_date_cte_explicit_join` (A), `pg_explicit_join_materialized` (F)  
+
+**Target 2: Rescue (A+E)**  
+- **Hypothesis**: Fix t1’s failed CTE by ensuring `prefetched_sales` includes all necessary columns and joins. Pre-filtering `store_sales` with `date_dim` and `ss_list_price` should reduce the large store_sales scan (218147 rows) and subsequent joins.  
+- **Target IR**: `S0`  
+- **Families**: A (Early Filtering) + E (Materialization)  
+- **Transform**: `prefetch_sales_fixed`  
+- **Examples**: `pg_date_cte_explicit_join` (A), `multi_dimension_prefetch` (E)  
+
+**Target 3: Novel (C)**  
+- **Hypothesis**: Pre-aggregate ticket-item pairs to avoid the expensive Merge Join (218145 rows, 654 ms in t3). Compute item pairs per ticket in a CTE, then join with filtered items. This targets the root bottleneck (Merge Join).  
+- **Target IR**: `S0`  
+- **Family**: C (Aggregation Pushdown)  
+- **Transform**: `ticket_pairs_early_aggregation`  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "early_filter_date_and_items",
+    "target_id": "t4",
+    "relevance_score": 0.95,
+    "hypothesis": "Combine t3's item filtering (A) with t2's date_dim CTE (F) to reduce input rows to Merge Join sort (218145 rows, 654 ms in t3).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A+E",
+    "transform": "prefetch_sales_fixed",
+    "target_id": "t5",
+    "relevance_score": 0.85,
+    "hypothesis": "Rescue t1's prefetched_sales CTE by ensuring correct column inclusion. Pre-filter store_sales with date_dim and list_price to cut scan rows (218147 in original).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "ticket_pairs_early_aggregation",
+    "target_id": "t6",
+    "relevance_score": 0.80,
+    "hypothesis": "Precompute item pairs per ticket in a CTE to avoid Merge Join (218145 rows, 654 ms). Join results with filtered items for aggregation.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

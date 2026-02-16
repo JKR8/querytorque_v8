@@ -1,0 +1,83 @@
+## Step 1 — Compare EXPLAIN Plans
+
+**t2 (NEUTRAL 1.02x) Analysis:**
+- **Improvement**: The `SetOp` for `cross_items` reduced from 7061 ms to 2893 ms. Key operator improvements:
+  - `Subquery Scan (*SELECT* 2)` reduced from 3830 ms to 704 ms
+  - `Subquery Scan (*SELECT* 1)` reduced from 2354 ms to 1605 ms
+- **Cause**: Aggregation pushdown in `avg_sales` CTE indirectly reduced pressure on `cross_items` by precomputing aggregates, allowing better resource allocation.
+- **New Bottleneck**: The `Nested Loop` in `this_year` subquery remains expensive (5099 ms) due to 272k row processing from `cross_items` CTE scans.
+
+**t1 (FAIL) & Synthetic Patches Analysis**:
+- **t1 Failure**: Literal mismatch in rewrite ('store' → other values). Structural change (INTERSECT→EXISTS) was sound but implementation flawed.
+- **syn_w1/syn_w3 Failure**: IR targeting failed due to missing anchor points for CTE materialization.
+
+**Winner Classification**:  
+t2 is **COMPLEMENTARY** to other families since it improved `avg_sales` while leaving `cross_items` and main query bottlenecks untouched.
+
+## Step 2 — Design Targets
+
+### Primary Bottleneck
+The `Nested Loop` processing 272k rows in `this_year` subquery (5099 ms in t2 plan) driven by `cross_items` CTE materialization.
+
+### Target Designs
+
+1. **Combination (C+D)**:  
+   Layer Family D (set operation rewrite) onto t2's baseline to attack `cross_items` CTE bottleneck.  
+   - **Target**: `SetOp` in `cross_items` (2893 ms in t2)  
+   - **Hypothesis**: Replace INTERSECT with EXISTS to avoid materializing 384k intermediate rows while preserving t2's gains.
+
+2. **Refinement (A)**:  
+   Optimize the expensive `Nested Loop` in `this_year` by pushing filters earlier.  
+   - **Target**: `Nested Loop` (rows=272575, time=5099 ms)  
+   - **Hypothesis**: Push `d_week_seq` filter into `cross_items` CTE to reduce output rows before the main query join.
+
+3. **Rescue (D)**:  
+   Fix t1's literal mismatch while preserving its core structural change.  
+   - **Target**: `SetOp` in `cross_items` (7061 ms in original)  
+   - **Hypothesis**: Correctly implement INTERSECT→EXISTS rewrite with literal preservation to avoid 384k row materialization.
+
+4. **Novel (E)**:  
+   Precompute and reuse `cross_items` CTE across both `this_year`/`last_year` subqueries.  
+   - **Target**: `CTE Scan (cross_items)` (2910 ms in t2)  
+   - **Hypothesis**: Materialize as temp table to prevent redundant computation in main query branches.
+
+```json
+[
+  {
+    "family": "C+D",
+    "transform": "aggregation_pushdown_then_setop_rewrite",
+    "target_id": "combo_1",
+    "relevance_score": 0.97,
+    "hypothesis": "Combine t2's aggregation pushdown (C) with INTERSECT→EXISTS rewrite (D) to attack both avg_sales (1951ms) and cross_items (2893ms) bottlenecks",
+    "target_ir": "S0:CTE_Q_S0_avg_sales & S0:CTE_Q_S0_cross_items",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_intersect_to_exists"]
+  },
+  {
+    "family": "A",
+    "transform": "push_week_filter_into_cte",
+    "target_id": "refine_1",
+    "relevance_score": 0.92,
+    "hypothesis": "Push d_week_seq filter into cross_items CTE to reduce output rows (currently 2664) before main query Nested Loop (5099ms)",
+    "target_ir": "S0:CTE_Q_S0_cross_items",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "D",
+    "transform": "fixed_setop_to_exists",
+    "target_id": "rescue_1",
+    "relevance_score": 0.90,
+    "hypothesis": "Rescue t1 by preserving literals during INTERSECT→EXISTS rewrite to avoid 384k row materialization (7061ms)",
+    "target_ir": "S0:CTE_Q_S0_cross_items",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "E",
+    "transform": "cte_materialization",
+    "target_id": "novel_1",
+    "relevance_score": 0.85,
+    "hypothesis": "Materialize cross_items as temp table to prevent redundant computation in this_year/last_year branches",
+    "target_ir": "S0:CTE_Q_S0_cross_items",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

@@ -1,0 +1,31 @@
+Based on the analysis, the primary bottleneck is the correlated subquery in the WHERE clause (`ctr1.ctr_total_return > (SELECT AVG(...) ...`), causing per-row re-execution. This is evident from the query structure and confirmed by the optimization history where decorrelation (Family B) was consistently applied. The most expensive operator in all patches is the `Hash Join` (e.g., 838.605 ms in t1) between the large CTE scan (383k rows) and the state average computation.
+
+### Step 1: Patch Analysis
+- **t1/syn_w2 (Family B)**: Decorrelates the subquery via `state_avg` CTE. Eliminates correlated execution. Most expensive operator: `Hash Join` (838.605 ms) between CTE scan and state average.  
+- **t2 (Family F+E)**: Adds explicit joins + CTE materialization. Slightly faster `Hash Join` (785.46 ms) but same bottleneck.  
+- **syn_w1 (Family A)**: Early filtering missing. Same `Hash Join` cost (803.971 ms).  
+- **All patches** are **COMPLEMENTARY** as they address different aspects (B decorrelates, F restructures joins, A misses filtering).
+
+### Step 2: Target Design
+**Primary Target (A+B+F Combination)**  
+Layer early filtering (A) onto the best decorrelation+explicit join approach (t2) to reduce the CTE size. Targets the `Hash Join`'s 383k-row CTE scan by pushing `ca_state='OH'` into the CTE.
+
+```json
+[
+  {
+    "family": "A+B+F",
+    "transform": "early_filter_decorrelate_explicit_join",
+    "target_id": "t2_plus",
+    "relevance_score": 0.97,
+    "hypothesis": "Push 'ca_state=OH' into CTE (A) reduces CTE rows from 383k to OH-only. Combine with decorrelation (B) and explicit joins (F) to optimize main query. Targets Hash Join's 383k-row CTE input.",
+    "target_ir": "S0: replace_where_predicate (dd1f5e0759584a73) to add 'ca_state = ''OH''' in CTE; replace_from (Q_S0) to use t2's explicit join structure.",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate", "pg_explicit_join_materialized"]
+  }
+]
+```
+
+**Why only 1 target?**  
+- High-confidence: Early filtering directly reduces the 383k-row CTE (proven by Family A gold examples).  
+- Combines complementary optimizations (A+B+F) without redundancy.  
+- Secondary bottlenecks (e.g., `Aggregate` in state_avg) resolve automatically after row reduction.  
+- Quality > quantity: Avoids speculative changes without plan evidence.

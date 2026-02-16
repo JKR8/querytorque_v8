@@ -1,0 +1,95 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (0.94x REGRESSION) Analysis**  
+- **Regression Cause**:  
+  The `Merge Join` (rows=0, time=1036.187) became the new bottleneck, taking longer than any original operator. This replaced the original efficient `Nested Loop` + `Index Scan` pattern on sales tables. The structural change (converting INTERSECT to EXISTS with CTEs) forced merge joins and materialization of the large `filtered_customers` CTE (139K rows), which increased input rows to the join.  
+
+**t2 (0.86x REGRESSION) Analysis**  
+- **Regression Cause**:  
+  Aggregation pushdown backfired: The `Group` operation on `store_sales` (rows=0, time=1067.438) became slower than the original `Index Only Scan` (time=2.288 ms). The structural change (pre-aggregating sales before joins) scanned the entire `store_sales` table without leveraging date/customer filters early, increasing input rows.  
+
+**t3 (0.49x REGRESSION) Analysis**  
+- **Regression Cause**:  
+  The `Merge Join` in the `store_sales` branch (rows=0, time=916.5) became 2.2x slower than the original `Nested Loop` (time=422.422 ms). Materializing CTEs changed join strategies from indexed nested loops to sort-merge joins, increasing sort costs despite reusing filtered dimensions.  
+
+### Step 2 — Design Targets  
+
+**Primary Bottleneck**:  
+The original `Nested Loop` + `Index Only Scan` on `store_sales` (time=422.422 ms) is the slowest operator. Input rows to `store_sales` scans remain high due to late filtering.  
+
+**Target 1: Combination (E + A)**  
+- **Family**: E + A  
+- **Transform**: `prefetch_with_early_sales_filter`  
+- **Target ID**: t1  
+- **Relevance**: 0.97  
+- **Hypothesis**: Precompute filtered dimensions (Family E) AND push sales table filters (list_price/wholesale_cost) into the CTEs (Family A). Reduces input rows to the expensive `store_sales` scan by applying all filters before joins.  
+- **Target IR**: S0  
+- **Examples**: ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]  
+
+**Target 2: Refinement (A)**  
+- **Family**: A  
+- **Transform**: `push_sales_filters_into_scan`  
+- **Target ID**: t2  
+- **Relevance**: 0.93  
+- **Hypothesis**: Target the `store_sales` scan directly. Move `ss_list_price`/`ss_wholesale_cost` filters into the scan operator (bypassing CTE limitations). Reduces rows fed into the `Nested Loop` (currently 0 rows but high time suggests hidden cardinality).  
+- **Target IR**: Anchor hash for `store_sales` scan (from IR map)  
+- **Examples**: ["pg_date_cte_explicit_join"]  
+
+**Target 3: Rescue (D)**  
+- **Family**: D  
+- **Transform**: `intersect_to_exists_optimized`  
+- **Target ID**: t3  
+- **Relevance**: 0.88  
+- **Hypothesis**: Fix t1's regression by using `web_sales` (fastest branch, 137.99 ms) as the EXISTS base table instead of `store_sales`. Correlated subqueries will run on smaller inputs.  
+- **Target IR**: S0  
+- **Examples**: ["pg_intersect_to_exists"]  
+
+**Target 4: Novel (F)**  
+- **Family**: F  
+- **Transform**: `convert_to_explicit_join_order`  
+- **Target ID**: t4  
+- **Relevance**: 0.85  
+- **Hypothesis**: Restructure joins to start with `customer` (filtered first) → `date_dim` → sales tables. Leverages index on `c_customer_sk` and reduces input rows to sales scans by filtering customers early.  
+- **Target IR**: S0  
+- **Examples**: ["pg_explicit_join_materialized"]  
+
+```json
+[
+  {
+    "family": "E+A",
+    "transform": "prefetch_with_early_sales_filter",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Apply dimension filters in CTEs (E) AND push sales table filters (list_price/wholesale_cost) into the same CTEs (A) to reduce input rows to the expensive store_sales scan (422 ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A",
+    "transform": "push_sales_filters_into_scan",
+    "target_id": "t2",
+    "relevance_score": 0.93,
+    "hypothesis": "Directly push ss_list_price/ss_wholesale_cost filters into the store_sales scan operator to reduce rows before joins, targeting the Nested Loop bottleneck (422 ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "D",
+    "transform": "intersect_to_exists_optimized",
+    "target_id": "t3",
+    "relevance_score": 0.88,
+    "hypothesis": "Rescue t1's EXISTS approach by using web_sales (fastest branch, 138 ms) as the base table for correlated subqueries, reducing iterations for EXISTS checks.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "F",
+    "transform": "convert_to_explicit_join_order",
+    "target_id": "t4",
+    "relevance_score": 0.85,
+    "hypothesis": "Restructure joins to start with filtered customer → date_dim → sales tables, leveraging customer indexes and reducing input to sales scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

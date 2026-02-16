@@ -1,0 +1,104 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches in Iteration 1 failed, so no winners exist. We analyze failures:  
+
+1. **t1 (E+A)**: Failed due to transaction abort. The plan attempted:  
+   - Prefiltered `store` and `date_dim` via CTEs (`filtered_stores`, `filtered_dates`)  
+   - **Why it backfired**: Likely incorrect scoping when joining CTEs. The original `wss` CTE remained unfiltered, forcing downstream joins to process all 9K rows (vs. filtered dimensions).  
+
+2. **t4 (A)**: Failed with "column s_store_name does not exist".  
+   - Attempted to push `s_state` filter into `wss` via `JOIN filtered_stores`.  
+   - **Why it backfired**: Aggressive predicate push into CTE broke column visibility in outer queries.  
+
+3. **t2 (B)**: Failed with transaction abort.  
+   - Attempted decorrelation by pre-joining `store_sales`+`date_dim` before aggregation.  
+   - **Why it backfired**: Unnecessary decorrelation (no correlated subqueries in original) added complexity.  
+
+4. **t3 (E+F)**: Failed with transaction abort.  
+   - Created partitioned `wss_1`/`wss_2` CTEs for date ranges.  
+   - **Why it backfired**: Duplicated aggregation logic (2 CTEs) increased memory pressure.  
+
+---
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**:  
+`Seq Scan on store_sales` (1.3M rows, 2392 ms) → `Nested Loop` → `Gather Merge` (3.9M rows, 3252 ms).  
+High-cost operators persist due to late filtering of `s_state` and `d_month_seq`.  
+
+**Target Design** (4 prioritized):  
+
+1. **Combination (A+E)**:  
+   - **Family**: A + E  
+   - **Transform**: `early_store_filter_plus_date_prefetch`  
+   - **Target ID**: `t1`  
+   - **Relevance**: 0.95  
+   - **Hypothesis**: Prefilter `store` (E) to reduce `store_sales` joins, and push `d_month_seq` into `wss` CTE (A) to avoid full scans.  
+   - **Target IR**: `S0` (anchor: `57528f4c700e359a` - add `d_month_seq` filter)  
+   - **Examples**: `pg_date_cte_explicit_join` (A), `multi_dimension_prefetch` (E)  
+
+2. **Refinement (A)**:  
+   - **Family**: A  
+   - **Transform**: `literal_push_into_wss_cte`  
+   - **Target ID**: `t2`  
+   - **Relevance**: 0.90  
+   - **Hypothesis**: Push `s_state` filter into `wss` CTE via `JOIN store` to reduce 9K CTE rows early.  
+   - **Target IR**: `S0` (anchor: `57528f4c700e359a` - inject `AND s_state IN (...)`)  
+   - **Examples**: `pg_date_cte_explicit_join`  
+
+3. **Rescue (E)**:  
+   - **Family**: E  
+   - **Transform**: `safe_store_prefetch`  
+   - **Target ID**: `t3`  
+   - **Relevance**: 0.85  
+   - **Hypothesis**: Precompute filtered `store` as CTE to avoid 2x scans (original: 2x `store` scans at 26 rows each).  
+   - **Target IR**: `S0` (anchor: `0b824afb49a292d0` - replace `store` with CTE)  
+   - **Examples**: `multi_dimension_prefetch`  
+
+4. **Novel (F)**:  
+   - **Family**: F  
+   - **Transform**: `eliminate_self_join_via_window`  
+   - **Target ID**: `t4`  
+   - **Relevance**: 0.80  
+   - **Hypothesis**: Replace self-join with single-pass LAG window over `d_week_seq` to avoid 629K-row `Hash Join`.  
+   - **Target IR**: `S0` (anchor: `0b824afb49a292d0` - replace subqueries with window func)  
+   - **Examples**: `pg_explicit_join_materialized`  
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "early_store_filter_plus_date_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefilter store (E) to reduce store_sales joins and push d_month_seq into wss CTE (A) to avoid full table scans. Targets Seq Scan on store_sales (1.3M rows) and Gather Merge (3.9M rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "literal_push_into_wss_cte",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Push s_state filter into wss CTE via JOIN store to reduce 9K CTE rows early. Avoids late filtering in Hash Join (629K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "safe_store_prefetch",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Precompute filtered store as CTE to eliminate 2x store scans (26 rows each). Targets redundant Seq Scan on store in Hash Join.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "eliminate_self_join_via_window",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Replace self-join with LAG window to avoid 629K-row Hash Join. Most expensive remaining operator after core fixes.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

@@ -1,0 +1,66 @@
+### Analysis of Execution Plan and Failed Patches
+
+**Original Plan Bottleneck**:  
+The most expensive operator is the `Hash Join` (rows=96, time=48.415 ms) between `customer` (250K rows) and `customer_address`. This is followed by the `Seq Scan on customer` (250K rows, 23.23 ms). The large sequential scan on `customer` dominates execution time.
+
+**Failed Patches Analysis**:  
+All prior patches failed due to **literal mismatch** – they replaced `ib_upper_bound <= 23567 + 50000` with `ib_upper_bound <= 73567`, violating structural equivalence. This caused semantic rejection despite valid optimizations. No plan comparisons are possible since all patches failed.
+
+---
+
+### Optimization Targets for Next Round
+
+**Primary Bottleneck**:  
+`Seq Scan on customer` (250K rows) → Reduced by pre-filtering customers linked to 'Jackson' addresses.
+
+**Target Design Strategy**:  
+Re-attempt proven families with strict literal preservation. Prioritize **Family A** (Early Filtering) to eliminate the sequential scan, followed by **Family E** for prefetching small dimensions. Combine where complementary.
+
+```json
+[
+  {
+    "family": "A",
+    "transform": "predicate_pushback_cte_fixed",
+    "target_id": "tA_fixed",
+    "relevance_score": 0.98,
+    "hypothesis": "Push 'ca_city = Jackson' into a CTE to reduce Seq Scan on customer from 250K rows. Preserves literal '23567 + 50000' verbatim.",
+    "target_ir": "S0:bfc6729fe553d3e9",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch_fixed",
+    "target_id": "tE_fixed",
+    "relevance_score": 0.85,
+    "hypothesis": "Prefetch tiny dimensions (income_band: 4 rows, customer_address: 49 rows) to avoid repeated scans. Targets residual cost after Family A.",
+    "target_ir": "S0:bfc6729fe553d3e9",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A+E",
+    "transform": "early_filter_then_prefetch",
+    "target_id": "tAE_combined",
+    "relevance_score": 0.92,
+    "hypothesis": "Layer Family E prefetch atop Family A's CTE. Eliminates Seq Scans on customer AND customer_address/income_band.",
+    "target_ir": "S0:bfc6729fe553d3e9",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_fixed",
+    "target_id": "tF_fixed",
+    "relevance_score": 0.75,
+    "hypothesis": "Rescue explicit joins (failed t1) with literal preservation. May enable better join order for customer_address filter.",
+    "target_ir": "S0:bfc6729fe553d3e9",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```
+
+### Rationale
+1. **Family A (tA_fixed)**: Directly attacks the `Seq Scan on customer` (250K rows). Gold example shows 2.28x speedup for similar late-filter pushdown.  
+2. **Family E (tE_fixed)**: Prefetches `customer_address` (49 rows) and `income_band` (4 rows) – tiny tables scanned repeatedly in the plan.  
+3. **Combo A+E (tAE_combined)**: Complementary – A reduces fact tables, E caches dimensions. Targets both `customer` and `customer_address` scans.  
+4. **Family F (tF_fixed)**: Low-risk rescue. Explicit joins may improve join order for the `customer_address` filter.  
+
+**Literal Preservation Critical**: All targets retain `ib_upper_bound <= 23567 + 50000` verbatim to avoid structural rejection.

@@ -1,0 +1,117 @@
+### Analysis of Results
+
+#### Step 1: Compare EXPLAIN Plans
+
+**t1 (WIN - 7.77x)**  
+- **Improved operators**:  
+  Original: `Hash Join (rows=0, time=434.22)` and `Nested Loop (rows=163368, time=188.502)`  
+  t1: These operators are eliminated entirely.  
+- **Structural change**: Materialized date_dim filters via CTE (`prefetched_dates`), avoiding repeated scans of the large date_dim table.  
+- **Most expensive remaining operator**:  
+  `Gather (rows=0, time=42.133)` → `Seq Scan on customer_demographics (rows=0, time=36.428)`  
+  This is now the bottleneck, consuming 86% of the total runtime (36.4ms/42.1ms).  
+
+**t2 (NEUTRAL - 1.00x)**  
+- **Regressed operators**:  
+  Original: `Hash Join (time=434.22)`  
+  t2: `Hash Join (time=488.093)`  
+- **Why backfired**: Early filtering CTEs for demographics/items didn’t reduce input rows enough to offset CTE overhead. The core expensive join (`catalog_sales` ↔ `date_dim`) remained unchanged.  
+
+**t3 (FAIL)** & **syn_w2 (FAIL)**  
+Syntax errors prevented execution. No plan comparison possible.  
+
+**Classification**:  
+- **t1 is COMPLEMENTARY** to other strategies. It optimized date_dim scans (Family E) but left customer_demographics unscathed.  
+
+---
+
+### Step 2: Design Targets
+
+**Baseline**: Start from **t1 (WIN)** SQL.  
+**Primary bottleneck**: `Seq Scan on customer_demographics (time=36.428ms)` in t1’s plan.  
+
+#### 1. Combination (E + A)  
+- **Family**: A + E  
+- **Transform**: `prefetch_dates_and_filter_demographics`  
+- **Hypothesis**: Layer Family A (early filtering) on t1 to reduce `customer_demographics` scan. Pre-filter demographics to cut input rows for the bottleneck sequential scan.  
+- **Target IR**: `S0` (entire query)  
+- **Examples**: `dimension_filter_pushdown` (A) + `multi_dimension_prefetch` (E)  
+
+```json
+{
+  "family": "A+E",
+  "transform": "prefetch_dates_and_filter_demographics",
+  "target_id": "t1_plus_A",
+  "relevance_score": 0.95,
+  "hypothesis": "Add CTEs to pre-filter customer_demographics (cd_marital_status='U', cd_dep_count=9-11) and household_demographics (hd_buy_potential='>10000') while retaining date_dim prefetch. Targets the 36ms Seq Scan on customer_demographics in t1's plan.",
+  "target_ir": "S0",
+  "recommended_examples": ["dimension_filter_pushdown", "multi_dimension_prefetch"]
+}
+```
+
+#### 2. Refinement (A)  
+- **Family**: A  
+- **Transform**: `customer_demographics_pushdown`  
+- **Hypothesis**: Isolate customer_demographics filtering into a CTE. Forces predicate application before joins, reducing input to the bottleneck scan.  
+- **Target IR**: `S0` + anchor `caca0908ce6d7a53` (WHERE clause)  
+- **Examples**: `dimension_filter_pushdown`  
+
+```json
+{
+  "family": "A",
+  "transform": "customer_demographics_pushdown",
+  "target_id": "t1_cd_filter",
+  "relevance_score": 0.90,
+  "hypothesis": "Filter customer_demographics early via CTE to avoid full Seq Scan (36ms in t1). Use WHERE-clause anchor to ensure predicates are pushed before joins.",
+  "target_ir": "S0",
+  "recommended_examples": ["dimension_filter_pushdown"]
+}
+```
+
+#### 3. Rescue (F)  
+- **Family**: F  
+- **Transform**: `date_self_join_elimination_fixed`  
+- **Hypothesis**: Fix t3’s syntax error (missing `d1` alias) and apply to t1. Replace `d1.d_week_seq = d2.d_week_seq` with a single date_dim scan, reducing join complexity.  
+- **Target IR**: `S0` + anchor `caca0908ce6d7a53` (d1.d_week_seq = d2.d_week_seq)  
+- **Examples**: `date_self_join_elimination`  
+
+```json
+{
+  "family": "F",
+  "transform": "date_self_join_elimination_fixed",
+  "target_id": "t1_fixed_t3",
+  "relevance_score": 0.80,
+  "hypothesis": "Fix t3's alias error and eliminate date_dim self-join. Targets the residual join overhead in t1's Nested Loops after date prefetch.",
+  "target_ir": "S0",
+  "recommended_examples": ["date_self_join_elimination"]
+}
+```
+
+#### 4. Novel (C)  
+- **Family**: C  
+- **Transform**: `aggregate_before_joins`  
+- **Hypothesis**: Aggregate `catalog_sales` by `item_sk` and `sold_date_sk` before joining dimensions. Reduces input rows to downstream joins (original: 163K rows).  
+- **Target IR**: `S0` (GROUP BY clause)  
+- **Examples**: `materialized_dimension_fact_prefilter`  
+
+```json
+{
+  "family": "C",
+  "transform": "aggregate_before_joins",
+  "target_id": "t1_agg_pushdown",
+  "relevance_score": 0.75,
+  "hypothesis": "Pre-aggregate catalog_sales by item_sk/sold_date_sk to shrink the 163K-row Nested Loop in the original plan. Viable since GROUP BY keys include item and date_dim columns.",
+  "target_ir": "S0",
+  "recommended_examples": ["materialized_dimension_fact_prefilter"]
+}
+```
+
+---
+
+### Summary
+1. **Priority 1**: Combine t1’s date prefetch (E) with demographics filtering (A) to attack the 36ms Seq Scan.  
+2. **Priority 2**: Directly optimize demographics scan via early filtering (A).  
+3. **Priority 3**: Rescue t3’s date self-join elimination (F) on t1’s base.  
+4. **Priority 4**: Novel aggregation pushdown (C) to shrink the 163K-row Nested Loop.  
+
+All targets focus on structurally distinct bottlenecks observed in EXPLAIN plans.

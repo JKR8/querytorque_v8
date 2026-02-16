@@ -1,0 +1,241 @@
+## Role
+
+You are a SQL optimization analyst. Your task is to analyze this query, identify the primary bottleneck, and design structural optimization targets.
+
+For each target, describe the STRUCTURAL SHAPE of the optimized query using an IR node map (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY). A separate code-generation worker will convert your targets into executable patch plans.
+
+Identify the primary bottleneck. Only provide secondary targets if they are distinct and high-confidence. **Quality > Quantity.**
+
+## Query: query025_agg_i2
+
+**Dialect**: POSTGRES
+
+```sql
+select 
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ ,stddev_samp(ss_net_profit) as store_sales_profit
+ ,stddev_samp(sr_net_loss) as store_returns_loss
+ ,stddev_samp(cs_net_profit) as catalog_sales_profit
+ from
+ store_sales
+ ,store_returns
+ ,catalog_sales
+ ,date_dim d1
+ ,date_dim d2
+ ,date_dim d3
+ ,store
+ ,item
+ where
+ d1.d_moy = 2
+ and d1.d_year = 2000
+ and d1.d_date_sk = ss_sold_date_sk
+ and i_item_sk = ss_item_sk
+ and s_store_sk = ss_store_sk
+ and ss_customer_sk = sr_customer_sk
+ and ss_item_sk = sr_item_sk
+ and ss_ticket_number = sr_ticket_number
+ and sr_returned_date_sk = d2.d_date_sk
+ and d2.d_moy               between 2 and  2 + 2
+ and d2.d_year              = 2000
+ and sr_customer_sk = cs_bill_customer_sk
+ and sr_item_sk = cs_item_sk
+ and cs_sold_date_sk = d3.d_date_sk
+ and d3.d_moy               between 2 and  2 + 2
+ and d3.d_year              = 2000
+ group by
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ order by
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ limit 100;
+```
+
+
+## Current Execution Plan
+
+```
+Limit  (rows=2, time=1778.818)
+  Aggregate  (rows=2, time=1778.814)
+    Nested Loop  (rows=2, time=1778.785)
+      Gather Merge  (rows=13, time=1778.711)
+        Sort  (rows=13, time=1777.9)
+          Nested Loop  (rows=13, time=1777.803)
+            Nested Loop  (rows=13, time=1777.406)
+              Nested Loop  (rows=13, time=1777.127)
+                Hash Join  (rows=13, time=1776.548)
+                  Nested Loop  (rows=189, time=1775.749)
+                    Nested Loop  (rows=218310, time=64.146)
+                      Index Only Scan on date_dim (d2)  (rows=90, time=3.804)
+                      Index Only Scan on store_returns  (rows=2426, time=0.454)
+                    Index Only Scan on catalog_sales  (rows=0, time=0.008)
+                  Hash  (rows=90, time=0.07)
+                    Index Only Scan on date_dim (d3)  (rows=90, time=0.06)
+                Index Scan on store_sales  (rows=1, time=0.036)
+              Index Only Scan on store  (rows=1, time=0.015)
+            Index Only Scan on item  (rows=1, time=0.025)
+      Index Only Scan on date_dim (d1)  (rows=0, time=0.004)
+```
+
+
+## IR Structure (for patch targeting)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, store_returns, catalog_sales, date_dim d1, date_dim d2, date_dim d3, store, item
+    WHERE [b0b26a1f74d8058a]: d1.d_moy = 2 AND d1.d_year = 2000 AND d1.d_date_sk = ss_sold_date_sk AND i_item_sk = ss_item_sk A...
+    GROUP BY: i_item_id, i_item_desc, s_store_id, s_store_name
+    ORDER BY: i_item_id, i_item_desc, s_store_id, s_store_name
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
+
+
+## Optimization Families
+
+Review the 6 families below. Each has a proven gold example.
+
+Choose up to **4 most relevant families** for this query based on:
+- Query structure (CTEs, subqueries, joins, aggregations, set operations)
+- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)
+- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
+
+
+
+### Family A: Early Filtering (Predicate Pushback)
+**Description**: Push small filters into CTEs early, reduce row count before expensive operations
+**Speedup Range**: 1.3–4.0x (~35% of all wins)
+**Use When**:
+  1. Late WHERE filters on dimension tables
+  2. Cascading CTEs with filters applied downstream
+  3. Expensive joins after filters could be pushed earlier
+
+**Gold Example**: `pg_date_cte_explicit_join` (2.28x)
+
+
+
+### Family B: Decorrelation (Sets Over Loops)
+**Description**: Convert correlated subqueries to standalone CTEs with GROUP BY, eliminate per-row re-execution
+**Speedup Range**: 2.4–2.9x (~15% of all wins)
+**Use When**:
+  1. Correlated subqueries in WHERE clause
+  2. Scalar aggregates computed per outer row
+  3. DELIM_SCAN in execution plan (indicates correlation)
+
+**Gold Example**: `pg_shared_scan_decorrelate` (8043.91x (timeout rescue))
+
+
+
+### Family C: Aggregation Pushdown (Minimize Rows Touched)
+**Description**: Aggregate before expensive joins when GROUP BY keys ⊇ join keys, reduce intermediate sizes
+**Speedup Range**: 1.3–15.3x (~5% of all wins (high variance))
+**Use When**:
+  1. GROUP BY happens after large joins
+  2. GROUP BY keys are subset of join keys
+  3. Intermediate result size >> final result size
+
+**Gold Example**: `pg_materialized_dimension_fact_prefilter` (12.07x (V2 DSB SF10, was 2.68x in V1))
+
+
+
+### Family D: Set Operation Optimization (Sets Over Loops)
+**Description**: Replace INTERSECT/UNION-based patterns with EXISTS/NOT EXISTS, avoid full materialization
+**Speedup Range**: 1.7–2.7x (~8% of all wins)
+**Use When**:
+  1. INTERSECT patterns between large sets
+  2. UNION ALL with duplicate elimination
+  3. Set operations materializing full intermediate results
+
+**Gold Example**: `pg_intersect_to_exists` (1.78x)
+
+
+
+### Family E: Materialization / Prefetch (Don't Repeat Work)
+**Description**: Extract repeated scans or pre-compute intermediate results for reuse across multiple consumers
+**Speedup Range**: 1.3–6.2x (~18% of all wins)
+**Use When**:
+  1. Repeated scans of same table with different filters
+  2. Dimension filters applied independently multiple times
+  3. CTE referenced multiple times with implicit re-evaluation
+
+**Gold Example**: `multi_dimension_prefetch` (2.71x)
+
+
+
+### Family F: Join Transform (Right Shape First)
+**Description**: Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation
+**Speedup Range**: 1.8–8.6x (~19% of all wins)
+**Use When**:
+  1. Comma-separated joins (implicit cross joins) in FROM clause
+  2. Self-joins scanning same table multiple times
+  3. Dimension-fact join order suboptimal for predicate pushdown
+
+**Gold Example**: `pg_explicit_join_materialized` (8.56x)
+
+
+
+## Worker Routing
+
+Your targets will be routed to specialized workers:
+- **W1 "Reducer"** (Families A, D): Cardinality reduction — early filtering, set operations
+- **W2 "Unnester"** (Families B, C): Decorrelation, aggregation pushdown
+- **W3 "Builder"** (Families F, E): Join restructuring, materialization/prefetch
+- **W4 "Wildcard"** (Dynamic): Deep specialist — your **#1 target** gets maximum effort
+
+The highest-relevance target always goes to W4. Design diverse targets across worker roles for maximum coverage.
+
+
+## Your Task
+
+Analyze this query against the 6 families above.
+
+Identify the **primary bottleneck**. Only provide secondary targets if they are distinct and high-confidence. Quality > Quantity.
+
+For each target (1 to 4):
+1. Describe the bottleneck hypothesis
+2. Design a TARGET IR node map showing what the optimized query SHOULD look like
+3. Score relevance (0.0–1.0)
+4. Recommend which gold example(s) a code-generation worker should use as reference
+
+
+**Output format**:
+
+```json
+[
+  {
+    "family": "B",
+    "transform": "shared_scan_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Correlated scalar subquery re-scans web_sales per row. Shared-scan variant: inner=outer table with same date filter.",
+    "target_ir": "S0 [SELECT]\n  CTE: common_scan  (via Q1)\n    FROM: web_sales, date_dim\n    WHERE: d_date BETWEEN ... AND d_date_sk = ws_sold_date_sk\n  CTE: thresholds  (via Q2)\n    FROM: common_scan\n    GROUP BY: ws_item_sk\n  MAIN QUERY (via Q0)\n    FROM: common_scan cs, item, thresholds t\n    WHERE: i_manufact_id = 320 AND ... AND cs.ws_ext_discount_amt > t.threshold\n    ORDER BY: sum(ws_ext_discount_amt)",
+    "recommended_examples": ["sf_shared_scan_decorrelate"]
+  }
+]
+```
+
+**Rules**:
+- target_ir must follow the IR node map format (same as Section 4)
+- target_ir describes the STRUCTURAL SHAPE of the optimized query (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY)
+- recommended_examples: list gold example IDs the worker should use as reference patch template
+- Each target should represent a DIFFERENT optimization strategy
+- Rank by relevance_score (highest first)
+- Output up to 4 targets
+
+After JSON, provide analysis:
+
+## Analysis
+For each available family, explain relevance (HIGH / MEDIUM / LOW) in 1-2 sentences.
+**Chosen families**: [list]
+**Confidence**: High/Medium/Low

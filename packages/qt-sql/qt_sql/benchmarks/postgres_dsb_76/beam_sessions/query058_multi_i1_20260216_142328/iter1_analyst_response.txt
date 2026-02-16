@@ -1,0 +1,44 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (WIN - 1.26x)**  
+- **Improved operator**:  
+  Original: `Hash Join (rows=16, time=4.736)` in `cs_items` CTE (repeated 3x)  
+  Patched: Eliminated via `date_filter` CTE reuse.  
+- **Structural change**: Precomputed `d_month_seq` and `d_date_sk` in `date_filter` CTE avoids repeated subquery executions and `date_dim` rescans.  
+- **Most expensive remaining operator**:  
+  `Aggregate (rows=192, time=104.895)` in `ss_items` CTE. This is the store_sales aggregation, now 49% slower than original (71.968ms → 104.895ms).  
+
+**Classification**: COMPLEMENTARY (only Family E applied; other bottlenecks remain).  
+
+**FAILED PATCHES (t2, t3, t4)**  
+- All failed due to implementation/targeting issues, not plan changes. No operator comparison possible.  
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**: `Aggregate` in `ss_items` CTE (104.895ms). Input = 6,909 rows (from `Nested Loop` in patched plan).  
+**Hypothesis**: Reduce input rows to `ss_items` aggregation by pushing filters earlier.  
+
+#### Target 1: Combine E + B (Prefetch + Decorrelation)
+**Family**: E + B  
+**Transform**: `prefetch_then_decorrelate`  
+**Target IR**:  
+- Anchor `163e671e5a9d3ce1` (ss_items WHERE): Replace `d_date IN (SELECT...)` with `ss_sold_date_sk IN (SELECT d_date_sk FROM date_filter)`  
+- Remove `date_dim` from `ss_items` FROM clause (using `delete_expr_subtree`).  
+**Hypothesis**: Eliminates `date_dim` scan (36,524 rows) in `ss_items`, reducing input to aggregation.  
+**Recommended Examples**: `multi_dimension_prefetch`, `pg_shared_scan_decorrelate`  
+
+```json
+[
+  {
+    "family": "E+B",
+    "transform": "prefetch_then_decorrelate",
+    "target_id": "t5",
+    "relevance_score": 0.95,
+    "hypothesis": "Replace date_dim join in CTEs with prefetched d_date_sk filter. Eliminates 36k-row scans in ss_items (104ms operator) and reduces aggregation input.",
+    "target_ir": "S0:163e671e5a9d3ce1 (replace_where_predicate) + remove date_dim FROM (delete_expr_subtree)",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_shared_scan_decorrelate"]
+  }
+]
+```

@@ -1,0 +1,69 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t2 (Family A — 1.02x NEUTRAL)**  
+- **Operator improvement**:  
+  `Nested Loop  (rows=168134, time=1763.263) → (rows=56045, time=308.701)`  
+  **Structural change**: Pushed `d_year=2001` into a CTE (`filtered_dates`), reducing `date_dim` rows from 365 to 122. This lowered input rows to the `store_sales` scan.  
+- **Most expensive remaining operator**:  
+  `Nested Loop  (rows=56045, time=308.701)`  
+  Still the bottleneck due to large intermediate join between `date_dim` and `store_sales`.  
+
+**FAILED PATCHES (t1, syn_w2, syn_w3)**  
+- **Failure reason**: All produced checksum mismatches due to incorrect predicate grouping. They combined `ss_sales_price` and `ss_net_profit` conditions into a single OR clause, breaking the original logic where these predicates were tied to specific dimension conditions. This altered semantics and increased row counts.  
+
+**WINNER CLASSIFICATION**  
+- **t2 (Family A)** is the only viable candidate. No redundant/complementary winners exist.  
+
+---
+
+### Step 2 — Design Refined Targets
+
+**Primary Bottleneck**:  
+`Nested Loop` between `date_dim` and `store_sales` (56045 rows, 308.701 ms in t2 plan).  
+
+**Target Design**:
+
+1. **Combination (A+E)**: Layer dimension prefetching (E) on t2’s early date filter (A).  
+   - **Why**: Pre-filter `customer_demographics` and `household_demographics` in CTEs to reduce rows joined to `store_sales`. Targets the expensive `Nested Loop` (56045 rows).  
+   - **Implementation**: Retain t2’s `filtered_dates` CTE. Add CTEs for valid demographics/address pairs. Keep original WHERE clause to preserve predicate grouping.  
+   - **Target**: `S0` (main query)  
+
+2. **Refinement (E)**: Prefilter `store_sales` using union of ranges.  
+   - **Why**: Reduce input to `Nested Loop` (56045 rows) by pushing `ss_sales_price`/`ss_net_profit` range filters into a CTE. Uses t2 as baseline.  
+   - **Target**: `S0`  
+
+3. **Rescue (F)**: Fix join topology.  
+   - **Why**: Convert comma joins to explicit `INNER JOIN` and enforce optimal order (small dimensions first). Addresses suboptimal join order in original.  
+   - **Target**: `S0`  
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "early_filter_and_dimension_prefetch",
+    "target_id": "S0",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-filter date_dim (A) and precompute valid dimension pairs (E) to reduce rows fed into the Nested Loop (56045 rows). Retain original WHERE clause to avoid semantic breaks.",
+    "target_ir": "S0: insert_cte for filtered_dates, valid_demo, valid_addr; replace_from to use explicit joins with CTEs; keep original WHERE clause.",
+    "recommended_examples": ["date_cte_isolate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "store_sales_range_prefilter",
+    "target_id": "S0",
+    "relevance_score": 0.85,
+    "hypothesis": "Add CTE to prefilter store_sales for ss_sales_price (50-200) and ss_net_profit (50-300) ranges. Reduces input rows to Nested Loop (56045 rows).",
+    "target_ir": "S0: insert_cte for filtered_store_sales; replace_from to use CTE; remove redundant range filters from WHERE.",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_order",
+    "target_id": "S0",
+    "relevance_score": 0.75,
+    "hypothesis": "Convert comma joins to explicit INNER JOIN and order joins as store→date_dim→prefiltered_dims→store_sales. Targets suboptimal join topology.",
+    "target_ir": "S0: replace_from with explicit JOIN order; use CTEs from A+E.",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

@@ -1,0 +1,93 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches in Iteration 1 **FAILED** with semantic errors (ambiguous column reference). No successful patches exist for comparison. The original plan remains the baseline.  
+
+**Primary bottleneck identification**:  
+The `Gather Merge` operator (time=3413.666 ms) and its child `Sort` (time=2135.805 ms) dominate execution time. These operators process 66,690 and 33,345 rows respectively, indicating:  
+1. Late-stage processing of large intermediate results  
+2. Inefficient join order forcing expensive sort-merge operations  
+3. No early reduction from `d1` date filters (applied last in `Nested Loop`)  
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Original query.  
+
+#### Target 1: Rescue Failed E+F Patch (Fixed)  
+- **Family**: E+F  
+- **Transform**: `prefetch_dates_fixed_join`  
+- **Target ID**: t1  
+- **Relevance**: 0.95 (high - fixes known error)  
+- **Hypothesis**: Prefetch filtered `d2` dates and compute `d1` range in CTEs (qualifying `d_date` to fix ambiguity). Use explicit joins to optimize join order. Targets the expensive `Gather Merge` (66K rows) by reducing date scans and enabling better join ordering.  
+- **Target IR**: S0  
+- **Recommended Examples**: `multi_dimension_prefetch`, `pg_explicit_join_materialized`  
+
+#### Target 2: Aggregation Pushdown + Date Prefilter (Novel)  
+- **Family**: C+E  
+- **Transform**: `agg_store_sk_prefetch`  
+- **Target ID**: t2  
+- **Relevance**: 0.90 (high - targets 34K-row `Nested Loop`)  
+- **Hypothesis**: Pre-aggregate `store_sales`/`store_returns` by `ss_store_sk` before joining to `store`. Prefetch date pairs to push `d1` filter early. Reduces input to the 34K-row `Nested Loop` (time=2045 ms) by minimizing rows before dimension joins.  
+- **Target IR**: S0  
+- **Recommended Examples**: `pg_materialized_dimension_fact_prefilter`, `multi_dimension_prefetch`  
+
+#### Target 3: Early Date Join + Filter Pushdown  
+- **Family**: A+F  
+- **Transform**: `early_date_join_explicit`  
+- **Target ID**: t3  
+- **Relevance**: 0.85 (medium - targets late `d1` filter)  
+- **Hypothesis**: Join `d1` and `d2` first with explicit `INNER JOIN`, pushing `d1.d_date BETWEEN ...` directly into the join. Forces early date filtering before fact table joins. Targets the late-applied `d1` filter (currently in top-level `Nested Loop`).  
+- **Target IR**: S0  
+- **Recommended Examples**: `pg_date_cte_explicit_join`, `pg_explicit_join_materialized`  
+
+#### Target 4: Limited Pre-Aggregation (Fallback)  
+- **Family**: C  
+- **Transform**: `partial_agg_store_key`  
+- **Target ID**: t4  
+- **Relevance**: 0.80 (medium - conservative approach)  
+- **Hypothesis**: Aggregate `store_sales`/`store_returns` by `ss_store_sk` and date keys before joining to `store`. Reduces input to the 52K-row `Aggregate` operator. Uses `ss_store_sk` as proxy for store attributes to minimize early row count.  
+- **Target IR**: S0  
+- **Recommended Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+---
+
+### Final Target List (JSON)  
+```json
+[
+  {
+    "family": "E+F",
+    "transform": "prefetch_dates_fixed_join",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Fix ambiguous column in prefetched date CTEs and use explicit joins to reduce Gather Merge (66K rows) and Sort (33K rows) costs by enabling better join order and eliminating repeated date scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C+E",
+    "transform": "agg_store_sk_prefetch",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Prefetch date pairs and pre-aggregate facts by ss_store_sk before joining to store. Targets 34K-row Nested Loop (2045 ms) by minimizing rows before dimension joins.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A+F",
+    "transform": "early_date_join_explicit",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Force early d1-d2 join with explicit INNER JOIN and pushed date filters. Targets late-applied d1 filter in top-level Nested Loop (0-time in plan but likely misestimated).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "partial_agg_store_key",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Pre-aggregate facts by ss_store_sk before store join to reduce 52K-row Aggregate input. Uses store key as proxy for store attributes to avoid early bloating.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

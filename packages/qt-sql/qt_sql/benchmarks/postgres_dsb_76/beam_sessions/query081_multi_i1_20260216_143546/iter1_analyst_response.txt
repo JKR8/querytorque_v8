@@ -1,0 +1,53 @@
+Based on analysis of the query, execution plan, and optimization history, the primary bottleneck is the **correlated subquery** in the WHERE clause (`ctr1.ctr_total_return > (SELECT avg(...)...`), causing repeated re-execution per row. This aligns with Family B (Decorrelation). The best-performing patch (syn_w2) decorrelates this subquery into a CTE, reducing runtime to 889ms. However, two key issues remain:
+
+1. **Expensive CTE Scans**: The `customer_total_return` CTE (288K rows) is scanned twice (for `ctr1` and `state_avg`), consuming 509ms (220ms + 289ms) in syn_w2.
+2. **Unnecessary State Processing**: The CTE computes returns for all states, while the main query filters to `ca_state='IA'`.
+
+### Step 1: EXPLAIN Plan Comparison
+- **syn_w2 (WIN)**: 
+  - **Improvement**: Eliminates correlated subquery execution (per-row re-execution). 
+  - **Most Expensive Remaining Operator**: `Hash Join` (604ms) due to dual CTE scans.
+- **t2 (FAIL)**: Syntax error during join restructuring (Family F). The core idea remains valid but requires corrected implementation.
+
+### Step 2: Target Design
+**Baseline**: Start from syn_w2 (decorrelated subquery via CTE).
+
+#### **Target 1: A+B (Early Filtering + Decorrelation)**
+- **Hypothesis**: Push `ca_state='IA'` into `customer_total_return` CTE to reduce output from 288K rows → ~1/50th (est. 5.7K rows). This directly targets the expensive CTE scans and aggregation.
+- **Target IR**: `S0:CTE_Q_S0_customer_total_return:WHERE:c0335294749216b8` (add `AND ca_state='IA'`).
+- **Why**: Quotes from syn_w2 plan show CTE scans consume 509ms. Reducing rows here cascades gains to downstream operators.
+
+```json
+{
+  "family": "A+B",
+  "transform": "early_filter_then_decorrelate",
+  "target_id": "t1",
+  "relevance_score": 0.95,
+  "hypothesis": "Pushing 'ca_state='IA'' into the CTE reduces CTE output from 288K to ~5.7K rows, slashing scan times (509ms in syn_w2) and aggregation costs (258ms). Decorrelation already avoids per-row subquery execution.",
+  "target_ir": "S0:CTE_Q_S0_customer_total_return:WHERE:c0335294749216b8",
+  "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+}
+```
+
+#### **Target 2: A+B+F (Add Explicit JOINs)**
+- **Hypothesis**: After A+B gains, rewrite comma joins to explicit `INNER JOIN` syntax to enable better join ordering for the reduced dataset.
+- **Target IR**: `S0:Q_S0:FROM` (replace comma joins with explicit `JOIN` syntax).
+- **Why**: t2 (Family F) failed syntactically but structurally addresses comma joins. Combined with A+B, this optimizes the smaller dataset.
+
+```json
+{
+  "family": "A+B+F",
+  "transform": "early_filter_decorrelate_explicit_join",
+  "target_id": "t2",
+  "relevance_score": 0.80,
+  "hypothesis": "After A+B reduces CTE size, explicit JOIN syntax allows optimizer to pick efficient join orders for the smaller dataset, improving nested loops (697ms in syn_w2).",
+  "target_ir": "S0:Q_S0:FROM",
+  "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate", "pg_explicit_join_materialized"]
+}
+```
+
+### Why Not Other Families?
+- **C (Agg Pushdown)**: Aggregation already occurs at optimal point (CTE).
+- **D (Set Ops)**: No `UNION`/`INTERSECT` patterns.
+- **E (Materialization)**: CTEs are already materialized; A+B reduces size more fundamentally.
+- **F (Solo)**: t2 failed syntactically; only viable when combined with A+B.

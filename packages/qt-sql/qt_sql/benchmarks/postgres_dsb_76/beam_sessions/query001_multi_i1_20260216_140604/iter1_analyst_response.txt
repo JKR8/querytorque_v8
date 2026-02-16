@@ -1,0 +1,47 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Winners (t1, syn_w2, syn_w3):**
+1. **Original expensive operator eliminated:**  
+   `CTE Scan (ctr1)  (rows=582, time=10857.287)`  
+   This operator was eliminated by decorrelation (Family B) and materialization (Family E). The structural change converted the correlated subquery into a standalone CTE (`store_avg_return`) with a hash join, avoiding per-row re-execution of the subquery.
+
+2. **Most expensive remaining operator in winners:**  
+   `CTE Scan (customer_total_return)  (rows=95599, time=702.229 ms in t1 / 605.097 ms in syn_w2)`  
+   This scans the full CTE output (95,599 rows) to compute store averages, now the bottleneck.
+
+**Failed Patch (t2):**  
+- **Failure reason:**  
+  Structural error due to column reference mismatch (`ctr_reason_sk`). The rewrite incorrectly handled column aliases when pushing `sr_reason_sk BETWEEN 43 AND 46` into the CTE.
+
+**Redundancy Classification:**  
+All winners (t1, syn_w2, syn_w3) are **REDUNDANT**—they share the same core structural change (decorrelation via `store_avg_return` CTE + hash join). syn_w2 (14.33x) is the fastest baseline.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline:** Best winner (syn_w2 SQL).  
+**Primary bottleneck:** `CTE Scan (customer_total_return)` (95,599 rows).  
+
+**Target 1: Combination (A+B)**  
+- **Hypothesis:** Push `sr_reason_sk BETWEEN 43 AND 46` and store state filters (`s_state IN ('IL','KY','TX')`) into the CTE. This reduces CTE rows before aggregation and decorrelation.  
+- **Target IR:**  
+  - `S0:CTE_Q_S0_customer_total_return:FROM`: Replace with `store_returns, date_dim, store`  
+  - `S0:CTE_Q_S0_customer_total_return:WHERE:ddc05012d854ff26`: Add `AND sr_store_sk = s_store_sk AND s_state IN ('IL','KY','TX') AND sr_reason_sk BETWEEN 43 AND 46`  
+  - `S0:Q_S0:FROM`: Remove `store`  
+  - `S0:Q_S0:WHERE:a05952426f9ba20b`: Remove store/`ctr_reason_sk` filters  
+- **Why:** Targets CTE scan (95,599 rows) and leverages decorrelation gains.  
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "push_store_state_reason_into_cte",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Push store state and reason_sk filters into CTE via store join. Reduces CTE rows before aggregation and decorrelation, targeting CTE Scan (95,599 rows).",
+    "target_ir": "S0:CTE_Q_S0_customer_total_return:FROM → replace with 'store_returns, date_dim, store'; S0:CTE_Q_S0_customer_total_return:WHERE:ddc05012d854ff26 → add 'AND sr_store_sk = s_store_sk AND s_state IN (''IL'',''KY'',''TX'') AND sr_reason_sk BETWEEN 43 AND 46'; S0:Q_S0:FROM → remove 'store'; S0:Q_S0:WHERE:a05952426f9ba20b → remove store/ctr_reason_sk conditions",
+    "recommended_examples": ["pg_date_cte_explicit_join", "shared_scan_decorrelate"]
+  }
+]
+```

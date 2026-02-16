@@ -1,0 +1,67 @@
+### Analysis of Optimization Families
+
+**Family A (Early Filtering): HIGH**  
+The query applies multiple dimension filters (date_dim, customer_demographics, item categories) that could be pushed earlier. The current plan shows late filtering on customer_demographics (after joining 84k rows), indicating significant early-row reduction potential.
+
+**Family B (Decorrelation): LOW**  
+No correlated subqueries exist. The execution plan shows nested loops but no DELIM_SCAN patterns, making decorrelation irrelevant.
+
+**Family C (Aggregation Pushdown): MEDIUM**  
+GROUP BY keys (item1.i_item_sk, item2.i_item_sk) are not a strict superset of join keys (ss_ticket_number). However, pre-aggregating ticket-level item pairs before joining to customer/demographics could reduce intermediate rows.
+
+**Family D (Set Operations): LOW**  
+No INTERSECT/UNION operations exist in the query structure.
+
+**Family E (Materialization/Prefetch): HIGH**  
+Repeated scans of store_sales (s1/s2) and item (item1/item2) with identical filters (date, customer, demographics) suggest strong potential for materializing a pre-filtered sales dataset.
+
+**Family F (Join Transform): HIGH**  
+Comma-separated joins obscure join order control. The self-join on store_sales via ss_ticket_number creates a combinatorial explosion (84k rows before joining item2), demanding explicit join restructuring.
+
+**Chosen families**: E, F, A, C  
+**Confidence**: High (plan shows materialization/join-order bottlenecks)
+
+---
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "E",
+    "transform": "multi_dimension_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Repeated full scans of store_sales with identical dimension filters (date/customer/demographics) cause redundant work. Materialize pre-joined sales data once.",
+    "target_ir": "S0 [SELECT]\n  CTE: prefetched_sales  (via Q1)\n    FROM: store_sales\n      INNER JOIN date_dim ON d_date_sk = ss_sold_date_sk\n      INNER JOIN customer ON ss_customer_sk = c_customer_sk\n      INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk\n      INNER JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk\n    WHERE: d_year BETWEEN 1999 AND 2000\n      AND cd_marital_status = 'D'\n      AND cd_education_status = 'College'\n      AND ss_list_price BETWEEN 115 AND 129\n  MAIN QUERY (via Q0)\n    FROM: prefetched_sales s1\n      INNER JOIN prefetched_sales s2 ON s1.ss_ticket_number = s2.ss_ticket_number\n      INNER JOIN item item1 ON s1.ss_item_sk = item1.i_item_sk\n      INNER JOIN item item2 ON s2.ss_item_sk = item2.i_item_sk\n    WHERE: item1.i_item_sk < item2.i_item_sk\n      AND item1.i_category IN ('Electronics', 'Men')\n      AND item2.i_manager_id BETWEEN 44 AND 63\n    GROUP BY: item1.i_item_sk, item2.i_item_sk\n    ORDER BY: count(*)",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_restructure",
+    "target_id": "t2",
+    "relevance_score": 0.95,
+    "hypothesis": "Comma-join obscures join dependencies. Restructure to explicit JOINs with optimal order: prefetched_sales → items before self-join to minimize early-row explosion.",
+    "target_ir": "S0 [SELECT]\n  CTE: prefetched_sales  (via Q1)  -- Reuse from t1\n    ...  \n  MAIN QUERY (via Q0)\n    FROM: prefetched_sales s1\n      INNER JOIN item item1 ON s1.ss_item_sk = item1.i_item_sk\n      INNER JOIN prefetched_sales s2 \n        ON s1.ss_ticket_number = s2.ss_ticket_number\n        AND s1.ss_item_sk < s2.ss_item_sk  -- Fold inequality into JOIN\n      INNER JOIN item item2 ON s2.ss_item_sk = item2.i_item_sk\n    WHERE: item1.i_category IN ('Electronics', 'Men')\n      AND item2.i_manager_id BETWEEN 44 AND 63\n    GROUP BY: item1.i_item_sk, item2.i_item_sk\n    ORDER BY: count(*)",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "item_filter_pushdown",
+    "target_id": "t3",
+    "relevance_score": 0.90,
+    "hypothesis": "Item filters apply late after large sales join. Push item1/i_category and item2/i_manager_id filters into CTEs to reduce early join cardinality.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_item1  (via Q1)\n    FROM: item\n    WHERE: i_category IN ('Electronics', 'Men')\n  CTE: filtered_item2  (via Q2)\n    FROM: item\n    WHERE: i_manager_id BETWEEN 44 AND 63\n  CTE: prefetched_sales  (via Q3)  \n    ...  \n  MAIN QUERY (via Q0)\n    FROM: prefetched_sales s1\n      INNER JOIN filtered_item1 item1 ON s1.ss_item_sk = item1.i_item_sk\n      INNER JOIN prefetched_sales s2 ON s1.ss_ticket_number = s2.ss_ticket_number\n      INNER JOIN filtered_item2 item2 ON s2.ss_item_sk = item2.i_item_sk\n    WHERE: item1.i_item_sk < item2.i_item_sk\n    GROUP BY: ...",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "ticket_item_aggregate",
+    "target_id": "t4",
+    "relevance_score": 0.85,
+    "hypothesis": "GROUP BY happens after expensive customer/demographic joins. Pre-aggregate ticket-item pairs before joining to demographic dimensions.",
+    "target_ir": "S0 [SELECT]\n  CTE: ticket_items  (via Q1)\n    FROM: store_sales\n      INNER JOIN date_dim ON d_date_sk = ss_sold_date_sk\n    WHERE: d_year BETWEEN 1999 AND 2000\n      AND ss_list_price BETWEEN 115 AND 129\n    GROUP BY: ss_ticket_number, ss_item_sk\n  CTE: filtered_tickets  (via Q2)\n    FROM: ticket_items t\n      INNER JOIN customer ON t.ss_customer_sk = c_customer_sk\n      INNER JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk\n    WHERE: cd_marital_status = 'D'\n      AND cd_education_status = 'College'\n  MAIN QUERY (via Q0)\n    FROM: filtered_tickets t1\n      INNER JOIN filtered_tickets t2 ON t1.ss_ticket_number = t2.ss_ticket_number\n      INNER JOIN item item1 ON t1.ss_item_sk = item1.i_item_sk\n      INNER JOIN item item2 ON t2.ss_item_sk = item2.i_item_sk\n    WHERE: ...\n    GROUP BY: ...",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

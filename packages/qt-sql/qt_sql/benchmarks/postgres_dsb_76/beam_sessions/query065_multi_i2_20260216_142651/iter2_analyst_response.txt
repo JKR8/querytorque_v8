@@ -1,0 +1,48 @@
+Based on the analysis of the query, execution plan, and prior optimization failures, I've identified the primary bottleneck and designed high-confidence targets for the next round. The key insights are:
+
+1. **Primary Bottleneck**: Redundant full scans of `store_sales` and `date_dim` (2x) due to duplicated subqueries `sb` and `sc`. The `Nested Loop` (rows=36,809, time=407-484 ms) and subsequent `Aggregate` (rows=23,814, time=818 ms) dominate execution time.
+
+2. **Failed Patch Analysis**: All prior attempts failed due to literal/column mismatches. The core structural issue remains unaddressed - redundant scans persist while filters aren't pushed early enough.
+
+### High-Confidence Targets
+
+```json
+[
+  {
+    "family": "E+A",
+    "transform": "materialize_base_sales_with_early_filters",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Materialize filtered store_sales once with store/item filters pushed early. Eliminates redundant scans of store_sales/date_dim and reduces input to expensive aggregations.",
+    "target_ir": "S0: Replace FROM via insert_cte. Anchor df5a282da9a18886: Push store/item filters into base CTE.",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E+C",
+    "transform": "materialized_agg_combine",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Precompute base sales once, then derive both revenue and avg(revenue) from same materialized set. Targets the expensive Aggregate (rows=23,814, time=818 ms) by avoiding recomputation.",
+    "target_ir": "S0: Replace FROM via insert_cte. Delete_expr_subtree on sb/sc subqueries.",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```
+
+### Rationale
+
+1. **Target 1 (E+A)**:
+   - **Why**: Combines materialization (E) and early filtering (A) to attack the root cause. The `Nested Loop` (rows=36,809) appears twice in the plan - this eliminates one instance entirely.
+   - **Fix for prior failures**: Preserves literals exactly (`79*0.01` not `0.79`) and maintains column references.
+   - **Expected improvement**: Removes 407-484 ms per scan (2x) and reduces input to downstream aggregates.
+
+2. **Target 2 (E+C)**:
+   - **Why**: Secondary optimization after base materialization. The `Aggregate` (rows=23,814, time=818 ms) recomputes from raw scans - derive metrics from pre-aggregated CTE.
+   - **Distinct from Target 1**: Focuses on aggregation pushdown after materialization rather than filter pushdown.
+   - **Fallback position**: Only valuable if Target 1 succeeds, hence lower relevance score.
+
+### Why Not Other Families
+- **B (Decorrelation)**: No correlated subqueries present
+- **D (Set Operations)**: No INTERSECT/UNION patterns
+- **F (Join Transform)**: Already addressed implicitly in CTE structure
+- **Novel targets avoided**: No new hypotheses about selectivity - all claims grounded in observed plan metrics.

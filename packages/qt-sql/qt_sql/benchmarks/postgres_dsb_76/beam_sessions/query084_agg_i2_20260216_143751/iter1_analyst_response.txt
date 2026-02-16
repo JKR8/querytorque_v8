@@ -1,0 +1,82 @@
+### Analysis of Prior Patches
+
+All prior patches (t1, t2, syn_w1, syn_w2) failed with the same error: **Tier-1 structural: LITERAL MISMATCH**. The rewrites incorrectly replaced the expression `40374 + 50000` with a precomputed value (`90374`), violating semantic equivalence. The original literal `50000` was missing in the rewritten queries, causing all attempts to fail. No performance data exists for comparison since all patches were rejected at the semantic validation stage.
+
+---
+
+### Bottleneck Identification
+The primary bottleneck is the **sequential scan on `customer` (250,000 rows, 22.844 ms)**. This full table scan dominates the execution time and feeds into a costly hash join. The large input row count propagates through nested loops, amplifying overhead.
+
+Secondary bottlenecks (lower priority):
+- **Seq Scan on `customer_address` (148 rows, 11.159 ms)**: Though smaller, it forces a full scan where an index could help.
+- **Nested Loop (57 rows, 50.259 ms)**: Processes rows after expensive joins, but cost stems from upstream scans.
+
+---
+
+### Target Design (Snipe Round 1)
+Based on the bottleneck and failed patches, we prioritize **early filtering** (Family A) and **join transform** (Family F) with literal preservation. Targets focus on reducing the `customer` scan by pushing filters earlier.
+
+#### **1. Primary Target: Early Filtering + Join Reorder (Family A+F)**  
+```json
+{
+  "family": "A+F",
+  "transform": "early_filter_explicit_join",
+  "target_id": "t1",
+  "relevance_score": 0.95,
+  "hypothesis": "Push city/income filters into CTEs to reduce customer rows early. Use explicit joins to enforce optimal dimension-table order, starting with filtered small tables. Preserves literal '50000' to avoid semantic errors.",
+  "target_ir": "WITH addr AS (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Mount Vernon'), income AS (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 40374 AND ib_upper_bound <= 40374 + 50000) SELECT c_customer_id AS customer_id, coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') AS customername FROM income JOIN household_demographics ON ib_income_band_sk = hd_income_band_sk JOIN customer_demographics ON hd_demo_sk = cd_demo_sk JOIN addr JOIN customer ON c_current_addr_sk = addr.ca_address_sk AND cd_demo_sk = c_current_cdemo_sk AND hd_demo_sk = c_current_hdemo_sk JOIN store_returns ON sr_cdemo_sk = cd_demo_sk ORDER BY c_customer_id LIMIT 100;",
+  "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+}
+```
+**Why**:  
+- Targets `customer` scan (250K rows) by joining it last, after applying filters via CTEs (`addr`, `income`).  
+- Explicit join order forces small dimension tables (`income` → `household_demographics` → `customer_demographics`) to reduce `customer` input size.  
+- Preserves literal `50000` in `income` CTE to avoid semantic errors.  
+
+---
+
+#### **2. Refinement: Materialized Filtered Dimensions (Family E)**  
+```json
+{
+  "family": "E",
+  "transform": "materialize_dimensions",
+  "target_id": "t2",
+  "relevance_score": 0.85,
+  "hypothesis": "Materialize filtered dimension tables (address/income) to avoid repeated scans. Join materialized results directly to customer to shrink its scan input.",
+  "target_ir": "WITH addr AS (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Mount Vernon'), income AS (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 40374 AND ib_upper_bound <= 40374 + 50000) SELECT c_customer_id AS customer_id, coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') AS customername FROM customer, addr, income, customer_demographics, household_demographics, store_returns WHERE c_current_addr_sk = addr.ca_address_sk AND ib_income_band_sk = hd_income_band_sk AND cd_demo_sk = c_current_cdemo_sk AND hd_demo_sk = c_current_hdemo_sk AND sr_cdemo_sk = cd_demo_sk ORDER BY c_customer_id LIMIT 100;",
+  "recommended_examples": ["multi_dimension_prefetch"]
+}
+```
+**Why**:  
+- Materializes filtered `customer_address` (148 rows) and `income_band` (4 rows) upfront.  
+- Reduces `customer` scan by joining it only to pre-materialized dimension tables.  
+- Avoids recomputing filters during joins (unlike original plan).  
+
+---
+
+#### **3. Rescue: Fixed Early Filtering (Family A)**  
+```json
+{
+  "family": "A",
+  "transform": "early_filter_fixed",
+  "target_id": "t3",
+  "relevance_score": 0.8,
+  "hypothesis": "Repair literal mismatch in prior Family A attempts by preserving '40374 + 50000'. Isolates filters in CTEs to reduce rows before joining customer.",
+  "target_ir": "WITH addr AS (SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Mount Vernon'), income AS (SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 40374 AND ib_upper_bound <= 40374 + 50000) SELECT c_customer_id AS customer_id, coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') AS customername FROM customer, addr, customer_demographics, household_demographics, income, store_returns WHERE c_current_addr_sk = addr.ca_address_sk AND ib_income_band_sk = hd_income_band_sk AND cd_demo_sk = c_current_cdemo_sk AND hd_demo_sk = c_current_hdemo_sk AND sr_cdemo_sk = cd_demo_sk ORDER BY c_customer_id LIMIT 100;",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+**Why**:  
+- Fixes literal error in prior Family A patches by retaining `40374 + 50000`.  
+- Uses CTEs to filter `customer_address` and `income_band` early, reducing rows fed into joins with `customer`.  
+- Minimal change from original structure, lowering risk.  
+
+---
+
+### Rationale for Excluded Families
+- **Family B (Decorrelation)**: No correlated subqueries exist. Not applicable. ❌  
+- **Family C (Agg Pushdown)**: No aggregations in query. Not applicable. ❌  
+- **Family D (Set Ops)**: No `UNION`/`INTERSECT` operations. Not applicable. ❌  
+
+### Key Insight
+**Preserve literals verbatim** in rewrites. All prior failures stemmed from replacing `40374 + 50000` with `90374`, violating semantic checks. Targets explicitly retain this expression to avoid rejection.

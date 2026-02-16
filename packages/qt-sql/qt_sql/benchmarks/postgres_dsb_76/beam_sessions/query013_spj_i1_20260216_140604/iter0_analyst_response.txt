@@ -1,0 +1,73 @@
+### Analysis of Optimization Families
+
+**Family A: Early Filtering (Predicate Pushback)**
+- **Relevance**: HIGH  
+  Dimension tables (`customer_demographics`, `household_demographics`, `customer_address`) have selective filters applied late. Pushing these into CTEs reduces join sizes early.
+
+**Family B: Decorrelation (Sets Over Loops)**
+- **Relevance**: LOW  
+  No correlated subqueries exist. The bottleneck involves joins and complex OR conditions, not per-row re-execution.
+
+**Family C: Aggregation Pushdown**
+- **Relevance**: LOW  
+  The query computes global MIN() aggregates without GROUP BY. No keys exist to push aggregation earlier.
+
+**Family D: Set Operation Optimization**
+- **Relevance**: MEDIUM  
+  OR conditions could be transformed into UNION ALL branches. This may enable partition pruning or indexed scans per branch.
+
+**Family E: Materialization/Prefetch**
+- **Relevance**: HIGH  
+  Repeated dimension scans with complex OR conditions. Precomputing filtered dimension keys in CTEs avoids redundant work.
+
+**Family F: Join Transform**
+- **Relevance**: HIGH  
+  Comma joins obscure join dependencies. Restructuring to explicit joins with filtered CTEs optimizes join order.
+
+**Chosen Families**: [A, E, F, D]  
+**Confidence**: High (plan shows large intermediate rows, selective dimension filters)
+
+---
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "F",
+    "transform": "join_restructure_explicit",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Implicit comma joins prevent optimal join ordering. Restructuring to explicit joins with filtered CTEs reduces row counts early.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_store (via Q1)\n    FROM: store\n  CTE: filtered_date (via Q2)\n    FROM: date_dim\n    WHERE: d_year = 2001\n  CTE: filtered_hd_cd (via Q3)\n    FROM: household_demographics, customer_demographics\n    WHERE: \n      (hd_dep_count = 3 AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree')\n      OR (hd_dep_count = 1 AND cd_marital_status = 'U' AND cd_education_status = 'College')\n      OR (hd_dep_count = 1 AND cd_marital_status = 'S' AND cd_education_status = 'Unknown')\n  CTE: filtered_ca (via Q4)\n    FROM: customer_address\n    WHERE: \n      (ca_country = 'United States' AND ca_state IN ('CO','NC','TX'))\n      OR (ca_country = 'United States' AND ca_state IN ('AR','NY','TX'))\n      OR (ca_country = 'United States' AND ca_state IN ('IA','IL','NC'))\n  MAIN QUERY (via Q0)\n    FROM: store_sales\n    INNER JOIN filtered_store ON s_store_sk = ss_store_sk\n    INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk\n    INNER JOIN filtered_hd_cd ON ss_hdemo_sk = hd_demo_sk AND ss_cdemo_sk = cd_demo_sk\n    INNER JOIN filtered_ca ON ss_addr_sk = ca_address_sk\n    WHERE: \n      (ss_sales_price BETWEEN 50.00 AND 200.00) \n      AND (ss_net_profit BETWEEN 50 AND 300)",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "predicate_push_into_cte",
+    "target_id": "t2",
+    "relevance_score": 0.95,
+    "hypothesis": "Expensive joins occur before applying dimension filters. Pushing country/state/dependency filters into CTEs reduces join cardinality.",
+    "target_ir": "S0 [SELECT]\n  CTE: prefiltered_ca (via Q1)\n    FROM: customer_address\n    WHERE: ca_country = 'United States' \n      AND (ca_state IN ('CO','NC','TX') OR ca_state IN ('AR','NY','TX') OR ca_state IN ('IA','IL','NC'))\n  CTE: prefiltered_hd (via Q2)\n    FROM: household_demographics\n    WHERE: hd_dep_count IN (1,3)\n  CTE: prefiltered_cd (via Q3)\n    FROM: customer_demographics\n    WHERE: \n      (cd_marital_status = 'M' AND cd_education_status = '2 yr Degree')\n      OR (cd_marital_status = 'U' AND cd_education_status = 'College')\n      OR (cd_marital_status = 'S' AND cd_education_status = 'Unknown')\n  MAIN QUERY (via Q0)\n    FROM: store_sales\n    INNER JOIN store ON s_store_sk = ss_store_sk\n    INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001\n    INNER JOIN prefiltered_hd ON ss_hdemo_sk = hd_demo_sk\n    INNER JOIN prefiltered_cd ON ss_cdemo_sk = cd_demo_sk\n    INNER JOIN prefiltered_ca ON ss_addr_sk = ca_address_sk\n    WHERE: \n      (\n        (cd_marital_status = 'M' AND ss_sales_price BETWEEN 100.00 AND 150.00) \n        OR (cd_marital_status = 'U' AND ss_sales_price BETWEEN 50.00 AND 100.00) \n        OR (cd_marital_status = 'S' AND ss_sales_price BETWEEN 150.00 AND 200.00)\n      )\n      AND (\n        (ca_state IN ('CO','NC','TX') AND ss_net_profit BETWEEN 100 AND 200) \n        OR (ca_state IN ('AR','NY','TX') AND ss_net_profit BETWEEN 150 AND 300) \n        OR (ca_state IN ('IA','IL','NC') AND ss_net_profit BETWEEN 50 AND 250)\n      )",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch",
+    "target_id": "t3",
+    "relevance_score": 0.90,
+    "hypothesis": "Repeated scans of customer_demographics/household_demographics for OR conditions. Materializing filtered keys avoids redundant scans.",
+    "target_ir": "S0 [SELECT]\n  CTE: valid_demo_keys (via Q1)\n    SELECT \n      hd_demo_sk, \n      cd_demo_sk,\n      CASE \n        WHEN cd_marital_status='M' THEN 1\n        WHEN cd_marital_status='U' THEN 2\n        WHEN cd_marital_status='S' THEN 3\n      END AS cond_id\n    FROM customer_demographics, household_demographics\n    WHERE \n      (cond_id=1 AND cd_education_status='2 yr Degree' AND hd_dep_count=3)\n      OR (cond_id=2 AND cd_education_status='College' AND hd_dep_count=1)\n      OR (cond_id=3 AND cd_education_status='Unknown' AND hd_dep_count=1)\n  MAIN QUERY (via Q0)\n    FROM: store_sales\n    INNER JOIN store ON s_store_sk = ss_store_sk\n    INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year=2001\n    INNER JOIN valid_demo_keys ON ss_hdemo_sk=hd_demo_sk AND ss_cdemo_sk=cd_demo_sk\n    INNER JOIN customer_address ON ss_addr_sk=ca_address_sk\n    WHERE: \n      (cond_id=1 AND ss_sales_price BETWEEN 100.00 AND 150.00)\n      OR (cond_id=2 AND ss_sales_price BETWEEN 50.00 AND 100.00)\n      OR (cond_id=3 AND ss_sales_price BETWEEN 150.00 AND 200.00)\n      AND (\n        (ca_country='United States' AND ca_state IN ('CO','NC','TX') AND ss_net_profit BETWEEN 100 AND 200)\n        OR (ca_country='United States' AND ca_state IN ('AR','NY','TX') AND ss_net_profit BETWEEN 150 AND 300)\n        OR (ca_country='United States' AND ca_state IN ('IA','IL','NC') AND ss_net_profit BETWEEN 50 AND 250)\n      )",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "D",
+    "transform": "or_to_union",
+    "target_id": "t4",
+    "relevance_score": 0.85,
+    "hypothesis": "OR conditions prevent indexed scans. UNION ALL branches enable partition pruning per condition set.",
+    "target_ir": "S0 [SELECT]\n  MAIN QUERY (via Q0)\n    SELECT min(ss_quantity), ... FROM (\n      -- Branch 1: M + 2yr Degree + dep3\n      FROM: store_sales, store, customer_demographics, household_demographics, date_dim\n      WHERE: s_store_sk=ss_store_sk\n        AND ss_sold_date_sk=d_date_sk AND d_year=2001\n        AND ss_hdemo_sk=hd_demo_sk AND hd_dep_count=3\n        AND ss_cdemo_sk=cd_demo_sk \n        AND cd_marital_status='M' AND cd_education_status='2 yr Degree'\n        AND ss_sales_price BETWEEN 100.00 AND 150.00\n        AND ss_net_profit BETWEEN 100 AND 200\n        AND ca_country='United States' AND ca_state IN ('CO','NC','TX')\n      UNION ALL\n      -- Branch 2: U + College + dep1\n      ...\n      UNION ALL\n      -- Branch 3: S + Unknown + dep1\n      ...\n    )",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  }
+]
+```

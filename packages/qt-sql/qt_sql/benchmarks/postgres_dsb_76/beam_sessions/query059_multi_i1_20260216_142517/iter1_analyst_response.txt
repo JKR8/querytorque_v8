@@ -1,0 +1,124 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (2.12x WIN) Analysis**  
+- **Improved Operator**:  
+  `Seq Scan on store_sales` (original: 2.7s, 2.3M rows) → replaced by `Index Only Scan on store_sales` (4ms, 3.5K rows)  
+- **Structural Change**:  
+  Pushed `d_month_seq BETWEEN 1187 AND 1187+23` into CTE `wss`, enabling index usage on `store_sales` and reducing input rows by 99.8%.  
+- **Most Expensive Remaining Operator**:  
+  `Hash Join` (2.4s, 315K rows) in the main query between `wss` CTE and `store/date_dim`.  
+
+**syn_w1 (2.10x WIN) Analysis**  
+- **Improved Operator**: Same as t1 (`Index Only Scan` replacing `Seq Scan`)  
+- **Structural Change**: Identical to t1 (early filtering).  
+- **Most Expensive Remaining Operator**: Same `Hash Join` (2.6s, 315K rows).  
+
+**syn_w2 (2.10x WIN) Analysis**  
+- **Improved Operator**: Same as t1 (`Index Only Scan`).  
+- **Structural Change**: Claimed decorrelation (Family B) but SQL/plan identical to t1/syn_w1. Likely mislabeled.  
+- **Most Expensive Remaining Operator**: Same `Hash Join` (2.7s, 315K rows).  
+
+**t2 (FAIL) Analysis**  
+- **Failure Cause**: Literal mismatch in `date_ranges` CTE (changed `d_month_seq` bounds).  
+- **Backfired Operator**: N/A (query failed semantic check).  
+
+**Redundancy Conclusion**:  
+All winners are **REDUNDANT**—identical structural change (push `d_month_seq` into CTE) yielding same operator improvements. Best baseline: **t1**.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: t1 SQL (2.12x WIN).  
+**Primary Bottleneck**: `Hash Join` (2.4s, 315K rows) joining CTE `wss` with `store/date_dim`.  
+**Hypothesis Source**: Row counts/times from EXPLAIN plans only.  
+
+#### Target 1: Combination (A + C)  
+- **Family**: A + C  
+- **Transform**: `early_filter_then_aggregate_pushdown`  
+- **Target ID**: t1  
+- **Relevance Score**: 0.95  
+- **Hypothesis**:  
+  CTE `wss` groups by `d_week_seq, ss_store_sk` → join keys for main query are `ss_store_sk` (≡ `s_store_id`). Push `store.s_state` filter into CTE to reduce rows *before* aggregation. Current CTE outputs 3.2K rows; `store` scan shows only 10 rows. Pushing filter could reduce CTE rows by 99% (based on `store` cardinality).  
+- **Target IR**:  
+  `S0` (CTE `wss`): Add join to `store` and filter `s_state IN (...)`. Anchor: `5f7f8283ea72d640` (CTE WHERE).  
+- **Recommended Examples**: `pg_date_cte_explicit_join` (A), `pg_materialized_dimension_fact_prefilter` (C)  
+
+#### Target 2: Refinement (F)  
+- **Family**: F  
+- **Transform**: `eliminate_self_join_via_conditional_agg`  
+- **Target ID**: t1  
+- **Relevance Score**: 0.90  
+- **Hypothesis**:  
+  Main query self-joins identical CTE `wss` for two time periods. Compute both periods in CTE using conditional aggregation:  
+  ```sql
+  SUM(CASE WHEN d_month_seq BETWEEN 1187 AND 1187+11 THEN sun_sales END) AS sun_sales1,
+  SUM(CASE WHEN d_month_seq BETWEEN 1187+12 AND 1187+23 THEN sun_sales END) AS sun_sales2
+  ```  
+  Eliminates self-join and reduces `Hash Join` (315K rows) → single CTE scan.  
+- **Target IR**:  
+  `S0` (CTE `wss`): Replace aggregation with conditional period splits. Anchor: `GROUP BY d_week_seq, ss_store_sk`.  
+- **Recommended Examples**: `pg_explicit_join_materialized` (F)  
+
+#### Target 3: Rescue (E)  
+- **Family**: E  
+- **Transform**: `prefetch_store_dimension`  
+- **Target ID**: t1  
+- **Relevance Score**: 0.85  
+- **Hypothesis**:  
+  `store` table scanned 2x (original plan) but only 10 rows. Pre-materialize filtered `store` (for `s_state`) as CTE. Reuse in main query and CTE `wss` to avoid repeated scans.  
+- **Target IR**:  
+  `S0`: Insert CTE `stores` before `wss`: `SELECT * FROM store WHERE s_state IN (...)`. Anchor: `S0` (top level).  
+- **Recommended Examples**: `multi_dimension_prefetch` (E)  
+
+#### Target 4: Novel (C)  
+- **Family**: C  
+- **Transform**: `push_agg_into_cte`  
+- **Target ID**: t1  
+- **Relevance Score**: 0.80  
+- **Hypothesis**:  
+  Main query computes ratios (`sun_sales1/sun_sales2`). Push division into CTE *after* aggregating sales. Reduces data shuffled in `Hash Join` (315K rows → 10 rows).  
+- **Target IR**:  
+  `S0` (main query): Replace `y, x` with pre-aggregated CTE. Anchor: `0b824afb49a292d0` (WHERE).  
+- **Recommended Examples**: `pg_materialized_dimension_fact_prefilter` (C)  
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_then_aggregate_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Push 's_state' filter into CTE wss using join with store. Current CTE outputs 3.2K rows; store scan shows 10 rows. Reduces input to downstream Hash Join (315K rows, 2.4s).",
+    "target_ir": "S0: Modify CTE wss (anchor:5f7f8283ea72d640) to join store and add s_state filter.",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "eliminate_self_join_via_conditional_agg",
+    "target_id": "t1",
+    "relevance_score": 0.90,
+    "hypothesis": "Replace self-join on wss with conditional aggregation in CTE for both time periods. Eliminates Hash Join (315K rows, 2.4s) and reduces intermediate data volume.",
+    "target_ir": "S0: Replace CTE wss aggregation (anchor:GROUP BY) with CASE statements for periods 1187-1198 and 1199-1210.",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_store_dimension",
+    "target_id": "t1",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-materialize filtered store (10 rows) as CTE to avoid repeated scans. Reduces redundant work in main query.",
+    "target_ir": "S0: Insert CTE 'stores' before wss: SELECT * FROM store WHERE s_state IN (...).",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "push_agg_into_cte",
+    "target_id": "t1",
+    "relevance_score": 0.80,
+    "hypothesis": "Compute sales ratios in CTE after aggregation. Reduces Hash Join input (315K rows → 10 rows) by minimizing row size early.",
+    "target_ir": "S0: Replace main query FROM (anchor:0b824afb49a292d0) with pre-aggregated CTE outputting ratios.",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

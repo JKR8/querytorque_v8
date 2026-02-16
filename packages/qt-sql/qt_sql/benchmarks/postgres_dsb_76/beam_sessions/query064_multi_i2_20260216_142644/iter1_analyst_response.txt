@@ -1,0 +1,60 @@
+### Step 1 — Compare EXPLAIN Plans  
+All prior patches failed, so we have no winners to analyze. The primary bottleneck remains the expensive `Merge Join` (rows=604, time=1912.341 ms) and `Seq Scan on catalog_sales` (rows=859,940, time=1,111.425 ms) in the original plan. These dominate the runtime.
+
+### Step 2 — Design Targets  
+Based on the query structure, execution plan, and optimization families, we design 3 high-confidence targets:
+
+1. **Combination (Families C + E)**  
+   Pre-aggregate `catalog_sales/catalog_returns` early (C) and materialize `cs_ui` (E) to avoid repeated scans. Targets the `Seq Scan on catalog_sales` (859K rows) and `Hash Join` (128K rows).  
+   ```json
+   {
+     "family": "C+E",
+     "transform": "preagg_cs_ui_materialize",
+     "target_id": "S0:93ee2873c3c88da7",
+     "relevance_score": 0.95,
+     "hypothesis": "Pre-aggregate catalog_sales/catalog_returns before joining and materialize cs_ui to eliminate repeated full scans of catalog tables. Targets the 859K-row Seq Scan and 128K-row Hash Join.",
+     "target_ir": "Replace cs_ui CTE with materialized pre-aggregation",
+     "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "multi_dimension_prefetch"]
+   }
+   ```
+
+2. **Refinement (Family F)**  
+   Restructure comma joins to explicit `INNER JOIN` and enforce optimal join order. Targets the `Nested Loop` chain (12 layers, 3087 ms).  
+   ```json
+   {
+     "family": "F",
+     "transform": "explicit_join_order",
+     "target_id": "S0:0cee22073fe2dd22",
+     "relevance_score": 0.90,
+     "hypothesis": "Convert comma joins to explicit INNER JOIN and prioritize selective joins first to break Nested Loop chain (12 layers, 3087 ms).",
+     "target_ir": "Restructure FROM clause in cross_sales CTE",
+     "recommended_examples": ["pg_explicit_join_materialized"]
+   }
+   ```
+
+3. **Rescue (Family A + C)**  
+   Fix failed `t4` by including `ss_sold_date_sk` in pre-aggregation and push dimension filters. Targets `store_sales` scan (1336 rows) and `Aggregate` (58K rows).  
+   ```json
+   {
+     "family": "A+C",
+     "transform": "rescue_preagg_dim_push",
+     "target_id": "S0:0cee22073fe2dd22",
+     "relevance_score": 0.85,
+     "hypothesis": "Fix t4 error by adding ss_sold_date_sk to pre-aggregation keys and push dimension filters (e.g., ad2.ca_state) earlier. Targets 1336-row store_sales scan and 58K-row Aggregate.",
+     "target_ir": "Add ss_sold_date_sk to ss_agg CTE group keys + push filters",
+     "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+   }
+   ```
+
+### Key Rationale  
+- **Primary Bottleneck**: `Merge Join` and `Seq Scan on catalog_sales` consume >60% of runtime (1912 ms + 1111 ms).  
+- **Family Selection**:  
+  - `C+E` directly attacks large scans via aggregation pushdown + materialization (proven 12.07x/2.71x wins).  
+  - `F` addresses Nested Loop explosion (12 layers) via join restructuring (proven 8.56x win).  
+  - `A+C` rescues `t4` by fixing grouping keys and adding early filtering.  
+- **Avoided Families**:  
+  - `B` (no correlated subqueries),  
+  - `D` (no set operations),  
+  - Novel (no new hypotheses beyond plan evidence).  
+
+Output: 3 high-confidence targets.

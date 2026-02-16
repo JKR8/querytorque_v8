@@ -1,0 +1,86 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t3 (WIN - 1.11x)**  
+- **Improved operator**:  
+  `Index Scan on store_returns` (ssr)  
+  Original: `(rows=0, time=0.561)` → t3: `(rows=0, time=0.049)`  
+  **Why**: Pre-aggregation of returns tables reduced join complexity.  
+- **Structural change**: Pre-aggregated returns (`agg_store_returns`) minimized data volume before joining with sales tables.  
+- **Most expensive remaining operator**:  
+  `Nested Loop` in ssr: `(rows=2, time=67.918)`  
+  (Joins between `store_sales`, `date_dim`, and `promotion` remain costly)  
+
+**syn_w1 (IMPROVED - 1.06x)**  
+- **Regressed operator**:  
+  `Seq Scan on date_dim` (wsr)  
+  Original: `(rows=16, time=2.585)` → syn_w1: `(rows=16, time=6.953)`  
+  **Why**: Added CTEs for filtered dimensions but failed to reuse them in main CTEs, adding overhead without reducing scans.  
+
+**Classification**:  
+- **t3 and syn_w1 are COMPLEMENTARY**:  
+  t3 optimized returns joins (reduced `store_returns` time 11.4x), while syn_w1 attempted (but failed) to optimize dimension filters.  
+  No overlapping operator improvements.  
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop` joins in `ssr`/`csr`/`wsr` (e.g., `rows=5432, time=24.435` in t3) due to repeated scans of unfiltered dimension tables (`date_dim`, `promotion`, `item`).  
+
+**Target 1: Combination (C+E)**  
+- **Family**: C (Aggregation Pushdown) + E (Materialization)  
+- **Transform**: `returns_preagg_with_dim_prefetch`  
+- **Hypothesis**: Pre-aggregate returns (C) AND prefetch filtered dimensions (E) to reduce nested loop input rows. Targets `Nested Loop` in ssr (`rows=5432`) and `Seq Scan on promotion` (scanned 3x).  
+- **Target IR**: `S0` (insert CTEs for dimensions + reuse in main CTEs)  
+- **Examples**: `returns_preaggregation` (C), `multi_dimension_prefetch` (E)  
+
+**Target 2: Refinement (E)**  
+- **Family**: E (Materialization)  
+- **Transform**: `dimension_prefetch_reuse`  
+- **Hypothesis**: Fix syn_w1’s failure by reusing filtered dimensions (`date_dim`, `promotion`, `item`) in all CTEs. Reduces `Seq Scan on promotion` (rows=18) and `Index Scan on item` (rows=0).  
+- **Target IR**: `S0` + `fe4ed6f8f1b0d0b5` (ssr WHERE)  
+- **Examples**: `multi_dimension_prefetch`  
+
+**Target 3: Rescue (F)**  
+- **Family**: F (Join Transform)  
+- **Transform**: `explicit_join_fixed`  
+- **Hypothesis**: Restructure comma-joins to explicit `LEFT JOIN`/`INNER JOIN` to optimize join order. Fixes t2’s syntax error. Targets `Nested Loop` in ssr (`time=67.918`).  
+- **Target IR**: `S0` + `fe4ed6f8f1b0d0b5` (ssr FROM)  
+- **Examples**: `explicit_join_materialized`  
+
+---
+
+### Final Targets (Prioritized)
+
+```json
+[
+  {
+    "family": "C+E",
+    "transform": "returns_preagg_with_dim_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Combine returns pre-aggregation (C) with dimension prefetching (E) to reduce nested loop input rows. Targets expensive Nested Loop in ssr (rows=5432) and repeated Seq Scans on promotion (3x).",
+    "target_ir": "S0",
+    "recommended_examples": ["returns_preaggregation", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch_reuse",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Reuse prefetched dimension CTEs (date_dim/promotion/item) in all sales CTEs to eliminate repeated scans. Fixes syn_w1's unused CTEs. Targets Seq Scan on promotion (rows=18) and Index Scan on item (rows=0).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_fixed",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Restructure comma-joins to explicit joins to optimize join order. Fixes t2's syntax error. Targets Nested Loop in ssr (time=67.918).",
+    "target_ir": "S0",
+    "recommended_examples": ["explicit_join_materialized"]
+  }
+]
+```

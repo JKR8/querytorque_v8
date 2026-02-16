@@ -1,0 +1,57 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t2 (Family E, 1.34x WIN)**  
+- **Improved operator**: Original `Hash Join (rows=13, time=1776.548)` was replaced by faster `Hash Join (rows=31701, time=185.603)` in t2.  
+  **Structural change**: Prefiltering `date_dim` via CTE (`filtered_dates`) reduced `d1` scan rows from 29 to 29 rows (no change in rows but faster due to CTE reuse) and eliminated redundant `date_dim` scans.  
+- **Most expensive remaining operator**: `Hash (rows=418244, time=91.848)` during hash table build for the `store_sales` ↔ `d1` join. High row count (418K) dominates execution.  
+
+**t1 (Family F, 0.95x REGRESSION)**  
+- **Regressed operator**: `Nested Loop (rows=72770, time=9.334)` became slower than original `Nested Loop (rows=218310, time=64.146)` despite lower rows.  
+  **Why**: Explicit join restructuring disrupted optimal join order, increasing per-row cost in the `store_returns` ↔ `d2` loop.  
+
+**syn_w1 (Family A, FAIL)**  
+- **Failure cause**: Ambiguous column `d_date_sk` in JOIN conditions due to CTEs lacking aliases.  
+
+**syn_w2 (Family B, FAIL)**  
+- **Failure cause**: Transaction aborted from prior error (likely syntax issue in decorrelation attempt).  
+
+**Winner classification**: COMPLEMENTARY  
+- t2 (E) and A address different bottlenecks: t2 reduces `date_dim` scans via reuse, while A (if fixed) could push filters earlier into dimension tables.  
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: t2’s SQL (winner, 1.34x).  
+**Primary bottleneck**: `Hash (rows=418244, time=91.848)` from hashing 418K `store_sales` rows during `d1` join.  
+**Hypothesis**: Reduce input rows to this hash build by pre-aggregating `store_sales` early (Family C) since `GROUP BY` keys (`i_item_id`, `s_store_id`) are supersets of `store_sales` join keys (`ss_item_sk`, `ss_store_sk`).  
+
+**Target 1: Combination (E + C)**  
+- Layer aggregation pushdown (C) onto t2’s CTE (E) to shrink `store_sales` before the costly hash join.  
+- Targets `Hash (rows=418244)` by reducing input rows via pre-aggregation.  
+
+**Target 2: Rescue (A)**  
+- Fix ambiguous columns in failed early filtering (syn_w1) while preserving t2’s CTE gains. Use aliased CTEs for clarity.  
+
+```json
+[
+  {
+    "family": "E+C",
+    "transform": "prefilter_plus_agg_pushdown",
+    "target_id": "t2",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-aggregate store_sales by (ss_item_sk, ss_store_sk) after d1 join but before hash join with store_returns. Reduces 418K-row hash build (91.848 ms) by collapsing duplicates early.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filter_fixed_aliases",
+    "target_id": "S0",
+    "relevance_score": 0.85,
+    "hypothesis": "Rescue syn_w1 by aliasing CTEs (d1, d2, d3) to resolve ambiguous d_date_sk. Targets redundant date_dim scans via early filtering.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

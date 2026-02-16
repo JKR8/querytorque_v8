@@ -1,0 +1,99 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Patches vs. Original:**
+
+All patches (t1, t2, t3, syn_w2) show **NEUTRAL** results. Key observations:
+
+1. **Original Bottleneck**:  
+   `Nested Loop (rows=135580, time=865.647)` between `date_dim` and `catalog_sales` dominates runtime.  
+   High row count (135K) flows into downstream joins.
+
+2. **Patch Improvements**:  
+   All patches reduce the `Nested Loop (rows=135580)` to `Nested Loop (rows=45193)` (e.g., t1, syn_w2).  
+   **Why?** CTEs (e.g., `filtered_date`, `filtered_item`) apply `d_year=1999` and `i_category='Music'` earlier, reducing `date_dim` rows from 365 → 122 and filtering `item` sooner.
+
+3. **Why Neutral?**  
+   Reduced rows (135K → 45K) are still processed by downstream operators:  
+   - `Nested Loop (rows=390, time=204.813)` in t1 (joins 45K rows to `item`) remains expensive.  
+   - Final `Aggregate` and `Sort` times are similar (382–399 ms vs. original 368 ms).
+
+4. **No Winner**:  
+   All patches are **REDUNDANT** — they address the same bottleneck (early filtering) but fail to reduce the most expensive downstream operator (join with `item`).
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: Start from `t1` (best performer, 0.96x). Its most expensive operator is:  
+`Nested Loop (rows=390, time=204.813)` (join of 45K pre-filtered rows with `item`).
+
+**New Targets**:
+
+1. **Combination (A + C)**:  
+   Layer **Aggregation Pushdown (C)** onto `t1` to reduce rows before joining `item`.  
+   - **Hypothesis**: Pre-aggregate `catalog_sales` by `i_item_sk` after filtering by `date_dim`/`customer_demographics`, then join to `item`. Reduces input to `Nested Loop (rows=390)` operator.  
+   - **Target IR**: `S0` (anchor `19e03965dd438c15` for the main query).  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter`.
+
+2. **Refinement (C)**:  
+   Target the `Nested Loop (rows=390)` in `t1` by pushing aggregation earlier.  
+   - **Hypothesis**: Group `catalog_sales` by `i_item_sk` and `cs_bill_customer_sk` after joining `date_dim`/`customer_demographics` but before joining `item`/`customer`. Reduces rows flowing into the loop.  
+   - **Target IR**: `S0` (anchor for `catalog_sales` joins).  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter`.
+
+3. **Novel (C)**:  
+   Isolate `catalog_sales` aggregation with all filter-compatible dimensions.  
+   - **Hypothesis**: Create a CTE for `catalog_sales` joined to `date_dim`, `customer_demographics`, and `item` (filtered), then aggregate. Join result to `customer`/`address` for final rollup.  
+   - **Target IR**: `S0` (anchor for `FROM` clause).  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter`.
+
+4. **Rescue (F + C)**:  
+   Fix `t1`'s structure by adding aggregation pushdown.  
+   - **Hypothesis**: Use `t1`'s CTEs but aggregate `catalog_sales` before joining `item` and `customer`.  
+   - **Target IR**: `S0` (same as above).  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter`.
+
+---
+
+### Final Targets (JSON)
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_then_agg_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Apply early filtering via CTEs (A) to reduce date_dim/item rows, then pre-aggregate catalog_sales by i_item_sk and cs_bill_customer_sk (C) before joining item/customer. Targets Nested Loop (rows=390) in t1's plan by reducing input rows.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown_pre_item_join",
+    "target_id": "t1",
+    "relevance_score": 0.90,
+    "hypothesis": "Push aggregation to after joining catalog_sales with date_dim/customer_demographics but before joining item. Reduces rows feeding into Nested Loop (rows=390) in t1's plan.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "C",
+    "transform": "isolated_sales_agg",
+    "target_id": "t1",
+    "relevance_score": 0.85,
+    "hypothesis": "Aggregate catalog_sales with date_dim, customer_demographics, and item in a CTE, then join to customer/address. Minimizes rows before expensive rollup.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F+C",
+    "transform": "rescue_t1_with_agg",
+    "target_id": "t1",
+    "relevance_score": 0.80,
+    "hypothesis": "Combine t1's CTE structure (F) with aggregation pushdown (C) to reduce rows before joining item and customer.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

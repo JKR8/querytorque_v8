@@ -9,6 +9,8 @@ from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
 
+from qt_sql.prompter import load_exploit_algorithm, _load_engine_profile
+
 logger = logging.getLogger(__name__)
 
 
@@ -180,6 +182,50 @@ def format_family_section(
     return "\n".join(lines)
 
 
+def format_family_description_only(family_id: str, dialect: str = "") -> str:
+    """Format a family section when no gold example exists for this engine.
+
+    Shows the full family description with a caveat that no gold example
+    has been observed yet. The analyst can still try the strategy if the
+    EXPLAIN plan warrants it.
+    """
+    desc = FAMILY_DESCRIPTIONS[family_id]
+    engine_label = dialect.upper().replace('POSTGRES', 'PostgreSQL') if dialect else "this engine"
+
+    lines = [
+        f"### Family {family_id}: {desc['name']} ({desc['pattern']})",
+        f"**Description**: {desc['description']}",
+        f"**Speedup Range**: {desc['speedup_range']} ({desc['win_rate']})",
+        f"**Use When**:",
+    ]
+
+    for i, condition in enumerate(desc['use_when'], 1):
+        lines.append(f"  {i}. {condition}")
+
+    lines.append("")
+    lines.append(f"**Gold Example**: None yet observed on {engine_label}. "
+                 "Strategy is valid if EXPLAIN evidence supports it.")
+
+    return "\n".join(lines)
+
+
+# ── Engine Intelligence Loader ─────────────────────────────────────────────
+
+def _load_engine_intelligence(dialect: str) -> Optional[str]:
+    """Load engine playbook for injection into beam prompt.
+
+    Single source of truth: knowledge/{dialect}.md — the distilled playbook
+    with pathologies, gates, regression registry, pruning guide.
+
+    Returns formatted prompt section or None if not available.
+    """
+    algo_text = load_exploit_algorithm(dialect)
+    if not algo_text:
+        return None
+
+    return f"## Engine Playbook ({dialect.upper()})\n\n{algo_text}"
+
+
 # ── Shared Prompt Body (Sections 1-5) ──────────────────────────────────────
 
 def _build_prompt_body(
@@ -245,22 +291,17 @@ def _build_prompt_body(
     # In tiered mode the analyst only sees family descriptions + example IDs.
     # Workers receive the full before/after SQL and patch plans.
     analyst_only = not include_patch_plans
-    if analyst_only:
-        family_intro = (
-            f"Review the {n_families} families below. Each has a proven gold example.\n\n"
-            f"Choose up to **{min(4, n_families)} most relevant families** for this query based on:\n"
-            "- Query structure (CTEs, subqueries, joins, aggregations, set operations)\n"
-            "- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)\n"
-            "- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)\n"
-        )
-    else:
-        family_intro = (
-            f"Review the {n_families} families below. Each shows a pattern with a gold example patch plan.\n\n"
-            f"Choose up to **{min(4, n_families)} most relevant families** for this query based on:\n"
-            "- Query structure (CTEs, subqueries, joins, aggregations, set operations)\n"
-            "- Execution plan signals (WHERE placement, repeated scans, correlated subqueries, materializations)\n"
-            "- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)\n"
-        )
+    family_intro = (
+        "This is a briefing of what we know, not a set of hard rules. "
+        "Use your judgement about what's worth trying based on the EXPLAIN plan above.\n\n"
+        f"**{n_families} families have proven gold examples** on this engine. "
+        f"All 6 families are listed — those without gold examples are still valid "
+        "strategies if the EXPLAIN plan warrants them.\n\n"
+        "Choose the most relevant families for this query based on:\n"
+        "- Query structure (CTEs, subqueries, joins, aggregations, set operations)\n"
+        "- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)\n"
+        "- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)\n"
+    )
     sections.append(f"## Optimization Families\n\n{family_intro}\n")
 
     for family_id in all_family_ids:
@@ -269,6 +310,11 @@ def _build_prompt_body(
             sections.append(format_family_section(
                 family_id, ex, include_patch_plans, analyst_only=analyst_only,
             ))
+            sections.append("")
+        else:
+            # No gold example for this family on this engine — still show
+            # the description so the analyst knows it exists
+            sections.append(format_family_description_only(family_id, dialect))
             sections.append("")
 
     # ── Section 5a: Detected Patterns (intelligence brief) ────────────
@@ -280,6 +326,14 @@ def _build_prompt_body(
 **Instruction**: Prioritize detected patterns above. If a high-confidence
 pathology is detected, your primary target SHOULD address it.
 """)
+
+    # ── Section 5b: Engine Intelligence ─────────────────────────────────
+    # Load the full exploit algorithm (knowledge/{dialect}.md) — the
+    # distilled playbook of pathologies, gates, regression registry.
+    # This is the same intel the swarm analyst gets.
+    engine_intel = _load_engine_intelligence(dialect)
+    if engine_intel:
+        sections.append(engine_intel)
 
     return sections, n_families
 
@@ -462,7 +516,7 @@ def build_beam_prompt_tiered(
         intelligence_brief=intelligence_brief,
     )
 
-    # ── Section 5b: Worker Routing ───────────────────────────────────────
+    # ── Section 5c: Worker Routing ───────────────────────────────────────
     sections.append("""## Worker Routing
 
 Your targets will be routed to specialized workers:

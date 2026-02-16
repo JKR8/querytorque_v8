@@ -1,0 +1,64 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (1.10x IMPROVED)**  
+- **Improved operator**:  
+  Original: `Nested Loop  (rows=3259, time=634.2)`  
+  t1: `Nested Loop  (rows=1086, time=42.907)`  
+  **Structural change**: Early filtering via CTEs (Family A) reduced input rows to downstream joins. Filters on `date_dim`, `item`, `customer_address`, and `customer` were pushed before joining with `store_sales`, cutting the `Nested Loop` input from 54,766 to 18,255 rows.  
+- **Most expensive remaining operator**:  
+  `Nested Loop  (rows=1086, time=42.907)` — Joins the filtered `store_sales` result with `item`.  
+
+**syn_w1 (1.03x NEUTRAL)**  
+- **Regressed operator**:  
+  Original: `Hash Join  (rows=54766, time=123.056)`  
+  syn_w1: `Hash Join  (rows=27383, time=23.538)`  
+  **Why backfired**: Redundant early filtering (same as t1) but with marginally worse row reduction (27,383 vs. t1's 18,255). Minimal gain due to identical core approach.  
+
+**Classification**:  
+Both t1 and syn_w1 are **REDUNDANT** — Same structural change (Family A), same operators improved. t1 is strictly superior.  
+
+**FAIL Analysis**:  
+- **t3 (FAIL)**: Syntax error (`ss_ext_sales_price` reference in outer query). Structural idea (aggregation pushdown) was sound but flawed implementation.  
+- **t2 (FAIL)**: Transaction error from unsafe cross-join in `precomputed_dims` CTE.  
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop  (rows=1086, time=42.907)` in t1 plan (joining aggregated sales with `item`).  
+**Hypothesis**: Reduce input rows to this operator via aggregation pushdown (Family C).  
+
+**Targets**:
+
+1. **Combination (A+C)**: Layer aggregation pushdown (Family C) onto t1’s early filtering (Family A).  
+   - **Why**: Targets the expensive `Nested Loop` (42.9 ms) by aggregating sales by `ss_item_sk` *before* joining with `item`. Uses t1’s filtered CTEs to minimize input to aggregation.  
+   - **Target operator**: `Nested Loop` (rows=1086 in t1 plan).  
+   - **Fix for t3 failure**: Use precomputed `ext_price` from CTE instead of raw `ss_ext_sales_price`.  
+
+2. **Refinement (A+E)**: Add geo-condition materialization (Family E) to t1.  
+   - **Why**: Precompute `(ca_address_sk, s_store_sk)` pairs meeting `SUBSTRING(ca_zip) <> SUBSTRING(s_zip)` to avoid per-row recomputation.  
+   - **Target operator**: Zip comparison in t1’s main query (not directly timed, but expensive string operation).  
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_aggregate_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Aggregate sales by item_sk after early filtering (reducing rows for item join). Fixes t3's syntax error by using precomputed ext_price.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "date_cte_isolate"]
+  },
+  {
+    "family": "A+E",
+    "transform": "early_filter_geo_materialize",
+    "target_id": "t1",
+    "relevance_score": 0.7,
+    "hypothesis": "Materialize valid (ca_address_sk, s_store_sk) pairs for zip comparison to avoid per-row computation. Safer than t2's cross-join.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_shared_scan_decorrelate"]
+  }
+]
+```

@@ -1,0 +1,109 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1_rescue (WIN - 1.16x)**  
+- **Improved operator**: Original `Hash Join (rows=18763, time=475.53)` was replaced by a cheaper `Hash Join (rows=6013, time=400.094)`.  
+  - **Cause**: Early filtering via CTEs (`filtered_d1_dates`, `filtered_web_sales`) reduced input rows to joins.  
+- **Most expensive remaining operator**: `Seq Scan on web_sales (rows=220247, time=373.279)` remains the bottleneck.  
+
+**t5 (REGRESSION - 0.76x)**  
+- **Regressed operator**: `CTE Scan (ss) (rows=266257, time=1542.967)` became the new bottleneck.  
+  - **Cause**: Correlated subquery with `LIMIT 1` forced repeated scans of `filtered_store_sales`, increasing overhead.  
+
+**Classification**:  
+- **t1_rescue** is **COMPLEMENTARY**—it optimized join structure and early filtering but left the `web_sales` scan unaddressed.  
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: Start with **t1_rescue** (WIN).  
+**Primary bottleneck**: `Seq Scan on web_sales (220247 rows, 373 ms)`.  
+
+#### Target 1: Refinement (Reduce `web_sales` Scan)  
+- **Family**: A (Early Filtering)  
+- **Hypothesis**: Pre-filter `web_sales` using a precomputed date range from `d1` to reduce rows scanned.  
+- **IR Target**:  
+  - Insert CTE for `d2` dates within 2001 + 30 days.  
+  - Modify `filtered_web_sales` to join with `d2` CTE.  
+- **Target Operator**: `Seq Scan on web_sales` (220K rows → potential 90% reduction).  
+```json
+{
+  "family": "A",
+  "transform": "early_filter_web_sales_with_d2_dates",
+  "target_id": "t2",
+  "relevance_score": 0.95,
+  "hypothesis": "Pre-filter web_sales using a precomputed set of d2 dates (within 2001 and 2001+30 days) to reduce Seq Scan rows from 220K. Targets the bottleneck in t1_rescue's plan.",
+  "target_ir": "S0: insert_cte('filtered_d2_dates', 'SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (SELECT MIN(d_date) FROM filtered_d1_dates) AND (SELECT MAX(d_date) FROM filtered_d1_dates) + INTERVAL ''30 DAY'''), then replace_expr_subtree(by_anchor_hash: [hash of filtered_web_sales body], 'SELECT * FROM web_sales WHERE ...', 'SELECT ws.* FROM web_sales ws JOIN filtered_d2_dates d2 ON ws.ws_sold_date_sk = d2.d_date_sk WHERE ws_wholesale_cost BETWEEN 35 AND 55')",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 2: Combination (Address `Merge Join`)  
+- **Family**: A + F (Early Filtering + Join Transform)  
+- **Hypothesis**: Combine `t1_rescue`'s CTEs with explicit join reordering to optimize the `Merge Join (time=504.585 ms)`.  
+- **IR Target**:  
+  - Restructure joins to prioritize filtered CTEs.  
+- **Target Operator**: `Merge Join (rows=3, time=504.585 ms)`.  
+```json
+{
+  "family": "A+F",
+  "transform": "cte_join_restructure",
+  "target_id": "t3",
+  "relevance_score": 0.85,
+  "hypothesis": "Restructure joins to process filtered CTEs (d1, web_sales) before merging with store_sales. Reduces input rows to the expensive Merge Join.",
+  "target_ir": "S0: replace_from(main_query, 'JOIN filtered_web_sales ON ... JOIN filtered_d1_dates d1 ON ... JOIN store_sales ON ...')",
+  "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 3: Rescue (Fix `t5` Decorrelation)  
+- **Family**: B (Decorrelation)  
+- **Hypothesis**: Replace `LIMIT 1` in `t5` with a join to avoid repeated scans.  
+- **IR Target**:  
+  - Convert correlated subquery to a batched join.  
+```json
+{
+  "family": "B",
+  "transform": "decorrelate_d2_dates",
+  "target_id": "t4",
+  "relevance_score": 0.75,
+  "hypothesis": "Replace correlated subquery in t5 with a batched join between d2 and filtered_d1_dates to eliminate the expensive CTE Scan.",
+  "target_ir": "S0: replace_expr_subtree(by_anchor_hash: [hash of d2 condition in t5], 'd2.d_date BETWEEN ...', 'JOIN filtered_d1_dates d1 ON d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL ''30 DAY'')')",
+  "recommended_examples": ["pg_shared_scan_decorrelate"]
+}
+```
+
+---
+
+### Final Targets
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filter_web_sales_with_d2_dates",
+    "target_id": "t2",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-filter web_sales using a precomputed set of d2 dates (within 2001 and 2001+30 days) to reduce Seq Scan rows from 220K. Targets the bottleneck in t1_rescue's plan.",
+    "target_ir": "S0: insert_cte('filtered_d2_dates', 'SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (SELECT MIN(d_date) FROM filtered_d1_dates) AND (SELECT MAX(d_date) FROM filtered_d1_dates) + INTERVAL ''30 DAY'''), then replace_expr_subtree(by_anchor_hash: [hash of filtered_web_sales body], 'SELECT * FROM web_sales WHERE ...', 'SELECT ws.* FROM web_sales ws JOIN filtered_d2_dates d2 ON ws.ws_sold_date_sk = d2.d_date_sk WHERE ws_wholesale_cost BETWEEN 35 AND 55')",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A+F",
+    "transform": "cte_join_restructure",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Restructure joins to process filtered CTEs (d1, web_sales) before merging with store_sales. Reduces input rows to the expensive Merge Join.",
+    "target_ir": "S0: replace_from(main_query, 'JOIN filtered_web_sales ON ... JOIN filtered_d1_dates d1 ON ... JOIN store_sales ON ...')",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_d2_dates",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Replace correlated subquery in t5 with a batched join between d2 and filtered_d1_dates to eliminate the expensive CTE Scan.",
+    "target_ir": "S0: replace_expr_subtree(by_anchor_hash: [hash of d2 condition in t5], 'd2.d_date BETWEEN ...', 'JOIN filtered_d1_dates d1 ON d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL ''30 DAY'')')",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

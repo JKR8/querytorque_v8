@@ -1,0 +1,91 @@
+### Analysis of Prior Failures
+
+All prior patches failed due to **syntax errors**, not performance issues. The core structural changes (decorrelation, prefiltering) were never tested. The primary bottleneck remains unaddressed:
+
+- **Original plan's most expensive operator**: `Hash Join` (rows=4230, time=795.54 ms)  
+  This consumes >57% of total execution time. It joins `web_sales` with a large `Seq Scan on web_returns` (77k rows).
+
+---
+
+### Target Design for Round 1
+
+#### **Target 1: Fix Decorrelation + Prefiltering (B+E)**  
+```json
+{
+  "family": "B+E",
+  "transform": "decorrelate_exists_with_prefilter",
+  "target_id": "t1",
+  "relevance_score": 0.98,
+  "hypothesis": "Fix ambiguous column in t1's decorrelation while adding prefiltering to reduce input to the expensive Hash Join (4230 rows). Prefiltering targets date_dim/price filters early. Decorrelation eliminates the correlated Index Scan (0.227ms/row).",
+  "target_ir": "S0: insert_cte(prefiltered_sales) + replace_expr_subtree(EXISTS subquery by_anchor_hash)",
+  "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+}
+```
+**Why**:  
+1. Fixes `t1`'s ambiguous column error  
+2. Combines decorrelation (B) with prefiltering (E) to attack both bottlenecks:  
+   - Decorrelation: Replaces correlated `Index Scan on web_sales (ws2)`  
+   - Prefiltering: Reduces rows fed into `Hash Join` (4230 rows)  
+
+---
+
+#### **Target 2: Prefilter web_returns for NOT EXISTS (E)**  
+```json
+{
+  "family": "E",
+  "transform": "prefilter_web_returns",
+  "target_id": "t2",
+  "relevance_score": 0.90,
+  "hypothesis": "Materialize filtered web_returns (wr_reason_sk IN (8,18,20,23,41)) to shrink the Hash Join's right side. Current Seq Scan on web_returns reads 77k rows (101.969ms).",
+  "target_ir": "S0: insert_cte(filtered_returns) + replace_where_predicate(NOT EXISTS by_anchor_hash)",
+  "recommended_examples": ["multi_dimension_prefetch"]
+}
+```
+**Why**:  
+Targets the `Hash Join`'s largest input: `Seq Scan on web_returns` (77k rows). Pre-materializing filtered returns reduces hash table build cost.
+
+---
+
+#### **Target 3: Push State/GMT Filters Early (A)**  
+```json
+{
+  "family": "A",
+  "transform": "early_dimension_filters",
+  "target_id": "t3",
+  "relevance_score": 0.85,
+  "hypothesis": "Push ca_state/web_gmt_offset filters into customer_address/web_site scans. Avoids joining unnecessary rows into the Nested Loop (836 rows).",
+  "target_ir": "S0: replace_where_predicate(ca_state/web_gmt_offset by_anchor_hash)",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+**Why**:  
+The `Index Scan on customer_address` and `Seq Scan on web_site` currently run without filters. Pushing `ca_state`/`web_gmt_offset` constraints reduces rows early.
+
+---
+
+#### **Target 4: Anti-Join for NOT EXISTS (D)**  
+```json
+{
+  "family": "D",
+  "transform": "not_exists_to_anti_join",
+  "target_id": "t4",
+  "relevance_score": 0.80,
+  "hypothesis": "Convert NOT EXISTS to LEFT JOIN + IS NULL. Avoids building a full hash table for web_returns (77k rows) by using a streaming anti-join.",
+  "target_ir": "S0: replace_expr_subtree(NOT EXISTS by_anchor_hash)",
+  "recommended_examples": ["pg_intersect_to_exists"]
+}
+```
+**Why**:  
+Replaces the expensive `Hash Join` for `NOT EXISTS` with a potentially cheaper anti-join. Avoids materializing all 77k `web_returns` rows upfront.
+
+---
+
+### Key Insights
+1. **Primary bottleneck** is the `Hash Join` (795.54 ms) joining `web_sales` with unfiltered `web_returns`.  
+2. **Syntax errors** masked potential gains from decorrelation/prefiltering in prior runs.  
+3. **Target prioritization**:  
+   - Fix decorrelation + prefiltering (B+E) first (highest potential)  
+   - Prefilter web_returns (E) directly attacks largest input  
+   - Early filters (A) and anti-join (D) provide complementary optimizations  
+
+**No redundant targets** – all address distinct operators in the plan.

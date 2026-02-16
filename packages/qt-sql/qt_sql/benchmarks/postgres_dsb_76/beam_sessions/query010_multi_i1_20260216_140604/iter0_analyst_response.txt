@@ -1,0 +1,56 @@
+### Analysis of Optimization Families
+
+**Family A: Early Filtering (HIGH)**  
+The query applies dimension filters (county, birth_month, demographics) late after joins. Pushing these into CTEs early would reduce the customer/customer_address join cardinality significantly.
+
+**Family B: Decorrelation (HIGH)**  
+The correlated EXISTS subqueries force re-execution per row. The main bottleneck is the repeated date_dim/item scans across 3 subqueries. Decorrelating via shared CTEs is critical.
+
+**Family C: Aggregation Pushdown (LOW)**  
+No aggregation opportunities in subqueries. The main GROUP BY happens late but is necessary for final dimensions.
+
+**Family D: Set Operation Optimization (MEDIUM)**  
+The OR-connected EXISTS could benefit from UNION-based transformation, but decorrelation is more impactful.
+
+**Family E: Materialization (HIGH)**  
+Multiple subqueries scan identical date_dim/item ranges. Materializing these once would eliminate redundant scans.
+
+**Family F: Join Transform (MEDIUM)**  
+Implicit comma joins could be converted to explicit joins, but this is secondary to decorrelation.
+
+**Chosen families**: B, E, A  
+**Confidence**: High (plan shows 3x date_dim scans and nested loops for correlated subqueries)
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "B",
+    "transform": "shared_scan_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Correlated subqueries force repeated date_dim/item scans. Precompute sales-eligible customers via shared CTEs to eliminate per-row execution.",
+    "target_ir": "S0 [SELECT]\n  CTE: valid_dates AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999\n      AND d_moy BETWEEN 8 AND 11\n  )\n  CTE: valid_items AS (\n    SELECT i_item_sk\n    FROM item\n    WHERE i_category IN ('Children','Electronics','Music')\n      AND i_manager_id BETWEEN 66 AND 75\n  )\n  CTE: sales_customers AS (\n    SELECT ss_customer_sk AS customer_sk\n    FROM store_sales\n    JOIN valid_dates ON ss_sold_date_sk = valid_dates.d_date_sk\n    JOIN valid_items ON ss_item_sk = valid_items.i_item_sk\n    WHERE ss_sales_price/ss_list_price BETWEEN 0.2 AND 0.3\n    UNION\n    SELECT ws_bill_customer_sk\n    FROM web_sales\n    JOIN valid_dates ON ws_sold_date_sk = valid_dates.d_date_sk\n    JOIN valid_items ON ws_item_sk = valid_items.i_item_sk\n    WHERE ws_sales_price/ws_list_price BETWEEN 0.2 AND 0.3\n    UNION\n    SELECT cs_ship_customer_sk\n    FROM catalog_sales\n    JOIN valid_dates ON cs_sold_date_sk = valid_dates.d_date_sk\n    JOIN valid_items ON cs_item_sk = valid_items.i_item_sk\n    WHERE cs_sales_price/cs_list_price BETWEEN 0.2 AND 0.3\n  )\n  MAIN QUERY (via Q_S0)\n    FROM: customer c\n    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\n    WHERE ca.ca_county IN ('Grays Harbor County','Kootenai County','Pike County','Thomas County','Uinta County')\n      AND c.c_birth_month IN (1,5)\n      AND cd.cd_marital_status IN ('U','M')\n      AND cd.cd_education_status IN ('College','Primary','2 yr Degree')\n      AND cd.cd_gender = 'M'\n      AND c.c_customer_sk IN (SELECT customer_sk FROM sales_customers)\n    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count\n    ORDER BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "date_dim and item are scanned 3x with identical filters. Materializing these first avoids redundant I/O.",
+    "target_ir": "S0 [SELECT]\n  CTE: prefetch_dates AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999\n      AND d_moy BETWEEN 8 AND 11\n  )\n  CTE: prefetch_items AS (\n    SELECT i_item_sk\n    FROM item\n    WHERE i_category IN ('Children','Electronics','Music')\n      AND i_manager_id BETWEEN 66 AND 75\n  )\n  MAIN QUERY (via Q_S0)\n    ... [original EXISTS subqueries modified to use prefetch_dates/prefetch_items] ...",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "customer_early_filter",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "County/birth_month filters apply too late. Pre-filter customer/customer_address before demographics join.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_customers AS (\n    SELECT c_customer_sk, c_current_cdemo_sk\n    FROM customer\n    JOIN customer_address ON c_current_addr_sk = ca_address_sk\n    WHERE ca_county IN ('Grays Harbor County','Kootenai County','Pike County','Thomas County','Uinta County')\n      AND c_birth_month IN (1,5)\n  )\n  MAIN QUERY (via Q_S0)\n    FROM: filtered_customers c\n    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk\n    ... [remaining logic] ...",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

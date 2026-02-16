@@ -1,7 +1,5 @@
 """WebSocket server for Fleet C2 live dashboard."""
 
-from __future__ import annotations
-
 import asyncio
 import json
 import logging
@@ -60,27 +58,27 @@ class FleetWSServer:
             return help_html
 
         @app.websocket("/ws")
-        async def websocket_endpoint(ws: WebSocket):
-            await ws.accept()
-            self._clients.append(ws)
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            self._clients.append(websocket)
             logger.info("Fleet C2: WebSocket client connected")
 
             # Send initial triage data
-            await ws.send_json({
+            await websocket.send_json({
                 "type": "triage_data",
                 "data": {"queries": self.initial_data},
             })
 
             try:
                 while True:
-                    msg = await ws.receive_json()
+                    msg = await websocket.receive_json()
                     self._handle_client_message(msg)
             except WebSocketDisconnect:
-                self._clients.remove(ws)
+                self._clients.remove(websocket)
                 logger.info("Fleet C2: WebSocket client disconnected")
             except Exception:
-                if ws in self._clients:
-                    self._clients.remove(ws)
+                if websocket in self._clients:
+                    self._clients.remove(websocket)
 
         @app.on_event("startup")
         async def start_broadcast():

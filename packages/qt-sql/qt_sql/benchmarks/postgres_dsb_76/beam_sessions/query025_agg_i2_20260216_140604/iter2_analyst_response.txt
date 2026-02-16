@@ -1,0 +1,149 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t2 (1.01x NEUTRAL) vs Original:**
+- **Improved Operator**:  
+  `Nested Loop (rows=218310 → 72770, time=64.146ms → 9.431ms)`  
+  Structural change: Prefetching `date_dim` via CTE reduced `store_returns` scan rows by 3x (2426 → 2426 remains, but date filter selectivity improved).
+- **Most Expensive Remaining Operator**:  
+  `Nested Loop (rows=63, time=139.731ms)`  
+  This joins `store_returns` and `catalog_sales`, now the bottleneck.
+
+**Analysis of S0 (0.93x REGRESSION) vs Original**:  
+- **Regressed Operator**:  
+  `Hash Join (time=1776.548ms → 142.654ms)`  
+  Structural change: CTE-based date prefetching caused suboptimal join order, increasing relative cost despite absolute time reduction. Backfired due to loss of predicate pushdown opportunities.
+
+**Winner Classification**:  
+- **t2 (E+C)** and original **t2 (E)** are REDUNDANT (both target date_dim scans).  
+- No COMPLEMENTARY winners exist.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: Iteration 0's **t2 (Family E)** winner (1.34x speedup).  
+**Primary Bottleneck**: `Nested Loop (rows=63, time=139.731ms)` joining `store_returns` → `catalog_sales`.
+
+#### Target 1: Combination (E + C)  
+**Family**: E + C  
+**Transform**: `prefetch_plus_agg_pushdown`  
+**Hypothesis**: Prefetch dates (E) and push partial aggregation to `store_returns`/`catalog_sales` (C) to reduce the 63-row nested loop input.  
+**Target IR**: `S0`  
+**Examples**: `multi_dimension_prefetch`, `pg_materialized_dimension_fact_prefilter`  
+**Relevance**: 0.95 (directly targets bottleneck operator)
+
+```json
+{
+  "family": "E+C",
+  "transform": "prefetch_plus_agg_pushdown",
+  "target_id": "t1",
+  "relevance_score": 0.95,
+  "hypothesis": "Prefetch all date dimensions (E) and pre-aggregate store_returns/catalog_sales by join keys (C) to reduce rows (63) in the expensive Nested Loop joining them.",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+#### Target 2: Refinement (F)  
+**Family**: F  
+**Transform**: `explicit_join_restructure`  
+**Hypothesis**: Restructure comma joins to explicit INNER JOIN + reorder to prioritize selective dimension tables before fact tables, reducing input to the 63-row nested loop.  
+**Target IR**: `S0`  
+**Examples**: `pg_explicit_join_materialized`  
+**Relevance**: 0.85 (addresses join topology inefficiency)
+
+```json
+{
+  "family": "F",
+  "transform": "explicit_join_restructure",
+  "target_id": "t2",
+  "relevance_score": 0.85,
+  "hypothesis": "Convert comma joins to explicit INNER JOIN and reorder joins to place dimension tables (date_dim, item) before fact tables, targeting the Nested Loop (rows=63) by reducing its input size.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_explicit_join_materialized"]
+}
+```
+
+#### Target 3: Rescue (A)  
+**Family**: A  
+**Transform**: `early_filter_fixed_join_order`  
+**Hypothesis**: Fix failed S0 patch by preserving CTE date prefetching but enforcing optimal join order (store_sales → store_returns → catalog_sales) to retain predicate pushdown.  
+**Target IR**: `S0`  
+**Examples**: `pg_date_cte_explicit_join`  
+**Relevance**: 0.80 (rescues sound idea with execution fix)
+
+```json
+{
+  "family": "A",
+  "transform": "early_filter_fixed_join_order",
+  "target_id": "t3",
+  "relevance_score": 0.80,
+  "hypothesis": "Rescue S0's date prefetching (A) by enforcing join order to maintain predicate pushdown to store_returns/catalog_sales, reducing input to the 63-row Nested Loop.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 4: Novel (B)  
+**Family**: B  
+**Transform**: `decorrelate_fact_joins`  
+**Hypothesis**: Convert implicit loop between `store_returns` and `catalog_sales` to set-based hash join via derived tables, eliminating nested iteration.  
+**Target IR**: `S0`  
+**Examples**: `pg_shared_scan_decorrelate`  
+**Relevance**: 0.75 (targets loop vs set behavior)
+
+```json
+{
+  "family": "B",
+  "transform": "decorrelate_fact_joins",
+  "target_id": "t4",
+  "relevance_score": 0.75,
+  "hypothesis": "Decouple store_returns → catalog_sales join into set-based operation to replace nested loop (rows=63) with hash join, avoiding per-row iteration.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_shared_scan_decorrelate"]
+}
+```
+
+---
+
+### Final Output
+```json
+[
+  {
+    "family": "E+C",
+    "transform": "prefetch_plus_agg_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefetch all date dimensions (E) and pre-aggregate store_returns/catalog_sales by join keys (C) to reduce rows (63) in the expensive Nested Loop joining them.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_restructure",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert comma joins to explicit INNER JOIN and reorder joins to place dimension tables (date_dim, item) before fact tables, targeting the Nested Loop (rows=63) by reducing its input size.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filter_fixed_join_order",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Rescue S0's date prefetching (A) by enforcing join order to maintain predicate pushdown to store_returns/catalog_sales, reducing input to the 63-row Nested Loop.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_fact_joins",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Decouple store_returns → catalog_sales join into set-based operation to replace nested loop (rows=63) with hash join, avoiding per-row iteration.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

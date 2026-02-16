@@ -1,0 +1,106 @@
+### Step 1 — Compare EXPLAIN Plans  
+**No winners in latest iteration** (all patches failed). Analysis focuses on original plan bottlenecks:  
+
+1. **Most expensive operator**:  
+   `Subquery Scan (*SELECT* 1) (rows=61843, time=1197.913)`  
+   - Drives 1197.913ms (57% of total runtime)  
+   - Scans `store_sales` via `Nested Loop` → `Index Only Scan` (75280 rows, 593.666ms)  
+   - Joined with `date_dim` (182 rows) and `customer` (34904 index scans)  
+
+2. **Secondary bottleneck**:  
+   `SetOp (rows=45, time=2103.716)`  
+   - Materializes 82,642 intermediate rows from `Append`  
+   - High cost from triple `INTERSECT` materialization  
+
+**Why prior patches failed**:  
+- `t1_combine`/`t3_rescue`: Column reference errors due to CTE scoping issues (`c_last_name` undefined).  
+- `t2_refine`: Transaction aborts from syntax/semantic errors in `EXISTS` rewrite.  
+
+---
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: Materialization of large `store_sales` intermediate (61,843 rows) and `INTERSECT` overhead.  
+
+#### Target 1: Combine Decorrelation + Prefetch (B+E)  
+```json
+{
+  "family": "B+E",
+  "transform": "decorrelate_intersect_prefetch",
+  "target_id": "t1",
+  "relevance_score": 0.97,
+  "hypothesis": "Replace INTERSECT with decorrelated EXISTS (B) to avoid materialization + prefetch dimensions (E) to eliminate repeated scans. Targets 1197ms store_sales scan and SetOp overhead.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+}
+```  
+**Rationale**:  
+- **Family B (Decorrelation)**: Convert `INTERSECT` to `EXISTS` avoids materializing 82,642 rows (SetOp).  
+- **Family E (Prefetch)**: CTEs for `date_dim`/`customer` prevent 3 repeated scans (original: 3×182 rows + 3× customer scans).  
+- **Combines gold examples** to attack both bottlenecks.  
+
+#### Target 2: Refined EXISTS Rewrite (D)  
+```json
+{
+  "family": "D",
+  "transform": "intersect_to_exists_refined",
+  "target_id": "t2",
+  "relevance_score": 0.93,
+  "hypothesis": "Fix t2_refine syntax errors in EXISTS rewrite. Use web_sales (21,773 rows) as smallest base to reduce nested loop cost in EXISTS subqueries.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_intersect_to_exists"]
+}
+```  
+**Rationale**:  
+- Fixes prior `t2_refine` errors by using valid syntax.  
+- Starts with `web_sales` (fastest branch, 419ms) as base for `EXISTS` to minimize nested loop iterations.  
+
+#### Target 3: Aggregation Pushdown (C)  
+```json
+{
+  "family": "C",
+  "transform": "early_aggregation",
+  "target_id": "t3",
+  "relevance_score": 0.85,
+  "hypothesis": "Pre-aggregate sales tables before joining dimensions. Reduces 61,843-row store_sales input to Nested Loop by grouping on (ss_customer_sk, ss_sold_date_sk).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```  
+**Rationale**:  
+- **Targets 1197ms store_sales scan**: Push `GROUP BY` before joins to shrink 75,280-row input to `Nested Loop`.  
+- Keys `(ss_customer_sk, ss_sold_date_sk)` ⊇ join keys → safe to push aggregation.  
+
+---
+
+### Final Target List  
+```json
+[
+  {
+    "family": "B+E",
+    "transform": "decorrelate_intersect_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Replace INTERSECT with decorrelated EXISTS (B) to avoid materialization + prefetch dimensions (E) to eliminate repeated scans. Targets 1197ms store_sales scan and SetOp overhead.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "D",
+    "transform": "intersect_to_exists_refined",
+    "target_id": "t2",
+    "relevance_score": 0.93,
+    "hypothesis": "Fix t2_refine syntax errors in EXISTS rewrite. Use web_sales (21,773 rows) as smallest base to reduce nested loop cost in EXISTS subqueries.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "C",
+    "transform": "early_aggregation",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-aggregate sales tables before joining dimensions. Reduces 61,843-row store_sales input to Nested Loop by grouping on (ss_customer_sk, ss_sold_date_sk).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

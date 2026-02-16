@@ -1,0 +1,145 @@
+### Step 1: Compare EXPLAIN Plans
+
+**WIN Analysis (t1 - 1.11x WIN):**
+- **Improved Operator**:  
+  `Hash Join (rows=54766 → 27383, time=123.056 → 27.214)`  
+  This operator saw a 4.5x speedup due to reduced input rows from pre-filtering `date_dim` and materializing `filtered_geo_pairs`.
+- **Structural Change**:  
+  Early filtering (`d_year=2002`, `d_moy=4`) and materialization of `filtered_geo_pairs` (geo conditions) reduced rows fed into the `Hash Join` between `store_sales` and `store`.
+- **Most Expensive Remaining Operator**:  
+  `Hash Join (rows=27383, time=27.214)`  
+  Still the slowest operation despite improvements.
+
+**Redundancy Check**:  
+Both wins are **REDUNDANT** (identical patch/same structural change).
+
+---
+
+### Step 2: Design Refined Targets
+
+**Baseline**: Best winner’s SQL (t1).  
+**Primary Bottleneck**: `Hash Join` (27.214 ms, 27K rows).
+
+#### Target 1: Aggregation Pushdown (Family C)
+- **Hypothesis**:  
+  Aggregate sales by item *before* joining with `customer`/`customer_address`. The `GROUP BY` keys (`i_brand_id`, etc.) are available after joining `store_sales` with `item`. This reduces rows flowing into the expensive `Hash Join`.
+- **Target**:  
+  Push aggregation after `item` join but before `customer`/geo joins.
+- **Confidence**:  
+  High. Current `Hash Join` handles 27K rows → aggregation could reduce this by orders of magnitude (e.g., jewelry items are sparse).
+
+```json
+{
+  "family": "C",
+  "transform": "aggregate_after_item_join",
+  "target_id": "t2",
+  "relevance_score": 0.95,
+  "hypothesis": "Aggregate sales by item keys after joining store_sales with item. This exploits GROUP BY keys (i_brand_id, etc.) being available early to shrink row count before customer/geo joins, directly targeting the Hash Join (27K rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+#### Target 2: Join Reordering + Early Geo Filter (Family F)
+- **Hypothesis**:  
+  Join `filtered_sales` with `filtered_geo_pairs` *before* `item`/`customer`. Geo conditions (`ca_state='IL'`, zip mismatch) are highly selective (only 102 stores). Applying this early reduces rows before propagating to larger tables.
+- **Target**:  
+  Restructure join order: `filtered_sales` → `filtered_geo_pairs` → `item` → `customer`.
+- **Confidence**:  
+  High. The current plan processes geo conditions late (`Index Scan on customer_address` at 0.008 ms) despite being cheap. Early application leverages selectivity.
+
+```json
+{
+  "family": "F",
+  "transform": "reorder_joins_early_geo",
+  "target_id": "t3",
+  "relevance_score": 0.85,
+  "hypothesis": "Join filtered_sales with filtered_geo_pairs immediately after date filtering. Geo conditions (102 stores) applied early will reduce rows before expensive item/customer joins, alleviating the Hash Join bottleneck.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_explicit_join_materialized"]
+}
+```
+
+#### Target 3: Fix Failed Aggregation Pushdown (Family C Rescue)
+- **Problem**:  
+  Previous `aggregation_pushdown` (t3) failed with "Equivalence execution error" due to column reference issues.
+- **Fix**:  
+  Explicitly include `ss_customer_sk` and `ss_store_sk` in the pre-aggregation CTE to preserve join keys.
+- **Confidence**:  
+  Medium. Addresses prior syntax/scope error while preserving core optimization.
+
+```json
+{
+  "family": "C",
+  "transform": "aggregate_pushdown_rescue",
+  "target_id": "t4",
+  "relevance_score": 0.75,
+  "hypothesis": "Rescue failed aggregation by including customer/store keys in pre-aggregation CTE. Ensures join integrity while reducing rows early, targeting Hash Join (27K rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+#### Target 4: Materialize Item Filter (Family A + E)
+- **Hypothesis**:  
+  Pre-filter `item` in a CTE (`i_category='Jewelry'`). Current `Index Scan on item` (0.002 ms) is fast but applied too late. Materializing this upfront reduces rows earlier in the pipeline.
+- **Target**:  
+  Add `filtered_items` CTE and join with `store_sales` before other operations.
+- **Confidence**:  
+  Medium. Complements t1 by adding another early filter layer.
+
+```json
+{
+  "family": "A+E",
+  "transform": "prefilter_item_materialize",
+  "target_id": "t5",
+  "relevance_score": 0.8,
+  "hypothesis": "Materialize filtered jewelry items upfront to reduce rows before joining with store_sales. Targets Hash Join by shrinking its left input (27K rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+}
+```
+
+---
+
+### Final Targets
+```json
+[
+  {
+    "family": "C",
+    "transform": "aggregate_after_item_join",
+    "target_id": "t2",
+    "relevance_score": 0.95,
+    "hypothesis": "Aggregate sales by item keys after joining store_sales with item. This exploits GROUP BY keys (i_brand_id, etc.) being available early to shrink row count before customer/geo joins, directly targeting the Hash Join (27K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "reorder_joins_early_geo",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Join filtered_sales with filtered_geo_pairs immediately after date filtering. Geo conditions (102 stores) applied early will reduce rows before expensive item/customer joins, alleviating the Hash Join bottleneck.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "aggregate_pushdown_rescue",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Rescue failed aggregation by including customer/store keys in pre-aggregation CTE. Ensures join integrity while reducing rows early, targeting Hash Join (27K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A+E",
+    "transform": "prefilter_item_materialize",
+    "target_id": "t5",
+    "relevance_score": 0.8,
+    "hypothesis": "Materialize filtered jewelry items upfront to reduce rows before joining with store_sales. Targets Hash Join by shrinking its left input (27K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  }
+]
+```

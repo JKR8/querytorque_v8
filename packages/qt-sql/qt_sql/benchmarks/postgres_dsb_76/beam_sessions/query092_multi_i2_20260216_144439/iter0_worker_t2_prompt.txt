@@ -1,0 +1,293 @@
+## Role
+
+You are **W3 "Builder"** — Structural optimization — join restructuring, materialization. Restructure join topology and materialize repeated work: convert comma joins to explicit INNER JOIN, extract shared scans into CTEs, prefetch dimension tables.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: E+F — multi_dimension_prefetch+explicit_join_materialized
+**Hypothesis**: Shared date_dim/web_sales scan reused in main query + subquery. Precompute filtered base set to avoid redundant scans. | Implicit comma-joins obscure join dependencies. Convert to explicit INNER JOINs with materialized base scan.
+
+## Original SQL
+
+```sql
+select 
+   sum(ws_ext_discount_amt)  as "Excess Discount Amount"
+from
+    web_sales
+   ,item
+   ,date_dim
+where
+(i_manufact_id BETWEEN 797 and 996
+or i_category IN ('Men', 'Shoes', 'Sports'))
+and i_item_sk = ws_item_sk
+and d_date between '1999-01-29' and
+        cast('1999-01-29' as date) + interval '90 day'
+and d_date_sk = ws_sold_date_sk
+and ws_wholesale_cost BETWEEN 35 AND 55
+and ws_ext_discount_amt
+     > (
+         SELECT
+            1.3 * avg(ws_ext_discount_amt)
+         FROM
+            web_sales
+           ,date_dim
+         WHERE
+              ws_item_sk = i_item_sk
+          and d_date between '1999-01-29' and
+                             cast('1999-01-29' as date) + interval '90 day'
+          and d_date_sk = ws_sold_date_sk
+          and ws_wholesale_cost BETWEEN 35 AND 55
+          and ws_sales_price / ws_list_price BETWEEN 76 * 0.01 AND 91 * 0.01
+  )
+order by sum(ws_ext_discount_amt)
+limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: web_sales, item, date_dim
+    WHERE [7274e57af0a5eb74]: (i_manufact_id BETWEEN 797 AND 996 OR i_category IN ('Men', 'Shoes', 'Sports')) AND i_item_sk = w...
+    ORDER BY: SUM(ws_ext_discount_amt)
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  CTE: base_sales  (via Q1)
+    FROM: web_sales
+    INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk
+    WHERE: d_date BETWEEN '1999-01-29' AND (cast('1999-01-29' as date) + interval '90 day')
+      AND ws_wholesale_cost BETWEEN 35 AND 55
+  MAIN QUERY (via Q0)
+    FROM: base_sales bs
+    INNER JOIN item i ON bs.ws_item_sk = i.i_item_sk
+    WHERE: (i.i_manufact_id BETWEEN 797 AND 996 OR i.i_category IN ('Men', 'Shoes', 'Sports'))
+      AND bs.ws_ext_discount_amt > (
+        SELECT 1.3 * AVG(ws_ext_discount_amt)
+        FROM base_sales bs2
+        WHERE bs2.ws_item_sk = i.i_item_sk
+          AND (bs2.ws_sales_price / bs2.ws_list_price) BETWEEN 0.76 AND 0.91
+      )
+    ORDER BY: sum(ws_ext_discount_amt)
+    LIMIT: 100
+---
+S0 [SELECT]
+  CTE: filtered_dates  (via Q1)
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-01-29' AND (cast('1999-01-29' as date) + interval '90 day')
+  CTE: filtered_web_sales  (via Q2)
+    FROM: web_sales
+    INNER JOIN filtered_dates ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 35 AND 55
+  MAIN QUERY (via Q0)
+    FROM: filtered_web_sales ws
+    INNER JOIN item i ON ws.ws_item_sk = i.i_item_sk
+    WHERE: (i.i_manufact_id BETWEEN 797 AND 996 OR i.i_category IN ('Men', 'Shoes', 'Sports'))
+      AND ws.ws_ext_discount_amt > (
+        SELECT 1.3 * AVG(ws_ext_discount_amt)
+        FROM filtered_web_sales ws2
+        WHERE ws2.ws_item_sk = i.i_item_sk
+          AND (ws2.ws_sales_price / ws2.ws_list_price) BETWEEN 0.76 AND 0.91
+      )
+    ORDER BY: sum(ws_ext_discount_amt)
+    LIMIT: 100
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_duckdb_multi_dimension_prefetch",
+  "dialect": "duckdb",
+  "description": "Pre-filter multiple dimension tables (date + store) into separate CTEs before joining with fact table",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_dates",
+        "cte_query_sql": "SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000"
+      },
+      "description": "Insert CTE 'filtered_dates' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_stores",
+        "cte_query_sql": "SELECT s_store_sk, s_store_id, s_store_name FROM store WHERE s_gmt_offset = -5"
+      },
+      "description": "Insert CTE 'filtered_stores'"
+    },
+    {
+      "step_id": "s3",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_sales",
+        "cte_query_sql": "SELECT ss_sales_price, d_day_name, s_store_id, s_store_name FROM store_sales JOIN filtered_dates ON d_date_sk = ss_sold_date_sk JOIN filtered_stores ON s_store_sk = ss_store_sk"
+      },
+      "description": "Insert CTE 'filtered_sales' for date dimension filtering"
+    },
+    {
+      "step_id": "s4",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "filtered_sales"
+      },
+      "description": "Replace FROM clause with optimized version"
+    },
+    {
+      "step_id": "s5",
+      "op": "delete_expr_subtree",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "834e9c75d01a8fa3"
+      },
+      "description": "Remove WHERE clause (conditions moved to CTEs)"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):
+## Additional Gold Examples (for compound strategy)
+
+**Gold Example 2:**
+```json
+{
+  "plan_id": "gold_postgres_pg_explicit_join_materialized",
+  "dialect": "postgres",
+  "description": "Convert comma joins to explicit INNER JOINs AND pre-filter date/item dimensions into MATERIALIZED CTEs. The combination enables PostgreSQL to use small materialized hash tables as probe inputs, dramatically improving join cardinality estimation on complex multi-table queries.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "date_subquery_cte",
+        "cte_query_sql": "SELECT d_date FROM date_dim WHERE d_month_seq IN (SELECT d_month_seq FROM date_dim WHERE d_date IN ('2002-02-01', '2002-04-11', '2002-07-17', '2002-10-09'))"
+      },
+      "description": "Insert CTE 'date_subquery_cte' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "sr_items"
+      },
+      "payload": {
+        "sql_fragment": "sr_items AS (SELECT i_item_id AS item_id, SUM(sr_return_quantity) AS sr_item_qty FROM store_returns INNER JOIN item ON sr_item_sk = i_item_sk INNER JOIN date_dim ON sr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND sr_reason_sk IN (26, 32, 40, 66, 73) AND sr_return_amt / sr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'sr_items' body with optimized version"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "cr_items"
+      },
+      "payload": {
+        "sql_fragment": "cr_items AS (SELECT i_item_id AS item_id, SUM(cr_return_quantity) AS cr_item_qty FROM catalog_returns INNER JOIN item ON cr_item_sk = i_item_sk INNER JOIN date_dim ON cr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND cr_reason_sk IN (26, 32, 40, 66, 73) AND cr_return_amount / cr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'cr_items' body with optimized version"
+    },
+    {
+      "step_id": "s4",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "wr_items"
+      },
+      "payload": {
+        "sql_fragment": "wr_items AS (SELECT i_item_id AS item_id, SUM(wr_return_quantity) AS wr_item_qty FROM web_returns INNER JOIN item ON wr_item_sk = i_item_sk INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND wr_reason_sk IN (26, 32, 40, 66, 73) AND wr_return_amt / wr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'wr_items' body with optimized version"
+    },
+    {
+      "step_id": "s5",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "sr_items JOIN cr_items ON sr_items.item_id = cr_items.item_id JOIN wr_items ON sr_items.item_id = wr_items.item_id"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s6",
+      "op": "delete_expr_subtree",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "6f618ce74d15a625"
+      },
+      "description": "Remove WHERE clause (conditions moved to CTEs)"
+    }
+  ]
+}
+```
+
+Combine techniques from ALL gold examples above into a single unified patch plan.

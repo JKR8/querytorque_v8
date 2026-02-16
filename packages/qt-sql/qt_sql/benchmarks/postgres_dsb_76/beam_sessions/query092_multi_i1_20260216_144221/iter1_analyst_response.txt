@@ -1,0 +1,76 @@
+### Step 1 — Compare EXPLAIN Plans  
+*No execution plans available for comparison. All prior patches either failed semantic checks or are pending. Analysis must rely on query structure and error patterns.*  
+
+**Primary Bottleneck**: Correlated subquery execution.  
+The subquery recalculates `1.3 * avg(ws_ext_discount_amt)` per outer row, with identical filters/joins as the main query. This is confirmed by:  
+- Failed decorrelation attempts (`t1`, `syn_w2`) due to literal mismatches  
+- Pending materialization patch (`t2`) that isolates shared filters but retains correlation  
+
+**Failed Patch Analysis**:  
+All decorrelation/materialization attempts failed due to **literal mismatch** in the subquery's `ws_sales_price/ws_list_price` filter. Patches simplified `35 * 0.01` → `0.35`, violating structural equivalence.  
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Pending `t2` (Family E+F) - isolates `web_sales` + `date_dim` filters in CTE.  
+**Highest-Impact Target**: Eliminate correlated subquery via decorrelation (Family B) while preserving literals.  
+
+#### Target 1: Rescue Decorrelation (Family B)  
+```json  
+{
+  "family": "B",
+  "transform": "decorrelate_fixed_literals",
+  "target_id": "S0:45f976cc8e3ef038",
+  "relevance_score": 0.98,
+  "hypothesis": "Precompute thresholds per item in CTE using original literals (35*0.01), eliminating per-row subquery execution. Reuse filtered_sales CTE from t2 to avoid repeated scans.",
+  "target_ir": "S0: Replace correlated subquery with item_thresholds CTE. Anchor: WHERE clause (hash 45f976cc8e3ef038).",
+  "recommended_examples": ["pg_shared_scan_decorrelate"]
+}
+```  
+
+#### Target 2: Combine Materialization + Decorrelation (Families E+B)  
+```json  
+{
+  "family": "E+B",
+  "transform": "materialize_shared_filters_then_decorrelate",
+  "target_id": "S0",
+  "relevance_score": 0.92,
+  "hypothesis": "Reuse filtered_sales CTE for both main query and threshold calculation. Avoid recomputing identical date/wholesale filters.",
+  "target_ir": "S0: Insert two CTEs: 1) filtered_sales (E), 2) item_thresholds (B). Replace subquery with item_thresholds join.",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_shared_scan_decorrelate"]
+}
+```  
+
+#### Target 3: Early Item Filtering (Family A)  
+```json  
+{
+  "family": "A",
+  "transform": "push_item_filters",
+  "target_id": "S0",
+  "relevance_score": 0.75,
+  "hypothesis": "Filter item table first (manufact_id/category) before joining with sales. May reduce rows fed to expensive threshold comparison.",
+  "target_ir": "S0: Insert CTE filtered_items. Change join order: filtered_items → filtered_sales.",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```  
+
+#### Target 4: Aggregation Pushdown (Family C)  
+```json  
+{
+  "family": "C",
+  "transform": "preaggregate_thresholds",
+  "target_id": "S0",
+  "relevance_score": 0.65,
+  "hypothesis": "Compute AVG(ws_ext_discount_amt) during item_thresholds CTE materialization. Reduce redundant scans.",
+  "target_ir": "S0: Move AVG() into item_thresholds CTE. Anchor: subquery SELECT list.",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```  
+
+### Key Rationale  
+1. **Decorrelate first**: Correlation is the primary bottleneck. Target 1 fixes literal handling in prior attempts.  
+2. **Leverage pending work**: `t2`'s filtered_sales CTE (Family E) is semantically sound - combine with B.  
+3. **Quality focus**: Target 3/4 are secondary (no plan data) but align with optimization families.  
+4. **Literal preservation**: All targets retain `35*0.01`/`50*0.01` expressions to avoid structural mismatch.  
+
+**No redundant targets**: Each addresses distinct phases (filtering → decorrelation → aggregation).

@@ -1,0 +1,89 @@
+### Step 1 — Compare EXPLAIN Plans
+
+All patches in Iteration 1 failed due to literal mismatches, preventing execution plan generation. Without successful patches, we cannot compare improved plans. The primary issue is structural: all rewrites altered filter expressions (`20 * 0.01` → `0.20`), violating semantic equivalence checks. 
+
+**Key Insight from Original Plan**:  
+The dominant bottleneck is the `Aggregate` operator at `rows=1942, time=1793.056 ms` (63% of total runtime). This occurs early in the plan during the `store_sales` subquery evaluation, indicating:
+- High-cost pre-aggregation of large intermediate results
+- Suboptimal predicate placement forcing full scans before filtering
+- No winner exists to analyze, so all optimizations remain viable if implemented correctly.
+
+---
+
+### Step 2 — Design Targets for Round 2
+
+**Primary Bottleneck**:  
+Early `Aggregate` on `store_sales` (1793 ms) due to late filtering and lack of decorrelation.
+
+**Target 1: Combination (B+E)**  
+- **Family**: B + E  
+- **Transform**: `decorrelate_with_prefetch`  
+- **Target IR**: `S0` (anchor: `367f52d66e539ba4` - WHERE clause)  
+- **Hypothesis**: Decorrelate subqueries (B) to eliminate per-row re-execution while prefetching shared dimensions (E) to avoid repeated `date_dim`/`item` scans. Targets both the expensive `Aggregate` (rows=1942) and repeated `Index Only Scan on date_dim` (3 instances).  
+- **Examples**: `shared_scan_decorrelate` (B) + `multi_dimension_prefetch` (E)  
+
+**Target 2: Refinement (C)**  
+- **Family**: C  
+- **Transform**: `push_agg_into_sales_cte`  
+- **Target IR**: `S0` (anchor: `367f52d66e539ba4`)  
+- **Hypothesis**: Push `COUNT(*)` into decorrelated CTEs from Target 1. Since GROUP BY keys include customer demographics, aggregating in sales CTEs before joining reduces input to the final `Aggregate` (currently 1942 rows).  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+**Target 3: Rescue (B with Literal Fix)**  
+- **Family**: B  
+- **Transform**: `decorrelate_preserve_literals`  
+- **Target IR**: `S0` (anchor: `367f52d66e539ba4`)  
+- **Hypothesis**: Fix literal mismatch in `t2` by preserving `20 * 0.01` verbatim. Convert correlated `EXISTS` to semi-joins with precomputed customer sets, eliminating nested loops for subqueries.  
+- **Examples**: `pg_shared_scan_decorrelate`  
+
+**Target 4: Novel (A+F)**  
+- **Family**: A + F  
+- **Transform**: `early_county_filter_explicit_join`  
+- **Target IR**: `S0` (anchor: `367f52d66e539ba4`)  
+- **Hypothesis**: Apply county filter immediately after `customer_address` join (A) and convert comma joins to explicit `INNER JOIN` (F). Reduces rows early for downstream operators, especially `Nested Loop` (rows=121,657).  
+- **Examples**: `pg_date_cte_explicit_join` (A) + `pg_explicit_join_materialized` (F)  
+
+---
+
+### Final Target JSON
+
+```json
+[
+  {
+    "family": "B+E",
+    "transform": "decorrelate_with_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Eliminate correlated subquery execution (B) and reuse dimension filters (E) to avoid repeated scans. Targets expensive Aggregate (1793 ms) and multiple date_dim scans.",
+    "target_ir": "S0:367f52d66e539ba4",
+    "recommended_examples": ["shared_scan_decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "push_agg_into_sales_cte",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-aggregate sales data in CTEs before joining to customer. Reduces input rows (currently 1942) to final Aggregate operator.",
+    "target_ir": "S0:367f52d66e539ba4",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_preserve_literals",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Rescue decorrelation by preserving original literals (20*0.01). Replace correlated EXISTS with semi-joins to avoid per-row re-execution.",
+    "target_ir": "S0:367f52d66e539ba4",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "A+F",
+    "transform": "early_county_filter_explicit_join",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Push county filter immediately after customer_address join (A) and use explicit JOIN syntax (F). Reduces early Nested Loop (rows=121,657).",
+    "target_ir": "S0:367f52d66e539ba4",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  }
+]
+```

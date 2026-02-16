@@ -1,0 +1,63 @@
+### Analysis of Execution Plans
+
+All patches in Iteration 1 **FAILED** due to literal mismatch (replaced `10+2` with `12`). There are no winners to analyze. The primary bottleneck remains the top-level `Nested Loop` (rows=964, time=27374.327 ms) in the original plan, which processes the anti-join for `catalog_sales`. This operator:
+1. Scans 310,812 materialized rows from `catalog_sales` for each row from the first subplan (1105 rows)
+2. Causes a combinatorial explosion (~343M row checks) due to nested loop anti-join semantics
+3. Dominates 27.3s of the total 27.4s runtime
+
+Secondary bottlenecks:
+- `Nested Loop` for `web_sales` anti-join (rows=1105, time=6326.222 ms)
+- Repeated full scans of `date_dim` (3x) despite small cardinality
+
+---
+
+### Design Targets for Round 2
+
+```json
+[
+  {
+    "family": "B+E",
+    "transform": "decorrelate_anti_joins_with_date_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Replace correlated NOT EXISTS with precomputed anti-join sets (B) while prefetching date_dim (E) to eliminate nested loops. Targets the 27.3s Nested Loop (310k rows) and repeated date_dim scans.",
+    "target_ir": "S0: Replace NOT EXISTS subqueries with CTEs for excluded_web_sales/excluded_catalog_sales. Anchor 'dae945277e160f9b' for WHERE clause.",
+    "recommended_examples": ["shared_scan_decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "push_state_demographics_filters",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Push ca_state + cd_* filters earlier to reduce customer rows before anti-joins. Targets Hash Join (rows=22398) feeding the 1105-row Nested Loop.",
+    "target_ir": "S0: Move ca_state/cd_* filters to CTEs. Anchor 'dae945277e160f9b' for WHERE clause.",
+    "recommended_examples": ["demographics_filter_push"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_exists_only",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Minimal decorrelation of only EXISTS clause to avoid literal mismatch risk. Targets Nested Loop (rows=150624) for store_sales.",
+    "target_ir": "S0: Convert EXISTS to JOIN with valid_store_sales CTE. Preserve original NOT EXISTS structure.",
+    "recommended_examples": ["shared_scan_decorrelate"]
+  },
+  {
+    "family": "E",
+    "transform": "date_prefetch_safe",
+    "target_id": "t4",
+    "relevance_score": 0.65,
+    "hypothesis": "Isolated date_dim prefetch with preserved 10+2 expression. Targets repeated date_dim scans (3x) without altering join logic.",
+    "target_ir": "S0: Insert filtered_dates CTE. Replace all date_dim references in subqueries.",
+    "recommended_examples": ["date_cte_isolate"]
+  }
+]
+```
+
+### Key Rationale
+1. **Primary Target (B+E)**: Directly attacks the 27.3s bottleneck by converting anti-joins to hash joins. Combines proven decorrelation (B) with date reuse (E). Preserves `10+2` expression.
+2. **Fallback Target (A)**: Early filtering reduces rows entering expensive anti-joins. Proven 1.08x gain in prior run.
+3. **Conservative Target (B)**: Partial decorrelation minimizes rewrite risk while optimizing the EXISTS scan.
+4. **Safe Target (E)**: Isolated date prefetch avoids literal mismatch issues while optimizing repeat scans.
+
+**Quality Focus**: All targets preserve `10+2` literals and target EXPLAIN-verified bottlenecks. No speculative optimizations.

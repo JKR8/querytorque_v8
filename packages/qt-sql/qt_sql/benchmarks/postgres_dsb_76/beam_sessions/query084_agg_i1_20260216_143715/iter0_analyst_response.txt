@@ -1,0 +1,58 @@
+### Analysis of Families
+
+- **Family A: Early Filtering (Predicate Pushback)**  
+  HIGH relevance. The query suffers from late filtering on `customer` (250K rows scanned) despite `customer_address` being filtered early to 49 rows. Pushing `ca_city='Jackson'` into a CTE and joining with `customer` first would drastically reduce the `customer` scan.
+
+- **Family B: Decorrelation (Sets Over Loops)**  
+  LOW relevance. The query has no correlated subqueries or scalar aggregates causing per-row re-execution.
+
+- **Family C: Aggregation Pushdown**  
+  LOW relevance. The query lacks GROUP BY aggregations, making this optimization inapplicable.
+
+- **Family D: Set Operation Optimization**  
+  LOW relevance. No INTERSECT/UNION operations exist in the query.
+
+- **Family E: Materialization / Prefetch**  
+  MEDIUM relevance. Materializing small filtered dimensions (`income_band`, `customer_address`) could help statistics estimation but isn't the primary bottleneck.
+
+- **Family F: Join Transform (Right Shape First)**  
+  HIGH relevance. Implicit comma joins obscure join order, causing a full `customer` scan. Restructuring to explicit joins with selective tables first is critical.
+
+**Chosen families**: A, F, E  
+**Confidence**: High (join order and filtering are clear bottlenecks)
+
+---
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "F",
+    "transform": "explicit_join_restructuring",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Implicit cross joins force full scan of 250K-row 'customer' table before applying selective filters. Restructuring with explicit INNER JOINs starting from 'customer_address' reduces base row count by 99.98%.",
+    "target_ir": "S0 [SELECT]\n  MAIN QUERY (via Q_S0)\n    FROM: customer_address\n      INNER JOIN customer ON c_current_addr_sk = ca_address_sk\n      INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk\n      INNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk\n      INNER JOIN income_band ON ib_income_band_sk = hd_income_band_sk\n      INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk\n    WHERE: ca_city = 'Jackson' \n      AND ib_lower_bound >= 23567 \n      AND ib_upper_bound <= 73567\n    ORDER BY: c_customer_id",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "predicate_pushback_cte",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Sequential scan on 'customer' processes 250K rows despite 'customer_address' filter reducing relevant rows to 49. Isolating filtered address-customer pairs first prevents full table scan.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_cust (via Q1)\n    FROM: customer_address\n      INNER JOIN customer ON c_current_addr_sk = ca_address_sk\n    WHERE: ca_city = 'Jackson'\n  MAIN QUERY (via Q_S0)\n    FROM: filtered_cust\n      INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk\n      INNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk\n      INNER JOIN income_band ON ib_income_band_sk = hd_income_band_sk\n      INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk\n    WHERE: ib_lower_bound >= 23567 \n      AND ib_upper_bound <= 73567\n    ORDER BY: c_customer_id",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Small dimension tables ('income_band', 'customer_address') are scanned multiple times in nested loops. Materializing them first improves statistics estimation and avoids re-scans.",
+    "target_ir": "S0 [SELECT]\n  CTE: prefetch_address (via Q1)\n    FROM: customer_address\n    WHERE: ca_city = 'Jackson'\n  CTE: prefetch_income (via Q2)\n    FROM: income_band\n    WHERE: ib_lower_bound >= 23567 AND ib_upper_bound <= 73567\n  MAIN QUERY (via Q_S0)\n    FROM: prefetch_address\n      INNER JOIN customer ON c_current_addr_sk = ca_address_sk\n      INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk\n      INNER JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk\n      INNER JOIN prefetch_income ON ib_income_band_sk = hd_income_band_sk\n      INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk\n    ORDER BY: c_customer_id",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

@@ -1,0 +1,79 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t1 (1.09x IMPROVED - Family A):**
+- **Improved Operator**:  
+  `Hash Join (rows=10720, time=76.772 → 89.088)`  
+  Reduced by 8ms due to early filtering in CTEs (`filtered_date`, `filtered_cd`, etc.) pushing dimension filters before joins.
+- **Structural Change**:  
+  Early filtering via CTEs reduced input rows to dimension joins, though gains were offset by increased overhead.
+- **Most Expensive Remaining Operator**:  
+  `Nested Loop (rows=10409, time=132.566 → 172.593)`  
+  Remains the bottleneck due to per-row index scans on `customer` (10509 rows).
+
+**Analysis of t2 (1.02x NEUTRAL - Family E+F):**
+- **Regressed Operator**:  
+  `Hash Join (rows=10509, time=78.079 → 94.894)`  
+  Prefetching dimensions (`prefetched_dims`) added overhead without reducing row counts.
+- **Why Backfired**:  
+  Combined CTE for all dimensions increased materialization cost. Join order changes didn’t reduce input to the `Nested Loop`.
+
+**Classification**:  
+- **REDUNDANT**: t1 and t2 both target dimension filtering (A and E overlap). Neither addresses the `Nested Loop` bottleneck.  
+- **COMPLEMENTARY**: None (both focus on dimension filtering).
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop (rows=10409, time=132.566)` joining `catalog_returns` → `customer` → dimensions.  
+Caused by per-row index scans on `customer` (10509 rows) after initial joins.
+
+**Refined Targets**:
+
+1. **Combination (A+C)**: Early filtering + aggregation pushdown  
+   - **Hypothesis**: Pre-aggregate `catalog_returns` by `cr_call_center_sk` and `cr_returning_customer_sk` *before* joining to `customer` and dimensions. Reduces `Nested Loop` input from 10509 rows to distinct customer-call center pairs.  
+   - **Target IR**: `S0` (main query)  
+   - **Confidence**: High. Original `catalog_returns` scan is 719K rows. Grouping keys align with join keys.
+
+2. **Refinement (C)**: Aggregation pushdown targeting `Nested Loop`  
+   - **Hypothesis**: Push aggregation to reduce rows *before* the `Nested Loop`. Current input (10509 rows) to `customer` index scans is the bottleneck.  
+   - **Target IR**: `S0`  
+   - **Confidence**: High. Final GROUP BY keys are superset of `cr_call_center_sk` and `cr_returning_customer_sk`.
+
+3. **Rescue (E)**: Prefetch dimensions with correct columns  
+   - **Hypothesis**: Fix `syn_w1` error by including `cd_marital_status`, `cd_education_status` in CTE. Pre-join dimensions to avoid per-row scans.  
+   - **Target IR**: `S0`  
+   - **Confidence**: Medium. t2 showed neutral results, but correct column inclusion may reduce `Nested Loop` cost.
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_and_aggregate_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-aggregate catalog_returns by call_center and customer after date filter. Reduces Nested Loop input (10409 rows) by collapsing duplicate customer-call center pairs before dimension joins.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_fact_table",
+    "target_id": "t1",
+    "relevance_score": 0.90,
+    "hypothesis": "Push aggregation before customer/dimension joins to shrink Nested Loop input. Targets 10509-row operator feeding customer index scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_dims_fixed_columns",
+    "target_id": "t1",
+    "relevance_score": 0.80,
+    "hypothesis": "Rescue syn_w1 by including cd_marital_status/cd_education_status in CTE. Pre-join dimensions to avoid per-row index scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

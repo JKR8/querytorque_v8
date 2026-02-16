@@ -1,0 +1,77 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t1 (0.87x REGRESSION):**
+- **Operator that improved**:  
+  `Index Only Scan on date_dim (rows=122, time=0.285)` vs original `(rows=365, time=1.833)`.  
+  *Why*: Prefiltering via CTEs reduced `date_dim` rows by 66% (365 → 122).  
+- **Operator that regressed**:  
+  Overall query time increased from **7.901ms → 9ms** despite `date_dim` improvement.  
+  *Why*: Materializing all dimension CTEs first forced repeated nested loops instead of batch processing. The `Nested Loop` structure remained identical, but CTE materialization added overhead.
+
+**FAILED patches (t2, t3, syn_w2)**:  
+All failed due to syntax/transaction errors. No plan comparison possible, but structural ideas were sound.
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop` joining 4 tables (time=7.458ms).  
+**Secondary Bottleneck**:  
+`Index Only Scan on date_dim` (time=1.833ms, rows=365).
+
+**Target 1: Combine Early Filtering + Aggregation Pushdown (A+C)**  
+- **Hypothesis**: Prefilter dimensions (A) to reduce `date_dim` scan (rows=365→122), then push partial aggregation before joining `customer_demographics` to shrink the largest `Nested Loop`.  
+- **Target IR**:  
+  `S0`: Insert CTEs for prefiltered `date_dim`, `store`, `item`;  
+  `e163f15ec5db8f48`: Replace `store_sales` join with aggregated subquery over `store_sales` + prefiltered dimensions.  
+- **Confidence**: High. `GROUP BY` keys (`i_item_id`, `s_state`) ⊇ join keys (`ss_item_sk`, `ss_store_sk`).  
+- **Examples**: `pg_date_cte_explicit_join` (A), `pg_materialized_dimension_fact_prefilter` (C).
+
+**Target 2: Rescue Explicit Join Restructure (F)**  
+- **Hypothesis**: Original `t3` failed syntactically but explicit joins may enable hash joins. Target `Nested Loop` (time=7.458ms) by forcing batch processing.  
+- **Target IR**:  
+  `S0`: `replace_from` to convert comma joins to explicit `INNER JOIN`;  
+  `e163f15ec5db8f48`: Delete join conditions from WHERE, move to `ON` clauses.  
+- **Confidence**: Medium. Gold example `pg_explicit_join_materialized` showed 8.56x gains.  
+- **Examples**: `pg_explicit_join_materialized`.
+
+**Target 3: Refinement for date_dim Scan (A)**  
+- **Hypothesis**: Isolate `date_dim` filter to reduce rows (365→122) without full CTE materialization overhead.  
+- **Target IR**:  
+  `S0`: `insert_cte` for `date_dim` only;  
+  `replace_from` to join `store_sales` directly with `date_dim` CTE.  
+- **Confidence**: High. `date_dim` is the most expensive scan (1.833ms).  
+- **Examples**: `pg_date_cte_explicit_join`.
+
+---
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_plus_agg_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefilter dimensions (A) to reduce date_dim scan from 365 to 122 rows, then aggregate store_sales with item/store before joining customer_demographics to shrink the Nested Loop bottleneck (7.458ms).",
+    "target_ir": "S0: insert_cte for date_dim, store, item; e163f15ec5db8f48: replace store_sales scan with aggregated subquery (GROUP BY ss_item_sk, ss_store_sk) joined to prefiltered dimensions.",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "rescue_explicit_joins",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix syntax from failed t3 to enable explicit joins, replacing nested loops (7.458ms) with hash joins by reordering joins and pushing filters to ON clauses.",
+    "target_ir": "S0: replace_from to convert comma joins to explicit INNER JOIN; e163f15ec5db8f48: delete_expr_subtree (join conditions) and move to ON clauses.",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "date_dim_cte_isolate",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Target only date_dim scan (1.833ms, 365 rows) with a lightweight CTE to reduce rows to 122, avoiding full materialization overhead from failed t1.",
+    "target_ir": "S0: insert_cte for date_dim (d_date_sk WHERE d_year=2002); replace_from to join store_sales directly with date_dim CTE.",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```

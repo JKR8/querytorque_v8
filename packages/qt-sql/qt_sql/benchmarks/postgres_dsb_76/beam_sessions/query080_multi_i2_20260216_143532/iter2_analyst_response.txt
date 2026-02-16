@@ -1,0 +1,58 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (WIN) Analysis:**
+- **Operator Improvement**:  
+  `Nested Loop (rows=5432, time=14.715) → Nested Loop (rows=5432, time=17.027)`  
+  **Structural Change**: Pre-aggregation (`ssr_preagg`) reduced input rows to nested loops by filtering via precomputed dimension CTEs (`filtered_dates`, `filtered_promos`, `filtered_items`).  
+- **Most Expensive Remaining Operator**:  
+  `Nested Loop (rows=9748, time=23.752)` in `wsr` (web_sales scan).  
+  This operator still processes 9,748 rows with high time (23.752 ms), indicating web sales remain a bottleneck.
+
+**t2 (FAIL) Analysis:**  
+- **Failure Cause**: Literal mismatch in channel names (`'catalog channel'` → `'catalog_page'`) violated semantic equivalence. The rewrite altered business logic by changing filter values instead of preserving them.
+
+**Classification**:  
+- **REDUNDANT** (t1): Both t1 and prior t3 (Family C) used pre-aggregation. t1 added dimension prefetch (Family E) but didn’t resolve the core bottleneck (high-row nested loops).
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Nested Loop` processing **9,748 rows** in web sales (`wsr`) remains the slowest operator after t1 (23.752 ms).  
+
+**Targets** (prioritized):
+
+1. **Combination (C+B+E)**:  
+   - **Family**: C (Aggregation Pushdown) + B (Decorrelation) + E (Materialization)  
+   - **Transform**: `preagg_decorrelate_returns`  
+   - **Target ID**: `t3`  
+   - **Relevance**: 0.95  
+   - **Hypothesis**: Pre-aggregate returns tables (`store_returns`, `catalog_returns`, `web_returns`) by join keys *before* joining to sales. Reuse precomputed dimensions from t1 to eliminate per-row lookups.  
+   - **Target IR**: `fe4ed6f8f1b0d0b5` (ssr WHERE), `0f90d5ad6b1f86af` (wsr WHERE)  
+   - **Examples**: `pg_shared_scan_decorrelate`, `pg_materialized_dimension_fact_prefilter`  
+   - **Why**: t1 reduced fact table rows but didn’t optimize returns joins. Decorrelation targets the 9,748-row nested loop in `wsr`.
+
+2. **Refinement (B+E)**:  
+   - **Family**: B (Decorrelation) + E (Materialization)  
+   - **Transform**: `decorrelate_returns_prefetch`  
+   - **Target ID**: `t4`  
+   - **Relevance**: 0.90  
+   - **Hypothesis**: Convert returns joins to set operations. Precompute returns aggregates by `(item_sk, order_number)` as CTEs, then join to sales via keys.  
+   - **Target IR**: `fe4ed6f8f1b0d0b5` (ssr WHERE)  
+   - **Examples**: `pg_shared_scan_decorrelate`, `multi_dimension_prefetch`  
+   - **Why**: Directly targets nested loop on returns (e.g., `Index Scan on store_returns (rows=0, time=0.561)`), which processes rows per sales record.
+
+3. **Rescue (F+E)**:  
+   - **Family**: F (Join Transform) + E (Materialization)  
+   - **Transform**: `explicit_join_reuse_dims`  
+   - **Target ID**: `t5`  
+   - **Relevance**: 0.85  
+   - **Hypothesis**: Fix t2’s literal mismatch. Convert comma joins to `INNER JOIN` with precomputed dimensions. Enforce join order: filtered dimensions → sales → returns.  
+   - **Target IR**: `S0` (entire statement)  
+   - **Examples**: `pg_explicit_join_materialized`, `multi_dimension_prefetch`  
+   - **Why**: Rescues t2’s sound join restructuring while preserving t1’s dimension prefetch.
+
+4. **Novel (A+B)**:  
+   - **Family**: A (Early Filtering) + B (Decorrelation)  
+   - **Transform**: `push_filters_decorrel

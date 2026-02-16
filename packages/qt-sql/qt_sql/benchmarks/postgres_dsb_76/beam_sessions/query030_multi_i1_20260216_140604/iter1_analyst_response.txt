@@ -1,0 +1,80 @@
+### Analysis of Latest Iteration Results
+
+**WIN Patch (t2 - Family A: Predicate Pushback)**
+- **Improved Operator**:  
+  `Seq Scan on web_returns (rows=255, time=37.942 ms)`  
+  vs original `Seq Scan on web_returns (rows=6084, time=196.791 ms)`  
+- **Structural Change**:  
+  Pushed `wr_reason_sk IN (22,23)` into CTE early, reducing rows scanned by 24x.  
+- **Most Expensive Remaining Operator**:  
+  `CTE Scan (ctr1) (rows=1, time=43.777 ms)` - Correlated subquery execution on CTE.
+
+**NEUTRAL Patches (t1, syn_w2, syn_w3)**
+- **Regressed Operator**:  
+  `Nested Loop (rows=1, time=82.058 ms)` in decorrelation/materialized CTE approaches.  
+- **Why Backfired**:  
+  Decorrelation added expensive joins with `state_averages` CTE (scanning 252 rows) without reducing correlated subquery cost. Materialization duplicated work without reducing row counts.
+
+**Winner Classification**:  
+- **t2 (A)** and decorrelation **(B)** are **COMPLEMENTARY** - t2 optimized CTE build (A), while decorrelation targets main query bottleneck (B).
+
+---
+
+### Target Design for Round 1
+
+#### Primary Target: Combine t2 (A) + Decorrelation (B)  
+**Hypothesis**: t2 reduced CTE size (1 row), making decorrelation cheap. Eliminate correlated subquery by precomputing state averages.  
+**Target IR**:  
+1. Keep `wr_reason_sk` push from t2 (by_node_id: S0, `replace_where_predicate`)  
+2. Replace correlated subquery (by_anchor_hash: `bef68d6eb401aa50`) with `state_averages` CTE join.  
+```json
+{
+  "family": "A+B",
+  "transform": "push_reason_then_decorrelate",
+  "target_id": "t1",
+  "relevance_score": 0.97,
+  "hypothesis": "After t2 reduced CTE to 1 row, decorrelation avoids per-row subquery. State averages join becomes trivial.",
+  "target_ir": "S0: replace_where_predicate (add wr_reason_sk IN). bef68d6eb401aa50: replace_expr_subtree (decorrelate subquery).",
+  "recommended_examples": ["pg_date_cte_explicit_join", "shared_scan_decorrelate"]
+}
+```
+
+#### Secondary Target: Push State Filter into CTE (A)  
+**Hypothesis**: Filter `ca_state IN (...)` earlier to reduce CTE groups. Targets expensive `web_returns` scan (255 rows in t2).  
+**Target IR**:  
+Add `ca_state IN (...) ` to CTE WHERE (by_node_id: S0, `replace_where_predicate`).  
+```json
+{
+  "family": "A",
+  "transform": "push_state_into_cte",
+  "target_id": "t2",
+  "relevance_score": 0.85,
+  "hypothesis": "Filter states during CTE build to reduce grouping rows. Targets web_returns scan (255 rows @37ms in t2).",
+  "target_ir": "S0: replace_where_predicate (add ca_state IN).",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+#### Tertiary Target: Materialize Small CTE (E)  
+**Hypothesis**: With CTE reduced to 1 row (t2), materialization accelerates main query scans.  
+**Target IR**:  
+Add `MATERIALIZED` to CTE definition (by_node_id: S0, `replace_from`).  
+```json
+{
+  "family": "E",
+  "transform": "materialize_tiny_cte",
+  "target_id": "t3",
+  "relevance_score": 0.75,
+  "hypothesis": "1-row CTE benefits from materialization to avoid re-compute during subquery.",
+  "target_ir": "S0: replace_from (add MATERIALIZED).",
+  "recommended_examples": ["multi_dimension_prefetch"]
+}
+```
+
+---
+
+### Why Not Other Families?
+- **C (Agg Pushdown)**: Group keys ≠ join keys.  
+- **D (Set Ops)**: No INTERSECT/UNION in query.  
+- **F (Join Transform)**: Implicit joins already optimized in t2.  
+- **Novel Targets Unnecessary**: t2 + decorrelation covers primary bottlenecks.

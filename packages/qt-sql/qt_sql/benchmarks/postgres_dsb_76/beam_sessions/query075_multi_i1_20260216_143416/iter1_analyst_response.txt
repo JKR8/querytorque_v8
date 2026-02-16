@@ -1,0 +1,66 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t4 (NEUTRAL):**
+- **Operator Changes**:  
+  - Seq Scan on store_returns: 829.623 ms (vs 635.775 ms original)  
+  - Seq Scan on catalog_returns: 149.534 ms (vs 91.618 ms original)  
+  - Seq Scan on web_returns: 188.354 ms (vs 97.178 ms original)  
+- **Why It Backfired**:  
+  The aggregation pushdown increased row counts (e.g., catalog_returns jumped from 52,609 to 78,913 rows) due to suboptimal pre-filtering. The expensive sequential scans on returns tables became slower because the structural change didn’t reduce input rows to these operators.  
+
+**No Winners Identified**:  
+All other patches failed. No complementary/redundant winners to analyze.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+Sequential scans on returns tables (`store_returns`, `catalog_returns`, `web_returns`) dominate runtime (635 ms, 91 ms, 97 ms respectively). These scans are unindexed and process 517K+ rows each.
+
+**Target Design Rationale**:  
+1. **Combination Target (A+C)**: Pre-aggregate returns tables *before* joins to reduce row counts feeding into nested loops.  
+2. **Refinement Target (A)**: Push `reason_sk` filters deeper into returns tables to minimize scanned rows.  
+3. **Rescue Target (F)**: Fix t2’s self-join rewrite to avoid CTE re-scans while preserving gains.  
+4. **Novel Target (E)**: Materialize filtered items early to avoid repeated dimension scans.
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "preagg_returns_early_filter",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Pre-aggregate returns tables by (order_number, item_sk) with early reason_sk filtering to reduce nested loop input rows. Targets Seq Scans on returns tables (517K+ rows, 635ms).",
+    "target_ir": "S0: Replace LEFT JOINs in UNION branches with LEFT JOINs to preaggregated CTEs: (SELECT order, item_sk, SUM(return_qty), SUM(return_amt) FROM returns WHERE reason_sk IN (...) GROUP BY order, item_sk)",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A",
+    "transform": "push_reason_filter",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Isolate reason_sk filter directly on returns tables before joins. Targets Seq Scan on store_returns (517K rows, 635ms) by reducing input rows.",
+    "target_ir": "S0: Anchor [WHERE clause] → Move cr/sr/wr_reason_sk filters into dedicated returns-table subqueries.",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "self_join_to_conditional",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix t2’s self-join rewrite: Compute curr_yr/prev_yr via conditional aggregation in one CTE scan. Avoids nested loop (50 rows, 1360ms) and CTE re-scans.",
+    "target_ir": "S0: Replace FROM all_sales curr_yr, prev_yr → FROM (SELECT ..., SUM(CASE WHEN d_year=1999 THEN sales_cnt END) AS curr_yr_cnt, ... FROM all_sales GROUP BY brand, class, ...)",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_home_items",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Materialize filtered items (i_category='Home') to avoid 3 repeated scans (Seq Scan: 8638 rows, 20ms; Index Scans: 2x).",
+    "target_ir": "S0: Insert CTE home_items AS (SELECT ... FROM item WHERE i_category='Home') → Replace all item joins with home_items.",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

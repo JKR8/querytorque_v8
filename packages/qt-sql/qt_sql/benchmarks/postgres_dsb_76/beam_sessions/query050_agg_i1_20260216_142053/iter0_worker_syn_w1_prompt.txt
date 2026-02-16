@@ -1,0 +1,197 @@
+## Role
+
+You are **W1 "Reducer"** — Cardinality reduction — WHERE filters, set operations, early pruning. Reduce row counts early: push predicates into CTEs, convert set operations to EXISTS/NOT EXISTS, apply early filtering before expensive joins.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: A — early_filter
+**Hypothesis**: Synthetic target for Reducer: Cardinality reduction — WHERE filters, set operations, early pruning. Apply early_filter patterns to the query.
+
+## Original SQL
+
+```sql
+select 
+   s_store_name
+  ,s_company_id
+  ,s_street_number
+  ,s_street_name
+  ,s_street_type
+  ,s_suite_number
+  ,s_city
+  ,s_county
+  ,s_state
+  ,s_zip
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 30) and
+                 (sr_returned_date_sk - ss_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 60) and
+                 (sr_returned_date_sk - ss_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 90) and
+                 (sr_returned_date_sk - ss_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   store_sales
+  ,store_returns
+  ,store
+  ,date_dim d1
+  ,date_dim d2
+where
+    d2.d_year = 2000
+and d2.d_moy  = 8
+and ss_ticket_number = sr_ticket_number
+and ss_item_sk = sr_item_sk
+and ss_sold_date_sk   = d1.d_date_sk
+and sr_returned_date_sk   = d2.d_date_sk
+and ss_customer_sk = sr_customer_sk
+and ss_store_sk = s_store_sk
+and d1.d_date between (d2.d_date - interval '120 day')
+               and d2.d_date
+group by
+   s_store_name
+  ,s_company_id
+  ,s_street_number
+  ,s_street_name
+  ,s_street_type
+  ,s_suite_number
+  ,s_city
+  ,s_county
+  ,s_state
+  ,s_zip
+order by s_store_name
+        ,s_company_id
+        ,s_street_number
+        ,s_street_name
+        ,s_street_type
+        ,s_suite_number
+        ,s_city
+        ,s_county
+        ,s_state
+        ,s_zip
+limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, store_returns, store, date_dim d1, date_dim d2
+    WHERE [b621d655cfd44fb4]: d2.d_year = 2000 AND d2.d_moy = 8 AND ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_ite...
+    GROUP BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    ORDER BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  CTE: d2_dates  (via Q1)
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy = 8
+  CTE: d1_date_bounds  (via Q2)
+    FROM: d2_dates
+    SELECT: min(d_date) as min_d2_date, max(d_date) as max_d2_date
+  CTE: d1_dates  (via Q3)
+    FROM: date_dim
+    WHERE: d_date BETWEEN (min_d2_date - interval '120 day') AND max_d2_date
+  CTE: filtered_sales  (via Q4)
+    SELECT: ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, d1_dates.d_date as sold_date
+    FROM: store_sales
+    INNER JOIN: d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk
+  CTE: filtered_returns  (via Q5)
+    SELECT: sr_ticket_number, sr_item_sk, sr_customer_sk, d2_dates.d_date as return_date
+    FROM: store_returns
+    INNER JOIN: d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk
+  MAIN QUERY (via Q0)
+    FROM: filtered_sales
+    INNER JOIN: filtered_returns ON 
+        filtered_sales.ss_ticket_number = filtered_returns.sr_ticket_number
+        AND filtered_sales.ss_item_sk = filtered_returns.sr_item_sk
+        AND filtered_sales.ss_customer_sk = filtered_returns.sr_customer_sk
+    INNER JOIN: store ON filtered_sales.ss_store_sk = store.s_store_sk
+    WHERE: filtered_sales.sold_date BETWEEN (filtered_returns.return_date - interval '120 day') AND filtered_returns.return_date
+    GROUP BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    ORDER BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_date_cte_explicit_join",
+  "dialect": "postgres",
+  "description": "Isolate a selective date_dim filter into a CTE AND convert all comma-separated joins to explicit JOIN syntax. The combination is key on PostgreSQL - the CTE alone can hurt, but CTE + explicit JOINs together enable better hash join planning with a tiny probe table.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_dates",
+        "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1193 + 23"
+      },
+      "description": "Insert CTE 'filtered_dates' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "c20744375cf92d6b"
+      },
+      "payload": {
+        "expr_sql": "cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5"
+      },
+      "description": "Replace WHERE predicate with optimized version"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

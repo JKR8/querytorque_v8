@@ -1,0 +1,104 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Regression Patches**:
+
+1. **t1 (Family E) - 0.50x REGRESSION**:
+   - Expensive operator: `Seq Scan on store_sales (rows=987998, time=2303.653 ms)`  
+   - Why it backfired: Replaced efficient `Index Only Scan on store_sales` (original: 1018 rows, 2.453 ms) with a full sequential scan. Materializing the entire `store_sales` with `ss_list_price` filter bloated intermediate rows (1.97M) before joins, overwhelming the pipeline.
+
+2. **t3 (Family A) - 0.49x REGRESSION**:
+   - Expensive operator: `Seq Scan on store_sales (rows=987998, time=2257.822 ms)`  
+   - Why it backfired: Pushing item filters into CTEs didn't prevent the sequential scan on `store_sales`. The CTE materialization forced full table scans instead of leveraging indexes, increasing row counts 194x vs original.
+
+3. **t2 (Family F) - 0.62x REGRESSION**:
+   - Expensive operator: `CTE Scan (s1) (rows=1975996, time=1105.541 ms)`  
+   - Why it backfired: Restructuring joins didn't address the core bottleneck. The CTE for `store_sales` still materialized 1.97M rows, drowning downstream joins.
+
+4. **t4 (Family C) - FAIL**:
+   - Failed due to missing column references (`c_current_addr_sk`, etc.) in the rewritten query. The aggregation pushdown idea was structurally sound but implemented incorrectly.
+
+**Primary Bottleneck**:  
+The `Nested Loop (rows=248158, time=612.57 ms)` feeding into `Sort (rows=248157, time=672.069 ms)` is the root cause. It generates 248K rows by joining `date_dim` and `store_sales` before applying customer/item filters. This forces expensive sorting and bloats intermediate data.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Target (Combination: A+C)**  
+- **Family**: A+C  
+- **Transform**: `early_filter_plus_aggregate`  
+- **Target ID**: t1  
+- **Relevance**: 0.95  
+- **Hypothesis**: Combine early filtering (Family A) on customer/demographics/date with aggregation pushdown (Family C) on `ss_ticket_number`. This reduces input to the bottleneck `Nested Loop` (248K rows) by:  
+  1. Pushing `cd_marital_status='D'`, `cd_education_status='College'`, and `d_year` filters into a CTE (Family A)  
+  2. Aggregating `store_sales` by `ss_ticket_number` before joining items (Family C)  
+- **Target IR**: `S0` + `WHERE [2dafc52d90775c79]` (replace FROM clause and predicate subtree)  
+- **Examples**: `pg_date_cte_explicit_join`, `pg_materialized_dimension_fact_prefilter`  
+
+**Secondary Target (Refinement: C)**  
+- **Family**: C  
+- **Transform**: `fixed_ticket_aggregate`  
+- **Target ID**: t2  
+- **Relevance**: 0.90  
+- **Hypothesis**: Rescue t4's aggregation idea by fixing missing columns. Pre-aggregate `store_sales` after applying `d_year` and `ss_list_price` filters, grouping by `ss_ticket_number` and `ss_item_sk`. This slashes input to the costly `Nested Loop` from 248K rows to <50K (based on gold example trends).  
+- **Target IR**: `S0` (replace entire FROM clause)  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+**Tertiary Target (Novel: E+A)**  
+- **Family**: E+A  
+- **Transform**: `prefetch_filtered_sales`  
+- **Target ID**: t3  
+- **Relevance**: 0.85  
+- **Hypothesis**: Prefetch `store_sales` with `ss_list_price` and `d_year` filters in a CTE (Family E), then push customer/demographics filters into the CTE (Family A). Avoids regressions by retaining index scans and reducing rows before joining items. Targets the `Sort` operator (672 ms) by cutting input rows early.  
+- **Target IR**: `S0` (replace FROM clause)  
+- **Examples**: `multi_dimension_prefetch`, `pg_date_cte_explicit_join`  
+
+**Fallback Target (Rescue: F)**  
+- **Family**: F  
+- **Transform**: `join_restructure_no_cte`  
+- **Target ID**: t4  
+- **Relevance**: 0.75  
+- **Hypothesis**: Restructure joins without materializing CTEs. Convert comma joins to explicit `INNER JOIN` and enforce optimal join order: `date_dim → store_sales (s1) → customer → demographics → items`. Prevents the 1.97M-row CTE scan from t2.  
+- **Target IR**: `S0` (replace FROM clause)  
+- **Examples**: `pg_explicit_join_materialized`  
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_plus_aggregate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Reduce input to bottleneck Nested Loop (248K rows) by pushing customer/demographics/date filters early (A) and aggregating store_sales by ticket (C).",
+    "target_ir": "S0 + WHERE [2dafc52d90775c79]",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "C",
+    "transform": "fixed_ticket_aggregate",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Rescue t4's aggregation pushdown by including missing columns. Pre-aggregate filtered store_sales to slash Nested Loop input rows.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E+A",
+    "transform": "prefetch_filtered_sales",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Prefetch store_sales with list_price/year filters (E) and push customer/demographics filters (A) to avoid CTE bloat and retain index scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "join_restructure_no_cte",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Restructure joins explicitly without CTEs to enforce optimal join order and prevent full store_sales scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

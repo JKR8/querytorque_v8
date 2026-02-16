@@ -1,0 +1,88 @@
+### Step 1 — Compare EXPLAIN Plans  
+**Analysis of t1 (0.54x REGRESSION) vs Original**:  
+- 🔴 **Expensive New Operator**: `Seq Scan on store_sales` (1507.82 ms, 658k rows) replaced efficient `Index Only Scan on store_sales` (2.453 ms, 1018 rows).  
+- **Why Backfired**: Materializing `filtered_store_sales` CTE disabled index usage, forcing full table scans. The `Hash Join` (5119 ms) became bottleneck due to inflated intermediate rows (316k vs original 65k in nested loops).  
+
+**t2/t3**: Both failed syntactically (invalid reference/transaction error), so no plan comparison possible.  
+
+**Winner Classification**: No winners in Iteration 1. All attempts either regressed or failed.  
+
+---
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**:  
+- Original plan's `Merge Join` (701 ms, 85k rows) and `Sort` (672 ms, 248k rows) dominate runtime due to late filtering and large intermediate sets.  
+
+**Target Design** (Prioritized):  
+
+1. **Combination (A+F)**:  
+   - **Family**: Early Filtering + Join Transform  
+   - **Transform**: `explicit_join_with_early_filters`  
+   - **Hypothesis**: Restructure joins to explicit INNER JOINs (Family F) while pushing `item`/`date_dim` filters into CTEs (Family A). Targets `Merge Join` (85k rows) and `Sort` (248k rows) by reducing input early.  
+   - **Target IR**: `S0:FROM` (anchor: implicit joins) + `S0:WHERE` (anchor: `2dafc52d90775c79`)  
+   - **Examples**: `pg_explicit_join_materialized` + `pg_date_cte_explicit_join`  
+
+2. **Refinement (E)**:  
+   - **Family**: Materialization/Prefetch  
+   - **Transform**: `prefetch_filtered_sales`  
+   - **Hypothesis**: Materialize `store_sales` with `ss_list_price` filter once (avoid duplicate scans). Targets both `Index Only Scan on store_sales` operators (1018 rows each) in original plan.  
+   - **Target IR**: `S0:SELECT` (insert CTE before main query)  
+   - **Examples**: `multi_dimension_prefetch`  
+
+3. **Rescue (C)**:  
+   - **Family**: Aggregation Pushdown  
+   - **Transform**: `ticket_aggregate_fix`  
+   - **Hypothesis**: Fix t2's syntax error by aggregating `ss_ticket_number` early. Reduces rows before joining `item2` (targeting `Nested Loop` with 6.5k rows).  
+   - **Target IR**: `S0:GROUP BY` (replace grouping logic)  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+4. **Novel (A+E)**:  
+   - **Family**: Early Filtering + Materialization  
+   - **Transform**: `filtered_sales_and_dates_cte`  
+   - **Hypothesis**: Combine date/year filter + `store_sales` price filter into a CTE. Targets `Sort` (248k rows) and `Index Only Scan on date_dim` (244 rows).  
+   - **Target IR**: `S0:SELECT` (insert CTE)  
+   - **Examples**: `pg_date_cte_explicit_join` + `multi_dimension_prefetch`  
+
+---
+
+### Final Targets (JSON)  
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "explicit_join_with_early_filters",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Replace comma joins with explicit INNER JOINs while pushing item/date filters into CTEs to reduce Merge Join (85k rows) and Sort (248k rows) input sizes.",
+    "target_ir": "S0:FROM",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_filtered_sales",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Materialize store_sales with price filter to avoid duplicate scans, targeting both Index Only Scans (1018 rows each).",
+    "target_ir": "S0:SELECT",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "ticket_aggregate_fix",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Fix syntax for early ss_ticket_number aggregation to reduce Nested Loop (6.5k rows) input.",
+    "target_ir": "S0:GROUP BY",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A+E",
+    "transform": "filtered_sales_and_dates_cte",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Combine date/year and store_sales filters in CTE to reduce Sort (248k rows) and date_dim scan (244 rows).",
+    "target_ir": "S0:SELECT",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  }
+]
+```

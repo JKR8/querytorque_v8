@@ -1,0 +1,53 @@
+Based on the analysis of the query structure, optimization history, and available families, I identify the primary bottleneck as **repeated full scans of the large CTE due to self-join patterns**. The CTE `inv` is computed once but scanned twice for the self-join, and the current implementation doesn't leverage month-based filtering early enough. 
+
+### Step 1: EXPLAIN Plan Comparison (Synthetic Reconstruction)
+Since actual EXPLAIN plans are unavailable, I reconstruct the likely bottlenecks based on query structure and error patterns:
+
+- **Original Bottleneck**: Full aggregation over inventory/year → CTE materialization → self-join with month filters applied late
+- **Family F (Window) Failure**: Syntax error in window implementation (missing FROM alias) prevented testing the core idea
+- **Family B Failure**: Transaction error masked potential benefits of month prefiltering
+- **Common Thread**: All failures stem from implementation errors, not structural flaws in the optimization hypotheses
+
+### Step 2: Target Designs (Prioritized)
+
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "early_month_filter_with_window",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Pushing d_moy filter into CTE reduces aggregation workload by 10x (est. 12→2 months). Replacing self-join with window avoids duplicate CTE scans and sort-merge join.",
+    "target_ir": "S0: Replace WHERE [ceb681f4fee117f7] with 'd_moy IN (5,6) AND ...'. Replace Q_S0 FROM with window CTE using LEAD(). S1: Analogous with cov filter.",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "B+E",
+    "transform": "decorrelate_month_prefetch",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Prefiltering months 5-6 in CTE enables single-pass computation. Materialized CTE prevents re-execution for inv1/inv2.",
+    "target_ir": "S0/S1: Insert CTE_Q_S0_inv WHERE [ceb681f4fee117f7] with 'd_moy IN (5,6) AND ...'. Add MATERIALIZED hint to CTE.",
+    "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "aggregate_before_joins",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Aggregating inventory before dimension joins reduces input rows to fact-dimension joins.",
+    "target_ir": "S0/S1: Replace CTE_Q_S0_inv FROM with: (AGG(inventory) → JOIN item/warehouse/date_dim)",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```
+
+### Rationale
+1. **Primary Target (A+F)**: Combines month prefiltering (A) with self-join elimination (F). Directly attacks the twin bottlenecks of oversized CTE and expensive join. Window functions avoid materializing two CTE instances.
+2. **Fallback Target (B+E)**: Prefilters months and materializes CTE. Safer alternative if window functions prove problematic, still avoids duplicate computation.
+3. **Aggregation Target (C)**: Reduces input to dimension joins. Though riskier without cardinality data, the fact that GROUP BY keys = join keys makes this viable.
+
+### Key Avoidance
+- No redundant targets for D (no set operations) or repeated A-only (already attempted)
+- All designs preserve semantic equivalence
+- Focus on structural changes proven in gold examples

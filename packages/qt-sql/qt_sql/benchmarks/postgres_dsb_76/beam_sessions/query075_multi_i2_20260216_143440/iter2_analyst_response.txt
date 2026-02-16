@@ -1,0 +1,100 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (1.62x WIN) Analysis**  
+- **Improved operator**: Eliminated `Nested Loop (rows=198, time=1966.84)` and `CTE Scan (curr_yr) (rows=1109, time=1668.688)` from original plan.  
+- **Structural change**: Replaced self-join with window functions (`LAG()` over partitions), avoiding full CTE materialization and nested-loop join.  
+- **Most expensive remaining operator**: `Append (rows=6763, time=994.903)` with web sales branch `Nested Loop (rows=2337, time=595.807)` due to sequential scans on large returns tables.  
+
+**t3 (1.11x WIN) Analysis**  
+- **Improved operator**: Reduced `Nested Loop (rows=198, time=1280.423)` vs original (1966.84ms) by pre-filtering CTEs (`filtered_curr_yr`, `filtered_prev_yr`).  
+- **Structural change**: Replaced comma-join with explicit `INNER JOIN` + pre-aggregated CTE scans for years.  
+- **Most expensive remaining operator**: `Append (rows=6763, time=912.727)` with catalog/web sales branches (439-514ms each) due to unoptimized returns table scans.  
+
+**Winner Classification**:  
+- **COMPLEMENTARY** (different structural changes):  
+  - t1 optimized main-query join (window functions vs nested loop).  
+  - t3 optimized CTE filtering (pre-aggregation vs full scan).  
+- **Shared bottleneck**: `Append` node (UNION branches) dominates runtime in both winners (55-60% of total time).
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: t1 (1.62x winner) as it addresses the costliest original operator (main-query nested loop).
+
+#### Target 1: Combination (t1 + Early Filtering)  
+**Family**: A+E  
+**Transform**: `push_returns_filter_and_precompute_items`  
+**Target ID**: t1  
+**Relevance**: 0.95  
+**Hypothesis**: Push `cr/sr/wr_reason_sk` filters into returns table scans and precompute filtered `item` CTE. Reduces `Seq Scan on *_returns` rows (original: 782k/794k/773k rows) and avoids repeated `item` scans.  
+**Target IR**: `CTE_Q_S0_all_sales` → `sales_detail` subqueries  
+**Examples**: `pg_date_cte_explicit_join`, `multi_dimension_prefetch`
+
+#### Target 2: Refinement (t1 + Aggregation Pushdown)  
+**Family**: C  
+**Transform**: `preaggregate_returns`  
+**Target ID**: t1  
+**Relevance**: 0.85  
+**Hypothesis**: Pre-aggregate returns by `(order_number, item_sk)` before joining sales. Reduces input rows to `Nested Loop` in web/catalog branches (original: 154k/119k rows).  
+**Target IR**: `CTE_Q_S0_all_sales` → `sales_detail` LEFT JOINs  
+**Examples**: `pg_materialized_dimension_fact_prefilter`
+
+#### Target 3: Rescue (t1 + Optimized Precomputation)  
+**Family**: E+A  
+**Transform**: `precompute_filtered_items_and_returns`  
+**Target ID**: t1  
+**Relevance**: 0.80  
+**Hypothesis**: Precompute filtered returns (`reason_sk IN (...)`) and items (`category='Children'`) as CTEs. Fixes t2’s failure by explicitly replacing tables in all 3 UNION branches.  
+**Target IR**: `sales_detail` subqueries → `FROM` clauses  
+**Examples**: `multi_dimension_prefetch`, `pg_date_cte_explicit_join`
+
+#### Target 4: Novel (t1 + Join Transform)  
+**Family**: F  
+**Transform**: `convert_union_to_join`  
+**Target ID**: t1  
+**Relevance**: 0.75  
+**Hypothesis**: Replace `UNION` with single query using `CASE`/`COALESCE` on `*_sales` tables. Eliminates `Append` materialization cost (original: 20290 rows gathered).  
+**Target IR**: `CTE_Q_S0_all_sales` → `sales_detail`  
+**Examples**: `pg_explicit_join_materialized`
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "push_returns_filter_and_precompute_items",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Push returns reason_sk filters into table scans and precompute filtered item CTE to reduce Seq Scan rows (original: 782k/794k/773k) and avoid repeated item scans.",
+    "target_ir": "CTE_Q_S0_all_sales → sales_detail subqueries",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_returns",
+    "target_id": "t1",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-aggregate returns by (order_number, item_sk) before joining sales to reduce Nested Loop input rows (original: 154k/119k in web/catalog branches).",
+    "target_ir": "CTE_Q_S0_all_sales → sales_detail LEFT JOINs",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E+A",
+    "transform": "precompute_filtered_items_and_returns",
+    "target_id": "t1",
+    "relevance_score": 0.80,
+    "hypothesis": "Precompute filtered returns (reason_sk) and items (category) as CTEs to avoid repeated scans. Fixes t2's failure via explicit table replacement.",
+    "target_ir": "sales_detail subqueries → FROM clauses",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "convert_union_to_join",
+    "target_id": "t1",
+    "relevance_score": 0.75,
+    "hypothesis": "Replace UNION with single query using CASE/COALESCE to eliminate Append materialization cost (original: 20290 rows gathered).",
+    "target_ir": "CTE_Q_S0_all_sales → sales_detail",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

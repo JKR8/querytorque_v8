@@ -1,0 +1,56 @@
+Based on the analysis of the query structure, execution plan, and failed optimizations, the primary bottleneck is the **SetOp (INTERSECT) materialization** (822.46 ms) which processes full intermediate results from all three sales branches. The secondary bottleneck is **repeated dimension table scans** (date_dim scanned 3x, customer scanned 3x) totaling ~10ms per scan.
+
+Here are the optimized targets for the next round:
+
+```json
+[
+  {
+    "family": "D+E",
+    "transform": "intersect_to_exists_with_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Replace INTERSECT with EXISTS to avoid SetOp materialization (822ms) while prefetching dimension tables to eliminate repeated scans. The original plan shows 3 identical date_dim scans (3.5ms each) and 3 customer scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "D+C",
+    "transform": "intersect_to_exists_with_agg_pushdown",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Replace INTERSECT with EXISTS while pushing aggregation to sales tables. The original Nested Loop (422ms) in store_sales branch processes unaggregated rows; pre-aggregating by (ss_customer_sk, ss_sold_date_sk) before joins reduces input to dimension tables.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "safe_multi_dimension_prefetch",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Rescue dimension prefetching (Family E) while preserving original literals. Fixes prior LITERAL MISMATCH by retaining '1200 + 11' expression to eliminate 3x date_dim scans (3.5ms each) and 3x customer scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```
+
+### Key Rationale:
+1. **Primary Target (D+E)**: Combines the most impactful optimizations:
+   - **SetOp Elimination (Family D)**: Targets the 822ms SetOp by converting to EXISTS
+   - **Dimension Prefetch (Family E)**: Eliminates 3x repeated date_dim/customer scans
+   - Complementary as SetOp targets root bottleneck while prefetching handles leaf scans
+
+2. **Secondary Target (D+C)**: Addresses SetOp + expensive Nested Loop:
+   - **Aggregation Pushdown (Family C)**: Reduces rows before the 422ms store_sales Nested Loop
+   - Grouping sales by (customer_sk, date_sk) before joins minimizes row processing
+
+3. **Rescue Target (E)**: Fixes prior implementation error:
+   - Preserves literal `1200 + 11` verbatim to avoid validation failure
+   - Isolates dimension scan reduction as fallback if SetOp rewrite fails
+
+### Avoided Families:
+- **Family B (Decorrelation)**: No correlated subqueries in plan
+- **Family F (Join Transform)**: Comma joins already optimized to nested loops
+- **Family A (Early Filtering)**: Superseded by E's dimension prefetching
+
+All targets strictly preserve original literals to avoid validation failures. The combination approach (D+E) has highest confidence given SetOp dominates runtime while dimension scans are low-hanging fruit.

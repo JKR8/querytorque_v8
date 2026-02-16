@@ -1,0 +1,76 @@
+### Step 1: Compare EXPLAIN Plans
+
+All prior patches failed, so we have no winners to analyze. However, examining the original plan reveals:
+
+**Primary bottleneck**: The sequential scan on `store_sales` (rows=1,333,491, time=2392ms) feeding the CTE is the most expensive operation. This is followed by the expensive Hash Join (rows=629,528, time=3920ms) in the main query due to repeated dimension table scans.
+
+**Failed patch analysis**:
+1. **t1/t2 (Family A)**: Failed due to literal mismatch and targeting errors. The predicate rewrite didn't preserve original values.
+2. **syn_w2 (Family B)**: Checksum mismatch indicates incorrect decorrelation logic altered results.
+3. **syn_w3 (Family E)**: Missing `d_month_seq` column in materialized CTE caused execution failure.
+
+---
+
+### Step 2: Design Targets
+
+**Primary target**: Combine dimension table filtering (Family E) with CTE optimization (Family A) to attack the sequential scan and Hash Join bottlenecks.
+
+#### Target 1: Combine Families E + A (Materialize + Early Filtering)
+```json
+{
+  "family": "E+A",
+  "transform": "prefilter_dimensions_plus_early_cte_filter",
+  "target_id": "t1",
+  "relevance_score": 0.98,
+  "hypothesis": "Prefiltering store/date_dim reduces CTE input rows. Pushing filters into CTE minimizes store_sales scan. Targets sequential scan (1.3M rows) and Hash Join (629K rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 2: Rescue Family B (Decorrelation)
+```json
+{
+  "family": "B",
+  "transform": "safe_decorrelate",
+  "target_id": "t2",
+  "relevance_score": 0.85,
+  "hypothesis": "Fix syn_w2's checksum error by preserving exact grouping logic. Avoid repeated dimension scans seen in Hash Join (629K rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_shared_scan_decorrelate"]
+}
+```
+
+#### Target 3: Novel - CTE Partitioning
+```json
+{
+  "family": "E+F",
+  "transform": "partitioned_cte_plus_join_order",
+  "target_id": "t3",
+  "relevance_score": 0.80,
+  "hypothesis": "Split CTE by time ranges to avoid downstream filtering. Optimize join order to leverage prefiltered dimensions. Targets Hash Join (629K rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+}
+```
+
+#### Target 4: Refine Family A (Early Filtering)
+```json
+{
+  "family": "A",
+  "transform": "literal_safe_predicate_push",
+  "target_id": "t4",
+  "relevance_score": 0.75,
+  "hypothesis": "Correct t2's literal handling. Push store_state filter into CTE to reduce store_sales scan early. Targets sequential scan (1.3M rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+### Key Rationale
+1. **E+A combination** directly attacks the two costliest operators (Seq Scan + Hash Join) by minimizing input rows through dimension prefetching and CTE optimization.
+2. **B rescue** addresses decorrelation potential while avoiding prior equivalence errors.
+3. **Novel partitioning** tackles downstream filtering inefficiencies in the main query.
+4. **A refinement** provides a fallback for early filtering with corrected literal handling.
+
+Quality focus: E+A (98% relevance) and B rescue (85%) are highest-confidence based on plan bottlenecks.

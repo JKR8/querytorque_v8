@@ -1,0 +1,62 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 Regression Analysis (0.03x):**
+- **Expensive New Operator:**  
+  `Nested Loop  (rows=141422865, time=11008.512)`  
+  This operator increased from 0 rows/0ms in original to 141M rows/11s in t1.
+- **Root Cause:**  
+  Decorrelation changed `IN (subquery)` to `IN (CTE)` but eliminated index usage on sales tables. The original plan used efficient `Index Only Scan on store_sales/catalog_sales/web_sales` (0.431-3.34ms), while t1 regressed to `Seq Scan on store_sales/catalog_sales` (674-1165ms). The structural change backfired because:
+  1. Loss of index access on sales tables' `sold_date_sk`
+  2. Massive row inflation (141M rows) from unoptimized joins
+  3. CTE scan forced nested loops instead of merge/hash joins
+
+**No Winners** in history - all prior patches failed. Primary bottleneck remains **repeated date_dim scans** (6 identical scans in original plan at 3.032-3.295ms each).
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck:**  
+Repeated identical scans of `date_dim` for month sequence (6 scans @ ~3.3ms each) and loss of index access on sales tables.
+
+**Target 1: E+F Combination (Materialization + Join Transform)**  
+```json
+{
+  "family": "E+F",
+  "transform": "prefetch_date_range_explicit_join",
+  "target_id": "t1",
+  "relevance_score": 0.97,
+  "hypothesis": "Materialize date_range CTE once to eliminate 5 redundant date_dim scans (saving ~15ms) while maintaining index usage on sales tables via explicit JOIN.",
+  "target_ir": "S0: insert_cte(date_range); CTE_Q_S0_ss_items: replace_from(store_sales, item, customer, date_range), replace_where_predicate(554a3fe2201f4929, 'ss_item_sk=i_item_sk AND ss_sold_date_sk=date_range.d_date_sk AND ss_list_price BETWEEN...'); similarly for cs/ws_items",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+}
+```
+
+**Why:**  
+- **Family E** eliminates redundant `date_dim` scans (original shows 6 identical scans)
+- **Family F** preserves index usage via `INNER JOIN date_range ON sold_date_sk=d_date_sk` instead of `IN (SELECT...)`
+- Targets expensive `Seq Scan on date_dim` (3.295ms) and `Index Only Scan` operators
+
+---
+
+**Target 2: A Refinement (Early Filtering)**  
+```json
+{
+  "family": "A",
+  "transform": "push_sales_filters_into_ctes",
+  "target_id": "t2",
+  "relevance_score": 0.65,
+  "hypothesis": "Push price/i_manager_id filters earlier into CTEs before joins to reduce input to expensive Nested Loop operators (original: 27168 rows input to store_sales scan).",
+  "target_ir": "CTE_Q_S0_ss_items: replace_where_predicate(554a3fe2201f4929, 'ss_item_sk=i_item_sk AND ... AND ss_list_price BETWEEN... AND i_manager_id BETWEEN...')",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+**Why:**  
+- Original shows `Index Only Scan on store_sales` reads 1811 rows before filtering
+- Pushing `ss_list_price BETWEEN` and `i_manager_id BETWEEN` into scan may reduce input to expensive operators
+- Lower confidence than Target 1 (filters may already be pushed)
+
+---
+
+**Only 2 high-quality targets identified.** Quality > quantity - avoid speculative changes given regression history. Focus on core issue: redundant scans and index usage degradation.

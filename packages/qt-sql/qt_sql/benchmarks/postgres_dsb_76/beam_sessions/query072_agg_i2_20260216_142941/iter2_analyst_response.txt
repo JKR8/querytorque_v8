@@ -1,0 +1,99 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Winners**:
+- **t2 (E+F: date_prefetch+join_restructure, 3.63x WIN)**  
+  - **Improved operators**: Eliminated the expensive `Nested Loop` (time=268.744 ms) and `Hash Join` (time=425.363 ms) from the original plan.  
+  - **Structural change**: Prefetched date_dim scans and restructured joins to avoid repeated full scans of dimension tables.  
+  - **Most expensive remaining operator**: `Sort` (time=431.443 ms) — now the primary bottleneck.  
+
+- **syn_w1 (A: early_filter, 1.20x WIN)**  
+  - **Improved operators**: Reduced `Index Scan on catalog_sales` (rows=113,468 → estimated lower) by pushing `d_year=1999` filter earlier.  
+  - **Structural change**: Early filtering on date_dim (d1) before joining with catalog_sales.  
+  - **Most expensive operator**: `Hash Join` (time=425.363 ms) — still dominant.  
+
+**Classification**:  
+- **REDUNDANT**: `syn_w1` is redundant with `t2` since both address the same `catalog_sales` scan.  
+- **COMPLEMENTARY**: `t2` is complementary to other strategies (e.g., `C: Aggregation Pushdown`) as it optimizes different operators (joins vs. aggregation).
+
+**Analysis of FAILs**:  
+- **t4 (E+F+A)**: Failed due to missing `cs_bill_hdemo_sk` in CTE. The structural idea (prefetching dimensions) was sound but implementation errored.  
+- **t5 (A)**, **t6 (C)**, **t7 (E)**: All failed with transaction errors, likely cascading from prior syntax issues. No operator comparison possible.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: Best winner is **t2 (E+F)**. Its plan shows:  
+1. `Sort` (time=431.443 ms) is now the bottleneck.  
+2. `Nested Loop` on `inventory` (rows=0, time=0.0 ms in original) likely increased due to restructured joins.
+
+**Targets**:
+
+1. **Combination (E+F + C)**:  
+   - **Family**: E+F+C  
+   - **Transform**: `prefetch_plus_agg_pushdown`  
+   - **Hypothesis**: After t2’s join restructuring, push aggregation to `inventory` (using Family C) to reduce rows before the expensive `Sort`. Targets the `Sort` (431.443 ms) and `Nested Loop` on `inventory`.  
+   - **Target IR**: `S0` + `replace_from` (add preagg CTE for inventory).  
+   - **Examples**: `fact_agg_pushdown`, `multi_dimension_prefetch`.
+
+2. **Refinement (Address Sort Bottleneck)**:  
+   - **Family**: A  
+   - **Transform**: `push_week_filter`  
+   - **Hypothesis**: Add `d_week_seq` filter to `date_dim` CTE (from t2) to reduce input rows to `Sort`. Targets `Sort` (431.443 ms) by cutting grouping keys early.  
+   - **Target IR**: `S0` + `replace_where_predicate` (anchor hash for `d1.d_week_seq = d2.d_week_seq`).  
+   - **Examples**: `pg_date_cte_explicit_join`.
+
+3. **Rescue t4 (E+F+A)**:  
+   - **Family**: E+F+A  
+   - **Transform**: `prefetch_dates_fixed`  
+   - **Hypothesis**: Fix t4’s column error by including `cs_bill_hdemo_sk` in CTEs. Retain early filtering (A) to reduce `catalog_sales` scan (original: 113,468 rows).  
+   - **Target IR**: `S0` + `replace_from` (CTE with all required columns).  
+   - **Examples**: `multi_dimension_prefetch`.
+
+4. **Novel (Materialize for Sort)**:  
+   - **Family**: E  
+   - **Transform**: `materialize_group_keys`  
+   - **Hypothesis**: Precompute grouping keys (`i_item_desc`, `w_warehouse_name`, `d_week_seq`) in a CTE to offload work from `Sort`. Targets `Sort` (431.443 ms).  
+   - **Target IR**: `S0` + `insert_cte` before `GROUP BY`.  
+   - **Examples**: `multi_dimension_prefetch`.
+
+```json
+[
+  {
+    "family": "E+F+C",
+    "transform": "prefetch_plus_agg_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Reduce input to Sort by pushing aggregation to inventory (preagg CTE) after join restructuring from t2. Targets Sort (431ms) and Nested Loop on inventory.",
+    "target_ir": "S0: replace_from",
+    "recommended_examples": ["fact_agg_pushdown", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "push_week_filter",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Add d_week_seq filter to date_dim CTE to reduce grouping keys before Sort. Targets Sort (431ms).",
+    "target_ir": "S0: replace_where_predicate (ece830e47c29a467)",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E+F+A",
+    "transform": "prefetch_dates_fixed",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Rescue t4: include cs_bill_hdemo_sk in CTEs to fix error while retaining early filtering. Targets catalog_sales scan (113k rows).",
+    "target_ir": "S0: replace_from",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "materialize_group_keys",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Precompute grouping keys in CTE to offload Sort work. Targets Sort (431ms).",
+    "target_ir": "S0: insert_cte (before GROUP BY)",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

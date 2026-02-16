@@ -1,0 +1,102 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (NEUTRAL) vs Original:**
+- 🔴 **Operator that regressed**:  
+  `Nested Loop (rows=43082, time=541.865)`  
+  (Original: `Nested Loop (rows=14361, time=139.646)`)  
+- **Why it backfired**:  
+  Restructuring joins with CTEs disrupted predicate pushdown to `web_sales`, causing 3x more rows (43k vs 14k) in the date_dim-web_sales join. The CTE materialization prevented filter propagation to `web_sales` scans.
+
+**Most expensive operator in t1**:  
+`Nested Loop (rows=43082, time=541.865)`  
+(Drives the entire regression)
+
+---
+
+### Step 2 — Design Targets
+
+**Primary bottleneck**:  
+`Nested Loop (rows=14361, time=139.646)` between `date_dim` and `web_sales`  
+**Secondary bottleneck**:  
+`Nested Loop (rows=2877, time=264.641)` joining results with `web_returns`
+
+**Baseline**: Original query (t1 regressed)
+
+**Targets**:
+
+1. **Combination (A+E)**:  
+   - **Family**: A + E  
+   - **Transform**: `early_filter_with_prefetch`  
+   - **Target ID**: `t1`  
+   - **Relevance**: 0.95  
+   - **Hypothesis**: Prefilter `customer_demographics` (E) and push `customer_address` filters early (A) to reduce rows feeding the expensive nested loops (14361 → target <5k).  
+   - **Target IR**: `S0:by_anchor_hash[edf10a498f1ee83a]` (WHERE clause)  
+   - **Examples**: `multi_dimension_prefetch`, `pg_date_cte_explicit_join`
+
+2. **Refinement (A)**:  
+   - **Family**: A  
+   - **Transform**: `web_sales_net_profit_pushdown`  
+   - **Target ID**: `t2`  
+   - **Relevance**: 0.90  
+   - **Hypothesis**: Move `ws_net_profit` filters directly into `web_sales` scan to reduce output rows (118/row in plan) before joining with `web_returns` (2877 rows).  
+   - **Target IR**: `S0:by_anchor_hash[edf10a498f1ee83a]` (ws_net_profit predicates)  
+   - **Examples**: `pg_date_cte_explicit_join`
+
+3. **Rescue (B)**:  
+   - **Family**: B  
+   - **Transform**: `decorrelate_fixed`  
+   - **Target ID**: `syn_w2_fixed`  
+   - **Relevance**: 0.85  
+   - **Hypothesis**: Fix decorrelation CTEs to avoid transaction errors while eliminating per-row re-scans of `web_sales` (original 14361-row scan done 3x in filters).  
+   - **Target IR**: `S0:by_anchor_hash[edf10a498f1ee83a]` (OR conditions)  
+   - **Examples**: `pg_shared_scan_decorrelate`
+
+4. **Novel (C)**:  
+   - **Family**: C  
+   - **Transform**: `preroll_web_returns_agg`  
+   - **Target ID**: `t3`  
+   - **Relevance**: 0.80  
+   - **Hypothesis**: Pre-aggregate `web_returns` by `(wr_item_sk, wr_order_number)` before joining with `web_sales` to reduce the 2877-row nested loop.  
+   - **Target IR**: `S0:by_node_id[S0]` (FROM clause)  
+   - **Examples**: `pg_materialized_dimension_fact_prefilter`
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "early_filter_with_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefilter customer_demographics (E) and push customer_address filters early (A) to reduce rows feeding the 14361-row nested loop between date_dim and web_sales.",
+    "target_ir": "S0:by_anchor_hash[edf10a498f1ee83a]",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A",
+    "transform": "web_sales_net_profit_pushdown",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Apply ws_net_profit filters during web_sales scan to reduce output rows (118/row) before the 2877-row nested loop with web_returns.",
+    "target_ir": "S0:by_anchor_hash[edf10a498f1ee83a]",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_fixed",
+    "target_id": "syn_w2_fixed",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix decorrelation to eliminate per-row rescans of web_sales (original 14361-row scan repeated in filters) without transaction errors.",
+    "target_ir": "S0:by_anchor_hash[edf10a498f1ee83a]",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "C",
+    "transform": "preroll_web_returns_agg",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Pre-aggregate web_returns by (wr_item_sk, wr_order_number) to shrink the 2877-row nested loop feeding the main join.",
+    "target_ir": "S0:by_node_id[S0]",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

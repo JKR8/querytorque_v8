@@ -1,0 +1,83 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches failed, so there are no winners to analyze. However, the primary bottleneck remains the initial `Nested Loop` between `date_dim` and `store_sales` (rows=168,134, time=1782.541 ms), which dominates execution time.  
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: `Nested Loop` between `date_dim` and `store_sales` (rows=168,134, time=1782.541 ms).  
+**Hypothesis**: The large row count from this join stems from un-pushed filters on `store_sales` (OR conditions on `ss_sales_price`/`ss_net_profit` and dimension joins).  
+
+#### Target 1: Combine Early Filtering + Set Operation Optimization (A+D)  
+- **Family**: A+D  
+- **Transform**: `early_filter_or_to_union_all_fixed`  
+- **Target ID**: `t1_fixed`  
+- **Relevance**: 0.95 (directly attacks bottleneck)  
+- **Hypothesis**: Break OR conditions into 9 branches (3 demographic × 3 address) with UNION ALL. Include `ss_sold_date_sk` and push `d_year=2001`/`s_store_sk` into each branch to eliminate the expensive nested loop.  
+- **Target IR**: `S0` (replace entire FROM/WHERE)  
+- **Examples**: `pg_date_cte_explicit_join`, `pg_intersect_to_exists`  
+
+#### Target 2: Materialization + Join Transform Rescue (E+F)  
+- **Family**: E+F  
+- **Transform**: `dimension_prefetch_explicit_join_fixed`  
+- **Target ID**: `t2_fixed`  
+- **Relevance**: 0.85 (complements A+D by reducing dimension rows)  
+- **Hypothesis**: Prefetch dimensions with necessary columns (`cd_marital_status`, `hd_dep_count`). Remove redundant dimension filters in main query and retain only fact table conditions.  
+- **Target IR**: `S0` (insert CTEs, replace joins)  
+- **Examples**: `multi_dimension_prefetch`, `pg_explicit_join_materialized`  
+
+#### Target 3: Early Filtering + Materialization (A+E)  
+- **Family**: A+E  
+- **Transform**: `push_filters_into_store_sales`  
+- **Target ID**: `t3`  
+- **Relevance**: 0.80 (targets nested loop via prefetch)  
+- **Hypothesis**: Use CTEs to pre-apply dimension filters (`customer_demographics`, `household_demographics`, `customer_address`) and join results directly with `store_sales` to reduce input rows to the nested loop.  
+- **Target IR**: `S0`  
+- **Examples**: `date_cte_isolate`, `multi_dimension_prefetch`  
+
+#### Target 4: Join Transform + Set Operations (F+D)  
+- **Family**: F+D  
+- **Transform**: `explicit_join_then_union`  
+- **Target ID**: `t4`  
+- **Relevance**: 0.75 (fallback for complex ORs)  
+- **Hypothesis**: Convert implicit joins to explicit INNER JOINs, then split OR conditions into UNION ALL subqueries. Isolates branches to leverage indexes.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_explicit_join_materialized`, `pg_intersect_to_exists`  
+
+```json
+[
+  {
+    "family": "A+D",
+    "transform": "early_filter_or_to_union_all_fixed",
+    "target_id": "t1_fixed",
+    "relevance_score": 0.95,
+    "hypothesis": "Break OR conditions into 9 branches (demog × address) with UNION ALL. Push d_year=2001 and store join into each branch to eliminate the 168k-row nested loop.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_intersect_to_exists"]
+  },
+  {
+    "family": "E+F",
+    "transform": "dimension_prefetch_explicit_join_fixed",
+    "target_id": "t2_fixed",
+    "relevance_score": 0.85,
+    "hypothesis": "Prefetch dimensions with all required columns (cd_marital_status, etc.) and remove redundant filters. Join prefiltered dimensions to reduce store_sales scan rows.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A+E",
+    "transform": "push_filters_into_store_sales",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Pre-apply dimension filters via CTEs (customer_demographics, household_demographics) and join directly with store_sales to shrink nested loop input.",
+    "target_ir": "S0",
+    "recommended_examples": ["date_cte_isolate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "F+D",
+    "transform": "explicit_join_then_union",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Convert comma joins to explicit INNER JOINs, then split OR conditions into UNION ALL subqueries to isolate branches and leverage indexes.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_intersect_to_exists"]
+  }
+]
+```

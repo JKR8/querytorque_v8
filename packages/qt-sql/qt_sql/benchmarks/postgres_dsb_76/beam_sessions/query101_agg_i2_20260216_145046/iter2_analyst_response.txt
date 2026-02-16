@@ -1,0 +1,91 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches in Iteration 1 **FAILED** due to literal mismatches (`76 * 0.01` → `0.76`). No winners exist. We must analyze the **original plan** to identify bottlenecks:  
+
+- **Most expensive operator**:  
+  `Nested Loop (rows=1167596, time=182.94)`  
+  - **Why expensive**: Scans `store_returns` 366 times (once per `d1` row) via `Index Only Scan`, generating 1.16M rows.  
+- **Secondary bottleneck**:  
+  `Hash Join (rows=222105, time=476.388)`  
+  - **Why expensive**: Joins 1.16M rows from the loop with 27K `item` rows, outputting 222K rows.  
+- **Tertiary issue**:  
+  `Nested Loop (rows=31479, time=2401.29)`  
+  - **Why expensive**: Processes 222K rows from `Hash Join` through nested index scans on `store_sales`/`customer`.  
+
+---
+
+### Step 2 — Design Targets  
+**Primary bottleneck**: The `Nested Loop` between `date_dim d1` and `store_returns` (1.16M rows).  
+**Hypothesis**: Pre-filter `d1` and `store_returns` early to reduce loop iterations.  
+
+#### Target 1: Early Filtering + Date Prefetch (A+E)  
+- **Family**: A+E  
+- **Transform**: `early_filter_date_prefetch_literal_fix`  
+- **Target IR**: `S0`  
+- **Relevance**: 0.95  
+- **Hypothesis**: Filter `d1` (`d_year=2000`), `item` (`i_category`), and `household_demographics` (`hd_income_band_sk`, `hd_buy_potential`) in CTEs. Precompute `d1`-`d2` pairs to avoid the expensive nested loop. Preserve literals (`76 * 0.01`).  
+- **Recommended Examples**: `pg_date_cte_explicit_join`, `multi_dimension_prefetch`  
+
+#### Target 2: Aggregation Pushdown (C)  
+- **Family**: C  
+- **Transform**: `agg_pushdown_before_joins`  
+- **Target IR**: `S0`  
+- **Relevance**: 0.85  
+- **Hypothesis**: Aggregate sales data by `ss_customer_sk` and `ss_item_sk` before joining with `customer`/`item`. Reduces input to the `Hash Join` (222K rows) and downstream `Nested Loop` (31K rows).  
+- **Recommended Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+#### Target 3: Join Restructure + Literal Fix (F)  
+- **Family**: F  
+- **Transform**: `explicit_join_literal_preserve`  
+- **Target IR**: `S0:f2ece665ad1a915f`  
+- **Relevance**: 0.80  
+- **Hypothesis**: Convert comma joins to explicit `INNER JOIN` and enforce optimal join order: filter `d1` first, then join with `store_returns` and `store_sales`. Preserve literals exactly.  
+- **Recommended Examples**: `pg_explicit_join_materialized`  
+
+#### Target 4: Decorrelation Rescue (B)  
+- **Family**: B  
+- **Transform**: `decorrelate_date_scan`  
+- **Target IR**: `S0`  
+- **Relevance**: 0.75  
+- **Hypothesis**: The `d2.d_date BETWEEN ...` condition acts as a correlated filter. Extract it into a CTE with `d1` dates to avoid per-row recomputation.  
+- **Recommended Examples**: `pg_shared_scan_decorrelate`  
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "early_filter_date_prefetch_literal_fix",
+    "target_id": "S0",
+    "relevance_score": 0.95,
+    "hypothesis": "Filter d1, item, and hd early in CTEs. Precompute d1-d2 date pairs to eliminate the 1.16M-row nested loop. Preserve literals (76 * 0.01) to avoid structural mismatch.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown_before_joins",
+    "target_id": "S0",
+    "relevance_score": 0.85,
+    "hypothesis": "Aggregate store_sales/store_returns by ss_customer_sk and ss_item_sk before joining with customer/item. Reduces input to the 222K-row Hash Join and 31K-row Nested Loop.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_literal_preserve",
+    "target_id": "S0:f2ece665ad1a915f",
+    "relevance_score": 0.80,
+    "hypothesis": "Restructure joins explicitly starting with filtered d1 → store_returns → store_sales. Preserve literal expressions (76 * 0.01) to avoid prior failures.",
+    "target_ir": "S0:f2ece665ad1a915f",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_date_scan",
+    "target_id": "S0",
+    "relevance_score": 0.75,
+    "hypothesis": "Decorrelate d2.d_date BETWEEN... by precomputing valid d1-d2 pairs in a CTE. Eliminates per-row date math in the nested loop.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

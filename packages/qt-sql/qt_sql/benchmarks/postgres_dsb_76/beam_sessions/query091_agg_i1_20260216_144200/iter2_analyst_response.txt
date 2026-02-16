@@ -1,0 +1,63 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches in Iteration 1 **FAILED** due to semantic errors (missing columns or transaction aborts). There are no winners to analyze. The primary bottleneck remains the expensive `Seq Scan on catalog_returns` (719,420 rows, 69.925 ms) in the original plan, which dominates execution time.  
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: Sequential scan on `catalog_returns` (719,420 rows) is the most expensive operation.  
+**Strategy**: Combine Early Filtering (Family A) and Aggregation Pushdown (Family C) to:  
+1. Filter dimension tables early to minimize joins.  
+2. Pre-aggregate `catalog_returns` to reduce rows before expensive joins.  
+
+**Targets** (prioritized):  
+1. **Combination (A+C)**: Early filtering + aggregation pushdown.  
+   - Targets `Seq Scan on catalog_returns` (719k rows) by pre-aggregating it.  
+   - Uses filtered CTEs from Family A to reduce dimension table sizes.  
+2. **Refinement (A+F)**: Early filtering + explicit join restructuring.  
+   - Targets `Nested Loop` operators (300+ rows) by pre-joining dimensions.  
+   - Reduces input rows to nested loops via filtered customer CTE.  
+3. **Rescue (A)**: Fix failed early filtering patch.  
+   - Corrects missing columns in CTEs for GROUP BY references.  
+   - Isolates dimension table filters to reduce join cardinality.  
+4. **Novel (C)**: Aggregation pushdown with key alignment.  
+   - Directly targets `Seq Scan on catalog_returns` via pre-aggregation.  
+   - Aligns GROUP BY keys with join keys to minimize data movement.  
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_then_agg_pushdown",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-aggregate catalog_returns after filtering dimension tables to reduce its 719k-row scan. Pushdown aggregates to shrink intermediate data before joins.",
+    "target_ir": "S0: replace_from (MAIN QUERY) to use CTEs; insert_cte for filtered dimensions and pre-aggregated catalog_returns",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A+F",
+    "transform": "prejoin_dimensions_early_filter",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Pre-join customer with filtered dimensions to reduce nested loop rows (300+ in original). Explicit joins avoid redundant scans.",
+    "target_ir": "S0: replace_from (MAIN QUERY) with explicit JOINs; insert_cte for prejoined customer-demos CTE",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A",
+    "transform": "early_filtering_rescue_fixed",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Fix missing columns in customer_demographics CTE to enable early filtering without breaking GROUP BY. Isolate dimension filters to cut join inputs.",
+    "target_ir": "S0: insert_cte for filtered_customer_demographics (include cd_marital_status/education_status); replace_where_predicate [ac46b9a793b959c6] to reference CTEs",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown_aligned_keys",
+    "target_id": "t4",
+    "relevance_score": 0.75,
+    "hypothesis": "Pre-aggregate catalog_returns on join keys (cr_call_center_sk, cr_returned_date_sk, cr_returning_customer_sk) to shrink 719k-row scan early.",
+    "target_ir": "S0: insert_cte for agg_catalog_returns; replace_from to use aggregated CTE",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

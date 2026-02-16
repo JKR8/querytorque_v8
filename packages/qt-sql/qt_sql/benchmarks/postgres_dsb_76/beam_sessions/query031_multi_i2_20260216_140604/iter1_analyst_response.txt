@@ -1,0 +1,137 @@
+### Step 1 — Compare EXPLAIN Plans
+
+#### Winners (t1 and syn_w1 - Family A)
+**Original bottleneck operator:**  
+`Seq Scan on store_sales (rows=415237, time=4627.233)`  
+**Improved in winner:**  
+`Index Only Scan on store_sales (rows=210, time=1.814)`  
+**Structural change:**  
+Pushed `d_year=1999` and `d_qoy IN (1,2,3)` filters into CTEs. This allowed date_dim to restrict store_sales via index scan, reducing input rows from 415K to 210.  
+**Most expensive remaining operator:**  
+`CTE Scan (ss1) (rows=8, time=355.803)`  
+**Redundancy:**  
+Both winners (t1/syn_w1) are REDUNDANT—identical structural changes (early filtering) targeting the same bottleneck (store_sales scan).
+
+#### Failures (t2 and syn_w2)
+**t2 failure (Family E+F):**  
+Failed due to literal mismatch (removed `1999`/`2`/`3` filters). The plan shows no operator degradation because the query failed semantic validation.  
+**syn_w2 failure (Family B):**  
+Failed due to missing decorrelation target. The query lacks correlated subqueries, making decorrelation inapplicable.
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline:** Best winner (t1) with 2.43x gain.  
+**Primary bottleneck:** CTE Scan (ss1) consuming 99% of runtime (355.803 ms) in the main query's nested loop.  
+**Hypothesis:** The main query self-joins 6 CTE instances (ss1-ss3, ws1-ws3). Restructuring to avoid multiple scans and nested loops could reduce overhead.
+
+#### Target 1: Combination (A+F)  
+- **Family:** A + F  
+- **Transform:** `early_filter_then_self_join_elimination`  
+- **Target IR:** Main query (anchor_hash: `e3d013ee216110fe`)  
+- **Hypothesis:** Replace 6 CTE self-joins with single-pass aggregation (F) while preserving early filters (A). Targets `CTE Scan (ss1)` (355.803 ms) by pivoting quarters into columns, eliminating nested loops.  
+- **SQL Sketch:**  
+  ```sql
+  WITH ss_aggr AS (
+    SELECT ca_county, d_year,
+      SUM(CASE d_qoy WHEN 1 THEN store_sales END) AS q1,
+      SUM(CASE d_qoy WHEN 2 THEN store_sales END) AS q2,
+      SUM(CASE d_qoy WHEN 3 THEN store_sales END) AS q3
+    FROM ss GROUP BY 1, 2
+  ),
+  ws_aggr AS (/* аналогично для ws */)
+  SELECT /* вычисления по q1,q2,q3 */
+  FROM ss_aggr JOIN ws_aggr ON ...
+  WHERE /* условия сравнения кварталов */
+  ```
+- **Confidence:** High. Complementary to A (targets CTE scan vs. store_sales scan).
+
+#### Target 2: Refinement (F)  
+- **Family:** F  
+- **Transform:** `explicit_join_ordering`  
+- **Target IR:** Main query (anchor_hash: `e3d013ee216110fe`)  
+- **Hypothesis:** Convert comma joins to explicit `JOIN` syntax to guide optimizer. Targets residual nested loop over `CTE Scan (ss1)` (355.803 ms) by enabling better join order.  
+- **SQL Sketch:**  
+  ```sql
+  FROM ss ss1
+  JOIN ss ss2 ON ss1.ca_county = ss2.ca_county AND ...
+  JOIN ss ss3 ON ...
+  JOIN ws ws1 ON ...
+  ```
+- **Confidence:** Medium. Low-risk syntactic change with potential plan improvements.
+
+#### Target 3: Rescue (t2)  
+- **Family:** E + F  
+- **Transform:** `prefilter_item_then_pivot`  
+- **Target IR:** Insert CTE `filtered_item` + restructure main query.  
+- **Hypothesis:** Rescue t2 by preserving literals. Precompute `filtered_item` (E) to avoid repeated item scans, then apply main-query pivot (F).  
+- **SQL Sketch:**  
+  ```sql
+  WITH filtered_item AS ( /* item prefilter */ ),
+  ss AS (/* join filtered_item */),
+  /* ... затем pivot из Target 1 */
+  ```
+- **Confidence:** Medium. Fixes t2’s literal mismatch while layering E+F.
+
+#### Target 4: Novel (C)  
+- **Family:** C  
+- **Transform:** `aggregate_before_join`  
+- **Target IR:** CTE `ss` (anchor_hash: `f55d9959a55a5f8c`)  
+- **Hypothesis:** Aggregate store_sales before joining to dimension tables. Since `ca_county` is a customer_address key, aggregate early if `ss_addr_sk` uniquely maps to `ca_county`. Targets large `Hash Join` in CTE (originally 4769 ms).  
+- **SQL Sketch:**  
+  ```sql
+  WITH ss AS (
+    SELECT ss_addr_sk, d_date_sk, SUM(ss_ext_sales_price) AS sales
+    FROM store_sales
+    WHERE /* filters */ 
+    GROUP BY 1, 2
+  )
+  /* затем присоединить date_dim, customer_address */
+  ```
+- **Confidence:** Low. Requires verifying functional dependencies but could reduce join input.
+
+---
+
+### Final Targets (JSON)
+
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "early_filter_then_self_join_elimination",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Replace 6 CTE self-joins with pivoted aggregation to eliminate nested loops targeting CTE Scan (ss1) (355.803 ms). Complements early filtering by optimizing main query.",
+    "target_ir": "Q_S0:e3d013ee216110fe",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_ordering",
+    "target_id": "t1",
+    "relevance_score": 0.75,
+    "hypothesis": "Convert comma joins to explicit JOIN syntax to optimize nested loop over CTE Scan (ss1) (355.803 ms). Low-risk syntactic refinement.",
+    "target_ir": "Q_S0:e3d013ee216110fe",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E+F",
+    "transform": "prefilter_item_then_pivot",
+    "target_id": "t1",
+    "relevance_score": 0.70,
+    "hypothesis": "Rescue t2: precompute filtered_item to avoid repeated scans (E), then apply main-query pivot (F). Preserves literals and targets CTE Scan (ss1).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "aggregate_before_join",
+    "target_id": "t1",
+    "relevance_score": 0.60,
+    "hypothesis": "Aggregate store_sales before joining dimensions if ca_county is functionally dependent on ss_addr_sk. Targets Hash Join (4769 ms in original).",
+    "target_ir": "CTE_Q_S0_ss:f55d9959a55a5f8c",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

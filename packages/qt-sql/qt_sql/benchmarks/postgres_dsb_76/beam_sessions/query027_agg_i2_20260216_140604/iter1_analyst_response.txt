@@ -1,0 +1,71 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t1 (0.26x REGRESSION):**
+- **Operator(s) that got more expensive:**  
+  `Hash Join (rows=1351, time=275.511)` and `Nested Loop (rows=1535039, time=180.56)` became the new bottlenecks.  
+- **Why backfired:**  
+  The aggregation pushdown (Family C) forced a full scan of `customer_demographics` (rows=9147, time=35.226) and a large scan of `store_sales` (rows=1,535,039) *before* applying store/item filters. This increased input rows to the hash join by 3 orders of magnitude vs the original nested loop with index-driven filtering. The pre-aggregation also lost the benefit of the original `store` filter pushdown (rows=1, time=0.046).
+
+**Other patches (t3/t2/syn_w2):**  
+All failed with syntax/column errors, so no operator comparisons possible.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck:**  
+The `Nested Loop` between `date_dim` and `store_sales` (time=519.771 ms) in the original plan. This loop executes 365 times (once per date) due to the index scan pattern.
+
+**Refined Targets:**
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "prefilter_dimensions_materialize",
+    "target_id": "S0",
+    "relevance_score": 0.98,
+    "hypothesis": "Pre-filter all dimension tables (store, item, date_dim, customer_demographics) in CTEs *before* joining with store_sales. Materialize results to break the nested loop. The original Nested Loop took 519ms over 365 date scans. Pre-filtering should reduce store_sales scans to 1.",
+    "target_ir": "S0: replace_from with CTEs for all filtered dimensions",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A+F",
+    "transform": "explicit_join_early_filter",
+    "target_id": "S0",
+    "relevance_score": 0.90,
+    "hypothesis": "Convert implicit joins to explicit INNER JOINs while pushing filters into CTEs. Targets the same Nested Loop (519ms) by enabling hash/merge joins instead of index-driven loops.",
+    "target_ir": "S0: replace_from with explicit JOINs + insert_cte for filtered dimensions",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown_with_dimension_filters",
+    "target_id": "S0",
+    "relevance_score": 0.85,
+    "hypothesis": "Fix t1's regression by adding store/item filters to the pre-aggregation CTE. The original t1 scanned 1.5M store_sales rows (time=180ms). With store/item filters, input to pre_agg should match the original 1-row store scan.",
+    "target_ir": "S0: replace_from with filtered pre_agg (include store/item conditions)",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_fixed",
+    "target_id": "S0",
+    "relevance_score": 0.75,
+    "hypothesis": "Rescue decorrelation by fixing column references. The original Nested Loop (519ms) suggests per-row execution. Standalone CTEs could eliminate correlation.",
+    "target_ir": "S0: replace_from with decorrelated CTEs (corrected column aliases)",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```
+
+**Reasoning:**  
+1. **A+E (Primary):** Directly attacks the 519ms nested loop by materializing all filtered dimensions upfront. Combines predicate pushdown (A) and reuse (E).  
+2. **A+F (Secondary):** Alternative approach to break nested loops via join restructuring + early filtering.  
+3. **C (Rescue):** Fixes t1's critical flaw (missing store/item filters) while preserving aggregation pushdown.  
+4. **B (Fallback):** Addresses potential correlation in the loop pattern as last-resort.  
+
+**Key Evidence from Plans:**  
+- Original bottleneck: `Nested Loop (rows=0, time=519.771)`  
+- t1 failure: `Hash (rows=9147, time=36.561)` from unfiltered dimension scan  
+- t1 regression: `Nested Loop (rows=1535039, time=180.56)` from premature store_sales scan

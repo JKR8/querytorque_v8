@@ -1,0 +1,65 @@
+### Analysis of Optimization Families
+
+**Family A (Early Filtering)**: HIGH  
+The query applies filters on dimension tables (`warehouse`, `ship_mode`, `call_center`) late in the join sequence. Pushing these highly selective filters (e.g., `w_gmt_offset = -5`, `sm_type = 'LIBRARY'`) into CTEs early would drastically reduce the rows processed in the large `catalog_sales` ↔ `date_dim` join.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries exist in this query. The execution plan shows no correlated scans (e.g., `DELIM_SCAN`), making decorrelation irrelevant.
+
+**Family C (Aggregation Pushdown)**: MEDIUM  
+The GROUP BY keys (`w_warehouse_name`, `sm_type`, `cc_name`) are functionally dependent on dimension tables. Aggregating `catalog_sales` by foreign keys (`cs_warehouse_sk`, etc.) before joining to dimensions could reduce intermediate data volume by ~1000x (25870 rows → ~25 groups).
+
+**Family D (Set Operations)**: LOW  
+The query contains no `UNION`/`INTERSECT` operations. The execution plan shows no set-operation bottlenecks.
+
+**Family E (Materialization)**: HIGH  
+Dimension tables (`ship_mode`, `warehouse`, `call_center`) are tiny and repeatedly scanned. Materializing them as CTEs would allow single-pass scanning and enable better join ordering.
+
+**Family F (Join Transform)**: HIGH  
+Implicit comma joins force suboptimal join order (starting with large fact-table joins). Restructuring to explicit joins with filtered dimension CTEs first would reduce the `catalog_sales` ↔ `date_dim` join cardinality by leveraging dimension constraints early.
+
+**Chosen families**: A, C, E, F  
+**Confidence**: High (plan shows 25870-row intermediate join, reduced to 1287 only after late dimension filters)
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "F",
+    "transform": "join_restructure_dimension_first",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Current join order processes 25,870 rows in date_dim ↔ catalog_sales before applying highly selective dimension filters (2-row warehouse, 3-row ship_mode). Restructuring joins to prioritize dimension tables reduces fact-table rows early.",
+    "target_ir": "S0 [SELECT]\n  CTE: dim_w (via Q1)\n    FROM: warehouse\n    WHERE: w_gmt_offset = -5\n  CTE: dim_sm (via Q2)\n    FROM: ship_mode\n    WHERE: sm_type = 'LIBRARY'\n  CTE: dim_cc (via Q3)\n    FROM: call_center\n    WHERE: cc_class = 'medium'\n  MAIN QUERY (via Q0)\n    FROM: catalog_sales\n    JOIN dim_w ON cs_warehouse_sk = w_warehouse_sk\n    JOIN dim_sm ON cs_ship_mode_sk = sm_ship_mode_sk\n    JOIN dim_cc ON cs_call_center_sk = cc_call_center_sk\n    JOIN date_dim ON cs_ship_date_sk = d_date_sk\n    WHERE: d_month_seq BETWEEN 1191 AND 1191+23 AND cs_list_price BETWEEN 244 AND 273\n    GROUP BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name\n    ORDER BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "aggregate_before_dimension_join",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "GROUP BY keys map to dimension tables. Aggregating catalog_sales by foreign keys + date filters before joining to dimensions reduces rows 100x (25k → ~250 groups), minimizing expensive string operations in final GROUP BY.",
+    "target_ir": "S0 [SELECT]\n  CTE: agg_cs (via Q1)\n    FROM: catalog_sales\n    JOIN date_dim ON cs_ship_date_sk = d_date_sk\n    WHERE: d_month_seq BETWEEN 1191 AND 1191+23 AND cs_list_price BETWEEN 244 AND 273\n    GROUP BY: cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk\n    SELECT: \n      cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk,\n      SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\",\n      ... [other aggregates]\n  MAIN QUERY (via Q0)\n    FROM: agg_cs\n    JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk\n    JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk\n    JOIN call_center ON cs_call_center_sk = cc_call_center_sk\n    WHERE: w_gmt_offset = -5 AND sm_type = 'LIBRARY' AND cc_class = 'medium'\n    GROUP BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name\n    ORDER BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A",
+    "transform": "push_dimension_filters",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Filters on dimension tables (warehouse/ship_mode/call_center) are applied late. Extracting them as CTEs with WHERE clauses enables predicate pushdown into catalog_sales joins.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_warehouse (via Q1)\n    FROM: warehouse\n    WHERE: w_gmt_offset = -5\n  CTE: filtered_ship_mode (via Q2)\n    FROM: ship_mode\n    WHERE: sm_type = 'LIBRARY'\n  CTE: filtered_call_center (via Q3)\n    FROM: call_center\n    WHERE: cc_class = 'medium'\n  MAIN QUERY (via Q0)\n    FROM: catalog_sales, filtered_warehouse, filtered_ship_mode, filtered_call_center, date_dim\n    WHERE: cs_warehouse_sk = w_warehouse_sk\n      AND cs_ship_mode_sk = sm_ship_mode_sk\n      AND cs_call_center_sk = cc_call_center_sk\n      AND cs_ship_date_sk = d_date_sk\n      AND d_month_seq BETWEEN 1191 AND 1191+23\n      AND cs_list_price BETWEEN 244 AND 273\n    GROUP BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name\n    ORDER BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "materialize_dimensions",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Repeated full scans of tiny dimension tables (ship_mode: 3 rows, warehouse: 2 rows) waste cycles. Materializing them as CTEs enables single-pass scanning and optimizes join planning.",
+    "target_ir": "S0 [SELECT]\n  CTE: mat_ship_mode (via Q1)\n    FROM: ship_mode\n    WHERE: sm_type = 'LIBRARY'\n  CTE: mat_warehouse (via Q2)\n    FROM: warehouse\n    WHERE: w_gmt_offset = -5\n  CTE: mat_call_center (via Q3)\n    FROM: call_center\n    WHERE: cc_class = 'medium'\n  MAIN QUERY (via Q0)\n    FROM: catalog_sales, mat_warehouse, mat_ship_mode, mat_call_center, date_dim\n    WHERE: cs_warehouse_sk = w_warehouse_sk\n      AND cs_ship_mode_sk = sm_ship_mode_sk\n      AND cs_call_center_sk = cc_call_center_sk\n      AND cs_ship_date_sk = d_date_sk\n      AND d_month_seq BETWEEN 1191 AND 1191+23\n      AND cs_list_price BETWEEN 244 AND 273\n    GROUP BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name\n    ORDER BY: SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

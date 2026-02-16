@@ -1,0 +1,47 @@
+Based on the analysis of the query structure and execution plan, the primary bottleneck is the repeated evaluation of expensive CTEs (`best_ss_customer` and `frequent_ss_items`) in the UNION ALL branches. This causes redundant computation of the same data. Below are the optimization targets:
+
+### JSON Output
+```json
+[
+  {
+    "family": "E",
+    "transform": "materialization_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "CTEs best_ss_customer (4.1s) and frequent_ss_items are evaluated twice due to UNION ALL branches, causing redundant computation.",
+    "target_ir": "S0 [SELECT]\n  CTE: frequent_ss_items  (unchanged)\n  CTE: max_store_sales  (unchanged)\n  CTE: best_ss_customer  (unchanged)\n  MAIN QUERY (via Q_S0)\n    WITH main_sales AS (\n        SELECT cs_quantity * cs_list_price AS sales, cs_bill_customer_sk, cs_item_sk, cs_wholesale_cost\n        FROM catalog_sales\n        JOIN date_dim ON cs_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 5\n        UNION ALL\n        SELECT ws_quantity * ws_list_price, ws_bill_customer_sk, ws_item_sk, ws_wholesale_cost\n        FROM web_sales\n        JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 5\n    )\n    SELECT SUM(sales)\n    FROM main_sales\n    WHERE wholesale_cost BETWEEN 26 AND 36\n      AND cs_item_sk IN (SELECT item_sk FROM frequent_ss_items)\n      AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)\n    LIMIT 100",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "predicate_pushback",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Unnecessary join with customer in max_store_sales CTE (3.1s) since customer attributes aren't used in aggregation.",
+    "target_ir": "S0 [SELECT]\n  CTE: frequent_ss_items  (unchanged)\n  CTE: max_store_sales  (via CTE_Q_S0_max_store_sales)\n    FROM: store_sales, date_dim\n    WHERE: ss_sold_date_sk = d_date_sk AND d_year = 1999 AND ss_wholesale_cost BETWEEN 26 AND 36\n    GROUP BY: ss_customer_sk\n  CTE: best_ss_customer  (unchanged)\n  MAIN QUERY (unchanged)",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```
+
+### Analysis
+**Family A (Early Filtering)**: HIGH  
+Removes redundant customer join in `max_store_sales` CTE. Filters on `date_dim` and `store_sales` can be applied earlier without customer table.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries detected. The scalar subquery in `best_ss_customer` uses a precomputed CTE (not per-row).
+
+**Family C (Aggregation Pushdown)**: LOW  
+Existing aggregations already use efficient indexes. No clear opportunity to push GROUP BY below joins.
+
+**Family D (Set Operation Optimization)**: MEDIUM  
+UNION ALL structure causes CTE re-evaluation, but addressed via Family E restructuring.
+
+**Family E (Materialization/Prefetch)**: HIGH  
+Critical for eliminating redundant CTE evaluations in UNION ALL branches via single materialized scan.
+
+**Family F (Join Transform)**: LOW  
+Explicit joins already used; no self-joins or comma-join patterns to optimize.
+
+**Chosen families**: E, A  
+**Confidence**: High (Both targets address distinct bottlenecks with clear plan signals)

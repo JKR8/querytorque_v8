@@ -1,0 +1,47 @@
+### Analysis of Optimization Families
+
+- **Family A (Early Filtering)**: **HIGH** relevance. The CTEs `ss` and `ws` lack filters for `d_year=1998` and `d_qoy IN (1,2,3)`, causing full-year scans. Pushing these filters into CTEs reduces data volume before joins/aggregations.
+- **Family B (Decorrelation)**: **LOW** relevance. No correlated subqueries exist. The query uses CTEs and self-joins, not per-row re-execution.
+- **Family C (Aggregation Pushdown)**: **MEDIUM** relevance. Aggregations happen after joins, but grouping keys (`ca_county`, `d_year`) are supersets of join keys. Pivoting during aggregation could reduce self-join costs.
+- **Family D (Set Operations)**: **LOW** relevance. No `INTERSECT`/`UNION` operations exist.
+- **Family E (Materialization)**: **MEDIUM** relevance. The CTEs `ss`/`ws` are reused 3x each in self-joins. Precomputing quarterly aggregates once per CTE avoids repeated scans.
+- **Family F (Join Transform)**: **HIGH** relevance. Comma-separated self-joins of `ss`/`ws` cause combinatorial explosion. Restructuring to single-row-per-county pivots eliminates self-joins.
+
+**Chosen families**: F, A, E, C  
+**Confidence**: High (structural bottlenecks are clear and align with gold examples).
+
+---
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "F",
+    "transform": "eliminate_self_join_via_pivot",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Self-join of CTE instances (ss1,ss2,ss3 and ws1,ws2,ws3) causes combinatorial explosion. Restructure CTEs to compute quarterly aggregates in a single row per county, then join once.",
+    "target_ir": "S0 [SELECT]\n  CTE: ss  (via CTE_Q_S0_ss)\n    FROM: store_sales, date_dim, customer_address, item\n    WHERE [e330e84b5ecc3b92]: ss_sold_date_sk = d_date_sk AND ss_addr_sk = ca_address_sk AND ss_item_sk = i_item_sk AND i_color IN ('navajo', 'orchid') AND i_manager_id BETWEEN 8 AND 27 AND ss_list_price BETWEEN 86 AND 100 AND ca_state IN ('IA','IL') AND d_year = 1998 AND d_qoy IN (1,2,3)\n    GROUP BY: ca_county, d_year\n    AGGREGATE: \n        q1_store = SUM(CASE WHEN d_qoy=1 THEN ss_ext_sales_price ELSE 0 END),\n        q2_store = SUM(CASE WHEN d_qoy=2 THEN ss_ext_sales_price ELSE 0 END),\n        q3_store = SUM(CASE WHEN d_qoy=3 THEN ss_ext_sales_price ELSE 0 END)\n  CTE: ws  (via CTE_Q_S0_ws)\n    FROM: web_sales, date_dim, customer_address, item\n    WHERE [51cf109531413dcd]: ws_sold_date_sk = d_date_sk AND ws_bill_addr_sk = ca_address_sk AND ws_item_sk = i_item_sk AND i_color IN ('navajo', 'orchid') AND i_manager_id BETWEEN 8 AND 27 AND ws_list_price BETWEEN 86 AND 100 AND ca_state IN ('IA','IL') AND d_year = 1998 AND d_qoy IN (1,2,3)\n    GROUP BY: ca_county, d_year\n    AGGREGATE: \n        q1_web = SUM(CASE WHEN d_qoy=1 THEN ws_ext_sales_price ELSE 0 END),\n        q2_web = SUM(CASE WHEN d_qoy=2 THEN ws_ext_sales_price ELSE 0 END),\n        q3_web = SUM(CASE WHEN d_qoy=3 THEN ws_ext_sales_price ELSE 0 END)\n  MAIN QUERY (via Q_S0)\n    FROM: ss, ws\n    WHERE: ss.ca_county = ws.ca_county AND ss.d_year = ws.d_year\n        AND (CASE WHEN ws.q1_web > 0 THEN ws.q2_web / ws.q1_web ELSE NULL END) > (CASE WHEN ss.q1_store > 0 THEN ss.q2_store / ss.q1_store ELSE NULL END)\n        AND (CASE WHEN ws.q2_web > 0 THEN ws.q3_web / ws.q2_web ELSE NULL END) > (CASE WHEN ss.q2_store > 0 THEN ss.q3_store / ss.q2_store ELSE NULL END)\n    ORDER BY: ss.d_year",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "push_quarter_year_filters",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "CTEs scan all years/quarters despite main query needing only 1998-Q1/Q2/Q3. Pushing d_year/d_qoy filters into CTEs reduces data volume early.",
+    "target_ir": "S0 [SELECT]\n  CTE: ss  (via CTE_Q_S0_ss)\n    FROM: store_sales, date_dim, customer_address, item\n    WHERE [e330e84b5ecc3b92]: ... AND d_year = 1998 AND d_qoy IN (1,2,3)  // ADDED\n    GROUP BY: ca_county, d_qoy, d_year\n  CTE: ws  (via CTE_Q_S0_ws)\n    FROM: web_sales, date_dim, customer_address, item\n    WHERE [51cf109531413dcd]: ... AND d_year = 1998 AND d_qoy IN (1,2,3)  // ADDED\n    GROUP BY: ca_county, d_qoy, d_year\n  MAIN QUERY: ... // UNCHANGED",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "prefilter_dimensions",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Repeated scans of item/customer_address with identical filters. Precompute filtered dimensions once.",
+    "target_ir": "S0 [SELECT]\n  CTE: dim_item  (via CTE_dim)\n    FROM: item\n    WHERE: i_color IN ('navajo', 'orchid') AND i_manager_id BETWEEN 8 AND 27\n  CTE: dim_addr  (via CTE_dim)\n    FROM: customer_address\n    WHERE: ca_state IN ('IA','IL')\n  CTE: ss  (via CTE_Q_S0_ss)\n    FROM: store_sales, date_dim, dim_addr, dim_item  // USE PRECOMPUTED DIMS\n    WHERE: ... AND d_year=1998 AND d_qoy IN (1,2,3)\n    GROUP BY: ...\n  CTE: ws  (via CTE_Q_S0_ws)\n    FROM: web_sales, date_dim, dim_addr, dim_item  // USE PRECOMPUTED DIMS\n    WHERE: ... AND d_year=1998 AND d_qoy IN (1,2,3)\n    GROUP BY: ...\n  MAIN QUERY: ... // UNCHANGED",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

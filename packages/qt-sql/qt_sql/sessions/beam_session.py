@@ -652,6 +652,30 @@ class BeamSession(OptimizationSession):
             iter_api_calls += worker_api_calls
 
             applied = [p for p in patches if p.output_sql]
+
+            # ── Dedup: kill identical SQL rewrites ────────────────
+            seen_sql: Dict[str, str] = {}  # normalized_sql → first patch_id
+            deduped = []
+            for p in applied:
+                # Normalize whitespace for comparison
+                norm = " ".join(p.output_sql.split())
+                if norm in seen_sql:
+                    logger.info(
+                        f"[{self.query_id}] Dedup: {p.patch_id} identical "
+                        f"to {seen_sql[norm]}, skipping"
+                    )
+                    p.status = "DEDUP"
+                    p.apply_error = f"Duplicate of {seen_sql[norm]}"
+                else:
+                    seen_sql[norm] = p.patch_id
+                    deduped.append(p)
+            if len(deduped) < len(applied):
+                logger.info(
+                    f"[{self.query_id}] Dedup removed "
+                    f"{len(applied) - len(deduped)} duplicates"
+                )
+            applied = deduped
+
             logger.info(
                 f"[{self.query_id}] Phase 2 done: "
                 f"{len(applied)}/{len(patches)} patches applied"
@@ -1088,10 +1112,59 @@ class BeamSession(OptimizationSession):
                 p.apply_error = error_msg
                 tier1_failed.append(p.patch_id)
 
+        # ── Tier-1 retry: feed specific error back to worker ──────
         if tier1_failed:
             logger.info(
-                f"[{self.query_id}] Tier-1 rejected {len(tier1_failed)} patches: "
-                f"{tier1_failed}"
+                f"[{self.query_id}] Tier-1 rejected {len(tier1_failed)} patches, "
+                f"retrying: {tier1_failed}"
+            )
+            for p in applied:
+                if p.patch_id not in tier1_failed or not p.apply_error:
+                    continue
+                target_match = next(
+                    (t for t in targets if t.target_id == p.patch_id), None
+                )
+                if not target_match:
+                    continue
+
+                logger.info(
+                    f"[{self.query_id}] Tier-1 retry for {p.patch_id}: "
+                    f"{p.apply_error[:80]}"
+                )
+                retried = orchestrator.retry_worker(
+                    original_sql=self.original_sql,
+                    ir_node_map=ir_node_map,
+                    target=target_match,
+                    error=p.apply_error,
+                    script_ir=script_ir,
+                    dialect_enum=dialect_enum,
+                )
+                api_calls += 1
+
+                if retried and retried.output_sql:
+                    # Re-run tier-1 on the retry output
+                    t1_retry = tier1_validator._tier1_structural(
+                        self.original_sql, retried.output_sql
+                    )
+                    if t1_retry.get("passed", True):
+                        # Retry passed tier-1 — replace the failed patch
+                        idx = applied.index(p)
+                        applied[idx] = retried
+                        tier1_failed.remove(p.patch_id)
+                        logger.info(
+                            f"[{self.query_id}] Tier-1 retry SUCCESS "
+                            f"for {p.patch_id}"
+                        )
+                    else:
+                        retry_errors = t1_retry.get("errors", [])
+                        logger.info(
+                            f"[{self.query_id}] Tier-1 retry STILL FAILED "
+                            f"for {p.patch_id}: {retry_errors}"
+                        )
+
+        if tier1_failed:
+            logger.info(
+                f"[{self.query_id}] Tier-1 final rejected: {tier1_failed}"
             )
         # Filter to only tier-1 passed for full-dataset check
         applied_for_equiv = [p for p in applied if p.patch_id not in tier1_failed]

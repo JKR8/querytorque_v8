@@ -1,0 +1,80 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis Summary**  
+All patches in Iteration 1 failed due to implementation errors (syntax/reference issues), not structural flaws. No winners exist to compare. The original plan reveals:
+
+**Primary Bottleneck**:  
+`Nested Loop (rows=218,147, time=604.275 ms)`  
+This operator consumes **32% of total execution time** and processes the largest row count (218K rows). It joins `date_dim` and `store_sales (s1)` before filtering, forcing expensive processing of irrelevant rows.
+
+### Step 2 — Design Targets
+
+**Baseline**: Original query (no winners to inherit).  
+**Primary Goal**: Eliminate the `Nested Loop (rows=218,147)` by pushing filters into CTEs early (Family A).  
+**Secondary Goal**: Avoid repeated `store_sales` scans via prefetching (Family E).
+
+---
+
+### Proposed Targets
+
+```json
+[
+  {
+    "family": "A+E",
+    "transform": "prefilter_dimensions_and_sales",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-filter date_dim, item, and store_sales in CTEs to shrink input to the main join. Reuse filtered sales via CTE to avoid repeated scans. Targets Nested Loop (218K rows) and duplicate store_sales scans.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A+F",
+    "transform": "explicit_join_early_filter",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Convert comma joins to explicit INNER JOIN + push date/item filters into CTEs. Optimize join order to prioritize selective filters (date_dim first). Targets Nested Loop (218K rows) and Merge Join (77.9K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_explicit_join_materialized", "predicate_pushdown_items"]
+  },
+  {
+    "family": "C",
+    "transform": "ticket_pair_aggregation",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Aggregate ticket-item pairs before joining dimensions. Since GROUP BY keys (item1, item2) = join keys, this reduces rows before customer/demographics joins. Targets Nested Loop (218K rows) and Aggregate (77.9K → 304 rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A",
+    "transform": "rescue_early_filter_date_items",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Fix t4's syntax error by using correct aliases in SELECT/GROUP BY. Isolate date and item filters in CTEs to enable predicate pushdown. Minimalist version for reliability. Targets Nested Loop (218K rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```
+
+### Rationale
+
+1. **A+E (Prefilter + Prefetch)**  
+   - **Why**: Combines the strongest signal (Family A reduces 218K-row Nested Loop) with sales reuse (Family E avoids duplicate scans).  
+   - **Targets**: `Nested Loop (rows=218,147)` and implicit `store_sales` rescanning.  
+   - **Low Risk**: Gold examples prove both strategies work independently.
+
+2. **A+F (Explicit Joins + Early Filter)**  
+   - **Why**: Fixes t4's alias error while adding join-order optimization (Family F). Explicit joins help optimizer push predicates.  
+   - **Targets**: `Nested Loop (rows=218,147)` and `Merge Join (rows=77,900)`.  
+   - **Distinct**: Changes join topology unlike A+E.
+
+3. **C (Aggregation Pushdown)**  
+   - **Why**: Grouping by ticket-item pairs before dimensions could collapse 77.9K rows → 304 rows early. High-reward if join keys align.  
+   - **Targets**: `Aggregate (rows=77,900 → 304)` and downstream sorts.  
+   - **Novelty**: Not attempted in Iteration 1 (t6 failed syntactically).
+
+4. **A (Rescue t4)**  
+   - **Why**: t4 failed only due to aliasing (`item1` vs `i1f`). Minimal fix preserves early filtering gains.  
+   - **Fallback**: Simpler than combos if complex CTEs risk errors.

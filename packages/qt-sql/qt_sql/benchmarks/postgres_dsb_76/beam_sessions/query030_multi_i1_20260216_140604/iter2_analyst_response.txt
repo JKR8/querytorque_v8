@@ -1,0 +1,88 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t2 (NEUTRAL):**
+- **Original bottleneck operator:** `CTE Scan (ctr1) (rows=1, time=233.892 ms)`  
+  **t2 improvement:** Reduced to `CTE Scan (ctr1) (rows=0, time=83.635 ms)`  
+  **Structural change:** Pushing `ca_state IN ('CA', 'MI', ...)` into CTE via `replace_where_predicate` (Family A) reduced CTE output rows.  
+  **Most expensive remaining operator:** `CTE Scan (ctr1) (time=83.635 ms)` — still dominates runtime due to correlated subquery re-execution.
+
+**Analysis of t1 (FAIL):**
+- **Failure reason:** Incorrect column reference (`ctr_reason_sk` dropped). Semantic mismatch during decorrelation (Family B) caused structural failure.
+
+**Analysis of t3 (FAIL):**
+- **Failure reason:** Join order error (`c_current_addr_sk` referenced before `customer` join). Syntax error in materialization (Family E) broke query.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary bottleneck:** Correlated subquery in `CTE Scan (ctr1)` (83.635 ms in t2 plan).  
+**Secondary issue:** Large CTE build (`Seq Scan on web_returns` at 74.055 ms).
+
+#### Target 1: Combine Decorrelation + Early Filtering (A+B)
+- **Hypothesis:** Decouple correlated subquery into materialized state thresholds (Family B) while pushing `wr_reason_sk IN (22,23)` into CTE (Family A). Targets both `CTE Scan (ctr1)` (83.635 ms) and `Seq Scan on web_returns` (74.055 ms).  
+- **Target IR:**  
+  - `insert_cte` for `state_avg_thresholds` (S0)  
+  - `replace_where_predicate` (anchor: `bef68d6eb401aa50`) to eliminate correlated subquery  
+- **Relevance:** 0.98 (complementary; addresses both bottlenecks)
+
+#### Target 2: Materialize Base CTE (E)
+- **Hypothesis:** Materialize unfiltered CTE to avoid recomputation in thresholds and main query. Targets `Aggregate` in subquery (0.008 ms) and `CTE Scan (ctr2)` (0.003 ms) — small but repeated.  
+- **Target IR:**  
+  - `replace_expr_subtree` (anchor: `b04b10b69569f03b`) to add `MATERIALIZED` keyword  
+- **Relevance:** 0.85 (reduces redundant scans)
+
+#### Target 3: Fix Join Order in Materialized Decorrelation (B+E)
+- **Hypothesis:** Rescue t3 by fixing `customer` join order during decorrelation. Eliminates per-row subquery execution (`CTE Scan (ctr1)`).  
+- **Target IR:**  
+  - `replace_from` (S0) to enforce `customer` before `customer_address`  
+  - `replace_expr_subtree` (anchor: `bef68d6eb401aa50`) for threshold join  
+- **Relevance:** 0.90 (rescues sound idea with corrected syntax)
+
+#### Target 4: Explicit Join Order (F)
+- **Hypothesis:** Convert comma joins to `INNER JOIN` + reorder to prioritize `date_dim` and `item` filters. Targets `Hash Join` (74.709 ms) in CTE build.  
+- **Target IR:**  
+  - `replace_from` (anchor: `b04b10b69569f03b`) with explicit joins  
+  - Join order: `web_returns` → `date_dim` → `item` → `customer_address`  
+- **Relevance:** 0.80 (optimizes CTE build path)
+
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "decorrelate_with_early_reason_filter",
+    "target_id": "t1_fixed",
+    "relevance_score": 0.98,
+    "hypothesis": "Eliminate correlated subquery (83.6ms) via state thresholds CTE while reducing CTE rows by pushing reason filter early. Targets CTE Scan (ctr1) and Seq Scan on web_returns.",
+    "target_ir": "S0: insert_cte(state_avg_thresholds); replace_where_predicate(bef68d6eb401aa50)",
+    "recommended_examples": ["shared_scan_decorrelate", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "materialize_base_cte",
+    "target_id": "t2_mat",
+    "relevance_score": 0.85,
+    "hypothesis": "Materialize base CTE to avoid recomputation for thresholds and main query. Reduces repeated Aggregate (0.008ms) and CTE Scan (ctr2) (0.003ms).",
+    "target_ir": "S0: replace_expr_subtree(b04b10b69569f03b) WITH MATERIALIZED customer_total_return",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "B+E",
+    "transform": "decorrelate_with_fixed_join",
+    "target_id": "t3_fixed",
+    "relevance_score": 0.90,
+    "hypothesis": "Rescue decorrelation with correct customer join order. Replace correlated subquery (83.6ms) with materialized thresholds join.",
+    "target_ir": "S0: replace_from(bef68d6eb401aa50) JOIN customer BEFORE customer_address; replace_expr_subtree(bef68d6eb401aa50)",
+    "recommended_examples": ["shared_scan_decorrelate", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "F",
+    "transform": "cte_explicit_join_reorder",
+    "target_id": "t4_join",
+    "relevance_score": 0.80,
+    "hypothesis": "Optimize CTE build path (74.7ms Hash Join) via explicit joins and selective order: web_returns → date_dim → item → customer_address.",
+    "target_ir": "S0: replace_from(b04b10b69569f03b) WITH web_returns INNER JOIN date_dim FIRST",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

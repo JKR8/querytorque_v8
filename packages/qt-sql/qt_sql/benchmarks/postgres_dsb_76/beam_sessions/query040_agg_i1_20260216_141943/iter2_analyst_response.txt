@@ -1,0 +1,77 @@
+Based on the analysis, the primary bottleneck is the **Nested Loop (rows=69937, time=196.728)** between `date_dim` and `catalog_sales`. This is confirmed by:
+1. It's the most expensive operator in the plan (196.728ms)
+2. It produces 69k rows that flow into subsequent operators
+3. All optimization attempts failed to address this core issue
+
+### Step 1: Plan Comparison
+No successful patches exist (all FAIL). The failed attempts:
+- **A+E patch**: Failed due to incorrect condition placement (`cr_reason_sk=33` moved to WHERE clause), turning LEFT JOIN into INNER JOIN
+- **A patch**: Failed because CTE referenced `cs_item_sk` before it was available (join order error)
+
+### Step 2: Target Design (Prioritized)
+Starting from original query since no winners exist.
+
+**Target 1: Primary Bottleneck Fix (Family A+F)**  
+```json
+{
+  "family": "A+F",
+  "transform": "early_date_filter_explicit_join",
+  "target_id": "S0",
+  "relevance_score": 0.98,
+  "hypothesis": "Pre-filter date_dim to 61 rows (A) and convert to explicit JOIN (F) to enable hash join instead of nested loop on 69k rows",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+}
+```
+
+**Target 2: Secondary Reduction (Family C)**  
+```json
+{
+  "family": "C",
+  "transform": "preaggregate_catalog_returns",
+  "target_id": "S0",
+  "relevance_score": 0.85,
+  "hypothesis": "Pre-aggregate catalog_returns by (cr_order_number, cr_item_sk) before join to reduce per-row catalog_returns Index Scan (0.193ms/row)",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+**Target 3: Rescue A+E (Family A+E Fixed)**  
+```json
+{
+  "family": "A+E",
+  "transform": "materialize_dims_fixed_condition",
+  "target_id": "S0",
+  "relevance_score": 0.75,
+  "hypothesis": "Fix failed A+E by moving cr_reason_sk=33 to LEFT JOIN condition while preserving CTEs for date_dim and item",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+}
+```
+
+**Target 4: Novel Prefilter (Family A)**  
+```json
+{
+  "family": "A",
+  "transform": "early_wholesale_cost_filter",
+  "target_id": "S0:90046ef2acd680cd",
+  "relevance_score": 0.7,
+  "hypothesis": "Push cs_wholesale_cost filter into catalog_sales scan to reduce 69k row nested loop output",
+  "target_ir": "S0:90046ef2acd680cd",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+### Rationale
+1. **Target 1** directly attacks the 69k-row Nested Loop (196ms) by:
+   - Isolating date_dim filter first (A)
+   - Enabling hash join via explicit syntax (F)
+2. **Target 2** addresses the secondary expensive operator (catalog_returns Index Scan at 0.193ms/row) via pre-aggregation (C)
+3. **Target 3** rescues the sound A+E approach with correct LEFT JOIN semantics
+4. **Target 4** provides a fallback by pushing cs_wholesale_cost filter earlier
+
+All hypotheses are grounded in plan metrics:
+- `date_dim` returns 61 rows (Seq Scan)
+- `catalog_sales` scan outputs 1147 rows/date_dim row
+- `catalog_returns` Index Scan costs 0.193ms/row

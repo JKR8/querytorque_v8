@@ -1,0 +1,85 @@
+### Analysis of Current State
+
+The primary bottleneck is the **Aggregate operation on `catalog_sales` and `catalog_returns`** (rows=58,699, time=1,874.918 ms) in the `cs_ui` CTE. This is evidenced by:
+1. The `Hash Join` (rows=128,936, time=1,681.965 ms) between these tables
+2. Subsequent expensive `Sort` (1,720.427 ms) and `Aggregate` (1,874.918 ms) operations
+3. Deep nested loops (15+ levels) amplifying the impact of this large intermediate result
+
+All previous optimizations failed due to:
+1. Implementation errors in predicate preservation (`rescue_preagg_dim_push`)
+2. Targeting issues (`preagg_cs_ui_materialize`)
+3. Literal expression mismatches (changed `77+10` to `87`)
+
+### Design of Refined Targets
+
+#### Target 1: Rescue Pre-Aggregation with Literal Preservation (Family A+C)
+```json
+{
+  "family": "A+C",
+  "transform": "rescue_preagg_dim_push_literal",
+  "target_id": "t1",
+  "relevance_score": 0.98,
+  "hypothesis": "Pre-aggregate store_sales early with exact literal preservation to reduce input rows to the 15-level nested loop. Maintains original filters: i_current_price BETWEEN 77 AND 77+10 and exact IN() lists.",
+  "target_ir": "S0:0cee22073fe2dd22",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 2: CS_UI Materialization + Decorrelation (Family E+B)
+```json
+{
+  "family": "E+B",
+  "transform": "cs_ui_materialize_decorrelate",
+  "target_id": "t2",
+  "relevance_score": 0.92,
+  "hypothesis": "Materialize cs_ui CTE to avoid re-computation in nested loops while decorrelating store_sales join. Targets the expensive Merge Join (rows=604, time=1,912 ms) feeding the nested loops.",
+  "target_ir": "S0:93ee2873c3c88da7",
+  "recommended_examples": ["pg_shared_scan_decorrelate", "multi_dimension_prefetch"]
+}
+```
+
+#### Target 3: Explicit Join Restructuring (Family F)
+```json
+{
+  "family": "F",
+  "transform": "cross_sales_explicit_join",
+  "target_id": "t3",
+  "relevance_score": 0.85,
+  "hypothesis": "Convert comma joins to explicit INNER JOIN in cross_sales CTE to optimize join order. Targets Nested Loop (rows=157,863, time=2,055 ms) where poor join order amplifies row counts.",
+  "target_ir": "S0:0cee22073fe2dd22",
+  "recommended_examples": ["pg_explicit_join_materialized"]
+}
+```
+
+#### Target 4: State Filter Pushdown (Family A)
+```json
+{
+  "family": "A",
+  "transform": "early_state_filter",
+  "target_id": "t4",
+  "relevance_score": 0.88,
+  "hypothesis": "Push ad2.ca_state filter into customer_address CTE to reduce rows before joining. Targets Index Scan on customer_address (ad2) currently scanning all states.",
+  "target_ir": "S0:0cee22073fe2dd22",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+### Rationale
+
+1. **Priority Order**: 
+   - Target 1 directly addresses the most expensive operator (Aggregate on 58K rows) while fixing previous literal preservation failures
+   - Target 2 tackles the secondary bottleneck (Merge Join) with complementary materialization+decorrelation
+   - Targets 3-4 address structural join issues and dimension filtering
+
+2. **Complementary Strategies**:
+   - A+C reduces input rows to expensive aggregations
+   - E+B avoids recomputation in nested loops
+   - F improves join ordering
+   - All address distinct operators from the execution plan
+
+3. **Safety**:
+   - Literal expressions preserved exactly in Target 1
+   - Gold examples provide proven patterns
+   - Targets focus on high-impact operators with measurable row counts
+
+4. **Novelty Constraint**: Avoided new hypotheses; all based on observed plan operators and row counts. No optimizer-equivalent rewrites proposed.

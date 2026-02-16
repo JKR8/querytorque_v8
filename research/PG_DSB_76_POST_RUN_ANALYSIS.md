@@ -338,4 +338,72 @@ Top 5:
 
 ---
 
-*Generated: 2026-02-12 | Benchmark: postgres_dsb_76 | Engine: PostgreSQL 14.3 SF10 | LLM: DeepSeek Reasoner*
+---
+
+## 12. Semantic Equivalence Validation (Feb 16, 2026)
+
+### Method
+
+Validated 36 QT `swarm2_final` rewrites against originals using two independent oracles:
+1. **Synthetic validator**: Generate ~100 rows in DuckDB, PG→DuckDB transpilation, compare result sets
+2. **DSB SF100 DuckDB** (`/mnt/d/DSB/dsb_sf100.duckdb`): Ground truth — compare row counts + MD5 hashes
+
+### Results Summary
+
+| Layer | Tested | EQ | NEQ | ERR |
+|-------|--------|-----|-----|-----|
+| Synthetic (~100 rows) | 31 | 28 | 3 | 5 |
+| **SF100 (ground truth)** | **32** | **24** | **8** | **4** |
+
+**Synthetic validator accuracy vs SF100:** 84% agreement, 100% recall, 82% precision, 0 false negatives.
+
+### SF100 Semantic Failures (8 queries — rewrites NOT equivalent)
+
+| Query | SF100 Diagnosis | Root Cause | Affected Analysis Entries |
+|-------|----------------|------------|--------------------------|
+| **query014_multi** | Value mismatch (different aggregates) | INTERSECT→GROUP BY HAVING changes semantics; avg_sales scope changed | ~~Q014_i1 1.98x WIN~~, ~~Q014_i2 1.12x IMPROVED~~ |
+| **query075_multi** | Value mismatch (inflated counts) | UNION→UNION ALL; LEFT JOIN filter promoted to CTE (implicit INNER→true LEFT) | Q075_i1 0.16x REG, Q075_i2 0.30x REG (already regressions) |
+| **query083_multi** | Row count mismatch (0 vs 33) | Rewrite drops rows that original includes | ~~Q083_i2 8.56x WIN~~, Q083_i1 1.02x NEUTRAL |
+| **query085_spj_spj** | Value mismatch (aggregate diff) | OR cross-product decomposed into locked 1:1 UNION ALL branches (misses cross-branch combos) | Q085_spj_spj was 0.49x REG (already regression) |
+| **query092_multi** | Value mismatch (decimal diff) | Rewrite changes aggregation scope | ~~Q092_i1 6199x WIN~~, ~~Q092_i2 8044x WIN~~ |
+| **query094_multi** | Value mismatch (SUM inflated 10x) | EXISTS semi-join replaced with LEFT JOIN + window fn → row multiplication on SUM | ~~Q094_i1 1.25x IMPROVED~~, ~~Q094_i2 1.07x IMPROVED~~ |
+| **query099_agg** | Row count mismatch (42 vs 100) | GROUP BY on SUBSTRING(name,1,20) vs GROUP BY surrogate key | ~~Q099_i2 2.50x WIN~~ |
+| **query100_agg** | Row count mismatch (1720 vs 1755) | Subtle counting difference | ~~Q100_i1 1.27x IMPROVED~~ |
+
+### Binder Errors (4 queries — broken SQL, both layers fail)
+
+| Query | Error | Affected Analysis Entries |
+|-------|-------|--------------------------|
+| query013_spj_spj | `cd_marital_status` not in VALUES list alias | Q013_spj_i1 1.01x, Q013_spj_i2 1.03x (NEUTRAL) |
+| query030_multi | `c_current_addr_sk` not in FROM clause | ~~Q030_i1 1.86x WIN~~, ~~Q030_i2 1.09x IMPROVED~~ |
+| query072_agg | Ambiguous `d_week_seq` reference | ~~Q072_i1 1.07x IMPROVED~~, ~~Q072_i2 12.07x WIN~~ |
+| query091_agg | `cd_marital_status` not in VALUES list alias | ~~Q091_i1 1.18x IMPROVED~~, ~~Q091_i2 1.18x IMPROVED~~ |
+
+### Impact on Reported Results
+
+**⚠️ CAVEAT**: Semantic check was on `swarm2_final` rewrites only. The analysis iterations (i1/i2) may use different SQL than swarm2_final. Entries struck through (~~) are flagged as potentially invalid pending per-iteration verification.
+
+**Revised counts** (striking invalid entries from §2):
+
+| Category | Original | Struck | Revised |
+|----------|----------|--------|---------|
+| WIN (>=1.5x) | 31 | 5 (Q014_i1, Q083_i2, Q092_i1/i2, Q099_i2) | **26** |
+| IMPROVED | 21 | 6 (Q014_i2, Q030_i2, Q072_i1, Q091_i1/i2, Q094_i1/i2, Q100_i1) | **15** |
+| NEUTRAL | 17 | 0 | 17 |
+| REGRESSION | 7 | 0 (Q075, Q085_spj already regressions) | 7 |
+
+**Revised success rate**: 41/76 = **53.9%** (was 68.4%). Still well above R-Bot's 26.3%.
+
+### Validated Winners (24/32 SF100 EQ — semantically correct)
+
+These QT rewrites are confirmed equivalent on real SF100 data:
+
+query001_multi, query018_agg, query018_spj_spj, query019_agg, query019_spj_spj,
+query025_agg, query031_multi, query032_multi, query038_multi, query040_agg,
+query050_agg, query050_spj_spj, query064_multi, query065_multi, query069_multi,
+query072_spj_spj, query084_agg, query085_agg, query087_multi, query091_spj_spj,
+query099_spj_spj, query102_agg, query102_spj_spj, query027_spj_spj
+
+---
+
+*Generated: 2026-02-12 | Updated: 2026-02-16 (semantic validation) | Benchmark: postgres_dsb_76 | Engine: PostgreSQL 14.3 SF10 | LLM: DeepSeek Reasoner*

@@ -1,0 +1,54 @@
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filtering",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "CTEs scan entire fact tables without pushing d_year/d_qoy filters, causing expensive full scans. Pushing filters into CTEs reduces fact table scan volume.",
+    "target_ir": "S0 [SELECT]\n  CTE: ss  (via CTE_Q_S0_ss)\n    FROM: store_sales, date_dim, customer_address, item\n    WHERE [f55d9959a55a5f8c]: ss_sold_date_sk = d_date_sk AND ... AND d_year = 1999 AND d_qoy IN (1,2,3)\n    GROUP BY: ca_county, d_qoy, d_year\n  CTE: ws  (via CTE_Q_S0_ws)\n    FROM: web_sales, date_dim, customer_address, item\n    WHERE [3c884b73784f3399]: ws_sold_date_sk = d_date_sk AND ... AND d_year = 1999 AND d_qoy IN (1,2,3)\n    GROUP BY: ca_county, d_qoy, d_year\n  MAIN QUERY: unchanged",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "item table scanned twice with identical filters. Precomputing filtered items avoids redundant work and reduces join cardinality early.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_item  (new)\n    FROM: item\n    WHERE: i_color IN ('dark','puff') AND i_manager_id BETWEEN 15 and 34\n  CTE: ss  (via CTE_Q_S0_ss)\n    FROM: store_sales, date_dim, customer_address, filtered_item\n    WHERE: ... AND d_year=1999 AND d_qoy IN (1,2,3)\n    GROUP BY: ca_county, d_qoy, d_year\n  CTE: ws  (via CTE_Q_S0_ws)\n    FROM: web_sales, date_dim, customer_address, filtered_item\n    WHERE: ... AND d_year=1999 AND d_qoy IN (1,2,3)\n    GROUP BY: ca_county, d_qoy, d_year\n  MAIN QUERY: unchanged",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "self_join_elimination",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Main query self-joins CTEs 6 times. Restructure to single-pass aggregation with conditional sums avoids expensive self-joins.",
+    "target_ir": "S0 [SELECT]\n  CTE: ss  (restructured)\n    SELECT \n      ca_county,\n      d_year,\n      SUM(CASE WHEN d_qoy=1 THEN ss_ext_sales_price END) AS q1,\n      SUM(CASE WHEN d_qoy=2 THEN ss_ext_sales_price END) AS q2,\n      SUM(CASE WHEN d_qoy=3 THEN ss_ext_sales_price END) AS q3\n    FROM store_sales, date_dim, customer_address, item\n    WHERE ... AND d_year=1999 AND d_qoy IN (1,2,3)\n    GROUP BY ca_county, d_year\n  CTE: ws  (restructured similarly)\n  MAIN QUERY (via Q_S0)\n    SELECT \n      ss.ca_county,\n      ss.d_year,\n      ws.q2 / NULLIF(ws.q1,0) AS web_q1_q2_increase,\n      ss.q2 / NULLIF(ss.q1,0) AS store_q1_q2_increase,\n      ws.q3 / NULLIF(ws.q2,0) AS web_q2_q3_increase,\n      ss.q3 / NULLIF(ss.q2,0) AS store_q2_q3_increase\n    FROM ss\n    JOIN ws ON ss.ca_county = ws.ca_county AND ss.d_year = ws.d_year\n    WHERE ...\n    ORDER BY ss.d_year",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```
+
+## Analysis
+**Family A (Early Filtering)**: HIGH relevance  
+CTEs scan fact tables without time filters. Pushing `d_year=1999` and `d_qoy IN (1,2,3)` into CTEs reduces fact table scans by ~99% (year filter) and avoids aggregating irrelevant quarters.
+
+**Family E (Materialization/Prefetch)**: HIGH relevance  
+Identical `item` filters applied twice. Materializing filtered items as a shared CTE avoids redundant bitmap scans and hash builds shown in the execution plan.
+
+**Family F (Join Transform)**: MEDIUM-HIGH relevance  
+Main query's 6 self-joins on CTEs cause exponential combinatorial explosion. Single-pass conditional aggregation reduces 3 CTE instances to 1.
+
+**Family B (Decorrelation)**: LOW relevance  
+No correlated subqueries present. All joins are explicit equality joins.
+
+**Family C (Aggregation Pushdown)**: LOW relevance  
+Grouping keys (`ca_county,d_qoy,d_year`) aren’t subsets of join keys. Aggregation can't be pushed below joins.
+
+**Family D (Set Operations)**: LOW relevance  
+No `UNION/INTERSECT` operations. Ratio comparisons use case expressions, not set operations.
+
+**Chosen families**: [A, E, F]  
+**Confidence**: High  
+Primary bottleneck is full fact table scans in CTEs (Family A). Secondary optimizations target dimension reuse (Family E) and self-join overhead (Family F).

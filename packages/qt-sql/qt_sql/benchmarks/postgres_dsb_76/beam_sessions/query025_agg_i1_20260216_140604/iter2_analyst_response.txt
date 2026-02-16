@@ -1,0 +1,74 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t2_rescue (REGRESSION):**
+- **Expensive new operator**: `Nested Loop (rows=304704, time=4371.616 ms)`  
+  This operator dominates runtime (74% of total time). The original had no equivalent nested loop at this scale.
+- **Why it backfired**:  
+  The CTE-based prefetch forced a merge join and materialization that didn't exist in the original. The original used efficient `Index Only Scan on store_returns` (0.6 ms/iter) in a tight loop, while the patched version materialized intermediate results (761 ms sort) and lost index-driven joins.
+
+**syn_w1_rescue & t3_rescue (FAILS):**  
+Both failed during execution due to implementation errors (ambiguous column references and transaction aborts), so we lack EXPLAIN plans. The structural ideas remain untested.
+
+---
+
+### Step 2 — Design Refined Targets
+
+**Primary Bottleneck**:  
+The original `Nested Loop (rows=329585, time=90.441 ms)` between `date_dim (d2)` and `store_returns`. Each iteration scans 3,582 rows via index, but 92 iterations (92 * 3,582 = 329,585 rows) dominate early-stage cost.
+
+**Best Baseline**: Original query (no winners exist).  
+**Target Strategy**: Combine Aggregation Pushdown (C) + Early Filtering (A) to attack the 329K-row bottleneck and downstream costs.
+
+---
+
+**Target 1: Pre-aggregate store_returns + Early date filters (Family C+A)**  
+```json
+{
+  "family": "C+A",
+  "transform": "preagg_store_returns_early_dates",
+  "target_id": "t1",
+  "relevance_score": 0.97,
+  "hypothesis": "Pre-aggregate store_returns by (sr_customer_sk, sr_item_sk, sr_ticket_number) before joining to store_sales/catalog_sales. Combine with CTE-based date filters to reduce input rows to the expensive nested loop (originally 329K rows).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+}
+```
+
+**Target 2: Pre-aggregate BOTH store_returns AND catalog_sales (Family C)**  
+```json
+{
+  "family": "C",
+  "transform": "preagg_store_returns_and_catalog_sales",
+  "target_id": "t2",
+  "relevance_score": 0.90,
+  "hypothesis": "Pre-aggregate store_returns AND catalog_sales independently before joining. This minimizes row counts earlier in the plan (especially for the 329K-row nested loop) while preserving MAX() semantics.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+**Target 3: Rescue prefetch with explicit join order (Family E+F)**  
+```json
+{
+  "family": "E+F",
+  "transform": "prefetch_with_forced_join_order",
+  "target_id": "t3",
+  "relevance_score": 0.85,
+  "hypothesis": "Fix t2_rescue's regression by: (1) Keeping date CTEs, (2) Enforcing join order: date_dim → store_sales → store_returns → catalog_sales, (3) Using explicit JOIN syntax. Targets the original 329K-row nested loop by ensuring index scans drive joins.",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized"]
+}
+```
+
+**Target 4: Early filtering + store_sales pre-join (Family A)**  
+```json
+{
+  "family": "A",
+  "transform": "early_filter_store_sales_join",
+  "target_id": "t4",
+  "relevance_score": 0.80,
+  "hypothesis": "Push date filters into CTEs and force store_sales to join before store_returns. Reduces input to the expensive nested loop by leveraging d1's high selectivity (rows=10 in original plan) earlier.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```

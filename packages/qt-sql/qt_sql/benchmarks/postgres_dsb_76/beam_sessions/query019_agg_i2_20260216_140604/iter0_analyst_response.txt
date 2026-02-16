@@ -1,0 +1,49 @@
+### Analysis of Optimization Families
+
+**Family A (Early Filtering)**: HIGH  
+The query applies dimension table filters (e.g., `i_category='Shoes'`, `c_birth_month=2`) late during nested loop joins. Pushing these filters into standalone CTEs reduces the dimension tables before joining with the large `store_sales` fact table, minimizing nested loop iterations.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries exist in the original query. The execution plan shows no DELIM_SCAN patterns, making decorrelation irrelevant.
+
+**Family C (Aggregation Pushdown)**: LOW  
+Grouping keys (`i_brand_id`, `i_brand`, etc.) are a subset of `item` keys, but filters on `customer_address`/`store` (`ca_state='KS'`, zip inequality) prevent safe early aggregation. Pushing aggregation would break non-grouped filter logic.
+
+**Family D (Set Operations)**: LOW  
+The query contains no `UNION`/`INTERSECT` operations or duplicate elimination patterns.
+
+**Family E (Materialization)**: MEDIUM  
+Repeated dimension scans don't occur, but materializing filtered dimensions (e.g., `item`, `customer`) could enable hash joins instead of nested loops. Overlaps with Family A benefits.
+
+**Family F (Join Transform)**: HIGH  
+Implicit comma joins obscure join order control. Restructuring to explicit joins with selective dimension-first ordering (e.g., starting with filtered `customer_address` → `customer`) reduces intermediate row counts early.
+
+**Chosen families**: A, F  
+**Confidence**: High (both directly address nested loop bottlenecks via predicate pushdown and join restructuring)
+
+---
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "A",
+    "transform": "early_filtering",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Nested loops on large dimension tables (item, customer) rescanned 123K+ times. Prefiltering dimensions reduces nested loop cardinality and enables hash joins.",
+    "target_ir": "S0 [SELECT]\n  CTE: pre_item (via Q1)\n    FROM: item\n    WHERE: i_category = 'Shoes'\n  CTE: pre_customer (via Q2)\n    FROM: customer\n    WHERE: c_birth_month = 2\n  CTE: pre_ca (via Q3)\n    FROM: customer_address\n    WHERE: ca_state = 'KS'\n  MAIN QUERY (via Q0)\n    FROM: store_sales\n      INNER JOIN date_dim ON d_date_sk = ss_sold_date_sk\n      INNER JOIN pre_item ON ss_item_sk = i_item_sk\n      INNER JOIN pre_customer ON ss_customer_sk = c_customer_sk\n      INNER JOIN pre_ca ON c_current_addr_sk = ca_address_sk\n      INNER JOIN store ON ss_store_sk = s_store_sk\n    WHERE: d_year = 1999\n      AND d_moy = 2\n      AND ss_wholesale_cost BETWEEN 76 AND 96\n      AND substring(ca_zip,1,5) <> substring(s_zip,1,5)\n    GROUP BY: i_brand, i_brand_id, i_manufact_id, i_manufact\n    ORDER BY: ext_price desc, i_brand, i_brand_id, i_manufact_id, i_manufact",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_reorder",
+    "target_id": "t2",
+    "relevance_score": 0.92,
+    "hypothesis": "Implicit joins force suboptimal join order (starting with 123K-row fact join). Explicit joins prioritize selective dimensions first (KS addresses → Feb-born customers) to minimize early-stage row growth.",
+    "target_ir": "S0 [SELECT]\n  MAIN QUERY (via Q0)\n    FROM: customer_address\n      INNER JOIN customer ON c_current_addr_sk = ca_address_sk\n      INNER JOIN store_sales ON ss_customer_sk = c_customer_sk\n      INNER JOIN date_dim ON d_date_sk = ss_sold_date_sk\n      INNER JOIN item ON ss_item_sk = i_item_sk\n      INNER JOIN store ON ss_store_sk = s_store_sk\n    WHERE: i_category = 'Shoes'\n      AND d_year = 1999\n      AND d_moy = 2\n      AND ca_state = 'KS'\n      AND c_birth_month = 2\n      AND ss_wholesale_cost BETWEEN 76 AND 96\n      AND substring(ca_zip,1,5) <> substring(s_zip,1,5)\n    GROUP BY: i_brand, i_brand_id, i_manufact_id, i_manufact\n    ORDER BY: ext_price desc, i_brand, i_brand_id, i_manufact_id, i_manufact",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

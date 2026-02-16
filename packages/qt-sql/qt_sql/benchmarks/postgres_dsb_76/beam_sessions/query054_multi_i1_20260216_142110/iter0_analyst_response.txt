@@ -1,0 +1,63 @@
+```json
+[
+  {
+    "family": "E",
+    "transform": "date_dim_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Repeated full scans of date_dim for identical date conditions in my_revenue subqueries. Materialize date_dim filters once for all consumers.",
+    "target_ir": "S0 [SELECT]\n  CTE: prefetched_dates  (new)\n    FROM: date_dim\n    WHERE: d_year=1998 AND d_moy=1\n  CTE: my_customers  (unchanged)\n  CTE: my_revenue\n    FROM: my_customers, store_sales, customer_address, store, date_dim\n    WHERE: ... AND d_month_seq BETWEEN (SELECT d_month_seq+1 FROM prefetched_dates) AND (SELECT d_month_seq+3 FROM prefetched_dates)\n  ... rest unchanged",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "A",
+    "transform": "push_into_union_branches",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Late application of item/category filters in my_customers CTE. Push filters directly into UNION ALL branches to leverage indexes earlier.",
+    "target_ir": "S0 [SELECT]\n  CTE: my_customers\n    FROM: (\n      SELECT cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk, cs_wholesale_cost \n      FROM catalog_sales \n      INNER JOIN item ON cs_item_sk = i_item_sk AND i_category='Electronics' AND i_class='personal'\n      UNION ALL\n      ... web_sales with identical item join\n    ) cs_or_ws_sales\n    JOIN date_dim ON sold_date_sk=d_date_sk\n    JOIN customer ON ...\n    WHERE: wholesale_cost BETWEEN 35 AND 65 AND ...\n  ... rest unchanged",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_chain",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Comma-joins in my_customers obscure join dependencies. Convert to explicit INNER JOINs for better predicate pushdown.",
+    "target_ir": "S0 [SELECT]\n  CTE: my_customers\n    FROM: (\n      SELECT ... FROM catalog_sales\n      UNION ALL\n      ...\n    ) cs_or_ws_sales\n    INNER JOIN item ON item_sk=i_item_sk\n    INNER JOIN date_dim ON sold_date_sk=d_date_sk\n    INNER JOIN customer ON customer_sk=c_customer_sk\n    WHERE: i_category='Electronics' AND ...\n  ... rest unchanged",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_sales",
+    "target_id": "t4",
+    "relevance_score": 0.65,
+    "hypothesis": "Large intermediate results from UNION ALL before distinct. Pre-aggregate sales data by customer_sk before expensive joins.",
+    "target_ir": "S0 [SELECT]\n  CTE: base_sales\n    SELECT customer_sk, item_sk, sold_date_sk\n    FROM (\n      SELECT cs_bill_customer_sk AS customer_sk, ...\n      FROM catalog_sales\n      UNION ALL ...\n    )\n    GROUP BY customer_sk, item_sk, sold_date_sk\n  CTE: my_customers\n    FROM base_sales\n    JOIN item ...\n    JOIN date_dim ...\n    JOIN customer ...\n  ... rest unchanged",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```
+
+## Analysis
+**Family A (Early Filtering)**: HIGH  
+Multiple late-applied filters (item category/class, wholesale_cost) in my_customers CTE. Pushing these into UNION ALL branches enables early row reduction.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries detected. Date_dim subqueries in my_revenue are uncorrelated and executed once.
+
+**Family C (Aggregation Pushdown)**: MEDIUM  
+Pre-aggregating UNION ALL results before joins could reduce my_customers input size, though GROUP BY keys don't perfectly align.
+
+**Family D (Set Operations)**: MEDIUM  
+UNION ALL with subsequent distinct is a candidate for optimization, but early filtering (Family A) may resolve more bottlenecks.
+
+**Family E (Materialization)**: HIGH  
+Critical win for date_dim subqueries. Identical date_dim scans executed multiple times (plan shows 4 scans) for same filter conditions.
+
+**Family F (Join Transform)**: HIGH  
+Comma-joins in my_customers obscure join relationships. Explicit joins enable better predicate pushdown and join ordering.
+
+**Chosen families**: E, A, F, C  
+**Confidence**: High  
+Rationale: Family E addresses the primary bottleneck (repeated date_dim scans). Family A and F resolve structural issues in my_customers CTE. Family C is a secondary optimization for large intermediate sets.

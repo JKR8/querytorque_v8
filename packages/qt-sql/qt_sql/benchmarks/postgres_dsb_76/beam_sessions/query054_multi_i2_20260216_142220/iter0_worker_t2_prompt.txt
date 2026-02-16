@@ -1,0 +1,195 @@
+## Role
+
+You are **W1 "Reducer"** — Cardinality reduction — WHERE filters, set operations, early pruning. Reduce row counts early: push predicates into CTEs, convert set operations to EXISTS/NOT EXISTS, apply early filtering before expensive joins.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: A — push_filters_into_union_branches
+**Hypothesis**: Date/item filters applied AFTER union of catalog/web sales. Push date_dim/item joins into each UNION ALL branch to prune early.
+
+## Original SQL
+
+```sql
+with my_customers as (
+ select distinct c_customer_sk
+        , c_current_addr_sk
+ from
+        ( select cs_sold_date_sk sold_date_sk,
+                 cs_bill_customer_sk customer_sk,
+                 cs_item_sk item_sk,
+                 cs_wholesale_cost wholesale_cost
+          from   catalog_sales
+          union all
+          select ws_sold_date_sk sold_date_sk,
+                 ws_bill_customer_sk customer_sk,
+                 ws_item_sk item_sk,
+                 ws_wholesale_cost wholesale_cost
+          from   web_sales
+         ) cs_or_ws_sales,
+         item,
+         date_dim,
+         customer
+ where   sold_date_sk = d_date_sk
+         and item_sk = i_item_sk
+         and i_category = 'Home'
+         and i_class = 'curtains/drapes'
+         and c_customer_sk = cs_or_ws_sales.customer_sk
+         and d_moy = 5
+         and d_year = 1998
+         and wholesale_cost BETWEEN 70 AND 100
+         and c_birth_year BETWEEN 1942 AND 1955
+ )
+ , my_revenue as (
+ select c_customer_sk,
+        sum(ss_ext_sales_price) as revenue
+ from   my_customers,
+        store_sales,
+        customer_address,
+        store,
+        date_dim
+ where  c_current_addr_sk = ca_address_sk
+        and ca_county = s_county
+        and ca_state = s_state
+        and ss_sold_date_sk = d_date_sk
+        and c_customer_sk = ss_customer_sk
+        and ss_wholesale_cost BETWEEN 70 AND 100
+        and s_state in ('AR','GA','IN'
+                    ,'KS','KY','NC'
+                    ,'OH','PA','SD'
+                    ,'VA')
+        and d_month_seq between (select distinct d_month_seq+1
+                                 from   date_dim where d_year = 1998 and d_moy = 5)
+                           and  (select distinct d_month_seq+3
+                                 from   date_dim where d_year = 1998 and d_moy = 5)
+ group by c_customer_sk
+ )
+ , segments as
+ (select cast((revenue/50) as int) as segment
+  from   my_revenue
+ )
+  select  segment, count(*) as num_customers, segment*50 as segment_base
+ from segments
+ group by segment
+ order by segment, num_customers
+ limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  CTE: my_customers  (via CTE_Q_S0_my_customers)
+    FROM: (subquery) cs_or_ws_sales, item, date_dim, customer
+    WHERE [b05f804bc25a41cf]: sold_date_sk = d_date_sk AND item_sk = i_item_sk AND i_category = 'Home' AND i_class = 'curtains/...
+  CTE: my_revenue  (via CTE_Q_S0_my_revenue)
+    FROM: my_customers, store_sales, customer_address, store, date_dim
+    WHERE [763590318bd26331]: c_current_addr_sk = ca_address_sk AND ca_county = s_county AND ca_state = s_state AND ss_sold_dat...
+    GROUP BY: c_customer_sk
+  CTE: segments  (via CTE_Q_S0_segments)
+    FROM: my_revenue
+  MAIN QUERY (via Q_S0)
+    FROM: segments
+    GROUP BY: segment
+    ORDER BY: segment, num_customers
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  CTE: my_customers (MODIFIED)
+    FROM: (
+      SELECT [...] 
+      FROM catalog_sales
+        INNER JOIN date_dim ON cs_sold_date_sk=d_date_sk AND d_moy=5 AND d_year=1998
+        INNER JOIN item ON cs_item_sk=i_item_sk AND i_category='Home' AND i_class='curtains/drapes'
+      UNION ALL
+      SELECT [...]
+      FROM web_sales
+        INNER JOIN date_dim ON ws_sold_date_sk=d_date_sk AND d_moy=5 AND d_year=1998
+        INNER JOIN item ON ws_item_sk=i_item_sk AND i_category='Home' AND i_class='curtains/drapes'
+    ) cs_or_ws_sales
+    INNER JOIN customer [...]
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_date_cte_explicit_join",
+  "dialect": "postgres",
+  "description": "Isolate a selective date_dim filter into a CTE AND convert all comma-separated joins to explicit JOIN syntax. The combination is key on PostgreSQL - the CTE alone can hurt, but CTE + explicit JOINs together enable better hash join planning with a tiny probe table.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_dates",
+        "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1193 + 23"
+      },
+      "description": "Insert CTE 'filtered_dates' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "c20744375cf92d6b"
+      },
+      "payload": {
+        "expr_sql": "cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5"
+      },
+      "description": "Replace WHERE predicate with optimized version"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

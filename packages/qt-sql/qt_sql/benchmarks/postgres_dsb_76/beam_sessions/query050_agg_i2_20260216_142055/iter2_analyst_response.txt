@@ -1,0 +1,58 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of WIN Patch (t2 - Family A):**
+- **Improved Operator**:  
+  `Seq Scan on date_dim (d2)  (rows=16, time=3.017)`  
+  This scan was optimized via early filtering (pushing `d_year=1999 AND d_moy=7` into a CTE). The structural change reduced rows scanned before joining to large fact tables.
+- **Cause of Improvement**:  
+  Filtering `d2` early minimized rows fed into downstream joins (store_returns and store_sales), reducing input to expensive nested loops.
+- **Most Expensive Remaining Operator**:  
+  `Gather Merge  (rows=81513, time=1455.872)`  
+  Despite early filtering, this parallel aggregation/sort remains costly due to high row count (81k rows).
+
+**Analysis of FAIL Patch (t1 - A+C):**
+- **Failure Cause**:  
+  Syntax error (`aggregate functions are not allowed in WHERE`) due to improper CTE structure. The core idea (pre-aggregation by `store_sk`) was sound but implemented incorrectly.
+
+**Classification**:  
+- **t2 (A)** is **COMPLEMENTARY** to potential C optimizations. It optimizes early scans (date_dim), while C targets downstream aggregation.
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`Gather Merge (rows=81513, time=1455.872)` due to high-volume intermediate data before aggregation.
+
+**Target 1: Combination (A+C)**  
+- **Hypothesis**: Combine t2’s early filtering (A) with corrected pre-aggregation (C) to reduce rows before the Gather Merge. Pre-aggregate sales/returns by `store_sk` and date buckets *before* joining to `store`, cutting input to the expensive sort/aggregation.  
+- **Target IR**: `S0` (entire query)  
+- **Confidence**: High (0.95). Fixes t1’s syntax error and leverages C’s proven 1.3–15.3x speedups when pre-aggregating keys ⊇ join keys.
+
+**Target 2: Refinement (C Focus)**  
+- **Hypothesis**: Optimize the `Gather Merge` by pre-aggregating sales/returns by `store_sk` *first*. This reduces input rows (81k → ~# stores) before sorting/aggregation.  
+- **Target IR**: Anchor `444f6473896f7965` (WHERE clause) to inject pre-aggregation CTEs.  
+- **Confidence**: High (0.90). Directly attacks the bottleneck operator using C’s aggregation pushdown.
+
+---
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "early_filter_and_preaggregate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Apply early filtering (A) to date_dim, then pre-aggregate store_sales/store_returns by store_sk and date buckets (C) before joining to store. Reduces input to Gather Merge (81k rows) by orders of magnitude.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_before_store_join",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Pre-aggregate sales/returns by store_sk and date buckets before joining to store. Targets reduction of Gather Merge input (81k rows) by pushing aggregation below the join.",
+    "target_ir": "444f6473896f7965",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

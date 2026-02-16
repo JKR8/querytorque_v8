@@ -1,0 +1,49 @@
+### Step 1 — Compare EXPLAIN Plans
+
+All patches in Iteration 0 failed with structural errors (COLUMN REF MISMATCH). None produced valid execution plans to compare against the original. The core failure was identical across all patches: the rewritten SQL omitted the `ctr_reason_sk` column required by the main query. This occurred because the rewrites incorrectly dropped this column during CTE restructuring. Since no valid plans exist for comparison, we cannot identify improved/regressed operators or classify winners.
+
+**Conclusion**: No successful patches to analyze. Focus shifts to fixing the structural error in the most promising family (B) while preserving its core optimization.
+
+---
+
+### Step 2 — Design Targets by Combining Strategies
+
+**Primary Bottleneck**: Correlated subquery in the main query's WHERE clause (`ctr1.ctr_total_return > (SELECT avg(...) ...`). The original plan shows this as a nested loop executing per row of `ctr1` (time=595.771 ms), consuming 99.9% of query time.
+
+**Target Design Rationale**:
+- **Family B (Decorrelation)** is the highest-potential approach for the bottleneck. The failed attempts had sound logic but dropped `ctr_reason_sk`.
+- **Rescue Strategy**: Fix the column omission in Family B while retaining its decorrelation transform.
+- **Combined with Family A**: Push the `ca_state IN (...)` filter into the CTE to reduce the CTE's output size before decorrelation. This leverages:
+  - Filtering on dimension tables early (Family A)
+  - Reduced input to the expensive state-threshold calculation (Family B)
+
+**Confidence**: High. The plan shows:
+- CTE scan takes 595.771 ms (99.9% of runtime)
+- Original CTE outputs all states, but main query only needs 4 states (`'OK','SC','TX','WI'`). Pushing this filter reduces CTE computation cost.
+
+**1 Target Designed**:
+
+```json
+[
+  {
+    "family": "B+A",
+    "transform": "decorrelate_fixed_columns_plus_early_filter",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Fix column omission in decorrelation by preserving ctr_reason_sk. Add early state filtering to reduce CTE size. Eliminates per-row subquery execution and cuts CTE computation by filtering states early.",
+    "target_ir": "S0: replace_expr_subtree by_anchor_hash:abbc651b66e2994c (CTE WHERE) to add 'AND ca_state IN (\\'OK\\',\\'SC\\',\\'TX\\',\\'WI\\')'; S0: insert_cte after customer_total_return with name='state_thresholds'; S0: replace_where_predicate by_anchor_hash:bf1e0f73684cdf2e with 'ctr1.ctr_total_return > st.avg_threshold AND st.ctr_state = ctr1.ctr_state'; S0: replace_from in Q_S0 to add 'state_thresholds st'",
+    "recommended_examples": ["shared_scan_decorrelate", "date_cte_isolate"]
+  }
+]
+```
+
+**Key Fixes**:
+1. Preserves `ctr_reason_sk` in all CTEs to avoid structural errors.
+2. Pushes `ca_state IN (...)` into the CTE WHERE clause (anchor `abbc651b66e2994c`).
+3. Maintains decorrelation logic from Family B but uses simpler CTE structure.
+
+**Why not other families?**:
+- **C (Agg Pushdown)**: Not applicable. Aggregation keys match join keys, and aggregation is already pushed to CTE.
+- **D (Set Ops)**: No set operations in query.
+- **E (Materialization)**: CTE is already materialized by PostgreSQL.
+- **F (Join Transform)**: Explicit joins unlikely to improve beyond decorrelation gains.

@@ -275,7 +275,7 @@ class TestStep4FormattedAnalysis:
 
     def test_formatted_has_analysis_header(self, artifacts):
         formatted = artifacts["04_analysis_formatted.txt"]
-        assert "## Analysis" in formatted
+        assert "## Analysis" in formatted or "## Expert Analysis" in formatted
 
     def test_formatted_has_structure(self, artifacts):
         formatted = artifacts["04_analysis_formatted.txt"]
@@ -361,6 +361,8 @@ class TestHistoryLoading:
 
     def test_manual_script_loads_state_history(self):
         """Verify real script load_query_history() finds state_N validation results."""
+        if not ANALYST_PROMPT_SCRIPT.exists():
+            pytest.skip("run_analyst_prompt_only.py not present")
         benchmark_dir = QT_SQL / "qt_sql" / "benchmarks" / "duckdb_tpcds"
         state_0_val = benchmark_dir / "state_0" / "validation"
         if not state_0_val.exists():
@@ -381,6 +383,8 @@ class TestHistoryLoading:
 
     def test_manual_script_loads_leaderboard_only_history(self):
         """Verify script loader can return history from leaderboard-only source."""
+        if not ANALYST_PROMPT_SCRIPT.exists():
+            pytest.skip("run_analyst_prompt_only.py not present")
         with tempfile.TemporaryDirectory() as tmpdir:
             benchmark_dir = Path(tmpdir)
             leaderboard = {

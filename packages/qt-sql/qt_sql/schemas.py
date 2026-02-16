@@ -120,7 +120,7 @@ class BenchmarkConfig:
     tiered_patch_enabled: bool = False
     analyst_model: str = "deepseek/deepseek-r1"
     worker_model: str = "qwen/qwen3-coder"
-    target_speedup: float = 10.0
+    target_speedup: float = 100.0
     snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
 
     @classmethod
@@ -149,7 +149,7 @@ class BenchmarkConfig:
             tiered_patch_enabled=data.get("tiered_patch_enabled", False),
             analyst_model=data.get("analyst_model", "deepseek/deepseek-r1"),
             worker_model=data.get("worker_model", "qwen/qwen3-coder"),
-            target_speedup=data.get("target_speedup", 10.0),
+            target_speedup=data.get("target_speedup", 100.0),
             snipe_rounds=data.get("snipe_rounds", 2),
         )
 

@@ -1,0 +1,58 @@
+### Analysis of Optimization Families
+
+**Family A (Early Filtering)**: HIGH  
+The query applies multiple late filters on dimension tables (`customer_demographics`, `customer_address`). Pushing these filters into CTEs early would drastically reduce join cardinality before expensive operations. The execution plan shows dimension table scans happening late in nested loops.
+
+**Family B (Decorrelation)**: LOW  
+No correlated subqueries exist in the query. All joins are explicit between tables in the FROM clause, eliminating the need for decorrelation.
+
+**Family C (Aggregation Pushdown)**: LOW  
+GROUP BY keys (`r_reason_desc`) are not a subset of join keys. Aggregation cannot be pushed down before joins since all tables are required to compute the averages and reason descriptions.
+
+**Family D (Set Operation Optimization)**: LOW  
+The query uses OR conditions but no set operations (UNION/INTERSECT). The OR patterns are already optimized as filter conditions.
+
+**Family E (Materialization/Prefetch)**: HIGH  
+`customer_demographics` is scanned twice (`cd1`/`cd2`) with identical filter conditions. Precomputing a filtered version in a CTE would avoid redundant scans. The execution plan shows repeated index scans on this table.
+
+**Family F (Join Transform)**: HIGH  
+Implicit comma joins obscure join relationships. Restructuring to explicit joins with optimized order (facts last, filtered dimensions first) would enable better predicate pushdown. The nested loop explosion in the plan signals join order issues.
+
+**Chosen Families**: A, E, F  
+**Confidence**: High (plan shows late dimension filtering, repeated scans, and suboptimal join topology)
+
+---
+
+### Optimization Targets
+
+```json
+[
+  {
+    "family": "F",
+    "transform": "explicit_join_reorder",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Implicit cross joins force suboptimal join order, delaying filter pushdown. Restructure to explicit joins with dimension-first order to reduce intermediate rows.",
+    "target_ir": "S0 [SELECT]\n  MAIN QUERY (via Q_S0)\n    FROM: date_dim\n      INNER JOIN web_sales ON (ws_sold_date_sk = d_date_sk AND d_year = 2002)\n      INNER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number)\n      INNER JOIN customer_demographics cd1 ON (wr_refunded_cdemo_sk = cd1.cd_demo_sk)\n      INNER JOIN customer_demographics cd2 ON (wr_returning_cdemo_sk = cd2.cd_demo_sk)\n      INNER JOIN customer_address ON (wr_refunded_addr_sk = ca_address_sk)\n      INNER JOIN web_page ON (ws_web_page_sk = wp_web_page_sk)\n      INNER JOIN reason ON (wr_reason_sk = r_reason_sk)\n    WHERE: [OR conditions on cd1/cd2/ws_sales_price AND ca_state/ws_net_profit]\n    GROUP BY: r_reason_desc\n    ORDER BY: SUBSTRING(r_reason_desc,1,20), AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee)",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A",
+    "transform": "dimension_prefilter",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Complex OR conditions on customer_demographics and customer_address are evaluated late. Prefilter dimensions via CTEs to reduce join cardinality early.",
+    "target_ir": "S0 [SELECT]\n  CTE: filtered_cd (via Q1)\n    SELECT cd_demo_sk, cd_marital_status, cd_education_status\n    FROM customer_demographics\n    WHERE (cd_marital_status, cd_education_status) IN (('S','Primary'), ('M','Secondary'), ('U','2 yr Degree'))\n  CTE: filtered_ca (via Q2)\n    SELECT ca_address_sk\n    FROM customer_address\n    WHERE ca_country = 'United States'\n      AND ca_state IN ('KY','NC','SD','AR','GA','IN','KS','OH','VA')\n  MAIN QUERY (via Q0)\n    FROM: date_dim\n      INNER JOIN web_sales ON (ws_sold_date_sk = d_date_sk AND d_year = 2002)\n      INNER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number)\n      INNER JOIN filtered_cd cd1 ON (wr_refunded_cdemo_sk = cd1.cd_demo_sk)\n      INNER JOIN filtered_cd cd2 ON (wr_returning_cdemo_sk = cd2.cd_demo_sk)\n      INNER JOIN filtered_ca ON (wr_refunded_addr_sk = ca_address_sk)\n      INNER JOIN web_page ON (ws_web_page_sk = wp_web_page_sk)\n      INNER JOIN reason ON (wr_reason_sk = r_reason_sk)\n    WHERE: [Original OR conditions on cd1/cd2/price AND ca_state/profit]\n    GROUP BY: r_reason_desc\n    ORDER BY: SUBSTRING(r_reason_desc,1,20), AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee)",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "shared_dimension_scan",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Repeated scans of customer_demographics (cd1/cd2) with identical filters waste resources. Materialize once in a CTE and reuse.",
+    "target_ir": "S0 [SELECT]\n  CTE: cd_filtered (via Q1)\n    SELECT cd_demo_sk, cd_marital_status, cd_education_status\n    FROM customer_demographics\n    WHERE cd_marital_status IN ('S','M','U') \n      AND cd_education_status IN ('Primary','Secondary','2 yr Degree')\n  MAIN QUERY (via Q0)\n    FROM: date_dim\n      INNER JOIN web_sales ON (ws_sold_date_sk = d_date_sk AND d_year = 2002)\n      INNER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number)\n      INNER JOIN cd_filtered cd1 ON (wr_refunded_cdemo_sk = cd1.cd_demo_sk)\n      INNER JOIN cd_filtered cd2 ON (wr_returning_cdemo_sk = cd2.cd_demo_sk)\n      INNER JOIN customer_address ON (wr_refunded_addr_sk = ca_address_sk)\n      INNER JOIN web_page ON (ws_web_page_sk = wp_web_page_sk)\n      INNER JOIN reason ON (wr_reason_sk = r_reason_sk)\n    WHERE: [OR conditions on cd1/cd2/price AND ca_state/profit]\n    GROUP BY: r_reason_desc\n    ORDER BY: SUBSTRING(r_reason_desc,1,20), AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee)",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

@@ -1,0 +1,145 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t2 (3.63x WIN)**  
+- **Improved operator**: Original `Hash Join (rows=0, time=425.363)` and `Nested Loop (rows=0, time=268.744)` were eliminated.  
+- **Structural change**: Prefetched `base_dates` (Family E) and restructured joins (Family F) reduced intermediate row counts and eliminated expensive hash operations.  
+- **Most expensive remaining operator**: `Gather (rows=0, time=47.357)` with its child `Hash Join (rows=0, time=39.188)` due to full scans on `customer_demographics` and `catalog_sales`.  
+
+**syn_w1 (1.20x WIN)**  
+- **Improved operator**: Slight reduction in `Nested Loop (time=294.122 vs 268.744)` due to early filtering (Family A) on dimension tables.  
+- **Structural change**: Early filtering via CTEs on `item`, `customer_demographics`, and `household_demographics` reduced input rows to joins.  
+- **Most expensive operator**: `Hash Join (rows=0, time=468.335)` persists due to unchanged join topology.  
+
+**t1 (0.97x NEUTRAL)**  
+- **Regressed operator**: `Hash Join (time=501.918 vs 431.445)` slowed due to CTE overhead without join restructuring.  
+- **Why**: Early filters helped marginally, but lack of date prefetching/join restructuring left the core bottleneck unaddressed.  
+
+**t3 (FAIL)**  
+- **Failure**: Structural error (missing `inv_date_sk`). Aggregation pushdown ignored join dependencies.  
+
+**Redundancy/Complementarity**:  
+- **t2 and syn_w1 are COMPLEMENTARY**:  
+  - `t2` optimized date joins (E+F) and eliminated the worst bottleneck (hash join).  
+  - `syn_w1` optimized dimension filters (A) but couldn't fix the join topology.  
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline**: `t2` (3.63x WIN) is the best starting point.  
+
+#### Target 1 (Combination: Layer syn_w1 onto t2)  
+- **Family**: E+F+A  
+- **Hypothesis**: `t2` fixed dates/joins but still scans full `customer_demographics` (time=38.993 ms). Add early filtering (A) from `syn_w1` to reduce rows fed into the expensive `Gather`/`Hash Join`.  
+- **Target IR**: `S0` (entire statement)  
+- **Examples**: `multi_dimension_prefetch` (E), `pg_explicit_join_materialized` (F), `pg_date_cte_explicit_join` (A)  
+
+```json
+{
+  "family": "E+F+A",
+  "transform": "prefetch_dates_plus_early_filter_dim",
+  "target_id": "t4",
+  "relevance_score": 0.97,
+  "hypothesis": "Add early filtering (A) on dimensions to t2's date prefetch (E) and join restructure (F). Targets Gather's Seq Scan on customer_demographics (38.993 ms).",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 2 (Refinement: Optimize t2's Gather)  
+- **Family**: A  
+- **Hypothesis**: The `Gather` (time=47.357 ms) processes 34,665 rows. Push `cs_wholesale_cost` filter into a CTE to reduce `catalog_sales` rows early.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_date_cte_explicit_join` (A)  
+
+```json
+{
+  "family": "A",
+  "transform": "push_catalog_filters",
+  "target_id": "t5",
+  "relevance_score": 0.90,
+  "hypothesis": "Add CTE for pre-filtered catalog_sales (cs_wholesale_cost) to reduce rows in Gather (34,665 rows, 47.357 ms).",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+#### Target 3 (Rescue: Fix t3's Aggregation)  
+- **Family**: C  
+- **Hypothesis**: `t3` failed due to missing `inv_date_sk`. Include all join keys (`inv_date_sk`, `cs_ship_date_sk`) in the pre-aggregation CTE.  
+- **Target IR**: `S0`  
+- **Examples**: `pg_materialized_dimension_fact_prefilter` (C)  
+
+```json
+{
+  "family": "C",
+  "transform": "fixed_agg_pushdown",
+  "target_id": "t6",
+  "relevance_score": 0.80,
+  "hypothesis": "Rescue t3 by including inv_date_sk/cs_ship_date_sk in pre-aggregation keys. Targets Hash Join (39.188 ms) if pre-aggregation reduces rows.",
+  "target_ir": "S0",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+#### Target 4 (Novel: Reduce Household_Demographics Scans)  
+- **Family**: E  
+- **Hypothesis**: `household_demographics` is scanned multiple times. Prefetch it with `hd_buy_potential` filter to reuse results.  
+- **Target IR**: `S0`  
+- **Examples**: `multi_dimension_prefetch` (E)  
+
+```json
+{
+  "family": "E",
+  "transform": "prefetch_household_demo",
+  "target_id": "t7",
+  "relevance_score": 0.75,
+  "hypothesis": "Prefetch household_demographics to avoid repeated scans. Targets Seq Scan in Gather's subtree.",
+  "target_ir": "S0",
+  "recommended_examples": ["multi_dimension_prefetch"]
+}
+```
+
+---
+
+### Final Targets (Prioritized)
+```json
+[
+  {
+    "family": "E+F+A",
+    "transform": "prefetch_dates_plus_early_filter_dim",
+    "target_id": "t4",
+    "relevance_score": 0.97,
+    "hypothesis": "Add early filtering (A) on dimensions to t2's date prefetch (E) and join restructure (F). Targets Gather's Seq Scan on customer_demographics (38.993 ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A",
+    "transform": "push_catalog_filters",
+    "target_id": "t5",
+    "relevance_score": 0.90,
+    "hypothesis": "Add CTE for pre-filtered catalog_sales (cs_wholesale_cost) to reduce rows in Gather (34,665 rows, 47.357 ms).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "fixed_agg_pushdown",
+    "target_id": "t6",
+    "relevance_score": 0.80,
+    "hypothesis": "Rescue t3 by including inv_date_sk/cs_ship_date_sk in pre-aggregation keys. Targets Hash Join (39.188 ms) if pre-aggregation reduces rows.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_household_demo",
+    "target_id": "t7",
+    "relevance_score": 0.75,
+    "hypothesis": "Prefetch household_demographics to avoid repeated scans. Targets Seq Scan in Gather's subtree.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  }
+]
+```

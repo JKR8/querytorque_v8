@@ -1,0 +1,139 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (WIN) - Family E (date_prefetch) - 1.26x speedup:**
+- **Improved operator:**  
+  `Index Only Scan on date_dim (date_dim_1)` reduced from 0.021ms to 0.024ms (in `cs_items` branch).  
+  `Hash Join` in `cs_items` reduced from 4.736ms to 4.444ms.  
+  **Structural change:** Precomputed `d_month_seq` via CTE eliminated repeated subquery executions for date filtering.
+- **Most expensive remaining operator:**  
+  `Aggregate (rows=192, time=104.895)` in `ss_items` branch.  
+  **Reason:** Prefetch helped date subqueries but didn't reduce the large `store_sales` scan feeding the aggregate.
+
+**FAILED patches (t2, t3, t4):**
+- All failed due to implementation errors in patch application (syntax/targeting issues), not plan changes. No operator comparison possible.
+
+**Classification:**  
+t1 is **COMPLEMENTARY** to other families. It optimized date subqueries (E) but didn't address the core bottleneck of large fact table scans (A, C) or join structure (F).
+
+---
+
+### Step 2 — Design Targets
+
+**Baseline:** t1 SQL (1.26x WIN)  
+**Primary bottleneck:** `Aggregate (rows=192, time=104.895)` in `ss_items` (and similar in other CTEs).  
+**Hypothesis:** Reduce input rows to aggregates by pushing filters earlier (Family A) and pre-aggregating facts (Family C).
+
+#### Target 1: Combine E + A (Prefetch + Early Filtering)
+**Family:** "E+A"  
+**Transform:** "prefetch_dimensions_and_early_filter"  
+**Target ID:** "t6"  
+**Relevance Score:** 0.95  
+**Hypothesis:** Prefetch filtered dimension keys (`item`, `customer`) before joining with large fact tables. Reduces input rows to the expensive `Aggregate` in CTEs by pushing filters into dimension scans earlier.  
+**Target IR:**  
+- Anchor: `S0` (main statement)  
+- Operations:  
+  1. `insert_cte` for filtered dimensions (`filtered_item`, `filtered_customer`)  
+  2. `replace_from` in `ss_items`, `cs_items`, `ws_items` CTEs to use these prefiltered dimensions  
+**Recommended Examples:** ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+
+#### Target 2: Combine E + C (Prefetch + Aggregation Pushdown)
+**Family:** "E+C"  
+**Transform:** "prefetch_then_aggregate_fact"  
+**Target ID:** "t7"  
+**Relevance Score:** 0.90  
+**Hypothesis:** Aggregate fact tables (`store_sales`/`catalog_sales`/`web_sales`) by foreign keys *before* joining with dimensions. Reduces `Aggregate` input rows from 6,909 to estimated 446 (per `Index Only Scan on store_sales` row count).  
+**Target IR:**  
+- Anchor: `163e671e5a9d3ce1` (ss_items WHERE)  
+- Operations:  
+  1. `replace_expr_subtree` to rewrite CTE body as:  
+     ```sql
+     WITH fact_agg AS (
+       SELECT ss_item_sk, ss_customer_sk, SUM(ss_ext_sales_price) AS rev
+       FROM store_sales, date_dim 
+       WHERE /* existing conditions */
+       GROUP BY ss_item_sk, ss_customer_sk
+     )
+     SELECT i_item_id, c_birth_year, rev 
+     FROM fact_agg
+     JOIN filtered_item ON ss_item_sk = i_item_sk
+     JOIN filtered_customer ON ss_customer_sk = c_customer_sk
+     ```
+**Recommended Examples:** ["pg_materialized_dimension_fact_prefilter"]
+
+#### Target 3: Rescue Family B (Decorrelation)
+**Family:** "B"  
+**Transform:** "decorrelate_date_as_join"  
+**Target ID:** "t8"  
+**Relevance Score:** 0.80  
+**Hypothesis:** Convert `d_date IN (subquery)` to explicit `JOIN date_filter` in CTEs. Fixes failed t3 by targeting correct anchor. Avoids repeated subquery execution visible as multiple `Seq Scan on date_dim` (each 3-5ms).  
+**Target IR:**  
+- Anchor: `163e671e5a9d3ce1` (ss_items WHERE)  
+- Operations:  
+  1. `replace_where_predicate` to change `d_date IN (...) AND ...` to `JOIN date_filter ON d_date = date_filter.d_date`  
+  2. `replace_from` to add `date_filter` to FROM clause  
+**Recommended Examples:** ["pg_shared_scan_decorrelate"]
+
+#### Target 4: Rescue Family F (Join Transform)
+**Family:** "F"  
+**Transform:** "explicit_join_main_query"  
+**Target ID:** "t9"  
+**Relevance Score:** 0.75  
+**Hypothesis:** Replace comma-join in main query with explicit `JOIN` syntax. Fixes t4's parsing error by simplifying transformation. Enables better join order optimization for the expensive `Merge Join` (138.738ms).  
+**Target IR:**  
+- Anchor: `c32fec078499ee27` (main WHERE)  
+- Operations:  
+  1. `replace_from` to change:  
+     ```sql
+     FROM ss_items, cs_items, ws_items
+     ```
+     to:  
+     ```sql
+     FROM ss_items 
+     JOIN cs_items ON ... 
+     JOIN ws_items ON ...
+     ```
+**Recommended Examples:** ["pg_explicit_join_materialized"]
+
+---
+
+### Final Target JSON
+```json
+[
+  {
+    "family": "E+A",
+    "transform": "prefetch_dimensions_and_early_filter",
+    "target_id": "t6",
+    "relevance_score": 0.95,
+    "hypothesis": "Prefetch filtered dimension keys (item, customer) to reduce input rows to expensive Aggregate in CTEs. Targets 6,909-row Nested Loop feeding ss_items Aggregate.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E+C",
+    "transform": "prefetch_then_aggregate_fact",
+    "target_id": "t7",
+    "relevance_score": 0.90,
+    "hypothesis": "Aggregate fact tables by foreign keys before joining dimensions. Reduces input to 104ms Aggregate from 6,909 rows to 446 rows (store_sales scan).",
+    "target_ir": "163e671e5a9d3ce1",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_date_as_join",
+    "target_id": "t8",
+    "relevance_score": 0.80,
+    "hypothesis": "Convert date subquery to explicit JOIN to avoid repeated Seq Scan on date_dim (3-5ms each). Fixes failed t3 by targeting WHERE anchor.",
+    "target_ir": "163e671e5a9d3ce1",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_main_query",
+    "target_id": "t9",
+    "relevance_score": 0.75,
+    "hypothesis": "Replace comma-join with explicit JOIN in main query to optimize 138ms Merge Join. Fixes t4's syntax error.",
+    "target_ir": "c32fec078499ee27",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  }
+]
+```

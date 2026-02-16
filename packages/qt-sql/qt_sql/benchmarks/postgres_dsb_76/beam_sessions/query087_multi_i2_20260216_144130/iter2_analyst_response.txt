@@ -1,0 +1,101 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**t1 (FAIL)**:  
+- **Structural Change**: Converted `EXCEPT` to `NOT EXISTS` and prefetched dimensions via CTEs.  
+- **Why Backfired**: The `NOT EXISTS` approach altered join semantics. The original `EXCEPT` handles set differences with distinct combinations, while `NOT EXISTS` correlates on `(c_last_name, c_first_name, d_date)`, which may not be unique. This caused checksum mismatches (semantic equivalence failure).  
+
+**t4 (FAIL)**:  
+- **Structural Change**: Converted `EXCEPT` to `NOT EXISTS` without prefetched dimensions.  
+- **Why Backfired**: Same semantic issue as `t1`. The `NOT EXISTS` logic incorrectly assumes uniqueness of `(c_last_name, c_first_name, d_date)`, leading to checksum mismatch.  
+
+**t2 (REGRESSION 0.70x)**:  
+- **Structural Change**: Prefetched dimensions and pre-aggregated fact tables.  
+- **Why Backfired**: Introduced expensive `Merge Join` (time=**857.503 ms**) between large CTE `filtered_customers` (63,204 rows) and fact tables. Original used efficient `Nested Loop` + `Index Scan` (time=**360.995 ms**).  
+- **Regressed Operator**:  
+  ```  
+  Merge Join (rows=6946, time=857.503)  // vs original Nested Loop (time=360.995)
+  ```  
+
+**Winners**: None (all failed or regressed).  
+**Primary Bottleneck**: Set operations (`EXCEPT`) materializing large intermediate results (original `SetOp` time=**1,042.019 ms**).  
+
+---
+
+### Step 2 — Design Targets  
+
+#### **Target 1: Rescue `t4` (Family D)**  
+- **Family**: D (Set Operation Optimization)  
+- **Transform**: `convert_except_to_not_exists`  
+- **Target ID**: `rescue_t4`  
+- **Hypothesis**: Fix uniqueness in `NOT EXISTS` by correlating on join keys (`c_customer_sk`, `d_date_sk`) instead of dimensions. This ensures semantic equivalence while avoiding materialization.  
+- **Relevance**: 0.95 (directly targets `SetOp` bottleneck).  
+- **Target IR**: Replace `EXCEPT` with `NOT EXISTS` using key-based correlation.  
+- **Examples**: `pg_intersect_to_exists`  
+
+#### **Target 2: Aggregation Pushdown (Family C)**  
+- **Family**: C (Aggregation Pushdown)  
+- **Transform**: `aggregate_fact_by_keys`  
+- **Target ID**: `agg_fact`  
+- **Hypothesis**: Pre-aggregate fact tables on `(ss_customer_sk, ss_sold_date_sk)` before joining dimensions. Reduces rows fed into `Nested Loop` (original: 27,680 rows, time=360.995 ms).  
+- **Relevance**: 0.90 (targets expensive `Nested Loop`).  
+- **Target IR**: Push `GROUP BY ss_customer_sk, ss_sold_date_sk` into fact subqueries.  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+#### **Target 3: Prefetch Dimensions (Family E)**  
+- **Family**: E (Materialization/Prefetch)  
+- **Transform**: `prefetch_dimensions`  
+- **Target ID**: `prefetch_dims`  
+- **Hypothesis**: Reuse filtered `date_dim` (scanned 3× in original) via CTE. Saves redundant scans (original `Seq Scan on date_dim` time=**3.258 ms × 3**).  
+- **Relevance**: 0.85 (complements `Target 1`/`2`).  
+- **Target IR**: Insert CTE for `date_dim` and reuse in all subqueries.  
+- **Examples**: `multi_dimension_prefetch`  
+
+#### **Target 4: Combine E + D (Rescue `t1`)**  
+- **Family**: E + D  
+- **Transform**: `prefetch_dimensions_and_convert_to_anti_join`  
+- **Target ID**: `rescue_t1`  
+- **Hypothesis**: Prefetch dimensions **and** convert `EXCEPT` to key-correlated `NOT EXISTS`. Combines gains from reduced scans and set operation elimination.  
+- **Relevance**: 0.80 (fallback if `Target 1` fails).  
+- **Target IR**: Prefetch dimensions + `NOT EXISTS` with key-based correlation.  
+- **Examples**: `multi_dimension_prefetch`, `pg_intersect_to_exists`  
+
+```json
+[
+  {
+    "family": "D",
+    "transform": "convert_except_to_not_exists",
+    "target_id": "rescue_t4",
+    "relevance_score": 0.95,
+    "hypothesis": "Replace EXCEPT with NOT EXISTS correlated on (c_customer_sk, d_date_sk) instead of dimension columns. Avoids materialization of SetOp (1,042 ms) while preserving semantics.",
+    "target_ir": "Replace entire set operation with NOT EXISTS using key-based correlation.",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "C",
+    "transform": "aggregate_fact_by_keys",
+    "target_id": "agg_fact",
+    "relevance_score": 0.90,
+    "hypothesis": "Pre-aggregate fact tables on (customer_sk, date_sk) before joining dimensions. Reduces rows in Nested Loop (27,680 rows, 360 ms) by grouping join keys early.",
+    "target_ir": "Push GROUP BY ss_customer_sk, ss_sold_date_sk into store_sales/catalog_sales/web_sales subqueries.",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "E",
+    "transform": "prefetch_dimensions",
+    "target_id": "prefetch_dims",
+    "relevance_score": 0.85,
+    "hypothesis": "Reuse filtered date_dim (scanned 3×, 3.26 ms per scan) via CTE. Eliminates redundant Seq Scans.",
+    "target_ir": "Insert CTE for filtered date_dim and replace all date_dim scans with CTE.",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "E+D",
+    "transform": "prefetch_dimensions_and_convert_to_anti_join",
+    "target_id": "rescue_t1",
+    "relevance_score": 0.80,
+    "hypothesis": "Combine dimension prefetch (saves 6.5 ms) and key-correlated NOT EXISTS (avoids SetOp). Targets both dimension scans and set operations.",
+    "target_ir": "Prefetch dimensions + NOT EXISTS with correlation on (c_customer_sk, d_date_sk).",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_intersect_to_exists"]
+  }
+]
+```

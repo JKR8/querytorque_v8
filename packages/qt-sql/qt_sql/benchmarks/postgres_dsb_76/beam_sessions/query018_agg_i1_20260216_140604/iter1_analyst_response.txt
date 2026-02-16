@@ -1,0 +1,54 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches in Iteration 0 failed, so there are no winners to analyze. The failures were due to syntax/implementation errors in the transformations (e.g., incorrect column references in CTEs, parsing errors in ROLLUP expressions). No operator improvements can be quoted from EXPLAIN plans since no patches succeeded.  
+
+---
+
+### Step 2 — Design Targets  
+**Primary Bottleneck**: The `Nested Loop` generating 12,994 rows (time=340.456 ms) is the dominant cost driver. This joins `date_dim` (122 rows) to `catalog_sales` (107 rows/iteration) and scales poorly.  
+
+#### Refined Targets:  
+1. **Combination (A+F)**: Fix `t2` (Family F) by including `i_item_id` in `filtered_item` CTE and add early filtering (Family A) for `customer_demographics`/`customer_address`. Targets the expensive `Nested Loop` (12,994 rows) by reducing input via pushed-down filters.  
+2. **Refinement (A+E)**: Layer materialization (Family E) onto `syn_w1` by pre-joining `customer` + `customer_address` with filters. Targets the subsequent `Nested Loop` joining customer (rows=0 in plan) by pre-reducing dimension rows.  
+3. **Rescue (C)**: Apply aggregation pushdown (Family C) to pre-aggregate `catalog_sales` by `i_item_sk` and date/customer FKs before dimensions. Targets `Aggregate` (rows=5) by minimizing input rows early.  
+4. **Novel (F+B)**: Combine explicit joins (Family F) with decorrelation (Family B) for `customer_demographics` to avoid per-row scans. Targets the `Index Scan on customer_demographics` (time=0.047 ms/row) by converting to batch.  
+
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "early_filter_explicit_join",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Pushing filters into CTEs (A) and using explicit joins (F) reduces the Nested Loop (12,994 rows) by restricting catalog_sales scans early.",
+    "target_ir": "S0: replace_from + replace_where_predicate",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "A+E",
+    "transform": "prefetch_customer_address",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Materializing filtered customer+address joins (E) on top of early filtering (A) reduces the Nested Loop (rows=0 for customer) by pre-joining dimensions.",
+    "target_ir": "S0: insert_cte (customer_address_prejoin) + replace_from",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_fact",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Aggregating catalog_sales by foreign keys before joining dimensions reduces input to the expensive Aggregate operator (rows=5).",
+    "target_ir": "S0: insert_cte (preagg_cs) + replace_from",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "F+B",
+    "transform": "decorrelate_demographics",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Decorrelating customer_demographics (B) with explicit joins (F) avoids per-row scans (Index Scan on customer_demographics, time=0.047 ms/row).",
+    "target_ir": "S0: replace_where_predicate (cd_gender/status) + replace_from",
+    "recommended_examples": ["pg_shared_scan_decorrelate", "pg_explicit_join_materialized"]
+  }
+]
+```

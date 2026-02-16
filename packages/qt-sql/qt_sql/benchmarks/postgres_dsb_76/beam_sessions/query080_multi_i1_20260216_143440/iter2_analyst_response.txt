@@ -1,0 +1,103 @@
+### Step 1 — Compare EXPLAIN Plans  
+All patches failed, so no winners exist. We analyze bottlenecks from the original plan:  
+
+1. **Primary Bottleneck**:  
+   - `Nested Loop` joins between large fact tables (`store_sales`, `catalog_sales`, `web_sales`) and dimension tables (`date_dim`, `promotion`, `item`) dominate runtime.  
+   - **Worst Operator**:  
+     `Nested Loop (rows=4857, time=14.979)` in `ssr` CTE. Processes 4,857 rows from `store_sales` × `date_dim` with inefficient index scans.  
+
+2. **Secondary Issues**:  
+   - **Repeated Scans**: `date_dim` and `promotion` scanned 3 times (once per CTE) with identical filters.  
+     - `Seq Scan on promotion (rows=11, time=0.239)` repeated 3×.  
+   - **Late Aggregation**: Aggregation happens after all joins, forcing large intermediate joins (e.g., 4,857 rows in `ssr` reduced to 4 after aggregation).  
+
+---
+
+### Step 2 — Design Targets  
+**Baseline**: Original query (no winners).  
+**Primary Target**: Reduce nested loop input rows via early filtering and pre-aggregation.  
+**Secondary Target**: Eliminate repeated dimension scans.  
+
+#### Target 1: Pre-aggregate Fact Tables + Early Filtering (Family C+A)  
+**Hypothesis**: Pre-aggregate `store_sales`/`catalog_sales`/`web_sales` by join keys *before* dimension joins. Combine with predicate pushdown to reduce nested loop input rows by 100× (4,857 → 4 rows).  
+**Target IR**:  
+- Anchor: `S0` (main query)  
+- Operations:  
+  1. `insert_cte` for pre-aggregated fact CTEs (e.g., `ssr_agg` grouping by `ss_store_sk`, `ss_item_sk`).  
+  2. `replace_from` in `ssr`/`csr`/`wsr` to use pre-aggregated CTEs.  
+  3. `replace_where_predicate` to push `i_current_price > 50` into fact table scans.  
+**Relevance**: 0.98 (addresses primary bottleneck)  
+**Examples**: `pg_materialized_dimension_fact_prefilter`, `pg_date_cte_explicit_join`  
+
+#### Target 2: Dimension Prefetch (Family E)  
+**Hypothesis**: Scan `date_dim`/`promotion`/`item` once via CTEs. Eliminates 2 redundant scans of `promotion` (saving 0.239ms × 2) and 2 scans of `date_dim` (saving 4.084ms × 2).  
+**Target IR**:  
+- Anchor: `S0`  
+- Operations:  
+  1. `insert_cte` for `filtered_dates`, `filtered_promos`, `filtered_items`.  
+  2. `replace_from` in CTEs to reference dimension CTEs.  
+**Relevance**: 0.90 (complements Target 1 by reducing dimension overhead)  
+**Examples**: `multi_dimension_prefetch`  
+
+#### Target 3: Explicit Join Syntax (Family F)  
+**Hypothesis**: Replace comma joins with explicit `LEFT JOIN ... ON` syntax. Enables better join reordering to prioritize selective tables (`item`, `promotion`) before large fact tables.  
+**Target IR**:  
+- Anchor: `4b0c667df090d0ee` (ssr WHERE)  
+- Operations:  
+  `replace_expr_subtree` to convert `FROM tableA, tableB` → `FROM tableA LEFT JOIN tableB ON ...`.  
+**Relevance**: 0.85 (improves join planning for nested loops)  
+**Examples**: `pg_explicit_join_materialized`  
+
+#### Target 4: Decorrelation via CTE (Family B)  
+**Hypothesis**: Convert correlated `item` filter (`i_current_price > 50`) into standalone CTE. Avoids per-row rechecks during nested loops.  
+**Target IR**:  
+- Anchor: `S0`  
+- Operations:  
+  1. `insert_cte` for `valid_items` (filtered `item`).  
+  2. `replace_where_predicate` to replace `i_current_price > 50` with `ss_item_sk IN (SELECT ... FROM valid_items)`.  
+**Relevance**: 0.80 (reduces nested loop complexity)  
+**Examples**: `pg_shared_scan_decorrelate`  
+
+---
+
+### Final Target JSON  
+```json
+[
+  {
+    "family": "C+A",
+    "transform": "preagg_fact_early_filter",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Pre-aggregate fact tables by join keys before dimension joins. Push item filters into fact scans. Reduces nested loop input from 4,857 to 4 rows (ssr).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Scan date_dim/promotion/item once via CTEs. Eliminates 2 redundant promotion scans (0.239ms each) and 2 date_dim scans (4.084ms each).",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "comma_to_explicit_join",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Replace comma joins with explicit LEFT JOIN. Enables join reordering to prioritize selective dimension tables before fact tables.",
+    "target_ir": "4b0c667df090d0ee",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_item_filter",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Convert correlated item filter (i_current_price > 50) to standalone CTE. Avoids per-row rechecks during nested loops.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```

@@ -1,0 +1,204 @@
+## Role
+
+You are **W4 "Wildcard"** — Deep specialist for the #1 identified problem. Focus entirely on the highest-priority optimization target. May combine strategies from multiple families or try novel approaches not covered by other workers.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: F — explicit_join_restructure
+**Hypothesis**: Implicit comma joins cause suboptimal join order where large fact tables (store_returns, catalog_sales) are processed before applying restrictive date_dim filters. Restructuring to explicit joins with optimal order reduces intermediate rows.
+
+## Original SQL
+
+```sql
+select 
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ ,stddev_samp(ss_net_profit) as store_sales_profit
+ ,stddev_samp(sr_net_loss) as store_returns_loss
+ ,stddev_samp(cs_net_profit) as catalog_sales_profit
+ from
+ store_sales
+ ,store_returns
+ ,catalog_sales
+ ,date_dim d1
+ ,date_dim d2
+ ,date_dim d3
+ ,store
+ ,item
+ where
+ d1.d_moy = 2
+ and d1.d_year = 2000
+ and d1.d_date_sk = ss_sold_date_sk
+ and i_item_sk = ss_item_sk
+ and s_store_sk = ss_store_sk
+ and ss_customer_sk = sr_customer_sk
+ and ss_item_sk = sr_item_sk
+ and ss_ticket_number = sr_ticket_number
+ and sr_returned_date_sk = d2.d_date_sk
+ and d2.d_moy               between 2 and  2 + 2
+ and d2.d_year              = 2000
+ and sr_customer_sk = cs_bill_customer_sk
+ and sr_item_sk = cs_item_sk
+ and cs_sold_date_sk = d3.d_date_sk
+ and d3.d_moy               between 2 and  2 + 2
+ and d3.d_year              = 2000
+ group by
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ order by
+ i_item_id
+ ,i_item_desc
+ ,s_store_id
+ ,s_store_name
+ limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: store_sales, store_returns, catalog_sales, date_dim d1, date_dim d2, date_dim d3, store, item
+    WHERE [b0b26a1f74d8058a]: d1.d_moy = 2 AND d1.d_year = 2000 AND d1.d_date_sk = ss_sold_date_sk AND i_item_sk = ss_item_sk A...
+    GROUP BY: i_item_id, i_item_desc, s_store_id, s_store_name
+    ORDER BY: i_item_id, i_item_desc, s_store_id, s_store_name
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: date_dim d1
+      INNER JOIN store_sales ON (d1.d_date_sk = ss_sold_date_sk)
+      INNER JOIN store ON (s_store_sk = ss_store_sk)
+      INNER JOIN item ON (i_item_sk = ss_item_sk)
+      INNER JOIN store_returns ON (ss_customer_sk = sr_customer_sk AND ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number)
+        INNER JOIN date_dim d2 ON (sr_returned_date_sk = d2.d_date_sk)
+      INNER JOIN catalog_sales ON (sr_customer_sk = cs_bill_customer_sk AND sr_item_sk = cs_item_sk)
+        INNER JOIN date_dim d3 ON (cs_sold_date_sk = d3.d_date_sk)
+    WHERE: d1.d_moy = 2 AND d1.d_year = 2000
+      AND d2.d_moy BETWEEN 2 AND 4 AND d2.d_year = 2000
+      AND d3.d_moy BETWEEN 2 AND 4 AND d3.d_year = 2000
+    GROUP BY: i_item_id, i_item_desc, s_store_id, s_store_name
+    ORDER BY: i_item_id, i_item_desc, s_store_id, s_store_name
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_explicit_join_materialized",
+  "dialect": "postgres",
+  "description": "Convert comma joins to explicit INNER JOINs AND pre-filter date/item dimensions into MATERIALIZED CTEs. The combination enables PostgreSQL to use small materialized hash tables as probe inputs, dramatically improving join cardinality estimation on complex multi-table queries.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "date_subquery_cte",
+        "cte_query_sql": "SELECT d_date FROM date_dim WHERE d_month_seq IN (SELECT d_month_seq FROM date_dim WHERE d_date IN ('2002-02-01', '2002-04-11', '2002-07-17', '2002-10-09'))"
+      },
+      "description": "Insert CTE 'date_subquery_cte' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "sr_items"
+      },
+      "payload": {
+        "sql_fragment": "sr_items AS (SELECT i_item_id AS item_id, SUM(sr_return_quantity) AS sr_item_qty FROM store_returns INNER JOIN item ON sr_item_sk = i_item_sk INNER JOIN date_dim ON sr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND sr_reason_sk IN (26, 32, 40, 66, 73) AND sr_return_amt / sr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'sr_items' body with optimized version"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "cr_items"
+      },
+      "payload": {
+        "sql_fragment": "cr_items AS (SELECT i_item_id AS item_id, SUM(cr_return_quantity) AS cr_item_qty FROM catalog_returns INNER JOIN item ON cr_item_sk = i_item_sk INNER JOIN date_dim ON cr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND cr_reason_sk IN (26, 32, 40, 66, 73) AND cr_return_amount / cr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'cr_items' body with optimized version"
+    },
+    {
+      "step_id": "s4",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "wr_items"
+      },
+      "payload": {
+        "sql_fragment": "wr_items AS (SELECT i_item_id AS item_id, SUM(wr_return_quantity) AS wr_item_qty FROM web_returns INNER JOIN item ON wr_item_sk = i_item_sk INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND wr_reason_sk IN (26, 32, 40, 66, 73) AND wr_return_amt / wr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'wr_items' body with optimized version"
+    },
+    {
+      "step_id": "s5",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "sr_items JOIN cr_items ON sr_items.item_id = cr_items.item_id JOIN wr_items ON sr_items.item_id = wr_items.item_id"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s6",
+      "op": "delete_expr_subtree",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "6f618ce74d15a625"
+      },
+      "description": "Remove WHERE clause (conditions moved to CTEs)"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

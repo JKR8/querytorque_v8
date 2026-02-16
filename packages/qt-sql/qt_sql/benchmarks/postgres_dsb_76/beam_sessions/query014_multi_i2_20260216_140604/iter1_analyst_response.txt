@@ -1,0 +1,92 @@
+### Step 1 — Compare EXPLAIN Plans  
+All prior patches failed, so there are no winners to analyze. We must identify the primary bottleneck from the original plan:  
+
+**Primary Bottleneck**:  
+The `SetOp` for INTERSECT operations in `cross_items` CTE (time=6622.753 ms, rows=435) is the most expensive operation. It materializes large intermediate sets from store/catalog/web sales before filtering, evidenced by:  
+- `Append` feeding into `SetOp` processes 840k rows (time=6555.582 ms)  
+- Nested loops for catalog/store sales take >3.6s and >2s respectively  
+
+**Secondary Bottleneck**:  
+The duplicated computation of `avg_sales` CTE (time=2044.731 ms) appears twice in the plan (`CTE Scan (avg_sales)` and `CTE Scan (avg_sales_1)`).  
+
+---
+
+### Step 2 — Design Refined Targets  
+Based on bottlenecks and failed history:  
+
+1. **Primary Target (Family D+E)**:  
+   - **Family**: D + E  
+   - **Transform**: `setop_to_exists_with_materialization`  
+   - **Target ID**: `t1`  
+   - **Relevance**: 0.98 (directly addresses primary bottleneck)  
+   - **Hypothesis**: Replace INTERSECT with EXISTS to avoid materializing 840k rows in `SetOp`, then materialize the result to prevent recomputation in both year subqueries.  
+   - **Target IR**: `S0` (anchor_hash: cross_items CTE)  
+   - **Recommended Examples**: `pg_intersect_to_exists` (D) + `multi_dimension_prefetch` (E)  
+
+2. **Secondary Target (Family E)**:  
+   - **Family**: E  
+   - **Transform**: `cte_materialize_avg_sales`  
+   - **Target ID**: `t2`  
+   - **Relevance**: 0.90 (addresses duplicated aggregation)  
+   - **Hypothesis**: Materialize `avg_sales` CTE to compute once (time=2044 ms) instead of twice.  
+   - **Target IR**: `S0` (anchor_hash: avg_sales CTE)  
+   - **Recommended Examples**: `multi_dimension_prefetch`  
+
+3. **Fallback Target (Family D)**:  
+   - **Family**: D  
+   - **Transform**: `intersect_to_exists`  
+   - **Target ID**: `t3`  
+   - **Relevance**: 0.85 (isolated fix if combination fails)  
+   - **Hypothesis**: Convert INTERSECT to EXISTS without materialization to reduce `SetOp` cost.  
+   - **Target IR**: `S0` (anchor_hash: INTERSECT subqueries)  
+   - **Recommended Examples**: `pg_intersect_to_exists`  
+
+4. **Aggregation Target (Family C)**:  
+   - **Family**: C  
+   - **Transform**: `preaggregate_cross_items`  
+   - **Target ID**: `t4`  
+   - **Relevance**: 0.80 (reduces rows before main joins)  
+   - **Hypothesis**: Pre-aggregate sales data by brand/class/category before joining with `cross_items`, leveraging GROUP BY keys ⊇ join keys.  
+   - **Target IR**: `S0` (anchor_hash: this_year/last_year subqueries)  
+   - **Recommended Examples**: `pg_materialized_dimension_fact_prefilter`  
+
+```json
+[
+  {
+    "family": "D+E",
+    "transform": "setop_to_exists_with_materialization",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Replace INTERSECT with EXISTS to avoid materializing 840k intermediate rows in SetOp (6.6s) and materialize result to prevent recomputation in both year subqueries.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "E",
+    "transform": "cte_materialize_avg_sales",
+    "target_id": "t2",
+    "relevance_score": 0.90,
+    "hypothesis": "Materialize avg_sales CTE to compute once (2044ms) instead of twice, eliminating duplicate aggregation work.",
+    "target_ir": "S0",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "D",
+    "transform": "intersect_to_exists",
+    "target_id": "t3",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert INTERSECT to EXISTS without materialization to reduce SetOp cost (6.6s) if combined approach fails.",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_intersect_to_exists"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_cross_items",
+    "target_id": "t4",
+    "relevance_score": 0.80,
+    "hypothesis": "Pre-aggregate sales by brand/class/category before joining with cross_items to reduce row counts in nested loops (89k rows).",
+    "target_ir": "S0",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  }
+]
+```

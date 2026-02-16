@@ -1,0 +1,88 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of Winners (Family B and E):**
+- **Family B (Decorrelation):**  
+  - **Improved operator:** The correlated subquery execution (rows=2450, time=3.876 ms per row, executed 582 times ≈ 2,345 ms total) was eliminated.  
+  - **Structural change:** Converted the correlated subquery `(SELECT AVG(ctr_total_return)*1.2 ...)` into a standalone CTE with a GROUP BY store_sk, avoiding per-row re-execution.  
+  - **Most expensive remaining operator:** CTE Scan (`ctr1`) at 10,857 ms (rows=582).  
+
+- **Family E (Materialization):**  
+  - **Improved operator:** Same correlated subquery as above was eliminated.  
+  - **Structural change:** Materialized the CTE to prevent re-execution of the correlated subquery.  
+  - **Most expensive remaining operator:** CTE Scan (`ctr1`) at 10,857 ms (rows=582).  
+
+**Classification:** Both B and E are **COMPLEMENTARY** to Family A (Early Filtering). B/E fix the correlation bottleneck, while A reduces input rows to the expensive CTE Scan.
+
+**Analysis of Failure (Iteration 1 — t1):**  
+- **Failed operator:** The patch accidentally removed literals `['IL','KY','TX']` and `[43,46]` from the query.  
+- **Why it backfired:** The rewrite altered filter values instead of preserving them, violating structural equivalence checks. The core idea (pushing filters into CTE) remains sound but needs correct implementation.
+
+---
+
+### Step 2 — Design Targets for Round 2
+
+**Baseline:** Start with the best winner (Family B decorrelation).  
+**Primary bottleneck:** CTE Scan (`ctr1`) at 10,857 ms (rows=582).  
+**Key insight:** Push filters into the CTE to reduce its output rows (currently 582).  
+
+#### **Target 1: Combine Early Filtering + Decorrelation (Rescue)**  
+- **Family:** A+B  
+- **Transform:** `push_store_state_reason_into_cte_fixed`  
+- **Hypothesis:** Push `s_state IN ('IL','KY','TX')` and `sr_reason_sk BETWEEN 43 AND 46` into the CTE. This reduces CTE rows (from 582) by filtering early and avoids joining `store` in the main query.  
+- **Target IR:**  
+  - `S0: replace_where_predicate(anchor_hash='a05952426f9ba20b')` → Remove `s_state`/`ctr_reason_sk` filters from main query.  
+  - `S0: replace_from(anchor_hash='S0')` → Remove `store` table from main query.  
+  - `S0: replace_where_predicate(anchor_hash='ddc05012d854ff26')` → Add `s_state`/`reason_sk` filters + `JOIN store` to CTE.  
+- **Examples:** `pg_date_cte_explicit_join`, `shared_scan_decorrelate`  
+
+#### **Target 2: Refinement — Reduce CTE Rows Further**  
+- **Family:** A+B  
+- **Transform:** `push_customer_demographics_into_cte`  
+- **Hypothesis:** Push customer/demographics filters (`c_birth_month=2`, `cd_gender='F'`, etc.) into the CTE. This shrinks CTE rows further by excluding irrelevant groups early.  
+- **Target IR:**  
+  - `S0: replace_from(anchor_hash='S0')` → Remove `customer`/`customer_demographics` from main query.  
+  - `S0: replace_where_predicate(anchor_hash='ddc05012d854ff26')` → Add customer/demographics filters + joins to CTE.  
+- **Examples:** `pg_date_cte_explicit_join`, `multi_dimension_prefetch`  
+
+#### **Target 3: Join Transform for CTE Efficiency**  
+- **Family:** A+B+F  
+- **Transform:** `cte_join_reorder_store_first`  
+- **Hypothesis:** Reorder CTE joins to start with `store` (small table with 9 rows). Filter states early to reduce `store_returns` scans.  
+- **Target IR:**  
+  - `S0: replace_from(anchor_hash='ddc05012d854ff26')` → Change CTE join order to `store → store_returns → date_dim`.  
+- **Examples:** `pg_explicit_join_materialized`, `pg_date_cte_explicit_join`  
+
+---
+
+### Final Targets (JSON)
+```json
+[
+  {
+    "family": "A+B",
+    "transform": "push_store_state_reason_into_cte_fixed",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Push store state and reason filters into CTE to reduce its output rows (currently 582). Remove 'store' join from main query. Fixes literal mismatch from prior failure.",
+    "target_ir": "S0: replace_where_predicate(anchor_hash='a05952426f9ba20b') to remove store/reason filters; replace_from(anchor_hash='S0') to remove 'store' table; replace_where_predicate(anchor_hash='ddc05012d854ff26') to add store join + filters to CTE.",
+    "recommended_examples": ["pg_date_cte_explicit_join", "shared_scan_decorrelate"]
+  },
+  {
+    "family": "A+B",
+    "transform": "push_customer_demographics_into_cte",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Push customer/demographics filters into CTE to further reduce rows. Current CTE scan (10,857 ms) dominates runtime; fewer rows accelerate decorrelated subquery.",
+    "target_ir": "S0: replace_from(anchor_hash='S0') to remove customer/demographics tables; replace_where_predicate(anchor_hash='ddc05012d854ff26') to add customer/demographics joins + filters to CTE.",
+    "recommended_examples": ["pg_date_cte_explicit_join", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "A+B+F",
+    "transform": "cte_join_reorder_store_first",
+    "target_id": "t3",
+    "relevance_score": 0.80,
+    "hypothesis": "Reorder CTE joins: start with 'store' (9 rows) to filter states early. Reduces store_returns scans during CTE computation.",
+    "target_ir": "S0: replace_from(anchor_hash='ddc05012d854ff26') to change join order to store → store_returns → date_dim.",
+    "recommended_examples": ["pg_explicit_join_materialized", "pg_date_cte_explicit_join"]
+  }
+]
+```

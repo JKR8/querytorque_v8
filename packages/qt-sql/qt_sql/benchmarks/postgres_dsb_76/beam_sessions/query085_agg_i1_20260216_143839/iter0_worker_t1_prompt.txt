@@ -1,0 +1,237 @@
+## Role
+
+You are **W4 "Wildcard"** — Deep specialist for the #1 identified problem. Focus entirely on the highest-priority optimization target. May combine strategies from multiple families or try novel approaches not covered by other workers.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: F — explicit_join_restructure
+**Hypothesis**: Implicit cross joins (comma syntax) prevent optimal join order planning. Restructure as explicit INNER JOINs with key-driven predicate pushdown to reduce nested loops.
+
+## Original SQL
+
+```sql
+select  substring(r_reason_desc,1,20)
+       ,avg(ws_quantity)
+       ,avg(wr_refunded_cash)
+       ,avg(wr_fee)
+ from web_sales, web_returns, web_page, customer_demographics cd1,
+      customer_demographics cd2, customer_address, date_dim, reason
+ where ws_web_page_sk = wp_web_page_sk
+   and ws_item_sk = wr_item_sk
+   and ws_order_number = wr_order_number
+   and ws_sold_date_sk = d_date_sk and d_year = 2000
+   and cd1.cd_demo_sk = wr_refunded_cdemo_sk
+   and cd2.cd_demo_sk = wr_returning_cdemo_sk
+   and ca_address_sk = wr_refunded_addr_sk
+   and r_reason_sk = wr_reason_sk
+   and
+   (
+    (
+     cd1.cd_marital_status = 'S'
+     and
+     cd1.cd_marital_status = cd2.cd_marital_status
+     and
+     cd1.cd_education_status = 'College'
+     and
+     cd1.cd_education_status = cd2.cd_education_status
+     and
+     ws_sales_price between 100.00 and 150.00
+    )
+   or
+    (
+     cd1.cd_marital_status = 'W'
+     and
+     cd1.cd_marital_status = cd2.cd_marital_status
+     and
+     cd1.cd_education_status = 'Unknown'
+     and
+     cd1.cd_education_status = cd2.cd_education_status
+     and
+     ws_sales_price between 50.00 and 100.00
+    )
+   or
+    (
+     cd1.cd_marital_status = 'M'
+     and
+     cd1.cd_marital_status = cd2.cd_marital_status
+     and
+     cd1.cd_education_status = 'Secondary'
+     and
+     cd1.cd_education_status = cd2.cd_education_status
+     and
+     ws_sales_price between 150.00 and 200.00
+    )
+   )
+   and
+   (
+    (
+     ca_country = 'United States'
+     and
+     ca_state in ('NC', 'PA', 'TX')
+     and ws_net_profit between 100 and 200
+    )
+    or
+    (
+     ca_country = 'United States'
+     and
+     ca_state in ('AR', 'CO', 'NY')
+     and ws_net_profit between 150 and 300
+    )
+    or
+    (
+     ca_country = 'United States'
+     and
+     ca_state in ('IA', 'IL', 'TX')
+     and ws_net_profit between 50 and 250
+    )
+   )
+group by r_reason_desc
+order by substring(r_reason_desc,1,20)
+        ,avg(ws_quantity)
+        ,avg(wr_refunded_cash)
+        ,avg(wr_fee)
+limit 100;
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: web_sales, web_returns, web_page, customer_demographics cd1, customer_demographics cd2, customer_address, date_dim, reason
+    WHERE [edf10a498f1ee83a]: ws_web_page_sk = wp_web_page_sk AND ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number...
+    GROUP BY: r_reason_desc
+    ORDER BY: SUBSTRING(r_reason_desc FROM 1 FOR 20), AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee)
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: web_sales
+      INNER JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_year = 2000
+      INNER JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+      INNER JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+      INNER JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk AND (cd1.cd_marital_status IN ('S','W','M') AND ...)
+      INNER JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk AND cd2.cd_marital_status = cd1.cd_marital_status AND cd2.cd_education_status = cd1.cd_education_status
+      INNER JOIN customer_address ON ca_address_sk = wr_refunded_addr_sk AND ((ca_country='United States' AND ca_state IN (...)) OR ...)
+      INNER JOIN reason ON r_reason_sk = wr_reason_sk
+    GROUP BY: r_reason_desc
+    ORDER BY: SUBSTRING(r_reason_desc FROM 1 FOR 20), ...
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_postgres_pg_explicit_join_materialized",
+  "dialect": "postgres",
+  "description": "Convert comma joins to explicit INNER JOINs AND pre-filter date/item dimensions into MATERIALIZED CTEs. The combination enables PostgreSQL to use small materialized hash tables as probe inputs, dramatically improving join cardinality estimation on complex multi-table queries.",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "date_subquery_cte",
+        "cte_query_sql": "SELECT d_date FROM date_dim WHERE d_month_seq IN (SELECT d_month_seq FROM date_dim WHERE d_date IN ('2002-02-01', '2002-04-11', '2002-07-17', '2002-10-09'))"
+      },
+      "description": "Insert CTE 'date_subquery_cte' for date dimension filtering"
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "sr_items"
+      },
+      "payload": {
+        "sql_fragment": "sr_items AS (SELECT i_item_id AS item_id, SUM(sr_return_quantity) AS sr_item_qty FROM store_returns INNER JOIN item ON sr_item_sk = i_item_sk INNER JOIN date_dim ON sr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND sr_reason_sk IN (26, 32, 40, 66, 73) AND sr_return_amt / sr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'sr_items' body with optimized version"
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "cr_items"
+      },
+      "payload": {
+        "sql_fragment": "cr_items AS (SELECT i_item_id AS item_id, SUM(cr_return_quantity) AS cr_item_qty FROM catalog_returns INNER JOIN item ON cr_item_sk = i_item_sk INNER JOIN date_dim ON cr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND cr_reason_sk IN (26, 32, 40, 66, 73) AND cr_return_amount / cr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'cr_items' body with optimized version"
+    },
+    {
+      "step_id": "s4",
+      "op": "replace_block_with_cte_pair",
+      "target": {
+        "by_node_id": "S0",
+        "by_label": "wr_items"
+      },
+      "payload": {
+        "sql_fragment": "wr_items AS (SELECT i_item_id AS item_id, SUM(wr_return_quantity) AS wr_item_qty FROM web_returns INNER JOIN item ON wr_item_sk = i_item_sk INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk WHERE d_date IN (SELECT d_date FROM date_subquery_cte) AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND wr_reason_sk IN (26, 32, 40, 66, 73) AND wr_return_amt / wr_return_quantity BETWEEN 184 AND 213 GROUP BY i_item_id)"
+      },
+      "description": "Replace CTE 'wr_items' body with optimized version"
+    },
+    {
+      "step_id": "s5",
+      "op": "replace_from",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "from_sql": "sr_items JOIN cr_items ON sr_items.item_id = cr_items.item_id JOIN wr_items ON sr_items.item_id = wr_items.item_id"
+      },
+      "description": "Replace comma-join FROM with explicit JOINs"
+    },
+    {
+      "step_id": "s6",
+      "op": "delete_expr_subtree",
+      "target": {
+        "by_node_id": "S0",
+        "by_anchor_hash": "6f618ce74d15a625"
+      },
+      "description": "Remove WHERE clause (conditions moved to CTEs)"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "postgres" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

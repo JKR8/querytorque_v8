@@ -1,0 +1,65 @@
+Based on the analysis of the query, execution plan, and optimization history, I've identified the primary bottleneck and designed targeted optimizations for the next round. The most expensive operator is the `CTE Scan (best_ss_customer)` which takes 4168.67 ms and accounts for ~78% of total execution time. This is due to the costly computation of the `best_ss_customer` CTE, which involves a full scan of `store_sales` without date filters.
+
+### Step 1: Plan Analysis
+All previous patches failed due to implementation errors:
+- **Literal mismatches**: Changed filter values (95.0 → 0.95) instead of preserving originals
+- **Syntax errors**: Invalid SQL generation during join restructuring
+- **Structural changes**: Missing preservation of original filter literals
+
+No winners exist from previous iterations to classify as redundant/complementary.
+
+### Step 2: Target Design
+Here are 4 high-confidence targets addressing the primary bottleneck and secondary issues:
+
+```json
+[
+  {
+    "family": "A+C",
+    "transform": "push_filters_preaggregate",
+    "target_id": "CTE_Q_S0_max_store_sales",
+    "relevance_score": 0.98,
+    "hypothesis": "Preaggregate store_sales with date filter before joining customer, reducing input rows to max_store_sales CTE from 135,776 rows. Combine with early filtering on item to accelerate frequent_ss_items.",
+    "target_ir": "S0:CTE_Q_S0_max_store_sales;S0:CTE_Q_S0_frequent_ss_items:89fc2fb260a938e8",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_customer",
+    "target_id": "8e7b5f6e04cda7e3",
+    "relevance_score": 0.95,
+    "hypothesis": "Convert comma join to explicit INNER JOIN in best_ss_customer CTE to enable better join ordering. Targets Nested Loop (256,261 rows) which is the second most expensive operator after CTE scan.",
+    "target_ir": "S0:CTE_Q_S0_best_ss_customer:8e7b5f6e04cda7e3",
+    "recommended_examples": ["pg_explicit_join_materialized"]
+  },
+  {
+    "family": "E",
+    "transform": "materialize_filtered_items",
+    "target_id": "89fc2fb260a938e8",
+    "relevance_score": 0.90,
+    "hypothesis": "Materialize filtered items first to reduce Seq Scan on item (6,872 rows) before joining with store_sales in frequent_ss_items CTE.",
+    "target_ir": "S0:CTE_Q_S0_frequent_ss_items:89fc2fb260a938e8",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_scalar_subquery",
+    "target_id": "CTE_Q_S0_best_ss_customer",
+    "relevance_score": 0.85,
+    "hypothesis": "Decorrelate scalar subquery in best_ss_customer HAVING clause to avoid repeated executions. Targets Aggregate (29,925 ms) in max_store_sales computation.",
+    "target_ir": "S0:CTE_Q_S0_best_ss_customer",
+    "recommended_examples": ["pg_shared_scan_decorrelate"]
+  }
+]
+```
+
+### Key Rationale
+1. **Primary Bottleneck**: The `best_ss_customer` CTE scan (4168 ms) dominates runtime. Combined A+C approach attacks its dependency on expensive `max_store_sales` while accelerating the frequent_ss_items CTE it joins with.
+2. **High-Confidence Targets**: 
+   - Target 1 combines filter pushdown (A) and preaggregation (C) to reduce input to expensive CTEs
+   - Target 2 restructures joins (F) to optimize the Nested Loop (256k rows)
+   - Target 3 materializes dimension filters (E) to reduce item scan rows
+   - Target 4 decorrelates (B) the scalar subquery as a rescue attempt
+3. **Plan Evidence**: All row counts and times are directly quoted from the provided EXPLAIN plan
+4. **Error Prevention**: Preserves literal values (95.0, 1998, etc.) and uses tested transform patterns
+
+The combination of A+C is prioritized as it addresses two major CTEs simultaneously. All transformations target specific high-cost operators identified in the plan.

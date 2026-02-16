@@ -1,0 +1,133 @@
+### Analysis of Execution Plans and Failed Patches
+
+**Step 1: Compare EXPLAIN Plans**  
+All patches (t3, t4, t5) failed with execution errors, so no winners exist. The original plan remains the baseline. The most expensive operator is:  
+```Nested Loop (rows=13167, time=1251.267)```  
+This processes 123,464 rows from the Hash Join and performs an Index Scan on `item` for each row. The high row count and nested loop structure indicate a bottleneck.
+
+**Failed Patch Diagnostics**:  
+- **t3/t5**: Transaction errors suggest syntax/scope issues in CTE references. Structural intent (early filtering + aggregation) was sound but implementation flawed.  
+- **t4**: Missing `ss_sold_date_sk` in CTE broke join logic. Aggregation pushdown was incorrectly scoped.  
+
+---
+
+### Step 2: Design Targets
+
+**Primary Bottleneck**:  
+Nested Loop processing 123,464 rows to join `store_sales` with `item` (time=1251.267 ms).  
+**Secondary Bottleneck**:  
+Subsequent Nested Loop on `customer` (rows=13,167 → 1,299, time=1494.656 ms).
+
+**Target 1: Combination (A+F) - Rescue + Refinement**  
+- **Family**: A+F  
+- **Transform**: `early_filter_explicit_join_fixed`  
+- **Hypothesis**: Pre-filter dimension tables (A) and enforce optimal join order (F) to reduce input rows to the Nested Loop on `item`. Fixes t5’s transaction error by correctly scoping CTEs.  
+- **Target IR**: `S0: replace_from with explicit JOIN order (date_dim → store_sales → item → customer → customer_address → store)`  
+- **Examples**: `pg_date_cte_explicit_join`, `pg_explicit_join_materialized`  
+```json
+{
+  "family": "A+F",
+  "transform": "early_filter_explicit_join_fixed",
+  "target_id": "t6",
+  "relevance_score": 0.95,
+  "hypothesis": "Pre-filtering dimensions (A) and enforcing join order (F) will reduce input rows to the Nested Loop (rows=123,464) by pushing filters early. Fixes t5's scope error.",
+  "target_ir": "S0: replace_from with CTEs for filtered dimensions + explicit JOIN order",
+  "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+}
+```
+
+**Target 2: Aggregation Pushdown Rescue (C)**  
+- **Family**: C  
+- **Transform**: `agg_pushdown_fixed_keys`  
+- **Hypothesis**: Pre-aggregate `store_sales` by `ss_item_sk`, `ss_customer_sk`, `ss_store_sk` *after* joining with `date_dim` and `store` to retain necessary keys. Fixes t4’s missing column error.  
+- **Target IR**: `S0: replace_expr_subtree (aggregation) with preagg CTE including all join keys`  
+- **Examples**: `pg_materialized_dimension_fact_prefilter`  
+```json
+{
+  "family": "C",
+  "transform": "agg_pushdown_fixed_keys",
+  "target_id": "t7",
+  "relevance_score": 0.85,
+  "hypothesis": "Aggregate store_sales after date_dim/store joins but before other dimensions. Retains keys to fix t4's error and reduces rows for the Nested Loop (rows=123,464).",
+  "target_ir": "S0: insert_cte for preagg (with ss_item_sk, ss_customer_sk, ss_store_sk, ext_price) and replace_from",
+  "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+}
+```
+
+**Target 3: Early Customer-Address Join (A+E)**  
+- **Family**: A+E  
+- **Transform**: `precomputed_customer_address`  
+- **Hypothesis**: Materialize filtered `customer` and `customer_address` as a single CTE to eliminate the Nested Loop on `customer_address` (rows=1,299 → 37).  
+- **Target IR**: `S0: insert_cte for joined customer/customer_address`  
+- **Examples**: `multi_dimension_prefetch`, `pg_date_cte_explicit_join`  
+```json
+{
+  "family": "A+E",
+  "transform": "precomputed_customer_address",
+  "target_id": "t8",
+  "relevance_score": 0.80,
+  "hypothesis": "Pre-join customer and customer_address (A+E) eliminates the Nested Loop (rows=1,299) by materializing filtered pairs. Targets the secondary bottleneck.",
+  "target_ir": "S0: insert_cte for customer_address JOIN customer and replace_from",
+  "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+}
+```
+
+**Target 4: Zip Filter Pushdown (A)**  
+- **Family**: A  
+- **Transform**: `early_zip_filter`  
+- **Hypothesis**: Push `ca_state='KS'` and `c_birth_month=2` into CTEs *before* joining to reduce `customer` rows early.  
+- **Target IR**: `S0: replace_where_predicate (ca_state, c_birth_month) pushed into CTEs`  
+- **Examples**: `pg_date_cte_explicit_join`  
+```json
+{
+  "family": "A",
+  "transform": "early_zip_filter",
+  "target_id": "t9",
+  "relevance_score": 0.75,
+  "hypothesis": "Filter customer/customer_address early (A) reduces input to the Nested Loop on customer (rows=13,167).",
+  "target_ir": "S0: replace_where_predicate for ca_state/c_birth_month pushed to CTEs",
+  "recommended_examples": ["pg_date_cte_explicit_join"]
+}
+```
+
+### Final Targets
+```json
+[
+  {
+    "family": "A+F",
+    "transform": "early_filter_explicit_join_fixed",
+    "target_id": "t6",
+    "relevance_score": 0.95,
+    "hypothesis": "Pre-filtering dimensions (A) and enforcing join order (F) will reduce input rows to the Nested Loop (rows=123,464) by pushing filters early. Fixes t5's scope error.",
+    "target_ir": "S0: replace_from with CTEs for filtered dimensions + explicit JOIN order",
+    "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown_fixed_keys",
+    "target_id": "t7",
+    "relevance_score": 0.85,
+    "hypothesis": "Aggregate store_sales after date_dim/store joins but before other dimensions. Retains keys to fix t4's error and reduces rows for the Nested Loop (rows=123,464).",
+    "target_ir": "S0: insert_cte for preagg (with ss_item_sk, ss_customer_sk, ss_store_sk, ext_price) and replace_from",
+    "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+  },
+  {
+    "family": "A+E",
+    "transform": "precomputed_customer_address",
+    "target_id": "t8",
+    "relevance_score": 0.80,
+    "hypothesis": "Pre-join customer and customer_address (A+E) eliminates the Nested Loop (rows=1,299) by materializing filtered pairs. Targets the secondary bottleneck.",
+    "target_ir": "S0: insert_cte for customer_address JOIN customer and replace_from",
+    "recommended_examples": ["multi_dimension_prefetch", "pg_date_cte_explicit_join"]
+  },
+  {
+    "family": "A",
+    "transform": "early_zip_filter",
+    "target_id": "t9",
+    "relevance_score": 0.75,
+    "hypothesis": "Filter customer/customer_address early (A) reduces input to the Nested Loop on customer (rows=13,167).",
+    "target_ir": "S0: replace_where_predicate for ca_state/c_birth_month pushed to CTEs",
+    "recommended_examples": ["pg_date_cte_explicit_join"]
+  }
+]
+```
