@@ -33,6 +33,7 @@ Success criterion per query:
 - Temporal anchor detection for date-heavy predicates.
 - Anti-pattern table skip logic (`NOT EXISTS`, `NOT IN`, `EXCEPT`).
 - Deterministic MVROWS fallback entrypoint (`_apply_mvrows_recipe`) with template handlers for known holdout families.
+- Simple UNSAT detector for obvious contradictions (for example `x <> x` under single-literal domain constraints).
 
 ## Determinism Rules
 - No randomness.
@@ -46,6 +47,7 @@ Success criterion per query:
 - Need wider arithmetic-constraint solver coverage (beyond current hardcoded patterns).
 - Example contradictory variant in current DSB76 set:
   - `query064_multi_i2`: `cd1.cd_marital_status <> cd2.cd_marital_status` while both sides are constrained to `'S'` only.
+  - This is now detected as `unsat_expected` in validation output.
 
 ## Next Work (In Order)
 1. Replace family recipes with generic DAG/constraint solver passes:

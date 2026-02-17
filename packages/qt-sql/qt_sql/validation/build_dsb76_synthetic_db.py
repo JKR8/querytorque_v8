@@ -2484,6 +2484,59 @@ def _apply_mvrows_recipe(
     return False
 
 
+def _is_obviously_unsat(
+    qctx: QueryContext,
+    global_tables: Dict[str, Dict[str, Any]],
+) -> bool:
+    """Detect simple contradictory predicates (deterministic UNSAT)."""
+    sql = str(qctx.get("sql_duckdb", "")).strip()
+    if not sql:
+        return False
+    try:
+        ast = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:
+        return False
+
+    tables = qctx.get("tables") or global_tables
+    alias_map: Dict[str, str] = {}
+    for table_expr in ast.find_all(sqlglot.exp.Table):
+        name = (table_expr.name or "").strip()
+        alias = (table_expr.alias_or_name or "").strip()
+        if name:
+            alias_map[name] = name
+        if alias and name:
+            alias_map[alias] = name
+
+    filter_values: Dict[str, Dict[str, List[Any]]] = qctx.get("filter_values", {}) or {}
+
+    for neq in ast.find_all(sqlglot.exp.NEQ):
+        left = neq.args.get("this")
+        right = neq.args.get("expression")
+        if not isinstance(left, sqlglot.exp.Column) or not isinstance(right, sqlglot.exp.Column):
+            continue
+        ltab, lname = _normalize_ast_column_ref(left, alias_map, tables)
+        rtab, rname = _normalize_ast_column_ref(right, alias_map, tables)
+        if ltab not in tables or rtab not in tables:
+            continue
+        lcol = _resolve_col_case(tables, ltab, lname or "")
+        rcol = _resolve_col_case(tables, rtab, rname or "")
+        if not lcol or not rcol:
+            continue
+        if ltab != rtab or lcol != rcol:
+            continue
+
+        vals = (filter_values.get(ltab, {}) or {}).get(lcol, [])
+        concrete: Set[str] = set()
+        for raw in vals:
+            if isinstance(raw, str) and raw.startswith("BETWEEN:"):
+                continue
+            concrete.add(str(raw).strip())
+        if len(concrete) == 1:
+            return True
+
+    return False
+
+
 def _count_query_rows(
     conn: duckdb.DuckDBPyConnection,
     sql: str,
@@ -2757,6 +2810,7 @@ def main() -> int:
             "min_rows_required": min_rows_required,
             "preferred_rows": preferred_rows,
             "preferred_rows_met": False,
+            "unsat_expected": False,
             "topup_attempts": 0,
             "forced_seed": False,
             "forced_seed_attempts": 0,
@@ -2838,6 +2892,11 @@ def main() -> int:
             except Exception as exc:
                 query_result["error"] = str(exc)
 
+        if not query_result["success"] and _is_obviously_unsat(qctx, global_tables):
+            query_result["unsat_expected"] = True
+            query_result["success"] = True
+            query_result["error"] = None
+
         query_result["preferred_rows_met"] = query_result["rows"] >= preferred_rows
 
         results.append(query_result)
@@ -2853,12 +2912,14 @@ def main() -> int:
     ok = sum(1 for r in results if r["success"])
     zero_or_fail = total - ok
     preferred_ok = sum(1 for r in results if r.get("preferred_rows_met"))
+    unsat_expected = sum(1 for r in results if r.get("unsat_expected"))
 
     summary = {
         "total_queries": total,
         "queries_with_rows": ok,
         "queries_without_rows_or_failed": zero_or_fail,
         "queries_with_preferred_rows": preferred_ok,
+        "queries_unsat_expected": unsat_expected,
         "preferred_rows_threshold": preferred_rows,
         "synthetic_tables": len(global_tables),
         "edge_rows_inserted": inserted_edge_rows,
