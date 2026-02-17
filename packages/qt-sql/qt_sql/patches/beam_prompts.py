@@ -4,7 +4,7 @@ Pipeline: analyst (8-16 probes) → workers → compiler stage (beam_prompt_buil
 
 Functions:
     build_beam_analyst_prompt()    — analyst: hypothesis + 8-16 probes
-    build_beam_worker_prompt()     — worker: one transform, DAG candidate out
+    build_beam_worker_prompt()     — worker: one transform, TREE candidate out
     parse_analyst_response()       — parse analyst JSON response
 """
 
@@ -220,21 +220,21 @@ def _load_gold_example_by_id(
     return None
 
 
-def _format_gold_dag_hint(gold_dag_example: Dict[str, Any]) -> List[str]:
-    """Compact gold DAG hint (avoid large JSON blocks in worker prompt)."""
+def _format_gold_tree_hint(gold_tree_example: Dict[str, Any]) -> List[str]:
+    """Compact gold TREE hint (avoid large JSON blocks in worker prompt)."""
     lines: List[str] = []
-    if not isinstance(gold_dag_example, dict):
+    if not isinstance(gold_tree_example, dict):
         return lines
 
-    dag = gold_dag_example.get("dag")
-    if not isinstance(dag, dict):
-        # Allow bare DAG payloads.
-        if isinstance(gold_dag_example.get("nodes"), list):
-            dag = gold_dag_example
+    tree = gold_tree_example.get("tree")
+    if not isinstance(tree, dict):
+        # Allow bare TREE payloads.
+        if isinstance(gold_tree_example.get("nodes"), list):
+            tree = gold_tree_example
         else:
             return lines
 
-    nodes = dag.get("nodes") or []
+    nodes = tree.get("nodes") or []
     if not isinstance(nodes, list) or not nodes:
         return lines
 
@@ -250,20 +250,20 @@ def _format_gold_dag_hint(gold_dag_example: Dict[str, Any]) -> List[str]:
         and n.get("changed") is True
         and str(n.get("node_id", "")).strip()
     ]
-    final_node = str(dag.get("final_node_id", "")).strip() or "final_select"
+    final_node = str(tree.get("final_node_id", "")).strip() or "final_select"
 
     lines.extend([
-        "### Gold DAG Pattern Reference",
-        f"- `plan_id`: `{gold_dag_example.get('plan_id', 'gold_dag')}`",
+        "### Gold TREE Pattern Reference",
+        f"- `plan_id`: `{gold_tree_example.get('plan_id', 'gold_dag')}`",
         f"- `final_node_id`: `{final_node}`",
     ])
     if node_ids:
-        lines.append("- `order`: " + ", ".join(f"`{n}`" for n in (dag.get("order") or node_ids)[:10]))
+        lines.append("- `order`: " + ", ".join(f"`{n}`" for n in (tree.get("order") or node_ids)[:10]))
     if changed_nodes:
         lines.append(
             "- `changed_nodes`: " + ", ".join(f"`{n}`" for n in changed_nodes[:6])
         )
-    lines.append("- Reuse DAG shape and invariants, not literal table/column names.")
+    lines.append("- Reuse TREE shape and invariants, not literal table/column names.")
     lines.append("")
     return lines
 
@@ -337,7 +337,7 @@ def _format_gold_overview_section(
         return ""
 
     lines = [
-        "## Gold DAG Pattern Cards",
+        "## Gold TREE Pattern Cards",
         "Use these as pattern priors; adapt shape, not literal table names.",
     ]
     for family in sorted(gold_examples.keys()):
@@ -346,11 +346,11 @@ def _format_gold_overview_section(
             continue
         ex_id = str(ex.get("id") or "unknown")
         speedup = str(ex.get("verified_speedup") or "n/a")
-        dag_example = ex.get("dag_example") or ex.get("dag")
+        dag_example = ex.get("dag_example") or ex.get("tree")
         dag_payload = None
         if isinstance(dag_example, dict):
-            if isinstance(dag_example.get("dag"), dict):
-                dag_payload = dag_example.get("dag")
+            if isinstance(dag_example.get("tree"), dict):
+                dag_payload = dag_example.get("tree")
             elif isinstance(dag_example.get("nodes"), list):
                 dag_payload = dag_example
         changed_nodes: List[str] = []
@@ -381,7 +381,7 @@ def build_beam_analyst_prompt(
     original_sql: str,
     explain_text: str,
     ir_node_map: str,
-    current_dag_map: str = "",
+    current_tree_map: str = "",
     gold_examples: Optional[Dict[str, Dict[str, Any]]] = None,
     dialect: str = "postgres",
     intelligence_brief: str = "",
@@ -396,7 +396,7 @@ def build_beam_analyst_prompt(
     template = _load_prompt_template("beam_analyst_v3.txt")
     stars = max(1, min(3, int(importance_stars or 1)))
     star_label = "*" * stars
-    _ = ir_node_map  # Backward-compatible arg; DAG map is the structural source.
+    _ = ir_node_map  # Backward-compatible arg; TREE map is the structural source.
 
     dynamic_sections = [
         f"## Query ID\n{query_id}",
@@ -414,7 +414,7 @@ def build_beam_analyst_prompt(
         ),
         f"## Original SQL\n```sql\n{original_sql}\n```",
         f"## Execution Plan\n```\n{explain_text}\n```",
-        f"## Current DAG Node Map\n```\n{current_dag_map or '(not provided)'}\n```",
+        f"## Current TREE Node Map\n```\n{current_tree_map or '(not provided)'}\n```",
         _build_transform_catalog_section(dialect),
     ]
     qerror_section = _format_qerror_section(qerror_analysis)
@@ -457,8 +457,8 @@ def build_beam_worker_prompt(
     ir_node_map: str,
     hypothesis: str,
     probe: ProbeSpec,
-    current_dag_map: str = "",
-    gold_dag_example: Optional[Dict[str, Any]] = None,
+    current_tree_map: str = "",
+    gold_tree_example: Optional[Dict[str, Any]] = None,
     explain_text: str = "",
     dialect: str = "postgres",
     schema_context: str = "",
@@ -575,8 +575,8 @@ def build_beam_worker_prompt(
             "### Current IR Node Map\n",
             f"```\n{ir_node_map}\n```",
             "",
-            "### Current DAG Node Map\n",
-            f"```\n{current_dag_map or '(not provided)'}\n```",
+            "### Current TREE Node Map\n",
+            f"```\n{current_tree_map or '(not provided)'}\n```",
             "",
         ]
     )
@@ -596,9 +596,9 @@ def build_beam_worker_prompt(
     lines.append(_build_transform_recipe_section(probe.transform_id))
     lines.append("")
 
-    # Gold DAG pattern (compact)
-    if gold_dag_example:
-        lines.extend(_format_gold_dag_hint(gold_dag_example))
+    # Gold TREE pattern (compact)
+    if gold_tree_example:
+        lines.extend(_format_gold_tree_hint(gold_tree_example))
 
     dynamic = "\n".join(lines)
     if template:
@@ -607,7 +607,7 @@ def build_beam_worker_prompt(
     return "\n".join(
         [
             "## Role",
-            "You are a Senior SQL Rewrite Engineer. Output ONLY one DAG JSON object.",
+            "You are a Senior SQL Rewrite Engineer. Output ONLY one TREE JSON object.",
             "First character must be `{` with no leading whitespace.",
             "## Cache Boundary",
             "Everything below is probe-specific input.",
@@ -678,17 +678,17 @@ def build_beam_worker_retry_prompt(
     gate_error: str,
     failed_sql: str = "",
     previous_response: str = "",
-    output_mode: str = "dag",
+    output_mode: str = "tree",
 ) -> str:
     """Append structured gate-failure feedback for one worker retry."""
-    mode = str(output_mode or "dag").strip().lower()
+    mode = str(output_mode or "tree").strip().lower()
     dag_mode = mode != "patchplan"
     parts = [
         worker_prompt,
         "",
         "## RETRY — Gate failure feedback (attempt 2/2)",
         (
-            "Your previous rewrite failed validation. Return a corrected DAG JSON object only."
+            "Your previous rewrite failed validation. Return a corrected TREE JSON object only."
             if dag_mode
             else "Your previous patch failed validation. Return a corrected PatchPlan JSON only."
         ),
@@ -733,12 +733,12 @@ def build_beam_worker_retry_prompt(
             "",
             "Fix only what caused the gate failure while preserving transform intent and semantics.",
             (
-                "Output ONLY valid DAG JSON."
+                "Output ONLY valid TREE JSON."
                 if dag_mode
                 else "Output ONLY valid PatchPlan JSON."
             ),
             (
-                "Do not emit PatchPlan `steps`/`payload` fields in DAG mode."
+                "Do not emit PatchPlan `steps`/`payload` fields in TREE mode."
                 if dag_mode
                 else "Never emit payload.sql; use payload.sql_fragment where SQL fragments are required."
             ),
