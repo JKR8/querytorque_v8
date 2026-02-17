@@ -629,10 +629,12 @@ def test_run_beam_dag_mode_executes_without_api_calls(
         }
     )
     responses = [dispatcher_response, worker_response]
+    prompts_seen = []
 
     def fake_make_llm_call_fn(provider_spec=None, model_spec=None):
         def _call(_prompt: str) -> str:
             assert responses, "Unexpected extra LLM call in test"
+            prompts_seen.append(_prompt)
             return responses.pop(0)
 
         return _call
@@ -643,3 +645,9 @@ def test_run_beam_dag_mode_executes_without_api_calls(
     assert result.status in {"WIN", "IMPROVED"}
     assert result.best_sql.strip().upper().startswith("SELECT 2")
     assert result.n_api_calls == 2
+    assert len(prompts_seen) >= 2
+    worker_prompt = prompts_seen[1]
+    assert "### Current DAG Node Map" in worker_prompt
+    assert "## Runtime Override: DAG Mode (Takes Precedence)" in worker_prompt
+    assert worker_prompt.count("## Base DAG Spec") == 1
+    assert "Expected shape:" not in worker_prompt

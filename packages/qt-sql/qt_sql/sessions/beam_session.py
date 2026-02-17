@@ -744,31 +744,24 @@ class BeamSession(OptimizationSession):
     @staticmethod
     def _worker_dag_mode_suffix(base_dag_spec: str) -> str:
         """Worker DAG-mode runtime contract (takes precedence over template text)."""
-        return (
-            "## Runtime Override: DAG Mode (Takes Precedence)\n"
-            "Ignore any conflicting output-shape instructions above.\n"
-            "Output ONE JSON object with a `dag` payload.\n"
-            "Worker constraints:\n"
-            "- exactly ONE changed node\n"
-            "- changed node must include full executable SQL in `sql`\n"
-            "- unchanged nodes should omit `sql`\n"
-            "- first character must be `{` (no prose/markdown)\n\n"
-            "Expected shape:\n"
-            "{\n"
-            "  \"probe_id\": \"pNN\",\n"
-            "  \"transform_id\": \"...\",\n"
-            "  \"family\": \"A|B|C|D|E|F\",\n"
-            "  \"hypothesis\": \"...\",\n"
-            "  \"dag\": {\n"
-            "    \"order\": [\"...\"],\n"
-            "    \"final_node_id\": \"final_select\",\n"
-            "    \"nodes\": [\n"
-            "      {\"node_id\": \"...\", \"deps\": [\"...\"], \"outputs\": [\"...\"], \"changed\": true, \"sql\": \"SELECT ...\"}\n"
-            "    ]\n"
-            "  }\n"
-            "}\n\n"
-            f"{base_dag_spec}"
-        )
+        parts = [
+            "## Runtime Override: DAG Mode (Takes Precedence)",
+            "Ignore any conflicting output-shape instructions above.",
+            "Output mode is DAG JSON; keep the full schema from the worker template.",
+            "Worker constraints:",
+            "- exactly ONE changed node",
+            "- changed node must include full executable SQL in `sql`",
+            "- unchanged nodes should omit `sql`",
+            "- first character must be `{` (no prose/markdown)",
+        ]
+        if base_dag_spec:
+            parts.extend(
+                [
+                    "",
+                    base_dag_spec,
+                ]
+            )
+        return "\n".join(parts)
 
     @staticmethod
     def _worker_lane_suffix(lane: str) -> str:
@@ -1641,7 +1634,7 @@ class BeamSession(OptimizationSession):
                     worker_prompt = (
                         worker_prompt
                         + "\n\n"
-                        + self._worker_dag_mode_suffix(base_dag_prompt)
+                        + self._worker_dag_mode_suffix("")
                     )
 
                 probe_id = str(getattr(probe, "probe_id", ""))
