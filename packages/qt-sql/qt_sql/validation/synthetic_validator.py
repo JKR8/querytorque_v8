@@ -4,7 +4,7 @@ Generates synthetic data matching query schema, executes both original
 and optimized queries on it, and compares results. Used as Gate 3
 (semantic validation) in the beam patch pipeline.
 
-Ported from research/synthetic_validator/validator.py.
+Ported from qt-synth/validator.py.
 """
 
 import argparse

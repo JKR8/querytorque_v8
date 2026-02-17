@@ -1512,10 +1512,39 @@ class Pipeline:
                     examples.append(ex_data)
 
         if not examples:
+            # Deterministic fallback: use dialect catalog examples so prepare/run
+            # can proceed even when tag index coverage is incomplete.
+            example_dir = Path(__file__).resolve().parent / "examples" / dialect_example_dir(canonical_dialect)
+            for path in sorted(example_dir.glob("*.json")):
+                if len(examples) >= k:
+                    break
+                try:
+                    ex_data = normalize_example_record(
+                        json.loads(path.read_text()),
+                        default_dialect=canonical_dialect,
+                    )
+                except Exception:
+                    continue
+                ex_id = str(ex_data.get("id", path.stem))
+                if ex_id in seen_ids:
+                    continue
+                seen_ids.add(ex_id)
+                ex_data["_match_score"] = 0.0
+                ex_data["_retrieval_mode"] = "catalog_fallback"
+                examples.append(ex_data)
+
+        if not examples:
             logger.error(
-                "No tag-matched examples found (dialect=%s, k=%d).",
+                "No examples found (dialect=%s, k=%d) after tag match + catalog fallback.",
                 canonical_dialect,
                 k,
+            )
+        elif all(float(ex.get("_match_score", 0.0) or 0.0) == 0.0 for ex in examples):
+            logger.warning(
+                "No tag-matched examples found (dialect=%s, k=%d). Using catalog fallback (%d examples).",
+                canonical_dialect,
+                k,
+                len(examples),
             )
         return examples
 

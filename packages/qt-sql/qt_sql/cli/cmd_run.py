@@ -34,10 +34,10 @@ import click
               help="Resume from last checkpoint in the run directory.")
 @click.option("-o", "--output-dir", type=click.Path(), default=None,
               help="Custom output directory (default: benchmark/runs/<timestamp>).")
-@click.option("--concurrency", type=int, default=0,
-              help="Parallel query concurrency (0=serial).")
-@click.option("--benchmark-concurrency", type=int, default=4, show_default=True,
-              help="Max concurrent benchmark lanes in patch-parallel mode.")
+@click.option("--concurrency", type=int, default=None,
+              help="Parallel query concurrency (default: config api_call_slots, fallback 0=serial).")
+@click.option("--benchmark-concurrency", type=int, default=None,
+              help="Max concurrent benchmark lanes (default: config benchmark_slots, fallback 4).")
 @click.option(
     "--launch-interval-seconds",
     type=float,
@@ -75,8 +75,8 @@ def run(
     fan_out_only_legacy: bool,
     resume: bool,
     output_dir: str | None,
-    concurrency: int,
-    benchmark_concurrency: int,
+    concurrency: int | None,
+    benchmark_concurrency: int | None,
     launch_interval_seconds: float,
     config_boost: bool,
     bootstrap: bool,
@@ -109,9 +109,6 @@ def run(
     if dry_run and mode != "fleet":
         print_error("--dry-run is only valid with --mode fleet.")
         raise SystemExit(2)
-    if benchmark_concurrency < 1:
-        print_error("--benchmark-concurrency must be >= 1.")
-        raise SystemExit(2)
     if launch_interval_seconds < 0:
         print_error("--launch-interval-seconds must be >= 0.")
         raise SystemExit(2)
@@ -122,6 +119,20 @@ def run(
 
     bench_dir = resolve_benchmark(benchmark)
     cfg = load_benchmark_config(bench_dir)
+
+    # Resolve runtime slots from config when CLI flags are omitted.
+    if concurrency is None:
+        concurrency = int(cfg.get("api_call_slots", 0) or 0)
+    if benchmark_concurrency is None:
+        benchmark_concurrency = int(cfg.get("benchmark_slots", 4) or 4)
+
+    if concurrency < 0:
+        print_error("--concurrency must be >= 0.")
+        raise SystemExit(2)
+    if benchmark_concurrency < 1:
+        print_error("--benchmark-concurrency must be >= 1.")
+        raise SystemExit(2)
+
     query_ids = parse_query_filter(query, bench_dir)
 
     if not query_ids:

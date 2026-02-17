@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from qt_sql.pipeline import Pipeline
-from qt_sql.patches.beam_wide_prompts import build_beam_worker_retry_prompt
+from qt_sql.patches.beam_prompts import build_beam_worker_retry_prompt
 from qt_sql.sessions.beam_session import AppliedPatch, BeamSession
 
 
@@ -242,7 +242,7 @@ def test_worker_retry_revalidates_tier1_failure(
                 p.status = "WIN"
                 p.speedup = 1.2
 
-    monkeypatch.setattr(session, "_apply_wide_worker_response", fake_apply)
+    monkeypatch.setattr(session, "_apply_beam_worker_response", fake_apply)
     monkeypatch.setattr(session, "_validate_and_benchmark_patches", fake_validate)
     monkeypatch.setattr(session, "_save_to_disk", lambda *args, **kwargs: None)
 
@@ -321,7 +321,7 @@ def test_editor_strike_uses_single_worker_call(
     monkeypatch.setattr(session, "_make_llm_call_fn", fake_make_llm_call_fn)
     monkeypatch.setattr(
         session,
-        "_apply_wide_worker_response",
+        "_apply_beam_worker_response",
         lambda *_args, **_kwargs: "SELECT 1",
     )
 

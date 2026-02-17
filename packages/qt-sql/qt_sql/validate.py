@@ -994,8 +994,12 @@ def _timed_runs_pg(executor, sql: str, runs: int = 3,
                    timeout_ms: int = 300_000):
     """Execute sql with proper run pattern for PG/Snowflake.
 
-    runs=3: warmup + 2 measures, average last 2  (default, backward compat)
-    runs>=5: N measures, drop min/max, average middle (N-2)  (trimmed mean)
+    Run patterns:
+      runs=1: one measured run
+      runs=2: two measured runs, average both
+      runs=3: warmup + 2 measured runs, average measured runs
+      runs=4: warmup + 3 measured runs, average measured runs
+      runs>=5: N measured runs, drop min/max, average middle (trimmed mean)
 
     Args:
         executor: Database executor with .execute(sql, timeout_ms=...) method.
@@ -1027,22 +1031,39 @@ def _timed_runs_pg(executor, sql: str, runs: int = 3,
             f"[{', '.join(f'{t:.0f}' for t in times)}]"
         )
         return avg_ms, rows, times
-    else:
-        # Default 3-run: warmup + 2 measures, average last 2
+
+    # runs=1..4 path (supports fast worker checks at 2 runs).
+    runs = max(1, int(runs))
+    measured_times = []
+    captured_rows = None
+
+    # For legacy behavior and cache-stable comparability, keep warmup for runs>=3.
+    if runs >= 3:
         executor.execute(sql, timeout_ms=timeout_ms)  # warmup
 
+    measured_count = runs if runs <= 2 else (runs - 1)
+    for i in range(measured_count):
         start = time.perf_counter()
         rows = executor.execute(sql, timeout_ms=timeout_ms)
-        t1 = (time.perf_counter() - start) * 1000
+        elapsed = (time.perf_counter() - start) * 1000
+        measured_times.append(elapsed)
+        if i == 0 and capture_rows:
+            captured_rows = rows
 
-        start = time.perf_counter()
-        executor.execute(sql, timeout_ms=timeout_ms)
-        t2 = (time.perf_counter() - start) * 1000
-
-        avg_ms = (t1 + t2) / 2
-        captured = rows if capture_rows else None
-        logger.debug(f"  3-run: warmup, {t1:.1f}ms, {t2:.1f}ms → avg {avg_ms:.1f}ms")
-        return avg_ms, captured, [t1, t2]
+    avg_ms = sum(measured_times) / len(measured_times)
+    if runs >= 3:
+        logger.debug(
+            f"  {runs}-run: warmup + {measured_count} measured "
+            f"[{', '.join(f'{t:.1f}ms' for t in measured_times)}] "
+            f"→ avg {avg_ms:.1f}ms"
+        )
+    else:
+        logger.debug(
+            f"  {runs}-run: measured "
+            f"[{', '.join(f'{t:.1f}ms' for t in measured_times)}] "
+            f"→ avg {avg_ms:.1f}ms"
+        )
+    return avg_ms, captured_rows, measured_times
 
 
 class ExecutorValidatorWrapper:

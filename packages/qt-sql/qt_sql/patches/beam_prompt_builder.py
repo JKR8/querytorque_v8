@@ -6,7 +6,8 @@ from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
 
-from qt_sql.prompter import _load_engine_profile
+from qt_sql.prompter import _load_engine_profile, load_exploit_algorithm
+from qt_sql.knowledge.normalization import normalize_dialect
 
 logger = logging.getLogger(__name__)
 PROMPT_TEMPLATES_DIR = (
@@ -154,6 +155,75 @@ def _compact_text(value: Any, max_len: int = 220) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
+def _format_qerror_section(
+    qerror_analysis: Optional[Any],
+    *,
+    heading: str = "## Estimation Errors (Q-Error)",
+) -> str:
+    """Render Q-Error routing guidance when analysis is available."""
+    if qerror_analysis is None:
+        return ""
+    try:
+        from ..qerror import format_qerror_for_prompt
+
+        qerror_text = format_qerror_for_prompt(qerror_analysis)
+    except Exception as e:
+        logger.debug("Q-Error formatting unavailable: %s", e)
+        return ""
+    if not qerror_text:
+        return ""
+    return f"{heading}\n{qerror_text}"
+
+
+def _format_worker_dag_evidence(strike_results: List[Dict[str, Any]]) -> str:
+    """Build compact DAG evidence cards from worker outputs."""
+    lines: List[str] = []
+    for s in strike_results:
+        if not isinstance(s, dict):
+            continue
+        probe_id = str(s.get("probe_id", "?"))
+        transform_id = str(s.get("transform_id", "?"))
+        status = str(s.get("status", "?"))
+
+        dag_payload = None
+        raw_plan = s.get("raw_plan")
+        if isinstance(raw_plan, dict):
+            if isinstance(raw_plan.get("dag"), dict):
+                dag_payload = raw_plan.get("dag")
+            elif isinstance(raw_plan.get("nodes"), list):
+                dag_payload = raw_plan
+        if dag_payload is None and isinstance(s.get("dag"), dict):
+            dag_payload = s.get("dag")
+        if not isinstance(dag_payload, dict):
+            continue
+
+        order = dag_payload.get("order") or []
+        nodes = dag_payload.get("nodes") or []
+        final_node = str(dag_payload.get("final_node_id", "")).strip() or "(missing)"
+        changed_nodes: List[str] = []
+        if isinstance(nodes, list):
+            changed_nodes = [
+                str(n.get("node_id", "")).strip()
+                for n in nodes
+                if isinstance(n, dict)
+                and n.get("changed") is True
+                and str(n.get("node_id", "")).strip()
+            ]
+        order_text = ", ".join(f"`{str(n)}`" for n in order[:8]) if isinstance(order, list) and order else "(none)"
+        changed_text = ", ".join(f"`{n}`" for n in changed_nodes[:4]) if changed_nodes else "(none)"
+        lines.extend(
+            [
+                f"### {probe_id}: {transform_id} ({status})",
+                f"- final_node_id: `{final_node}`",
+                f"- order: {order_text}",
+                f"- changed_nodes: {changed_text}",
+            ]
+        )
+    if not lines:
+        return ""
+    return "## Worker DAG Evidence\n\n" + "\n".join(lines)
+
+
 # ── Build Individual Family Sections ───────────────────────────────────────
 
 def format_family_section(
@@ -283,55 +353,28 @@ def format_family_description_only(family_id: str, dialect: str = "") -> str:
 # ── Engine Intelligence Loader ─────────────────────────────────────────────
 
 def _load_engine_intelligence(dialect: str) -> Optional[str]:
-    """Load structured dialect profile for compact prompt injection."""
-    profile = _load_engine_profile(dialect)
+    """Load full dialect intelligence for prompt injection (no truncation)."""
+    dialect_norm = normalize_dialect(dialect)
+
+    # Primary source of truth: full dialect knowledge markdown.
+    exploit_md = load_exploit_algorithm(dialect_norm)
+    if isinstance(exploit_md, str) and exploit_md.strip():
+        return (
+            f"## Dialect Intelligence ({dialect_norm.upper()})\n\n"
+            + exploit_md.strip()
+        )
+
+    # Fallback: emit full engine profile JSON if markdown is unavailable.
+    profile = _load_engine_profile(dialect_norm)
     if not profile:
         return None
 
-    lines = [f"## Dialect Profile ({dialect.upper()})"]
-    briefing = profile.get("briefing_note")
-    if briefing:
-        lines.append("")
-        lines.append(
-            "**Combined Intelligence Baseline**: "
-            + _compact_text(briefing, max_len=320)
-        )
-
-    strengths = profile.get("strengths") or []
-    if strengths:
-        lines.append("")
-        lines.append("### Optimizer Strengths (don't fight these)")
-        for s in strengths[:4]:
-            sid = s.get("id", "?")
-            implication = _compact_text(
-                s.get("implication") or s.get("summary") or "",
-                max_len=180,
-            )
-            if sid == "SEMI_JOIN_EXISTS":
-                implication = (
-                    implication
-                    + " Note: NOT EXISTS anti-join decorrelation can still be valid when replacing large correlated anti patterns."
-                )
-            lines.append(f"- `{sid}`: {implication}")
-
-    gaps = profile.get("gaps") or []
-    if gaps:
-        prio = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-        lines.append("")
-        lines.append("### Known Gaps (exploit these)")
-        for g in sorted(gaps, key=lambda x: prio.get((x.get("priority") or "").upper(), 3))[:5]:
-            gid = g.get("id", "?")
-            priority = (g.get("priority") or "MEDIUM").upper()
-            detect = _compact_text(g.get("detect", ""), max_len=140)
-            opportunity = _compact_text(
-                g.get("opportunity") or g.get("what") or "",
-                max_len=160,
-            )
-            lines.append(
-                f"- `{gid}` [{priority}] detect: {detect} | action: {opportunity}"
-            )
-
-    return "\n".join(lines)
+    return (
+        f"## Dialect Profile ({dialect_norm.upper()})\n\n"
+        "```json\n"
+        + json.dumps(profile, indent=2)
+        + "\n```"
+    )
 
 
 def _build_explain_analysis_procedure_section() -> str:
@@ -565,6 +608,7 @@ def build_beam_compiler_prompt(
     dispatch_hypothesis: str = "",
     dispatch_reasoning_trace: Optional[List[str]] = None,
     equivalence_tier: str = "",
+    qerror_analysis: Optional[Any] = None,
 ) -> str:
     """Build compiler prompt from beam_compiler_v3 template + dynamic tail."""
     template = _load_prompt_template("beam_compiler_v3.txt")
@@ -602,6 +646,9 @@ def build_beam_compiler_prompt(
         dynamic.append(f"## Equivalence Tier\n- {equivalence_tier}")
     if intelligence_brief:
         dynamic.append(f"## Additional Intelligence\n{intelligence_brief}")
+    qerror_section = _format_qerror_section(qerror_analysis)
+    if qerror_section:
+        dynamic.append(qerror_section)
 
     n_total = len(strike_results)
     n_pass = sum(
@@ -650,6 +697,9 @@ def build_beam_compiler_prompt(
                 f"```sql\n{s.get('sql', '').strip()}\n```\n"
             )
         dynamic.append("\n".join(sql_sections))
+    dag_evidence = _format_worker_dag_evidence(strike_results)
+    if dag_evidence:
+        dynamic.append(dag_evidence)
 
     if template:
         return f"{template}\n\n" + "\n\n".join(dynamic)
@@ -657,7 +707,7 @@ def build_beam_compiler_prompt(
     return "\n\n".join(
         [
             "## Role",
-            "You are the Beam Compiler. Output one DAG object or a JSON array with exactly two DAG objects.",
+            "You are a Principal SQL Optimization Reviewer. Output one DAG object or a JSON array with exactly two DAG objects.",
             "## Cache Boundary",
             "Everything below is query-specific input.",
         ]

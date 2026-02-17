@@ -29,8 +29,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# LLM call timeout (seconds)
-LLM_TIMEOUT_SECONDS = 600
+# LLM call timeout (seconds). Can be overridden per run via env.
+# DeepSeek reasoning calls can legitimately take several minutes.
+LLM_TIMEOUT_SECONDS = max(
+    60,
+    int(os.environ.get("QT_BEAM_LLM_TIMEOUT_SECONDS", "600") or 600),
+)
 
 
 # ── Per-Iteration Data Classes ──────────────────────────────────────────────
@@ -298,7 +302,7 @@ class BeamSession(OptimizationSession):
         - one worker LLM call scoped to one transform id
         """
         from ..ir import build_script_ir, render_ir_node_map, Dialect
-        from ..patches.beam_wide_prompts import build_beam_editor_strike_prompt
+        from ..patches.beam_prompts import build_beam_editor_strike_prompt
 
         strike_transform = (transform_id or "").strip() or "auto"
         logger.info(
@@ -320,9 +324,9 @@ class BeamSession(OptimizationSession):
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
         beam_edit_mode = self._beam_edit_mode()
-        dag_mode = beam_edit_mode == "dag"
-        base_dag = self._build_base_dag(self.original_sql)
-        base_dag_prompt = self._render_dag_for_prompt(base_dag)
+        tree_mode = beam_edit_mode == "tree"
+        base_tree = self._build_base_tree(self.original_sql)
+        base_tree_prompt = self._render_tree_for_prompt(base_tree)
         beam_provider_override, beam_model_override = self._beam_llm_override()
         logger.info(f"[{self.query_id}] BEAM edit mode: {beam_edit_mode}")
 
@@ -344,11 +348,11 @@ class BeamSession(OptimizationSession):
             dialect=self.dialect,
             schema_context=schema_context,
         )
-        if dag_mode:
+        if tree_mode:
             strike_prompt = (
                 strike_prompt
                 + "\n\n"
-                + self._worker_dag_mode_suffix(base_dag_prompt)
+                + self._worker_tree_mode_suffix(base_tree_prompt)
             )
         self._save_to_disk(session_dir, 0, "strike_prompt", strike_prompt)
 
@@ -367,7 +371,7 @@ class BeamSession(OptimizationSession):
             strike_response,
             script_ir,
             dialect_enum,
-            dag_base=base_dag if dag_mode else None,
+            tree_base=base_tree if tree_mode else None,
         )
         patch = AppliedPatch(
             patch_id="strike_01",
@@ -507,12 +511,12 @@ class BeamSession(OptimizationSession):
     def _beam_edit_mode(self) -> str:
         """Return BEAM edit representation mode."""
         mode = str(
-            getattr(self.pipeline.config, "beam_edit_mode", "dag")
-            or "dag"
+            getattr(self.pipeline.config, "beam_edit_mode", "tree")
+            or "tree"
         ).strip().lower()
         if mode in {"patchplan", "patch_plan"}:
             return "patchplan"
-        return "dag"
+        return "tree"
 
     @staticmethod
     def _extract_json_value(text: str) -> Optional[Any]:
@@ -568,7 +572,7 @@ class BeamSession(OptimizationSession):
                             break
         return None
 
-    def _extract_dag_candidates(self, response: str) -> List[Dict[str, Any]]:
+    def _extract_tree_candidates(self, response: str) -> List[Dict[str, Any]]:
         """Parse DAG plan candidates from worker/compiler output."""
         payload = self._extract_json_value(response)
         if payload is None:
@@ -605,7 +609,7 @@ class BeamSession(OptimizationSession):
                 )
         return candidates
 
-    def _extract_dag_outputs(self, sql_text: str) -> List[str]:
+    def _extract_tree_outputs(self, sql_text: str) -> List[str]:
         """Extract projected output column names from a SQL fragment."""
         try:
             import sqlglot
@@ -630,7 +634,7 @@ class BeamSession(OptimizationSession):
         except Exception:
             return []
 
-    def _extract_dag_deps(self, sql_text: str, known_nodes: List[str]) -> List[str]:
+    def _extract_tree_sources(self, sql_text: str, known_nodes: List[str]) -> List[str]:
         """Extract dependencies on known DAG node ids from table references."""
         if not known_nodes:
             return []
@@ -651,7 +655,7 @@ class BeamSession(OptimizationSession):
             return []
         return deps
 
-    def _build_base_dag(self, sql_text: str) -> Dict[str, Any]:
+    def _build_base_tree(self, sql_text: str) -> Dict[str, Any]:
         """Build a lightweight DAG from query CTEs + final select."""
         base = {
             "order": ["final_select"],
@@ -662,7 +666,7 @@ class BeamSession(OptimizationSession):
                     "deps": [],
                     "grain": [],
                     "keys": {},
-                    "outputs": self._extract_dag_outputs(sql_text),
+                    "outputs": self._extract_tree_outputs(sql_text),
                     "sql": sql_text.strip().rstrip(";"),
                 }
             ],
@@ -692,10 +696,10 @@ class BeamSession(OptimizationSession):
             nodes.append(
                 {
                     "node_id": node_id,
-                    "deps": self._extract_dag_deps(cte_sql, cte_ids),
+                    "deps": self._extract_tree_sources(cte_sql, cte_ids),
                     "grain": [],
                     "keys": {},
-                    "outputs": self._extract_dag_outputs(cte_sql),
+                    "outputs": self._extract_tree_outputs(cte_sql),
                     "sql": cte_sql,
                 }
             )
@@ -706,10 +710,10 @@ class BeamSession(OptimizationSession):
         nodes.append(
             {
                 "node_id": "final_select",
-                "deps": self._extract_dag_deps(final_sql, cte_ids),
+                "deps": self._extract_tree_sources(final_sql, cte_ids),
                 "grain": [],
                 "keys": {},
-                "outputs": self._extract_dag_outputs(final_sql),
+                "outputs": self._extract_tree_outputs(final_sql),
                 "sql": final_sql,
             }
         )
@@ -719,7 +723,7 @@ class BeamSession(OptimizationSession):
             "nodes": nodes,
         }
 
-    def _render_dag_for_prompt(self, dag: Dict[str, Any]) -> str:
+    def _render_tree_for_prompt(self, dag: Dict[str, Any]) -> str:
         """Render compact DAG spec for prompt context."""
         lines = [
             "## Base DAG Spec",
@@ -742,7 +746,7 @@ class BeamSession(OptimizationSession):
         return "\n".join(lines)
 
     @staticmethod
-    def _worker_dag_mode_suffix(base_dag_spec: str) -> str:
+    def _worker_tree_mode_suffix(base_dag_spec: str) -> str:
         """Worker DAG-mode runtime contract (takes precedence over template text)."""
         parts = [
             "## Runtime Override: DAG Mode (Takes Precedence)",
@@ -784,7 +788,7 @@ class BeamSession(OptimizationSession):
         )
 
     @staticmethod
-    def _compiler_dag_mode_suffix(base_dag_spec: str) -> str:
+    def _compiler_tree_mode_suffix(base_dag_spec: str) -> str:
         """Compiler DAG-mode runtime contract (takes precedence over template text)."""
         return (
             "## Runtime Override: DAG Mode (Takes Precedence)\n"
@@ -801,7 +805,7 @@ class BeamSession(OptimizationSession):
         )
 
     @staticmethod
-    def _append_dag_shot_results(base_prompt: str, patches: List[AppliedPatch]) -> str:
+    def _append_tree_shot_results(base_prompt: str, patches: List[AppliedPatch]) -> str:
         """Append shot results with DAG-mode compiler instructions."""
         lines = [base_prompt, "", "## Shot 1 Results", ""]
         lines.append("| # | Transform | Speedup | Status | Error |")
@@ -823,10 +827,10 @@ class BeamSession(OptimizationSession):
         )
         return "\n".join(lines)
 
-    def _compile_dag_candidate_sql(
+    def _compile_tree_candidate_sql(
         self,
         candidate: Dict[str, Any],
-        base_dag: Dict[str, Any],
+        base_tree: Dict[str, Any],
         *,
         strict_single_change: bool,
     ) -> Tuple[Optional[str], Optional[str]]:
@@ -836,7 +840,7 @@ class BeamSession(OptimizationSession):
             return None, "Missing `dag` object"
 
         base_nodes = {}
-        for node in base_dag.get("nodes", []):
+        for node in base_tree.get("nodes", []):
             if not isinstance(node, dict):
                 continue
             node_id = str(node.get("node_id", "")).strip()
@@ -846,14 +850,14 @@ class BeamSession(OptimizationSession):
 
         order = dag.get("order")
         if not isinstance(order, list) or not order:
-            order = list(base_dag.get("order") or [])
+            order = list(base_tree.get("order") or [])
         order = [str(x).strip() for x in order if str(x).strip()]
         if not order:
             return None, "DAG order is empty"
 
         final_node_id = str(
             dag.get("final_node_id")
-            or base_dag.get("final_node_id")
+            or base_tree.get("final_node_id")
             or order[-1]
         ).strip()
         if not final_node_id:
@@ -900,29 +904,29 @@ class BeamSession(OptimizationSession):
             return final_sql + ";", None
         return f"WITH {', '.join(with_parts)} {final_sql};", None
 
-    def _apply_dag_worker_response(
+    def _apply_tree_worker_response(
         self,
         response: str,
-        base_dag: Dict[str, Any],
+        base_tree: Dict[str, Any],
     ) -> Optional[str]:
         """Apply worker DAG response and return SQL if valid."""
-        candidates = self._extract_dag_candidates(response)
+        candidates = self._extract_tree_candidates(response)
         if not candidates:
             return None
-        sql, _err = self._compile_dag_candidate_sql(
-            candidates[0], base_dag, strict_single_change=True
+        sql, _err = self._compile_tree_candidate_sql(
+            candidates[0], base_tree, strict_single_change=True
         )
         return sql
 
-    def _apply_dag_compiler_response(
+    def _apply_tree_compiler_response(
         self,
         response: str,
-        base_dag: Dict[str, Any],
+        base_tree: Dict[str, Any],
         *,
         prefix: str,
     ) -> List[AppliedPatch]:
         """Apply compiler DAG response (1-2 attempts) into AppliedPatch objects."""
-        candidates = self._extract_dag_candidates(response)
+        candidates = self._extract_tree_candidates(response)
         if not candidates:
             return []
 
@@ -931,8 +935,8 @@ class BeamSession(OptimizationSession):
             plan_id = str(candidate.get("plan_id") or f"{prefix}_{idx}")
             family = str(candidate.get("family") or "?")
             transform = str(candidate.get("transform") or "dag_rewrite")
-            sql, err = self._compile_dag_candidate_sql(
-                candidate, base_dag, strict_single_change=False
+            sql, err = self._compile_tree_candidate_sql(
+                candidate, base_tree, strict_single_change=False
             )
             patch = AppliedPatch(
                 patch_id=plan_id,
@@ -1046,11 +1050,11 @@ class BeamSession(OptimizationSession):
         self,
         response: str,
         *,
-        dag_mode: bool = False,
+        tree_mode: bool = False,
     ) -> bool:
         """True when compiler output violates expected top-level shape."""
-        if dag_mode:
-            return len(self._extract_dag_candidates(response)) == 0
+        if tree_mode:
+            return len(self._extract_tree_candidates(response)) == 0
 
         from ..patches.beam_patch_validator import _extract_json_array
 
@@ -1070,10 +1074,10 @@ class BeamSession(OptimizationSession):
         self,
         base_prompt: str,
         *,
-        dag_mode: bool = False,
+        tree_mode: bool = False,
     ) -> str:
         """Append hard shape feedback for one compiler retry."""
-        if dag_mode:
+        if tree_mode:
             return (
                 base_prompt
                 + "\n\n## RETRY — Output Shape Failure (DAG Mode)\n"
@@ -1310,7 +1314,7 @@ class BeamSession(OptimizationSession):
             append_shot_results,
             _load_engine_intelligence,
         )
-        from ..patches.beam_wide_prompts import (
+        from ..patches.beam_prompts import (
             build_beam_analyst_prompt,
             build_beam_worker_prompt,
             build_beam_worker_retry_prompt,
@@ -1345,9 +1349,9 @@ class BeamSession(OptimizationSession):
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
         beam_edit_mode = self._beam_edit_mode()
-        dag_mode = beam_edit_mode == "dag"
-        base_dag = self._build_base_dag(self.original_sql)
-        base_dag_prompt = self._render_dag_for_prompt(base_dag)
+        tree_mode = beam_edit_mode == "tree"
+        base_tree = self._build_base_tree(self.original_sql)
+        base_tree_prompt = self._render_tree_for_prompt(base_tree)
         beam_provider_override, beam_model_override = self._beam_llm_override()
         logger.info(f"[{self.query_id}] BEAM edit mode: {beam_edit_mode}")
 
@@ -1373,6 +1377,8 @@ class BeamSession(OptimizationSession):
             logger.info(f"[{self.query_id}] Engine knowledge attached to beam prompts")
 
         gold_examples = load_gold_examples(self.dialect)
+        qerror_analysis = self._load_qerror_analysis()
+        iteration_history = self._load_recent_beam_attempts(self.query_id)
         total_api_calls = 0
 
         # ── Intelligence Brief ────────────────────────────────────────
@@ -1409,12 +1415,15 @@ class BeamSession(OptimizationSession):
             original_sql=self.original_sql,
             explain_text=original_explain,
             ir_node_map=ir_node_map,
+            current_tree_map=base_tree_prompt,
             gold_examples=gold_examples,
             dialect=self.dialect,
             intelligence_brief=intelligence_brief,
             importance_stars=importance_stars,
             schema_context=schema_context,
             engine_knowledge=engine_knowledge,
+            qerror_analysis=qerror_analysis,
+            iteration_history=iteration_history,
         )
 
         max_analyst_attempts = max(
@@ -1603,9 +1612,9 @@ class BeamSession(OptimizationSession):
                     gold_ex = _load_gold_example_for_family(
                         probe.family, self.dialect
                     )
-                gold_dag_example = None
+                gold_tree_example = None
                 if gold_ex:
-                    gold_dag_example = (
+                    gold_tree_example = (
                         gold_ex.get("dag_example")
                         or gold_ex.get("dag")
                     )
@@ -1613,14 +1622,16 @@ class BeamSession(OptimizationSession):
                 worker_prompt = build_beam_worker_prompt(
                     original_sql=self.original_sql,
                     ir_node_map=ir_node_map,
-                    current_dag_map=base_dag_prompt,
+                    current_tree_map=base_tree_prompt,
                     hypothesis=scout_result.hypothesis,
                     probe=probe,
-                    gold_dag_example=gold_dag_example,
+                    gold_tree_example=gold_tree_example,
+                    explain_text=original_explain,
                     dialect=self.dialect,
                     schema_context=schema_context,
                     equivalence_tier=scout_result.equivalence_tier,
                     reasoning_trace=scout_result.reasoning_trace,
+                    qerror_analysis=qerror_analysis,
                     engine_knowledge=engine_knowledge,
                     do_not_do=scout_result.do_not_do,
                     worker_lane=lane,
@@ -1630,11 +1641,11 @@ class BeamSession(OptimizationSession):
                     + "\n\n"
                     + self._worker_lane_suffix(lane)
                 )
-                if dag_mode:
+                if tree_mode:
                     worker_prompt = (
                         worker_prompt
                         + "\n\n"
-                        + self._worker_dag_mode_suffix("")
+                        + self._worker_tree_mode_suffix("")
                     )
 
                 probe_id = str(getattr(probe, "probe_id", ""))
@@ -1652,12 +1663,17 @@ class BeamSession(OptimizationSession):
                         session_dir, 0,
                         f"worker_{probe.probe_id}_response", response,
                     )
+                    dag_candidates = (
+                        self._extract_tree_candidates(response)
+                        if tree_mode
+                        else []
+                    )
 
                     output_sql = self._apply_worker_response_compat(
                         response,
                         script_ir,
                         dialect_enum,
-                        dag_base=base_dag if dag_mode else None,
+                        tree_base=base_tree if tree_mode else None,
                     )
 
                     patch = AppliedPatch(
@@ -1671,6 +1687,7 @@ class BeamSession(OptimizationSession):
                         worker_response=response,
                         worker_role=f"{lane}:{lane_model}",
                         description=f"[{lane}:{lane_model}] {probe.target}",
+                        raw_plan=dag_candidates[0] if dag_candidates else None,
                     )
                     if not output_sql:
                         patch.apply_error = "Failed to parse/apply worker output"
@@ -1745,7 +1762,7 @@ class BeamSession(OptimizationSession):
             db_path=db_path,
             session_dir=session_dir,
             shot=0,
-            dag_base=base_dag if dag_mode else None,
+            tree_base=base_tree if tree_mode else None,
             worker_call_fn_by_patch_id=worker_call_fn_by_patch_id,
         )
         total_api_calls += retry_calls
@@ -1787,6 +1804,13 @@ class BeamSession(OptimizationSession):
                     "error": p.apply_error,
                     "explain_text": p.explain_text,
                     "sql": p.output_sql,
+                    "raw_plan": p.raw_plan,
+                    "dag": (
+                        p.raw_plan.get("dag")
+                        if isinstance(p.raw_plan, dict)
+                        and isinstance(p.raw_plan.get("dag"), dict)
+                        else p.raw_plan
+                    ),
                     "description": p.description or "",
                 }
                 for p in patches
@@ -1808,12 +1832,13 @@ class BeamSession(OptimizationSession):
                 dispatch_hypothesis=scout_result.hypothesis,
                 dispatch_reasoning_trace=scout_result.reasoning_trace,
                 equivalence_tier=scout_result.equivalence_tier,
+                qerror_analysis=qerror_analysis,
             )
-            if dag_mode:
+            if tree_mode:
                 compiler_shot1_prompt = (
                     compiler_shot1_prompt
                     + "\n\n"
-                    + self._compiler_dag_mode_suffix(base_dag_prompt)
+                    + self._compiler_tree_mode_suffix(base_tree_prompt)
                 )
 
             self._save_to_disk(
@@ -1825,9 +1850,9 @@ class BeamSession(OptimizationSession):
                 session_dir, 0, "compiler_shot1_response", compiler_shot1_response
             )
 
-            if dag_mode:
-                shot1_compiler = self._apply_dag_compiler_response(
-                    compiler_shot1_response, base_dag or {}, prefix="s1"
+            if tree_mode:
+                shot1_compiler = self._apply_tree_compiler_response(
+                    compiler_shot1_response, base_tree or {}, prefix="s1"
                 )
             else:
                 shot1_compiler = self._apply_patchplan_array(
@@ -1835,14 +1860,14 @@ class BeamSession(OptimizationSession):
                 )
             if not shot1_compiler and self._is_compiler_tier0_shape_failure(
                 compiler_shot1_response,
-                dag_mode=dag_mode,
+                tree_mode=tree_mode,
             ):
                 logger.warning(
                     f"[{self.query_id}] Compiler shot 1 Tier-0 shape failure, retrying once"
                 )
                 compiler_shot1_retry_prompt = self._build_compiler_tier0_retry_prompt(
                     compiler_shot1_prompt,
-                    dag_mode=dag_mode,
+                    tree_mode=tree_mode,
                 )
                 self._save_to_disk(
                     session_dir, 0, "compiler_shot1_retry_prompt", compiler_shot1_retry_prompt
@@ -1852,9 +1877,9 @@ class BeamSession(OptimizationSession):
                 self._save_to_disk(
                     session_dir, 0, "compiler_shot1_retry_response", compiler_shot1_retry_response
                 )
-                if dag_mode:
-                    shot1_compiler = self._apply_dag_compiler_response(
-                        compiler_shot1_retry_response, base_dag or {}, prefix="s1r"
+                if tree_mode:
+                    shot1_compiler = self._apply_tree_compiler_response(
+                        compiler_shot1_retry_response, base_tree or {}, prefix="s1r"
                     )
                 else:
                     shot1_compiler = self._apply_patchplan_array(
@@ -1877,8 +1902,8 @@ class BeamSession(OptimizationSession):
                 has_retry_errors or bool(shot1_retry_errors)
             )
             if should_run_shot2:
-                if dag_mode:
-                    compiler_shot2_prompt = self._append_dag_shot_results(
+                if tree_mode:
+                    compiler_shot2_prompt = self._append_tree_shot_results(
                         base_prompt=compiler_shot1_prompt,
                         patches=shot1_compiler,
                     )
@@ -1901,9 +1926,9 @@ class BeamSession(OptimizationSession):
                     session_dir, 0, "compiler_shot2_response", compiler_shot2_response
                 )
 
-                if dag_mode:
-                    shot2_compiler = self._apply_dag_compiler_response(
-                        compiler_shot2_response, base_dag or {}, prefix="s2"
+                if tree_mode:
+                    shot2_compiler = self._apply_tree_compiler_response(
+                        compiler_shot2_response, base_tree or {}, prefix="s2"
                     )
                 else:
                     shot2_compiler = self._apply_patchplan_array(
@@ -1911,14 +1936,14 @@ class BeamSession(OptimizationSession):
                     )
                 if not shot2_compiler and self._is_compiler_tier0_shape_failure(
                     compiler_shot2_response,
-                    dag_mode=dag_mode,
+                    tree_mode=tree_mode,
                 ):
                     logger.warning(
                         f"[{self.query_id}] Compiler shot 2 Tier-0 shape failure, retrying once"
                     )
                     compiler_shot2_retry_prompt = self._build_compiler_tier0_retry_prompt(
                         compiler_shot2_prompt,
-                        dag_mode=dag_mode,
+                        tree_mode=tree_mode,
                     )
                     self._save_to_disk(
                         session_dir, 0, "compiler_shot2_retry_prompt", compiler_shot2_retry_prompt
@@ -1928,9 +1953,9 @@ class BeamSession(OptimizationSession):
                     self._save_to_disk(
                         session_dir, 0, "compiler_shot2_retry_response", compiler_shot2_retry_response
                     )
-                    if dag_mode:
-                        shot2_compiler = self._apply_dag_compiler_response(
-                            compiler_shot2_retry_response, base_dag or {}, prefix="s2r"
+                    if tree_mode:
+                        shot2_compiler = self._apply_tree_compiler_response(
+                            compiler_shot2_retry_response, base_tree or {}, prefix="s2r"
                         )
                     else:
                         shot2_compiler = self._apply_patchplan_array(
@@ -2029,7 +2054,7 @@ class BeamSession(OptimizationSession):
         db_path: str,
         session_dir: Path,
         shot: int,
-        dag_base: Optional[Dict[str, Any]] = None,
+        tree_base: Optional[Dict[str, Any]] = None,
         worker_call_fn_by_patch_id: Optional[Dict[str, Callable[[str], str]]] = None,
     ) -> int:
         """Retry workers once with structured gate feedback for Tier-1 failures."""
@@ -2076,7 +2101,7 @@ class BeamSession(OptimizationSession):
                     gate_error=patch.apply_error or "Tier-1 structural failure",
                     failed_sql=patch.output_sql or "",
                     previous_response=patch.worker_response or "",
-                    output_mode="dag" if dag_base is not None else "patchplan",
+                    output_mode="tree" if tree_base is not None else "patchplan",
                 )
                 self._save_to_disk(
                     session_dir,
@@ -2112,7 +2137,7 @@ class BeamSession(OptimizationSession):
                     retry_response,
                     script_ir,
                     dialect_enum,
-                    dag_base=dag_base,
+                    tree_base=tree_base,
                 )
                 if not output_sql:
                     patch.status = "FAIL"
@@ -2144,15 +2169,15 @@ class BeamSession(OptimizationSession):
 
         return retry_calls
 
-    def _apply_wide_worker_response(
+    def _apply_beam_worker_response(
         self,
         response: str,
         script_ir,
         dialect_enum,
         *,
-        dag_base: Optional[Dict[str, Any]] = None,
+        tree_base: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Parse a wide worker response and apply to IR/DAG → SQL.
+        """Parse a BEAM worker response and apply to IR/DAG → SQL.
 
         DAG mode parses a DAG candidate and compiles executable SQL from
         base + changed nodes. PatchPlan mode remains supported for legacy
@@ -2201,8 +2226,8 @@ class BeamSession(OptimizationSession):
             return None
 
         # DAG mode: parse DAG candidate first.
-        if dag_base is not None:
-            sql = self._apply_dag_worker_response(response, dag_base)
+        if tree_base is not None:
+            sql = self._apply_tree_worker_response(response, tree_base)
             if sql and sql.strip():
                 return sql.strip()
             return None
@@ -2264,19 +2289,19 @@ class BeamSession(OptimizationSession):
         response: str,
         script_ir,
         dialect_enum,
-        dag_base: Optional[Dict[str, Any]] = None,
+        tree_base: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Call worker apply path with backwards-compatible signature handling."""
         try:
-            return self._apply_wide_worker_response(
+            return self._apply_beam_worker_response(
                 response,
                 script_ir,
                 dialect_enum,
-                dag_base=dag_base,
+                tree_base=tree_base,
             )
         except TypeError:
             # Test monkeypatches may still use the legacy 3-arg signature.
-            return self._apply_wide_worker_response(
+            return self._apply_beam_worker_response(
                 response,
                 script_ir,
                 dialect_enum,
@@ -2565,6 +2590,93 @@ class BeamSession(OptimizationSession):
             logger.debug(f"[{query_id}] No cached classification: {e}")
             return None
 
+    def _load_qerror_analysis(self) -> Optional[Any]:
+        """Load Q-Error analysis for the current query when available."""
+        getter = getattr(self.pipeline, "_get_qerror_analysis", None)
+        if callable(getter):
+            try:
+                return getter(self.query_id)
+            except Exception as e:
+                logger.debug(f"[{self.query_id}] Q-Error load failed via pipeline: {e}")
+        return None
+
+    def _load_recent_beam_attempts(
+        self,
+        query_id: str,
+        *,
+        max_attempts: int = 6,
+    ) -> Optional[Dict[str, Any]]:
+        """Load compact history from prior BEAM session artifacts."""
+        try:
+            sessions_root = self.pipeline.benchmark_dir / "beam_sessions"
+            if not sessions_root.exists():
+                return None
+
+            prefix = f"{query_id}_"
+            session_dirs = [
+                p
+                for p in sessions_root.iterdir()
+                if p.is_dir() and p.name.startswith(prefix)
+            ]
+            session_dirs.sort(
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            )
+
+            attempts: List[Dict[str, Any]] = []
+            for session_dir in session_dirs:
+                result_path = session_dir / "iter0_result.txt"
+                if not result_path.exists():
+                    continue
+                try:
+                    data = json.loads(result_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+
+                best_speedup = data.get("best_speedup")
+                speedup: Optional[float] = None
+                if isinstance(best_speedup, (int, float)):
+                    speedup = float(best_speedup)
+
+                patches = data.get("patches") or []
+                transforms: List[str] = []
+                status = "UNKNOWN"
+                if isinstance(patches, list) and patches:
+                    winners = [
+                        p for p in patches
+                        if isinstance(p, dict)
+                        and str(p.get("status", "")).upper() in {"WIN", "PASS", "IMPROVED"}
+                    ]
+                    status = "WIN" if winners else "FAIL"
+                    source = winners if winners else patches
+                    for p in source:
+                        if not isinstance(p, dict):
+                            continue
+                        t = str(p.get("transform", "")).strip()
+                        if t and t not in transforms:
+                            transforms.append(t)
+                        if len(transforms) >= 4:
+                            break
+
+                attempts.append(
+                    {
+                        "status": status,
+                        "speedup": speedup if speedup is not None else data.get("best_speedup"),
+                        "transforms": transforms,
+                    }
+                )
+                if len(attempts) >= max(1, int(max_attempts)):
+                    break
+
+            if not attempts:
+                return None
+            return {"attempts": attempts}
+        except Exception as e:
+            logger.debug(f"[{query_id}] Failed to load beam attempt history: {e}")
+            return None
+
     def _load_workload_baselines(self) -> Dict[str, float]:
         """Load cached baseline runtimes from benchmark explains."""
         baselines: Dict[str, float] = {}
@@ -2758,7 +2870,8 @@ class BeamSession(OptimizationSession):
             "beam_qwen_model": getattr(self.pipeline.config, "beam_qwen_model", "") or "",
             "beam_reasoner_provider": getattr(self.pipeline.config, "beam_reasoner_provider", "") or "",
             "beam_reasoner_model": getattr(self.pipeline.config, "beam_reasoner_model", "") or "",
-            "beam_edit_mode": getattr(self.pipeline.config, "beam_edit_mode", "dag"),
+            "beam_edit_mode": getattr(self.pipeline.config, "beam_edit_mode", "tree"),
+            "llm_timeout_seconds": LLM_TIMEOUT_SECONDS,
             "provider": self.pipeline.provider or "?",
             "semantic_validation_enabled": self.pipeline.config.semantic_validation_enabled,
             "semantic_sample_pct": self.pipeline.config.semantic_sample_pct,
@@ -2782,18 +2895,26 @@ class BeamSession(OptimizationSession):
 
     def _call_llm_with_timeout(self, generator, prompt: str) -> str:
         """Call LLM with timeout protection."""
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(generator._analyze, prompt)
-            try:
-                return future.result(timeout=LLM_TIMEOUT_SECONDS)
-            except TimeoutError:
-                logger.error(
-                    f"[{self.query_id}] LLM call timed out after {LLM_TIMEOUT_SECONDS}s"
-                )
-                return '[]'  # empty JSON array — will trigger retry or skip
-            except Exception as e:
-                logger.error(f"[{self.query_id}] LLM call failed: {e}")
-                return '[]'
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(generator._analyze, prompt)
+        try:
+            return future.result(timeout=LLM_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.error(
+                f"[{self.query_id}] LLM call timed out after {LLM_TIMEOUT_SECONDS}s"
+            )
+            future.cancel()
+            return '[]'  # empty JSON array — will trigger retry or skip
+        except Exception as e:
+            logger.error(f"[{self.query_id}] LLM call failed: {e}")
+            return '[]'
+        finally:
+            # IMPORTANT: do not wait forever on a hung provider thread.
+            # If the future has not completed, shut down the pool without waiting.
+            if future.done():
+                pool.shutdown(wait=True)
+            else:
+                pool.shutdown(wait=False, cancel_futures=True)
 
     def _sequential_benchmark(
         self, patches: List[AppliedPatch], db_path: str
@@ -2806,22 +2927,34 @@ class BeamSession(OptimizationSession):
         from ..validate import _timed_runs_pg
         from ..validation.equivalence_checker import EquivalenceChecker
 
-        BENCH_RUNS = 3
+        baseline_runs = max(
+            1,
+            int(getattr(self.pipeline.config, "beam_baseline_runs", 3) or 3),
+        )
+        candidate_runs = max(
+            1,
+            int(getattr(self.pipeline.config, "beam_candidate_runs", 3) or 3),
+        )
+        winner_runs = max(
+            candidate_runs,
+            int(getattr(self.pipeline.config, "beam_winner_runs", 3) or 3),
+        )
         checker = EquivalenceChecker()
 
         logger.info(
             f"[{self.query_id}] Sequential benchmark: "
-            f"{len(patches)} patches, {BENCH_RUNS}x (warmup + avg last 2)"
+            f"{len(patches)} patches, baseline={baseline_runs}x, "
+            f"candidate={candidate_runs}x, winner={winner_runs}x"
         )
 
         try:
             with create_executor_from_dsn(db_path) as executor:
                 # Measure original and capture rows for correctness.
                 logger.info(
-                    f"[{self.query_id}] Baseline: {BENCH_RUNS}x..."
+                    f"[{self.query_id}] Baseline: {baseline_runs}x..."
                 )
                 orig_ms, orig_rows, orig_times = _timed_runs_pg(
-                    executor, self.original_sql, runs=BENCH_RUNS,
+                    executor, self.original_sql, runs=baseline_runs,
                     capture_rows=True,
                 )
                 orig_count = len(orig_rows) if orig_rows else 0
@@ -2837,6 +2970,49 @@ class BeamSession(OptimizationSession):
                     f"[{', '.join(f'{t:.0f}' for t in orig_times)}]"
                 )
 
+                # Current best valid candidate speedup in this shot.
+                current_winner_speedup = float("-inf")
+
+                def _mark_correctness_failure(
+                    patch: AppliedPatch,
+                    patch_count: int,
+                    patch_rows: List[Any],
+                ) -> bool:
+                    # ── Correctness gate: row count + checksum ──
+                    if patch_count != orig_count:
+                        patch.speedup = 0.0
+                        patch.status = "FAIL"
+                        patch.apply_error = (
+                            f"Row count mismatch: original={orig_count}, "
+                            f"patch={patch_count}"
+                        )
+                        logger.warning(
+                            f"[{self.query_id}]   FAIL: {patch.patch_id}: "
+                            f"{patch.apply_error}"
+                        )
+                        return True
+
+                    if orig_checksum and patch_rows:
+                        try:
+                            patch_checksum = checker.compute_checksum(patch_rows)
+                            if patch_checksum != orig_checksum:
+                                patch.speedup = 0.0
+                                patch.status = "FAIL"
+                                patch.apply_error = (
+                                    f"Checksum mismatch: original={orig_checksum}, "
+                                    f"patch={patch_checksum}"
+                                )
+                                logger.warning(
+                                    f"[{self.query_id}]   FAIL: {patch.patch_id}: "
+                                    f"{patch.apply_error}"
+                                )
+                                return True
+                        except Exception:
+                            # Checksum compute failed — do not block.
+                            pass
+
+                    return False
+
                 for idx, p in enumerate(patches):
                     logger.info(
                         f"[{self.query_id}] Benchmark {idx + 1}/{len(patches)}: "
@@ -2844,42 +3020,15 @@ class BeamSession(OptimizationSession):
                     )
                     try:
                         patch_ms, patch_rows, patch_times = _timed_runs_pg(
-                            executor, p.output_sql, runs=BENCH_RUNS,
+                            executor,
+                            p.output_sql,
+                            runs=candidate_runs,
                             capture_rows=True,
                         )
                         patch_count = len(patch_rows) if patch_rows else 0
 
-                        # ── Correctness gate: row count + checksum ──
-                        if patch_count != orig_count:
-                            p.speedup = 0.0
-                            p.status = "FAIL"
-                            p.apply_error = (
-                                f"Row count mismatch: original={orig_count}, "
-                                f"patch={patch_count}"
-                            )
-                            logger.warning(
-                                f"[{self.query_id}]   FAIL: {p.patch_id}: "
-                                f"{p.apply_error}"
-                            )
+                        if _mark_correctness_failure(p, patch_count, patch_rows):
                             continue
-
-                        if orig_checksum and patch_rows:
-                            try:
-                                patch_checksum = checker.compute_checksum(patch_rows)
-                                if patch_checksum != orig_checksum:
-                                    p.speedup = 0.0
-                                    p.status = "FAIL"
-                                    p.apply_error = (
-                                        f"Checksum mismatch: original={orig_checksum}, "
-                                        f"patch={patch_checksum}"
-                                    )
-                                    logger.warning(
-                                        f"[{self.query_id}]   FAIL: {p.patch_id}: "
-                                        f"{p.apply_error}"
-                                    )
-                                    continue
-                            except Exception:
-                                pass  # checksum compute failed — don't block
 
                         p.original_ms = orig_ms
                         p.patch_ms = patch_ms
@@ -2892,6 +3041,41 @@ class BeamSession(OptimizationSession):
                             f"({p.status}, {patch_count} rows) "
                             f"[{', '.join(f'{t:.0f}' for t in patch_times)}]"
                         )
+
+                        # If this candidate becomes the current winner, confirm with
+                        # a fuller timing pass (e.g., 3x) for stability.
+                        if (
+                            winner_runs > candidate_runs
+                            and p.speedup > current_winner_speedup
+                        ):
+                            logger.info(
+                                f"[{self.query_id}]   winner confirm: {p.patch_id} "
+                                f"{candidate_runs}x→{winner_runs}x"
+                            )
+                            win_ms, win_rows, win_times = _timed_runs_pg(
+                                executor,
+                                p.output_sql,
+                                runs=winner_runs,
+                                capture_rows=True,
+                            )
+                            win_count = len(win_rows) if win_rows else 0
+
+                            if _mark_correctness_failure(p, win_count, win_rows):
+                                continue
+
+                            p.patch_ms = win_ms
+                            p.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
+                            p.status = self._classify_speedup(p.speedup)
+
+                            logger.info(
+                                f"[{self.query_id}]   winner confirmed: "
+                                f"patch={win_ms:.1f}ms, speedup={p.speedup:.2f}x "
+                                f"({p.status}, {win_count} rows) "
+                                f"[{', '.join(f'{t:.0f}' for t in win_times)}]"
+                            )
+
+                        if p.speedup is not None and p.speedup > current_winner_speedup:
+                            current_winner_speedup = p.speedup
                     except Exception as e:
                         p.speedup = 0.0
                         p.status = "ERROR"

@@ -1,0 +1,1071 @@
+{
+  "explain_plan_text": "{'GlobalStats': {'partitionsTotal': 0, 'partitionsAssigned': 0, 'bytesAssigned': 0}, 'Operations': [[{'id': 0, 'operation': 'Result', 'expressions': ['CS1.PRODUCT_NAME', 'CS1.STORE_NAME', 'CS1.STORE_ZIP', 'CS1.B_STREET_NUMBER', 'CS1.B_STREET_NAME', 'CS1.B_CITY', 'CS1.B_ZIP', 'CS1.C_STREET_NUMBER', 'CS1.C_STREET_NAME', 'CS1.C_CITY', 'CS1.C_ZIP', 'CS1.SYEAR', 'CS1.CNT', 'CS1.S1', 'CS1.S2', 'CS1.S3', 'CS2.S1', 'CS2.S2', 'CS2.S3', 'CS2.SYEAR', 'CS2.CNT']}, {'id': 1, 'operation': 'Generator', 'expressions': ['0'], 'parentOperators': [0]}]]}",
+  "plan_scanner_text": null,
+  "semantic_intents": null,
+  "matched_examples": [
+    {
+      "id": "sf_inline_decorrelate",
+      "name": "Inline Correlated Subquery Decorrelation (Snowflake)",
+      "description": "When a WHERE clause contains a correlated scalar subquery (e.g., col > (SELECT 1.3 * avg(col) FROM ... WHERE key = outer.key)), Snowflake re-executes the subquery per outer row. Fix: decompose into CTEs \u2014 (1) pre-filter dimension table, (2) pre-filter fact table by date range, (3) compute per-key aggregate threshold \u2014 then JOIN the threshold CTE in the final query.",
+      "verified_speedup": "23.17x",
+      "principle": "Inline Decorrelation: when WHERE has a correlated scalar subquery that re-scans the fact table per outer row, decompose into 3 CTEs: (1) dimension filter, (2) date-filtered fact rows, (3) per-key aggregate threshold via GROUP BY. The final query JOINs the threshold CTE, replacing O(N*M) correlated scans with a single hash join.",
+      "benchmark": {
+        "dataset": "tpcds_sf10tcl",
+        "warehouse": "MEDIUM",
+        "orig_ms": 69414.7,
+        "opt_ms": 2995.5,
+        "speedup": 23.17,
+        "validation": "3x3 (discard warmup, average last 2)",
+        "row_match": true
+      },
+      "example": {
+        "opportunity": "SF_INLINE_DECORRELATE",
+        "input_slice": "select sum(cs_ext_discount_amt) as \"excess discount amount\"\nfrom catalog_sales, item, date_dim\nwhere ... and i_item_sk = cs_item_sk\n  and d_date between '...' and '...' + interval '90 day'\n  and d_date_sk = cs_sold_date_sk\n  and cs_ext_discount_amt > (\n    SELECT 1.3 * avg(cs_ext_discount_amt)\n    FROM catalog_sales, date_dim\n    WHERE cs_item_sk = i_item_sk  -- correlated!\n      and d_date between ... and d_date_sk = cs_sold_date_sk\n      and cs_list_price between 16 and 45\n      and cs_sales_price / cs_list_price BETWEEN ...)",
+        "output": {
+          "rewrite_sets": [
+            {
+              "id": "rs_01",
+              "transform": "decorrelate",
+              "nodes": {
+                "filtered_items": "SELECT i_item_sk FROM item WHERE i_manufact_id IN (...) OR i_manager_id BETWEEN ...",
+                "date_filtered_sales": "SELECT cs.cs_item_sk, cs.cs_ext_discount_amt, ... FROM catalog_sales cs JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk WHERE d.d_date BETWEEN ...",
+                "item_avg_discount": "SELECT dfs.cs_item_sk, 1.3 * avg(dfs.cs_ext_discount_amt) AS threshold FROM date_filtered_sales dfs JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk WHERE ... GROUP BY dfs.cs_item_sk",
+                "main_query": "SELECT sum(dfs.cs_ext_discount_amt) FROM date_filtered_sales dfs JOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk WHERE dfs.cs_ext_discount_amt > iad.threshold"
+              },
+              "invariants_kept": [
+                "same result rows",
+                "same aggregation"
+              ],
+              "expected_speedup": "23x",
+              "risk": "low"
+            }
+          ]
+        },
+        "transforms": [
+          "decorrelate",
+          "early_filter",
+          "date_cte_isolate"
+        ],
+        "key_insight": "Snowflake P2 pathology: correlated scalar subqueries in WHERE re-execute the inner query per outer row. The optimizer cannot flatten when the inner query aggregates over a correlated key. Fix: decompose into 3 CTEs \u2014 dimension filter, date-filtered fact, per-key threshold \u2014 then JOIN. The correlated O(N*M) execution becomes a single hash join. Also converts comma joins to explicit JOINs (P1 synergy)."
+      },
+      "original_sql": "select  sum(cs_ext_discount_amt)  as \"excess discount amount\"\nfrom\n   catalog_sales\n   ,item\n   ,date_dim\nwhere\n(i_manufact_id in (1, 78, 97, 516, 521)\nor i_manager_id BETWEEN 25 and 54)\nand i_item_sk = cs_item_sk\nand d_date between '1999-03-07' and\n        cast('1999-03-07' as date) + interval '90 day'\nand d_date_sk = cs_sold_date_sk\nand cs_ext_discount_amt\n     > (\n         select\n            1.3 * avg(cs_ext_discount_amt)\n         from\n            catalog_sales\n           ,date_dim\n         where\n              cs_item_sk = i_item_sk\n          and d_date between '1999-03-07' and\n                             cast('1999-03-07' as date) + interval '90 day'\n          and d_date_sk = cs_sold_date_sk\n          and cs_list_price between 16 and 45\n          and cs_sales_price / cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01\n      )\norder by sum(cs_ext_discount_amt)\nlimit 100;",
+      "optimized_sql": "WITH filtered_items AS (\n    SELECT i_item_sk\n    FROM item\n    WHERE i_manufact_id IN (1, 78, 97, 516, 521)\n       OR i_manager_id BETWEEN 25 AND 54\n),\ndate_filtered_sales AS (\n    SELECT cs.cs_item_sk, cs.cs_ext_discount_amt,\n           cs.cs_list_price, cs.cs_sales_price\n    FROM catalog_sales cs\n    JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk\n    WHERE d.d_date BETWEEN '1999-03-07' AND cast('1999-03-07' as date) + interval '90 day'\n),\nitem_avg_discount AS (\n    SELECT dfs.cs_item_sk,\n           1.3 * avg(dfs.cs_ext_discount_amt) AS threshold\n    FROM date_filtered_sales dfs\n    JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk\n    WHERE dfs.cs_list_price BETWEEN 16 AND 45\n      AND dfs.cs_sales_price / dfs.cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01\n    GROUP BY dfs.cs_item_sk\n)\nSELECT sum(dfs.cs_ext_discount_amt) AS \"excess discount amount\"\nFROM date_filtered_sales dfs\nJOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk\nWHERE dfs.cs_ext_discount_amt > iad.threshold\nORDER BY 1\nLIMIT 100;",
+      "optimized_source": "adapted_from_pg",
+      "type": "gold",
+      "family": "A",
+      "ir_node_map_before": "S0 [SELECT]\n  MAIN QUERY (via Q_S0)\n    FROM: catalog_sales, item, date_dim\n    WHERE [09dc78125155e528]: (i_manufact_id IN (1, 78, 97, 516, 521) OR i_manager_id BETWEEN 25 AND 54) AND i_item_sk = cs_ite...\n    ORDER BY: SUM(cs_ext_discount_amt)\n\nPatch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree\nTarget: by_node_id (statement, e.g. \"S0\") + by_anchor_hash (expression)",
+      "ir_node_map_target": "S0 [SELECT]\n  CTE: filtered_items  (via CTE_Q_S0_filtered_items)\n    FROM: item\n    WHERE [5779e47e1e6d90f4]: i_manufact_id IN (1, 78, 97, 516, 521) OR i_manager_id BETWEEN 25 AND 54\n  CTE: date_filtered_sales  (via CTE_Q_S0_date_filtered_sales)\n    FROM: catalog_sales cs, date_dim d\n    WHERE [a0208e1ff961ae1e]: d.d_date BETWEEN '1999-03-07' AND CAST('1999-03-07' AS DATE) + INTERVAL '90 DAY'\n  CTE: item_avg_discount  (via CTE_Q_S0_item_avg_discount)\n    FROM: date_filtered_sales dfs, filtered_items fi\n    WHERE [6e96ef577bfa5c2a]: dfs.cs_list_price BETWEEN 16 AND 45 AND dfs.cs_sales_price / dfs.cs_list_price BETWEEN 63 * 0.01 ...\n    GROUP BY: dfs.cs_item_sk\n  MAIN QUERY (via Q_S0)\n    FROM: date_filtered_sales dfs, item_avg_discount iad\n    WHERE [61cfeb7bed62437b]: dfs.cs_ext_discount_amt > iad.threshold\n    ORDER BY: 1\n\nPatch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree\nTarget: by_node_id (statement, e.g. \"S0\") + by_anchor_hash (expression)",
+      "dialect": "snowflake",
+      "transforms": [
+        "date_cte_isolate",
+        "decorrelate",
+        "early_filter"
+      ],
+      "families": [
+        "A",
+        "B",
+        "C"
+      ],
+      "gap_ids": [
+        "CORRELATED_SUBQUERY_PARALYSIS",
+        "CROSS_CTE_PREDICATE_BLINDNESS"
+      ],
+      "dag_example": {
+        "plan_id": "gold_snowflake_sf_inline_decorrelate",
+        "dialect": "snowflake",
+        "target_ir": "rewrite final_select to optimized query shape",
+        "dag": {
+          "order": [
+            "final_select"
+          ],
+          "final_node_id": "final_select",
+          "nodes": [
+            {
+              "node_id": "final_select",
+              "deps": [],
+              "outputs": [
+                "excess discount amount"
+              ],
+              "changed": true,
+              "sql": "WITH filtered_items AS (\n    SELECT i_item_sk\n    FROM item\n    WHERE i_manufact_id IN (1, 78, 97, 516, 521)\n       OR i_manager_id BETWEEN 25 AND 54\n),\ndate_filtered_sales AS (\n    SELECT cs.cs_item_sk, cs.cs_ext_discount_amt,\n           cs.cs_list_price, cs.cs_sales_price\n    FROM catalog_sales cs\n    JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk\n    WHERE d.d_date BETWEEN '1999-03-07' AND cast('1999-03-07' as date) + interval '90 day'\n),\nitem_avg_discount AS (\n    SELECT dfs.cs_item_sk,\n           1.3 * avg(dfs.cs_ext_discount_amt) AS threshold\n    FROM date_filtered_sales dfs\n    JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk\n    WHERE dfs.cs_list_price BETWEEN 16 AND 45\n      AND dfs.cs_sales_price / dfs.cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01\n    GROUP BY dfs.cs_item_sk\n)\nSELECT sum(dfs.cs_ext_discount_amt) AS \"excess discount amount\"\nFROM date_filtered_sales dfs\nJOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk\nWHERE dfs.cs_ext_discount_amt > iad.threshold\nORDER BY 1\nLIMIT 100"
+            }
+          ]
+        }
+      },
+      "_match_score": 0.0,
+      "_retrieval_mode": "catalog_fallback"
+    },
+    {
+      "id": "sf_shared_scan_decorrelate",
+      "name": "Shared Scan Decorrelation (Snowflake)",
+      "description": "When a correlated subquery re-scans the same fact table as the outer query with the same date/cost filters, extract the common scan into a shared CTE. Derive both the threshold computation and the outer rows from a single result. Eliminates O(N*M) re-execution.",
+      "verified_speedup": "7.82x",
+      "principle": "Shared Scan Decorrelation: when inner and outer queries scan the same fact table with the same date/cost filters, extract the common scan into a single CTE. Then compute per-item thresholds via GROUP BY in a second CTE, and JOIN back to filter. Converts O(N*M) correlated execution to O(N+M) hash join.",
+      "benchmark": {
+        "dataset": "tpcds_sf10tcl",
+        "warehouse": "MEDIUM",
+        "orig_ms": 8024.6,
+        "opt_ms": 1026.1,
+        "speedup": 7.82,
+        "validation": "3x3 (discard warmup, average last 2)",
+        "row_match": true
+      },
+      "example": {
+        "opportunity": "SF_SHARED_SCAN_DECORRELATE",
+        "input_slice": "select sum(ws_ext_discount_amt) as \"Excess Discount Amount\"\nfrom web_sales, item, date_dim\nwhere ... and i_item_sk = ws_item_sk\n  and d_date between '...' and '...' + interval '90 day'\n  and ws_wholesale_cost BETWEEN 26 AND 46\n  and ws_ext_discount_amt > (\n    SELECT 1.3 * avg(ws_ext_discount_amt)\n    FROM web_sales, date_dim\n    WHERE ws_item_sk = i_item_sk  -- correlated!\n      and d_date between ... and d_date_sk = ws_sold_date_sk\n      and ws_wholesale_cost BETWEEN 26 AND 46\n      and ws_sales_price / ws_list_price BETWEEN ...)",
+        "output": {
+          "rewrite_sets": [
+            {
+              "id": "rs_01",
+              "transform": "decorrelate",
+              "nodes": {
+                "common_scan": "SELECT ws_item_sk, ws_ext_discount_amt, ws_sales_price, ws_list_price FROM web_sales JOIN date_dim ON d_date_sk = ws_sold_date_sk WHERE d_date BETWEEN ... AND ws_wholesale_cost BETWEEN ...",
+                "threshold_computation": "SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold FROM common_scan WHERE ws_sales_price / ws_list_price BETWEEN ... GROUP BY ws_item_sk",
+                "outer_rows": "SELECT cs.ws_item_sk, cs.ws_ext_discount_amt FROM common_scan cs JOIN item ON i_item_sk = cs.ws_item_sk WHERE i_manufact_id BETWEEN ... OR i_category IN (...)",
+                "join_filter": "SELECT o.ws_ext_discount_amt FROM outer_rows o JOIN threshold_computation t ON o.ws_item_sk = t.ws_item_sk WHERE o.ws_ext_discount_amt > t.threshold",
+                "main_query": "SELECT SUM(ws_ext_discount_amt) FROM join_filter ORDER BY 1 LIMIT 100"
+              },
+              "invariants_kept": [
+                "same result rows",
+                "same aggregation"
+              ],
+              "expected_speedup": "7.8x",
+              "risk": "low"
+            }
+          ]
+        },
+        "transforms": [
+          "decorrelate"
+        ],
+        "key_insight": "Snowflake P2 variant: when the correlated subquery re-scans the SAME fact table with the SAME date/cost filters as the outer query, extract the common scan once into a CTE, then derive (1) per-item thresholds via GROUP BY and (2) outer rows via item join from the same result. The shared-scan pattern applies when inner = outer table with overlapping filters. This avoids scanning the large fact table twice."
+      },
+      "original_sql": "select \n   sum(ws_ext_discount_amt)  as \"Excess Discount Amount\"\nfrom\n    web_sales\n   ,item\n   ,date_dim\nwhere\n(i_manufact_id BETWEEN 341 and 540\nor i_category IN ('Home', 'Men', 'Music'))\nand i_item_sk = ws_item_sk\nand d_date between '1998-03-13' and\n        cast('1998-03-13' as date) + interval '90 day'\nand d_date_sk = ws_sold_date_sk\nand ws_wholesale_cost BETWEEN 26 AND 46\nand ws_ext_discount_amt\n     > (\n         SELECT\n            1.3 * avg(ws_ext_discount_amt)\n         FROM\n            web_sales\n           ,date_dim\n         WHERE\n              ws_item_sk = i_item_sk\n          and d_date between '1998-03-13' and\n                             cast('1998-03-13' as date) + interval '90 day'\n          and d_date_sk = ws_sold_date_sk\n          and ws_wholesale_cost BETWEEN 26 AND 46\n          and ws_sales_price / ws_list_price BETWEEN 34 * 0.01 AND 49 * 0.01\n      )\norder by sum(ws_ext_discount_amt)\nlimit 100;",
+      "optimized_sql": "WITH common_scan AS (\n  SELECT ws_item_sk, ws_ext_discount_amt, ws_sales_price, ws_list_price\n  FROM web_sales\n  INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk\n  WHERE d_date BETWEEN '1998-03-13' AND CAST('1998-03-13' AS DATE) + INTERVAL '90 DAY'\n    AND ws_wholesale_cost BETWEEN 26 AND 46\n),\nthreshold_computation AS (\n  SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold\n  FROM common_scan\n  WHERE ws_sales_price / ws_list_price BETWEEN 34 * 0.01 AND 49 * 0.01\n  GROUP BY ws_item_sk\n),\nouter_rows AS (\n  SELECT cs.ws_item_sk, cs.ws_ext_discount_amt\n  FROM common_scan cs\n  INNER JOIN item ON i_item_sk = cs.ws_item_sk\n  WHERE i_manufact_id BETWEEN 341 AND 540\n     OR i_category IN ('Home', 'Men', 'Music')\n),\njoin_filter AS (\n  SELECT o.ws_ext_discount_amt\n  FROM outer_rows o\n  INNER JOIN threshold_computation t ON o.ws_item_sk = t.ws_item_sk\n  WHERE o.ws_ext_discount_amt > t.threshold\n)\nSELECT SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\"\nFROM join_filter\nORDER BY SUM(ws_ext_discount_amt)\nLIMIT 100",
+      "optimized_source": "adapted_from_pg",
+      "type": "gold",
+      "family": "B",
+      "ir_node_map_before": "S0 [SELECT]\n  MAIN QUERY (via Q_S0)\n    FROM: web_sales, item, date_dim\n    WHERE [0ef6ffe2461512ae]: (i_manufact_id BETWEEN 341 AND 540 OR i_category IN ('Home', 'Men', 'Music')) AND i_item_sk = ws_...\n    ORDER BY: SUM(ws_ext_discount_amt)\n\nPatch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree\nTarget: by_node_id (statement, e.g. \"S0\") + by_anchor_hash (expression)",
+      "ir_node_map_target": "S0 [SELECT]\n  CTE: common_scan  (via CTE_Q_S0_common_scan)\n    FROM: web_sales, date_dim\n    WHERE [528282f372d6460c]: d_date BETWEEN '1998-03-13' AND CAST('1998-03-13' AS DATE) + INTERVAL '90 DAY' AND ws_wholesale_c...\n  CTE: threshold_computation  (via CTE_Q_S0_threshold_computation)\n    FROM: common_scan\n    WHERE [72f98b50cc17ebb7]: ws_sales_price / ws_list_price BETWEEN 34 * 0.01 AND 49 * 0.01\n    GROUP BY: ws_item_sk\n  CTE: outer_rows  (via CTE_Q_S0_outer_rows)\n    FROM: common_scan cs, item\n    WHERE [c12aae6a913f2cad]: i_manufact_id BETWEEN 341 AND 540 OR i_category IN ('Home', 'Men', 'Music')\n  CTE: join_filter  (via CTE_Q_S0_join_filter)\n    FROM: outer_rows o, threshold_computation t\n    WHERE [d0a3b37ae99bcef6]: o.ws_ext_discount_amt > t.threshold\n  MAIN QUERY (via Q_S0)\n    FROM: join_filter\n    ORDER BY: SUM(ws_ext_discount_amt)\n\nPatch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree\nTarget: by_node_id (statement, e.g. \"S0\") + by_anchor_hash (expression)",
+      "dialect": "snowflake",
+      "transforms": [
+        "decorrelate"
+      ],
+      "families": [
+        "B"
+      ],
+      "gap_ids": [
+        "CORRELATED_SUBQUERY_PARALYSIS"
+      ],
+      "dag_example": {
+        "plan_id": "gold_snowflake_sf_shared_scan_decorrelate",
+        "dialect": "snowflake",
+        "target_ir": "rewrite final_select to optimized query shape",
+        "dag": {
+          "order": [
+            "final_select"
+          ],
+          "final_node_id": "final_select",
+          "nodes": [
+            {
+              "node_id": "final_select",
+              "deps": [],
+              "outputs": [
+                "Excess Discount Amount"
+              ],
+              "changed": true,
+              "sql": "WITH common_scan AS (\n  SELECT ws_item_sk, ws_ext_discount_amt, ws_sales_price, ws_list_price\n  FROM web_sales\n  INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk\n  WHERE d_date BETWEEN '1998-03-13' AND CAST('1998-03-13' AS DATE) + INTERVAL '90 DAY'\n    AND ws_wholesale_cost BETWEEN 26 AND 46\n),\nthreshold_computation AS (\n  SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold\n  FROM common_scan\n  WHERE ws_sales_price / ws_list_price BETWEEN 34 * 0.01 AND 49 * 0.01\n  GROUP BY ws_item_sk\n),\nouter_rows AS (\n  SELECT cs.ws_item_sk, cs.ws_ext_discount_amt\n  FROM common_scan cs\n  INNER JOIN item ON i_item_sk = cs.ws_item_sk\n  WHERE i_manufact_id BETWEEN 341 AND 540\n     OR i_category IN ('Home', 'Men', 'Music')\n),\njoin_filter AS (\n  SELECT o.ws_ext_discount_amt\n  FROM outer_rows o\n  INNER JOIN threshold_computation t ON o.ws_item_sk = t.ws_item_sk\n  WHERE o.ws_ext_discount_amt > t.threshold\n)\nSELECT SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\"\nFROM join_filter\nORDER BY SUM(ws_ext_discount_amt)\nLIMIT 100"
+            }
+          ]
+        }
+      },
+      "_match_score": 0.0,
+      "_retrieval_mode": "catalog_fallback"
+    },
+    {
+      "id": "sf_sk_pushdown_3fact",
+      "name": "SK Range Pushdown on 3 Fact Tables (Snowflake)",
+      "description": "When 3 fact tables (store_sales, catalog_sales, web_sales) each join date_dim via comma join with the same date filter (d_year=2000, d_moy=2), Snowflake may not push the date_sk range to the fact table scans for micro-partition pruning. Fix: look up the date_sk range and add explicit sold_date_sk BETWEEN predicates on each fact table. Also convert comma joins to explicit JOINs.",
+      "verified_speedup": "1.17x",
+      "principle": "Predicate Transitivity on multi-fact queries: when multiple fact tables are comma-joined to date_dim with the same date filter, Snowflake may not infer the date_sk range for fact table pruning. Adding explicit sold_date_sk BETWEEN on each fact table forces micro-partition pruning. Combined with comma-to-explicit JOIN conversion.",
+      "benchmark": {
+        "dataset": "tpcds_sf10tcl",
+        "warehouse": "X-Small",
+        "orig_ms": 10233.6,
+        "opt_ms": 8729.9,
+        "speedup": 1.17,
+        "validation": "5x trimmed mean (discard min/max, average middle 3)",
+        "row_match": true,
+        "hash_match": true
+      },
+      "example": {
+        "opportunity": "SF_SK_PUSHDOWN_3FACT",
+        "input_slice": "with ss as (\n select i_item_id, sum(ss_ext_sales_price) total_sales\n from store_sales, date_dim, customer_address, item\n where ... and ss_sold_date_sk = d_date_sk\n   and d_year = 2000 and d_moy = 2 ...),\n cs as (\n select i_item_id, sum(cs_ext_sales_price) total_sales\n from catalog_sales, date_dim, customer_address, item\n where ... and cs_sold_date_sk = d_date_sk\n   and d_year = 2000 and d_moy = 2 ...),\n ws as (...same pattern with web_sales...)",
+        "output": {
+          "rewrite_sets": [
+            {
+              "id": "rs_01",
+              "transform": "sf_sk_pushdown_union_all",
+              "nodes": {
+                "sk_range_lookup": "SELECT MIN(d_date_sk), MAX(d_date_sk) FROM date_dim WHERE d_year = 2000 AND d_moy = 2",
+                "ss_pushdown": "store_sales: AND ss_sold_date_sk BETWEEN <sk_min> AND <sk_max>",
+                "cs_pushdown": "catalog_sales: AND cs_sold_date_sk BETWEEN <sk_min> AND <sk_max>",
+                "ws_pushdown": "web_sales: AND ws_sold_date_sk BETWEEN <sk_min> AND <sk_max>",
+                "comma_to_explicit": "FROM fact, date_dim, ... WHERE fact_sk = d_date_sk \u2192 FROM fact JOIN date_dim ON fact_sk = d_date_sk JOIN ..."
+              },
+              "invariants_kept": [
+                "same result rows",
+                "same aggregation",
+                "same ORDER BY"
+              ],
+              "expected_speedup": "1.2x",
+              "risk": "low"
+            }
+          ]
+        },
+        "transforms": [
+          "sf_sk_pushdown_union_all"
+        ],
+        "key_insight": "When multiple CTE branches each comma-join a fact table to date_dim with the same date filter, Snowflake may not push the implied date_sk range to the fact table scans. Adding explicit BETWEEN on the sold_date_sk column of each fact table enables micro-partition pruning. Works best with narrow date ranges (29 values = 1 month)."
+      },
+      "original_sql": "with ss as (\n select i_item_id,sum(ss_ext_sales_price) total_sales\n from store_sales, date_dim, customer_address, item\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and ss_item_sk = i_item_sk\n and ss_sold_date_sk = d_date_sk\n and d_year = 2000 and d_moy = 2\n and ss_addr_sk = ca_address_sk\n and ca_gmt_offset = -6\n group by i_item_id),\n cs as (\n select i_item_id,sum(cs_ext_sales_price) total_sales\n from catalog_sales, date_dim, customer_address, item\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and cs_item_sk = i_item_sk\n and cs_sold_date_sk = d_date_sk\n and d_year = 2000 and d_moy = 2\n and cs_bill_addr_sk = ca_address_sk\n and ca_gmt_offset = -6\n group by i_item_id),\n ws as (\n select i_item_id,sum(ws_ext_sales_price) total_sales\n from web_sales, date_dim, customer_address, item\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and ws_item_sk = i_item_sk\n and ws_sold_date_sk = d_date_sk\n and d_year = 2000 and d_moy = 2\n and ws_bill_addr_sk = ca_address_sk\n and ca_gmt_offset = -6\n group by i_item_id)\nselect i_item_id, sum(total_sales) total_sales\nfrom (select * from ss union all select * from cs union all select * from ws) tmp1\ngroup by i_item_id\norder by total_sales, i_item_id\nLIMIT 100",
+      "optimized_sql": "with ss as (\n select i_item_id,sum(ss_ext_sales_price) total_sales\n from store_sales\n JOIN date_dim ON ss_sold_date_sk = d_date_sk\n JOIN customer_address ON ss_addr_sk = ca_address_sk\n JOIN item ON ss_item_sk = i_item_sk\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and d_year = 2000 and d_moy = 2\n and ca_gmt_offset = -6\n and ss_sold_date_sk BETWEEN 2451576 AND 2451604\n group by i_item_id),\n cs as (\n select i_item_id,sum(cs_ext_sales_price) total_sales\n from catalog_sales\n JOIN date_dim ON cs_sold_date_sk = d_date_sk\n JOIN customer_address ON cs_bill_addr_sk = ca_address_sk\n JOIN item ON cs_item_sk = i_item_sk\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and d_year = 2000 and d_moy = 2\n and ca_gmt_offset = -6\n and cs_sold_date_sk BETWEEN 2451576 AND 2451604\n group by i_item_id),\n ws as (\n select i_item_id,sum(ws_ext_sales_price) total_sales\n from web_sales\n JOIN date_dim ON ws_sold_date_sk = d_date_sk\n JOIN customer_address ON ws_bill_addr_sk = ca_address_sk\n JOIN item ON ws_item_sk = i_item_sk\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and d_year = 2000 and d_moy = 2\n and ca_gmt_offset = -6\n and ws_sold_date_sk BETWEEN 2451576 AND 2451604\n group by i_item_id)\nselect i_item_id, sum(total_sales) total_sales\nfrom (select * from ss union all select * from cs union all select * from ws) tmp1\ngroup by i_item_id\norder by total_sales, i_item_id\nLIMIT 100",
+      "type": "gold",
+      "family": "A",
+      "ir_node_map_before": "S0 [SELECT]\n  CTE: ss  (via CTE_Q_S0_ss)\n    FROM: store_sales, date_dim, customer_address, item\n    WHERE [fa12b7a175b8a163]: i_item_id IN (...) AND ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND d_year = 2000 AND d_moy = 2 ...\n    GROUP BY: i_item_id\n  CTE: cs  (via CTE_Q_S0_cs)\n    FROM: catalog_sales, date_dim, customer_address, item\n    WHERE [48639c7117d4306c]: i_item_id IN (...) AND cs_item_sk = i_item_sk AND cs_sold_date_sk = d_date_sk ...\n    GROUP BY: i_item_id\n  CTE: ws  (via CTE_Q_S0_ws)\n    FROM: web_sales, date_dim, customer_address, item\n    WHERE [58f58d0b7668a7f3]: i_item_id IN (...) AND ws_item_sk = i_item_sk AND ws_sold_date_sk = d_date_sk ...\n    GROUP BY: i_item_id\n  MAIN QUERY (via Q_S0)\n    FROM: (subquery) tmp1\n    GROUP BY: i_item_id\n    ORDER BY: total_sales, i_item_id",
+      "ir_node_map_target": "S0 [SELECT]\n  CTE: ss  (via CTE_Q_S0_ss)\n    FROM: store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk JOIN customer_address ON ss_addr_sk = ca_address_sk JOIN item ON ss_item_sk = i_item_sk\n    WHERE: i_item_id IN (...) AND d_year = 2000 AND d_moy = 2 AND ca_gmt_offset = -6 AND ss_sold_date_sk BETWEEN 2451576 AND 2451604\n    GROUP BY: i_item_id\n  CTE: cs  (via CTE_Q_S0_cs)\n    FROM: catalog_sales JOIN date_dim ON cs_sold_date_sk = d_date_sk JOIN customer_address ON cs_bill_addr_sk = ca_address_sk JOIN item ON cs_item_sk = i_item_sk\n    WHERE: ... AND cs_sold_date_sk BETWEEN 2451576 AND 2451604\n    GROUP BY: i_item_id\n  CTE: ws  (via CTE_Q_S0_ws)\n    FROM: web_sales JOIN date_dim ON ws_sold_date_sk = d_date_sk JOIN customer_address ON ws_bill_addr_sk = ca_address_sk JOIN item ON ws_item_sk = i_item_sk\n    WHERE: ... AND ws_sold_date_sk BETWEEN 2451576 AND 2451604\n    GROUP BY: i_item_id\n  MAIN QUERY (via Q_S0)\n    FROM: (subquery) tmp1\n    GROUP BY: i_item_id\n    ORDER BY: total_sales, i_item_id",
+      "dialect": "snowflake",
+      "transforms": [
+        "sf_sk_pushdown_union_all"
+      ],
+      "families": [
+        "A"
+      ],
+      "gap_ids": [
+        "PREDICATE_TRANSITIVITY_FAILURE"
+      ],
+      "dag_example": {
+        "plan_id": "gold_snowflake_sf_sk_pushdown_3fact",
+        "dialect": "snowflake",
+        "target_ir": "rewrite final_select to optimized query shape",
+        "dag": {
+          "order": [
+            "final_select"
+          ],
+          "final_node_id": "final_select",
+          "nodes": [
+            {
+              "node_id": "final_select",
+              "deps": [],
+              "outputs": [
+                "i_item_id",
+                "total_sales"
+              ],
+              "changed": true,
+              "sql": "with ss as (\n select i_item_id,sum(ss_ext_sales_price) total_sales\n from store_sales\n JOIN date_dim ON ss_sold_date_sk = d_date_sk\n JOIN customer_address ON ss_addr_sk = ca_address_sk\n JOIN item ON ss_item_sk = i_item_sk\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and d_year = 2000 and d_moy = 2\n and ca_gmt_offset = -6\n and ss_sold_date_sk BETWEEN 2451576 AND 2451604\n group by i_item_id),\n cs as (\n select i_item_id,sum(cs_ext_sales_price) total_sales\n from catalog_sales\n JOIN date_dim ON cs_sold_date_sk = d_date_sk\n JOIN customer_address ON cs_bill_addr_sk = ca_address_sk\n JOIN item ON cs_item_sk = i_item_sk\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and d_year = 2000 and d_moy = 2\n and ca_gmt_offset = -6\n and cs_sold_date_sk BETWEEN 2451576 AND 2451604\n group by i_item_id),\n ws as (\n select i_item_id,sum(ws_ext_sales_price) total_sales\n from web_sales\n JOIN date_dim ON ws_sold_date_sk = d_date_sk\n JOIN customer_address ON ws_bill_addr_sk = ca_address_sk\n JOIN item ON ws_item_sk = i_item_sk\n where i_item_id in (select i_item_id from item where i_color in ('powder','green','cyan'))\n and d_year = 2000 and d_moy = 2\n and ca_gmt_offset = -6\n and ws_sold_date_sk BETWEEN 2451576 AND 2451604\n group by i_item_id)\nselect i_item_id, sum(total_sales) total_sales\nfrom (select * from ss union all select * from cs union all select * from ws) tmp1\ngroup by i_item_id\norder by total_sales, i_item_id\nLIMIT 100"
+            }
+          ]
+        }
+      },
+      "_match_score": 0.0,
+      "_retrieval_mode": "catalog_fallback"
+    },
+    {
+      "id": "sf_sk_pushdown_union_all",
+      "name": "SK Range Pushdown into UNION ALL Branches (Snowflake)",
+      "description": "When a UNION ALL CTE combines multiple fact tables (web_sales + catalog_sales) and is later joined to date_dim via comma join, Snowflake does not push the date_sk range into the UNION ALL branches. Fix: look up the date_sk range from date_dim and add explicit BETWEEN predicates inside each UNION ALL branch. Also convert comma joins to explicit JOINs.",
+      "verified_speedup": "2.13x",
+      "principle": "Predicate Transitivity through UNION ALL: Snowflake's optimizer fails to push date_sk ranges through UNION ALL CTEs. Manually adding sold_date_sk BETWEEN <min> AND <max> inside each branch enables micro-partition pruning on both fact tables, reducing full scans to narrow range scans.",
+      "benchmark": {
+        "dataset": "tpcds_sf10tcl",
+        "warehouse": "X-Small",
+        "orig_ms": 229847.3,
+        "opt_ms": 107982.0,
+        "speedup": 2.13,
+        "validation": "5x trimmed mean (discard min/max, average middle 3)",
+        "row_match": true
+      },
+      "example": {
+        "opportunity": "SF_SK_PUSHDOWN_UNION_ALL",
+        "input_slice": "with wscs as\n (select sold_date_sk, sales_price\n  from (select ws_sold_date_sk sold_date_sk, ws_ext_sales_price sales_price\n        from web_sales\n        union all\n        select cs_sold_date_sk sold_date_sk, cs_ext_sales_price sales_price\n        from catalog_sales)),\n wswscs as\n (select d_week_seq, sum(case when ...) ...\n from wscs, date_dim\n where d_date_sk = sold_date_sk\n group by d_week_seq)",
+        "output": {
+          "rewrite_sets": [
+            {
+              "id": "rs_01",
+              "transform": "sf_sk_pushdown_union_all",
+              "nodes": {
+                "sk_range_lookup": "SELECT MIN(d_date_sk), MAX(d_date_sk) FROM date_dim WHERE d_year IN (1998, 1999)",
+                "wscs_with_pushdown": "UNION ALL branches each get: WHERE ws/cs_sold_date_sk BETWEEN <sk_min> AND <sk_max>",
+                "comma_to_explicit": "FROM wscs, date_dim WHERE d_date_sk = sold_date_sk \u2192 FROM wscs JOIN date_dim ON d_date_sk = sold_date_sk"
+              },
+              "invariants_kept": [
+                "same result rows",
+                "same aggregation",
+                "same ORDER BY"
+              ],
+              "expected_speedup": "2x",
+              "risk": "low"
+            }
+          ]
+        },
+        "transforms": [
+          "sf_sk_pushdown_union_all"
+        ],
+        "key_insight": "Snowflake cannot push date_sk ranges through UNION ALL CTEs. The wscs CTE scans ALL web_sales + catalog_sales partitions even though only 2 years of data are needed. Adding explicit sold_date_sk BETWEEN filters inside each UNION ALL branch enables micro-partition pruning, cutting scan volume dramatically. The multi-ref CTE (wswscs used twice for year 1998 and 1999) amplifies the benefit."
+      },
+      "original_sql": "with wscs as\n (select sold_date_sk, sales_price\n  from (select ws_sold_date_sk sold_date_sk, ws_ext_sales_price sales_price\n        from web_sales\n        union all\n        select cs_sold_date_sk sold_date_sk, cs_ext_sales_price sales_price\n        from catalog_sales)),\n wswscs as\n (select d_week_seq,\n        sum(case when (d_day_name='Sunday') then sales_price else null end) sun_sales,\n        sum(case when (d_day_name='Monday') then sales_price else null end) mon_sales,\n        sum(case when (d_day_name='Tuesday') then sales_price else null end) tue_sales,\n        sum(case when (d_day_name='Wednesday') then sales_price else null end) wed_sales,\n        sum(case when (d_day_name='Thursday') then sales_price else null end) thu_sales,\n        sum(case when (d_day_name='Friday') then sales_price else null end) fri_sales,\n        sum(case when (d_day_name='Saturday') then sales_price else null end) sat_sales\n from wscs, date_dim\n where d_date_sk = sold_date_sk\n group by d_week_seq)\n select d_week_seq1,\n       round(sun_sales1/sun_sales2,2),\n       round(mon_sales1/mon_sales2,2),\n       round(tue_sales1/tue_sales2,2),\n       round(wed_sales1/wed_sales2,2),\n       round(thu_sales1/thu_sales2,2),\n       round(fri_sales1/fri_sales2,2),\n       round(sat_sales1/sat_sales2,2)\n from\n (select wswscs.d_week_seq d_week_seq1,\n        sun_sales sun_sales1, mon_sales mon_sales1, tue_sales tue_sales1,\n        wed_sales wed_sales1, thu_sales thu_sales1, fri_sales fri_sales1,\n        sat_sales sat_sales1\n  from wswscs, date_dim\n  where date_dim.d_week_seq = wswscs.d_week_seq and d_year = 1998) y,\n (select wswscs.d_week_seq d_week_seq2,\n        sun_sales sun_sales2, mon_sales mon_sales2, tue_sales tue_sales2,\n        wed_sales wed_sales2, thu_sales thu_sales2, fri_sales fri_sales2,\n        sat_sales sat_sales2\n  from wswscs, date_dim\n  where date_dim.d_week_seq = wswscs.d_week_seq and d_year = 1998+1) z\n where d_week_seq1=d_week_seq2-53\n order by d_week_seq1",
+      "optimized_sql": "with wscs as\n (select sold_date_sk, sales_price\n  from (select ws_sold_date_sk sold_date_sk, ws_ext_sales_price sales_price\n        from web_sales\n        where ws_sold_date_sk BETWEEN 2450815 AND 2451544\n        union all\n        select cs_sold_date_sk sold_date_sk, cs_ext_sales_price sales_price\n        from catalog_sales\n        where cs_sold_date_sk BETWEEN 2450815 AND 2451544)),\n wswscs as\n (select d_week_seq,\n        sum(case when (d_day_name='Sunday') then sales_price else null end) sun_sales,\n        sum(case when (d_day_name='Monday') then sales_price else null end) mon_sales,\n        sum(case when (d_day_name='Tuesday') then sales_price else null end) tue_sales,\n        sum(case when (d_day_name='Wednesday') then sales_price else null end) wed_sales,\n        sum(case when (d_day_name='Thursday') then sales_price else null end) thu_sales,\n        sum(case when (d_day_name='Friday') then sales_price else null end) fri_sales,\n        sum(case when (d_day_name='Saturday') then sales_price else null end) sat_sales\n from wscs\n JOIN date_dim ON d_date_sk = sold_date_sk\n group by d_week_seq)\n select d_week_seq1,\n       round(sun_sales1/sun_sales2,2),\n       round(mon_sales1/mon_sales2,2),\n       round(tue_sales1/tue_sales2,2),\n       round(wed_sales1/wed_sales2,2),\n       round(thu_sales1/thu_sales2,2),\n       round(fri_sales1/fri_sales2,2),\n       round(sat_sales1/sat_sales2,2)\n from\n (select wswscs.d_week_seq d_week_seq1,\n        sun_sales sun_sales1, mon_sales mon_sales1, tue_sales tue_sales1,\n        wed_sales wed_sales1, thu_sales thu_sales1, fri_sales fri_sales1,\n        sat_sales sat_sales1\n  from wswscs\n  JOIN date_dim ON date_dim.d_week_seq = wswscs.d_week_seq\n  where d_year = 1998) y,\n (select wswscs.d_week_seq d_week_seq2,\n        sun_sales sun_sales2, mon_sales mon_sales2, tue_sales tue_sales2,\n        wed_sales wed_sales2, thu_sales thu_sales2, fri_sales fri_sales2,\n        sat_sales sat_sales2\n  from wswscs\n  JOIN date_dim ON date_dim.d_week_seq = wswscs.d_week_seq\n  where d_year = 1998+1) z\n where d_week_seq1=d_week_seq2-53\n order by d_week_seq1",
+      "type": "gold",
+      "family": "A",
+      "ir_node_map_before": "S0 [SELECT]\n  CTE: wscs  (via CTE_Q_S0_wscs)\n    FROM: (subquery) \n  CTE: wswscs  (via CTE_Q_S0_wswscs)\n    FROM: wscs, date_dim\n    WHERE [a502d7ffeceaa78e]: d_date_sk = sold_date_sk\n    GROUP BY: d_week_seq\n  MAIN QUERY (via Q_S0)\n    FROM: (subquery) y, (subquery) z\n    WHERE [114524ba4f840dfa]: d_week_seq1 = d_week_seq2 - 53\n    ORDER BY: d_week_seq1",
+      "ir_node_map_target": "S0 [SELECT]\n  CTE: sk_range  (via CTE_Q_S0_sk_range)\n    FROM: date_dim\n    WHERE: d_year IN (1998, 1999)\n  CTE: wscs  (via CTE_Q_S0_wscs)\n    FROM: (subquery with WHERE ws/cs_sold_date_sk BETWEEN sk_min AND sk_max)\n  CTE: wswscs  (via CTE_Q_S0_wswscs)\n    FROM: wscs JOIN date_dim ON d_date_sk = sold_date_sk\n    GROUP BY: d_week_seq\n  MAIN QUERY (via Q_S0)\n    FROM: (subquery) y, (subquery) z\n    WHERE: d_week_seq1 = d_week_seq2 - 53\n    ORDER BY: d_week_seq1",
+      "dialect": "snowflake",
+      "transforms": [
+        "sf_sk_pushdown_union_all"
+      ],
+      "families": [
+        "A"
+      ],
+      "gap_ids": [
+        "PREDICATE_TRANSITIVITY_FAILURE"
+      ],
+      "dag_example": {
+        "plan_id": "gold_snowflake_sf_sk_pushdown_union_all",
+        "dialect": "snowflake",
+        "target_ir": "rewrite final_select to optimized query shape",
+        "dag": {
+          "order": [
+            "final_select"
+          ],
+          "final_node_id": "final_select",
+          "nodes": [
+            {
+              "node_id": "final_select",
+              "deps": [],
+              "outputs": [
+                "d_week_seq1",
+                "ROUND(sun_sales1 / sun_sales2, 2)",
+                "ROUND(mon_sales1 / mon_sales2, 2)",
+                "ROUND(tue_sales1 / tue_sales2, 2)",
+                "ROUND(wed_sales1 / wed_sales2, 2)",
+                "ROUND(thu_sales1 / thu_sales2, 2)",
+                "ROUND(fri_sales1 / fri_sales2, 2)",
+                "ROUND(sat_sales1 / sat_sales2, 2)"
+              ],
+              "changed": true,
+              "sql": "with wscs as\n (select sold_date_sk, sales_price\n  from (select ws_sold_date_sk sold_date_sk, ws_ext_sales_price sales_price\n        from web_sales\n        where ws_sold_date_sk BETWEEN 2450815 AND 2451544\n        union all\n        select cs_sold_date_sk sold_date_sk, cs_ext_sales_price sales_price\n        from catalog_sales\n        where cs_sold_date_sk BETWEEN 2450815 AND 2451544)),\n wswscs as\n (select d_week_seq,\n        sum(case when (d_day_name='Sunday') then sales_price else null end) sun_sales,\n        sum(case when (d_day_name='Monday') then sales_price else null end) mon_sales,\n        sum(case when (d_day_name='Tuesday') then sales_price else null end) tue_sales,\n        sum(case when (d_day_name='Wednesday') then sales_price else null end) wed_sales,\n        sum(case when (d_day_name='Thursday') then sales_price else null end) thu_sales,\n        sum(case when (d_day_name='Friday') then sales_price else null end) fri_sales,\n        sum(case when (d_day_name='Saturday') then sales_price else null end) sat_sales\n from wscs\n JOIN date_dim ON d_date_sk = sold_date_sk\n group by d_week_seq)\n select d_week_seq1,\n       round(sun_sales1/sun_sales2,2),\n       round(mon_sales1/mon_sales2,2),\n       round(tue_sales1/tue_sales2,2),\n       round(wed_sales1/wed_sales2,2),\n       round(thu_sales1/thu_sales2,2),\n       round(fri_sales1/fri_sales2,2),\n       round(sat_sales1/sat_sales2,2)\n from\n (select wswscs.d_week_seq d_week_seq1,\n        sun_sales sun_sales1, mon_sales mon_sales1, tue_sales tue_sales1,\n        wed_sales wed_sales1, thu_sales thu_sales1, fri_sales fri_sales1,\n        sat_sales sat_sales1\n  from wswscs\n  JOIN date_dim ON date_dim.d_week_seq = wswscs.d_week_seq\n  where d_year = 1998) y,\n (select wswscs.d_week_seq d_week_seq2,\n        sun_sales sun_sales2, mon_sales mon_sales2, tue_sales tue_sales2,\n        wed_sales wed_sales2, thu_sales thu_sales2, fri_sales fri_sales2,\n        sat_sales sat_sales2\n  from wswscs\n  JOIN date_dim ON date_dim.d_week_seq = wswscs.d_week_seq\n  where d_year = 1998+1) z\n where d_week_seq1=d_week_seq2-53\n order by d_week_seq1"
+            }
+          ]
+        }
+      },
+      "_match_score": 0.0,
+      "_retrieval_mode": "catalog_fallback"
+    }
+  ],
+  "all_available_examples": [
+    {
+      "id": "sf_inline_decorrelate",
+      "speedup": "23.17x",
+      "description": "When a WHERE clause contains a correlated scalar subquery (e.g., col > (SELECT 1"
+    },
+    {
+      "id": "sf_shared_scan_decorrelate",
+      "speedup": "7.82x",
+      "description": "When a correlated subquery re-scans the same fact table as the outer query with "
+    },
+    {
+      "id": "sf_sk_pushdown_3fact",
+      "speedup": "1.17x",
+      "description": "When 3 fact tables (store_sales, catalog_sales, web_sales) each join date_dim vi"
+    },
+    {
+      "id": "sf_sk_pushdown_union_all",
+      "speedup": "2.13x",
+      "description": "When a UNION ALL CTE combines multiple fact tables (web_sales + catalog_sales) a"
+    }
+  ],
+  "engine_profile": {
+    "version_tested": "8.x (cloud)",
+    "profile_type": "engine_profile",
+    "briefing_note": "P3 (correlated scalar decorrelation) 2/2 (100%) \u2014 23.17x and 7.82x wins on SF10TCL MEDIUM, 3x3 validated.",
+    "strengths": [
+      {
+        "id": "MICRO_PARTITION_PRUNING",
+        "summary": "Filters on clustered columns skip micro-partitions at scan level",
+        "implication": "Snowflake's #1 optimization. Functions on filter columns kill pruning. Runtime pruning from CTE values invisible in static EXPLAIN."
+      },
+      {
+        "id": "COLUMN_PRUNING",
+        "summary": "Reads only columns referenced by final query, even through CTEs",
+        "implication": "Automatic unless final SELECT is *."
+      },
+      {
+        "id": "PREDICATE_PUSHDOWN",
+        "summary": "Filters pushed to storage layer including through single-ref CTEs",
+        "implication": "Also does predicate mirroring across join sides."
+      },
+      {
+        "id": "CORRELATED_DECORRELATION",
+        "summary": "Simple correlated subqueries (EXISTS/IN) automatically decorrelated to hash joins",
+        "implication": "Do NOT decorrelate simple EXISTS/IN. DOES NOT handle correlated scalar subqueries with aggregation (see gap)."
+      },
+      {
+        "id": "SEMI_JOIN",
+        "summary": "EXISTS \u2192 SemiJoin with early termination",
+        "implication": "Never materialize EXISTS patterns."
+      },
+      {
+        "id": "JOIN_FILTER",
+        "summary": "Bloom filter pushdown from build side to probe-side TableScan",
+        "implication": "77/99 TPC-DS queries show JoinFilter."
+      },
+      {
+        "id": "COST_BASED_JOIN_ORDER",
+        "summary": "Evaluates multiple join orders, selects lowest cost",
+        "implication": "Usually correct. Do NOT force join order."
+      },
+      {
+        "id": "QUALIFY_OPTIMIZATION",
+        "summary": "Native window-function filtering, more efficient than nested subquery",
+        "implication": "Gives optimizer full visibility into filter intent."
+      }
+    ],
+    "gaps": [
+      {
+        "id": "CORRELATED_SUBQUERY_PARALYSIS",
+        "priority": "HIGH",
+        "goal": "DECORRELATE",
+        "detect": "WHERE col > (SELECT agg(col) FROM fact WHERE key = outer.key). Correlated scalar subquery with AVG/SUM/COUNT that re-scans fact table per outer row.",
+        "gates": "REQUIRED: correlated scalar subquery with aggregate function (AVG, SUM, COUNT). REQUIRED: inner query joins fact table. Works on any fact table.",
+        "what": "Correlated scalar subqueries with aggregation re-execute per outer row \u2014 O(N*M) scans.",
+        "why": "Snowflake cannot flatten correlated scalar subqueries that aggregate over a correlated key. Unlike simple EXISTS/IN, these require per-row evaluation.",
+        "opportunity": "Decompose into CTEs: (1) dimension filter, (2) date-filtered fact rows, (3) per-key aggregate threshold via GROUP BY. JOIN threshold CTE in final query. If inner and outer scan SAME fact table with SAME filters, use shared-scan variant.",
+        "frequency_pct": 100,
+        "what_worked": "2/2 wins. inline_decorrelate 23.17x (69.4s\u21923.0s), shared_scan_decorrelate 7.82x (8.0s\u21921.0s). Both on SF10TCL MEDIUM warehouse, 3x3 validation.",
+        "what_didnt_work": "None observed.",
+        "field_notes": "Tested on catalog_sales and web_sales. The shared-scan variant applies when inner = outer table with overlapping filters."
+      }
+    ],
+    "dialect": "snowflake"
+  },
+  "constraints": [
+    {
+      "id": "COMPLETE_OUTPUT",
+      "severity": "CRITICAL",
+      "description": "The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns.",
+      "constraint_rules": [
+        {
+          "rule": "ALL_COLUMNS_PRESENT",
+          "description": "Every column in the original SELECT list must appear in the rewritten SELECT list."
+        },
+        {
+          "rule": "NO_COLUMN_RENAME",
+          "description": "Column aliases must be preserved exactly. If the original says 'AS total_sales', the rewrite must use the same alias."
+        },
+        {
+          "rule": "PRESERVE_COLUMN_ORDER",
+          "description": "Columns must appear in the same order as the original SELECT list."
+        }
+      ],
+      "prompt_instruction": "The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original."
+    },
+    {
+      "id": "CTE_COLUMN_COMPLETENESS",
+      "severity": "CRITICAL",
+      "description": "When creating or modifying a CTE, its SELECT list MUST include ALL columns that downstream nodes reference. Check the Node Contracts and Downstream Usage sections before writing any CTE.",
+      "failure_rate": "Caused 54% of all execution errors (7 of 13 failures)",
+      "observed_failures": [
+        {
+          "query": "Q21",
+          "error": "prefetched_inventory CTE omits i_item_id but main query references it in SELECT and GROUP BY",
+          "type": "MISSING_COLUMN_IN_CTE"
+        },
+        {
+          "query": "Q76",
+          "error": "filtered_store_dates CTE omits d_year and d_qoy but aggregation CTE uses them in GROUP BY",
+          "type": "MISSING_COLUMN_IN_CTE"
+        },
+        {
+          "query": "Q24",
+          "error": "filtered_base CTE omits s_state, i_current_price, i_manager_id, i_units, i_size needed by downstream CTEs",
+          "type": "MISSING_COLUMN_IN_CTE"
+        },
+        {
+          "query": "Q64",
+          "error": "filtered_store_sales CTE omits ss_sold_date_sk needed for JOIN in cross_sales CTE",
+          "type": "MISSING_COLUMN_IN_CTE"
+        },
+        {
+          "query": "Q60",
+          "error": "ss/ws/cs CTEs reference item.i_item_sk and item.i_category in WHERE but item table not joined in CTE",
+          "type": "MISSING_TABLE_IN_CTE"
+        },
+        {
+          "query": "Q13",
+          "error": "filtered_store_sales CTE references hd_demo_sk, cd_demo_sk from tables not joined in the CTE",
+          "type": "MISSING_TABLE_IN_CTE"
+        },
+        {
+          "query": "Q2",
+          "error": "Ambiguous d_date_sk and d_week_seq columns between CTE and re-joined date_dim",
+          "type": "AMBIGUOUS_COLUMN_REF"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "CHECK_DOWNSTREAM_REFS",
+          "description": "Before writing a CTE, check the Downstream Usage section. Every column listed in downstream_refs for that node MUST appear in the CTE's SELECT list."
+        },
+        {
+          "rule": "CHECK_JOIN_COLUMNS",
+          "description": "If a downstream node JOINs on a column from this CTE (e.g., ON cte.d_date_sk = ...), that column MUST be in the CTE's SELECT."
+        },
+        {
+          "rule": "CHECK_TABLE_PRESENCE",
+          "description": "If a CTE's WHERE clause references columns from a table, that table MUST be in the CTE's FROM/JOIN clause."
+        }
+      ],
+      "prompt_instruction": "CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error."
+    },
+    {
+      "id": "LITERAL_PRESERVATION",
+      "severity": "CRITICAL",
+      "description": "All literal values (strings, numbers, dates) from the original query MUST be preserved EXACTLY in the rewrite",
+      "failure_rate": "100% of Q2-Q16 failures were caused by hallucinated literals",
+      "observed_failures": [
+        {
+          "query": "Q2",
+          "original": "d_year = 2001, d_year = 2002",
+          "hallucinated": "d_year = 1998, d_year = 1999",
+          "type": "YEAR_HALLUCINATION"
+        },
+        {
+          "query": "Q7",
+          "original": "cd_gender = 'M', cd_marital_status = 'S', d_year = 2000",
+          "hallucinated": "cd_gender = 'F', cd_marital_status = 'W', d_year = 2001",
+          "type": "MULTIPLE_LITERAL_HALLUCINATION"
+        },
+        {
+          "query": "Q10",
+          "original": "d_year = 2002, ca_county IN ('Rush County', 'Toole County', 'Jefferson County', 'Dona Ana County', 'La Porte County')",
+          "hallucinated": "d_year = 2001, ca_county IN ('Storey County', 'Marquette County', 'Warren County', 'Cochran County', 'Kandiyohi County')",
+          "type": "YEAR_AND_STRING_HALLUCINATION"
+        },
+        {
+          "query": "Q13",
+          "original": "cd_marital_status = 'M', cd_education_status = 'Advanced Degree'",
+          "hallucinated": "cd_marital_status = 'D', cd_education_status = 'Unknown'",
+          "type": "STRING_HALLUCINATION"
+        },
+        {
+          "query": "Q16",
+          "original": "ca_state = 'GA', cc_county = 'Williamson County', d_date BETWEEN '2002-02-01' AND '2002-04-02'",
+          "hallucinated": "ca_state = 'WV', cc_county IN ('Ziebach County', ...), d_date BETWEEN '2002-4-01' AND ...",
+          "type": "STATE_COUNTY_DATE_HALLUCINATION"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "EXACT_STRING_MATCH",
+          "description": "String literals in WHERE clauses must be copied character-for-character",
+          "examples": [
+            "'M' not 'F'",
+            "'GA' not 'WV'",
+            "'Rush County' not 'Storey County'"
+          ]
+        },
+        {
+          "rule": "EXACT_NUMBER_MATCH",
+          "description": "Numeric literals (years, amounts, counts) must be copied exactly",
+          "examples": [
+            "2000 not 2001",
+            "2002 not 2001",
+            "100.00 not 150.00"
+          ]
+        },
+        {
+          "rule": "EXACT_DATE_MATCH",
+          "description": "Date literals must be copied exactly, including format",
+          "examples": [
+            "'2002-02-01' not '2002-4-01'"
+          ]
+        },
+        {
+          "rule": "EXACT_LIST_MATCH",
+          "description": "IN lists must contain the exact same values in the same order",
+          "examples": [
+            "IN ('TX', 'OH', 'TX') not IN ('SD', 'KS', 'MI')"
+          ]
+        }
+      ],
+      "prompt_instruction": "CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED."
+    },
+    {
+      "id": "SEMANTIC_EQUIVALENCE",
+      "severity": "CRITICAL",
+      "description": "The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive.",
+      "constraint_rules": [
+        {
+          "rule": "SAME_ROWS",
+          "description": "The rewritten query must produce the same set of rows as the original. No rows may be added or removed."
+        },
+        {
+          "rule": "SAME_COLUMNS",
+          "description": "The rewritten query must return the same columns in the same order with the same names and data types."
+        },
+        {
+          "rule": "SAME_ORDERING",
+          "description": "If the original query has an ORDER BY clause, the rewritten query must preserve the same ordering."
+        }
+      ],
+      "prompt_instruction": "The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set \u2014 even by one row, one column, or a different sort order \u2014 is WRONG and will be REJECTED."
+    },
+    {
+      "id": "KEEP_EXISTS_AS_EXISTS",
+      "severity": "HIGH",
+      "overridable": true,
+      "description": "Prefer preserving EXISTS/NOT EXISTS subqueries. Converting to IN/NOT IN risks NULL-handling changes; converting to JOINs risks duplicate rows.",
+      "observed_failures": [
+        {
+          "problem": "Converting NOT EXISTS to NOT IN changes behavior when the subquery column contains NULLs. NOT IN with NULLs returns no rows.",
+          "type": "NULL_SEMANTIC_CHANGE"
+        },
+        {
+          "problem": "Converting EXISTS to JOIN can produce duplicate rows when the subquery matches multiple rows per outer row.",
+          "type": "DUPLICATE_ROW_INTRODUCTION"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "AVOID_EXISTS_TO_IN",
+          "description": "Avoid converting EXISTS/NOT EXISTS to IN/NOT IN unless the subquery column is provably NOT NULL (has a NOT NULL constraint or is a primary key)."
+        },
+        {
+          "rule": "EXISTS_TO_JOIN_NEEDS_DISTINCT",
+          "description": "Converting EXISTS to JOIN requires SELECT DISTINCT or GROUP BY to prevent row duplication when the subquery matches multiple rows per outer row."
+        }
+      ],
+      "override_conditions": [
+        "The subquery join column has a NOT NULL constraint or is a primary key (safe for IN conversion)",
+        "The subquery returns at most 1 row per outer row (1:1 relationship, safe for JOIN)",
+        "EXISTS is converted to JOIN + DISTINCT/GROUP BY to explicitly handle duplicates"
+      ],
+      "prompt_instruction": "DEFAULT: Preserve EXISTS/NOT EXISTS as-is. NOT EXISTS\u2192NOT IN breaks with NULLs; EXISTS\u2192JOIN can duplicate rows. HOWEVER: if the join column is NOT NULL (PK or explicit constraint), EXISTS\u2192IN is safe. If the subquery is 1:1 with the outer query, EXISTS\u2192JOIN is safe. The exploration worker MAY convert EXISTS with written proof of NULL safety or 1:1 cardinality."
+    },
+    {
+      "id": "NO_CROSS_JOIN_DIMENSIONS",
+      "severity": "HIGH",
+      "overridable": true,
+      "description": "Avoid CROSS JOINing dimension tables into a single CTE. The Cartesian product can explode row counts and prevent index use on fact tables.",
+      "failure_rate": "Caused 0.0076x regression on Q080 (132x slower) when 3 dimensions were cross-joined",
+      "observed_failures": [
+        {
+          "query": "Q080_multi",
+          "regression": "0.0076x (57ms -> 7500ms)",
+          "broken_rewrite": "filtered_dims AS (SELECT d_date_sk, i_item_sk, p_promo_sk FROM date_dim CROSS JOIN item CROSS JOIN promotion WHERE ...)",
+          "problem": "CROSS JOIN created 120K-row CTE (30 \u00d7 200 \u00d7 20), then 3-key join prevented index use on fact tables.",
+          "type": "CROSS_JOIN_DIMENSION_EXPLOSION"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "PREFER_SEPARATE_DIMENSION_CTES",
+          "description": "Each dimension table should generally be its own CTE with its own filter. Combining via CROSS JOIN risks Cartesian explosion."
+        }
+      ],
+      "override_conditions": [
+        "Only 2 dimensions are joined (not 3+) AND the product is <1000 rows",
+        "The dimensions share a foreign key (not a true Cartesian \u2014 it's a filtered JOIN)",
+        "The combined CTE replaces N separate semi-joins with 1 multi-key join on the fact table"
+      ],
+      "prompt_instruction": "DEFAULT: Keep each dimension as a SEPARATE CTE (filtered_date, filtered_item, etc.). Cross-joining 3 dimensions caused 0.0076x on Q080 (30\u00d7200\u00d720 = 120K rows). HOWEVER: joining exactly 2 small dimensions (<1000 row product) via a foreign key (not Cartesian) may be acceptable if it reduces total join count on the fact table. The exploration worker MAY attempt a 2-dimension join with size estimate. Never cross-join 3+ dimensions."
+    },
+    {
+      "id": "NO_MATERIALIZE_EXISTS",
+      "severity": "HIGH",
+      "overridable": true,
+      "description": "Avoid converting EXISTS/NOT EXISTS subqueries into materialized CTEs with full table scans. EXISTS uses semi-join short-circuiting which is typically more efficient.",
+      "failure_rate": "Caused 0.14x and 0.54x regressions (7x and 2x slowdowns)",
+      "observed_failures": [
+        {
+          "query": "Q16",
+          "regression": "0.14x (18ms -> 126ms)",
+          "original": "EXISTS (SELECT * FROM catalog_sales cs2 WHERE cs1.cs_order_number = cs2.cs_order_number AND cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk)",
+          "broken_rewrite": "WITH multi_warehouse_orders AS (SELECT DISTINCT cs_order_number FROM catalog_sales GROUP BY cs_order_number HAVING MIN(cs_warehouse_sk) <> MAX(cs_warehouse_sk))",
+          "type": "EXISTS_TO_FULL_SCAN_CTE"
+        },
+        {
+          "query": "Q95",
+          "regression": "0.54x (390ms -> 728ms)",
+          "original": "EXISTS(SELECT 1 FROM ws_wh WHERE ws_wh.ws_order_number = ws1.ws_order_number)",
+          "broken_rewrite": "WITH multi_warehouse_orders AS (SELECT DISTINCT ws_order_number FROM ws_wh)",
+          "type": "EXISTS_TO_MATERIALIZED_DISTINCT"
+        }
+      ],
+      "observed_successes": [
+        {
+          "query": "Q14",
+          "speedup": "1.83x",
+          "context": "intersect_to_exists: INTERSECT converted to EXISTS for semi-join short-circuit. Shows EXISTS restructuring CAN help when applied in the right direction."
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "PREFER_EXISTS_SEMI_JOIN",
+          "description": "EXISTS and NOT EXISTS use semi-join optimization that short-circuits after finding the first match. Converting to materialized CTEs usually forces a full scan."
+        },
+        {
+          "rule": "AVOID_FULL_TABLE_DISTINCT_CTE",
+          "description": "Avoid creating CTEs like SELECT DISTINCT key FROM large_table to replace EXISTS. The CTE scans the entire table; EXISTS can stop after one match."
+        }
+      ],
+      "override_conditions": [
+        "The EXISTS subquery is correlated and executed many times (optimizer fails to decorrelate it)",
+        "The CTE would be small (<10K rows) and probed multiple times, amortizing materialization cost",
+        "The EXISTS is inside a UNION ALL branch where each branch re-executes the same correlated subquery"
+      ],
+      "prompt_instruction": "DEFAULT: Keep EXISTS/NOT EXISTS as-is \u2014 semi-join short-circuiting is usually faster than materialization. Converting to CTEs caused 0.14x on Q16 and 0.54x on Q95. HOWEVER: if the correlated EXISTS is executed many times and the optimizer fails to decorrelate it, materializing into a small CTE (<10K rows) probed via JOIN may help. The exploration worker MAY attempt this with reasoning about correlation frequency and CTE size."
+    },
+    {
+      "id": "NO_UNFILTERED_DIMENSION_CTE",
+      "severity": "HIGH",
+      "description": "Never create a 'filtered' dimension CTE that has no WHERE clause. A CTE that selects all rows from a dimension table is pure materialization overhead with zero filtering benefit.",
+      "failure_rate": "Caused 0.85x regression on Q67",
+      "observed_failures": [
+        {
+          "query": "Q67",
+          "regression": "0.85x (4509ms -> 5291ms)",
+          "broken_rewrite": "filtered_stores AS (SELECT s_store_sk, s_store_id FROM store), filtered_items AS (SELECT i_item_sk, i_category, i_class, i_brand, i_product_name FROM item)",
+          "problem": "Both CTEs select ALL rows - no WHERE clause, no filtering. Pure overhead.",
+          "type": "UNFILTERED_DIMENSION_CTE"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "CTE_MUST_FILTER",
+          "description": "Every dimension CTE you create MUST have a WHERE clause that reduces the row count. If a dimension table has no filter to apply, do NOT extract it into a CTE."
+        },
+        {
+          "rule": "COLUMN_PROJECTION_IS_NOT_FILTERING",
+          "description": "Selecting a subset of columns (SELECT a, b FROM table) is NOT filtering. The CTE still materializes all rows. Only a WHERE clause reduces rows."
+        }
+      ],
+      "prompt_instruction": "Every CTE you create must include a WHERE clause that actually reduces row count. Selecting fewer columns is not filtering \u2014 the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query instead of wrapping it in a CTE."
+    },
+    {
+      "id": "OR_TO_UNION_GUARD",
+      "severity": "HIGH",
+      "overridable": true,
+      "description": "Guard rails for or_to_union: branches should have different access paths (not same column) and be limited to 3 or fewer.",
+      "observed_failures": [
+        {
+          "query": "Q90",
+          "regression": "0.59x (16ms -> 27ms)",
+          "original": "WHERE t.t_hour BETWEEN 10 AND 11 OR t.t_hour BETWEEN 16 AND 17",
+          "broken_rewrite": "UNION ALL of two separate web_sales scans (one for AM hours, one for PM hours)",
+          "problem": "Doubles the fact table scan. The OR on t_hour is trivial for the optimizer - it just checks two ranges on one column.",
+          "type": "UNION_SAME_COLUMN_OR"
+        },
+        {
+          "query": "Q13",
+          "regression": "0.23x",
+          "problem": "9 UNION branches from nested OR expansion (3 conditions x 3 values) caused 9x fact table scans.",
+          "type": "UNION_BRANCH_EXPLOSION"
+        },
+        {
+          "query": "Q48",
+          "regression": "0.41x",
+          "problem": "9 UNION branches from nested OR expansion caused severe regression from multiplied fact table scans.",
+          "type": "UNION_BRANCH_EXPLOSION"
+        }
+      ],
+      "observed_successes": [
+        {
+          "query": "Q88",
+          "speedup": "6.28x",
+          "context": "8 time-bucket subqueries on store_sales, each filtering distinct hour ranges via different WHERE clauses. Branches access genuinely different row subsets."
+        },
+        {
+          "query": "Q10",
+          "speedup": "1.49x",
+          "context": "OR across different dimension table lookups creating distinct access paths."
+        },
+        {
+          "query": "Q45",
+          "speedup": "1.35x",
+          "context": "OR conditions reference different tables/subqueries."
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "OR_TO_UNION_REQUIRES_DIFFERENT_PATHS",
+          "description": "or_to_union is most beneficial when OR conditions create fundamentally different access paths (e.g., across different tables or between a correlated subquery and a direct filter). Same-column ORs on trivial ranges are usually handled efficiently by the optimizer as a single scan."
+        },
+        {
+          "rule": "OR_TO_UNION_PREFER_3_OR_FEWER",
+          "description": "Prefer 3 or fewer UNION ALL branches. Nested ORs that expand into 9+ combinations are almost always harmful. 4-5 branches may be acceptable if each accesses genuinely different row subsets."
+        }
+      ],
+      "override_conditions": [
+        "Branches access genuinely different row subsets (different WHERE predicates, not just same-column ranges)",
+        "Total branch count stays at 4-5 or fewer (not Cartesian expansion of nested ORs)",
+        "EXPLAIN shows the fact table is already scanned N times in baseline, so splitting does not increase scan count",
+        "Each branch filters to <20% of fact table rows (high selectivity per branch)"
+      ],
+      "prompt_instruction": "DEFAULT: Prefer 3 or fewer UNION ALL branches with different access paths per branch. Same-column ORs on simple ranges are usually handled efficiently by the optimizer. Nested ORs that expand into 4+ branches (e.g., 3 x 3 = 9 combinations) caused 0.23x-0.41x regressions. HOWEVER: or_to_union achieved 6.28x on Q88 where branches had genuinely different row subsets. The exploration worker MAY try 4-5 branches if each branch has distinct access paths and high selectivity. Provide reasoning."
+    },
+    {
+      "id": "OR_TO_UNION_SELF_JOIN",
+      "severity": "HIGH",
+      "overridable": true,
+      "description": "Avoid or_to_union on queries with self-joins. Splitting OR conditions on self-joined tables can create multiple independent scans that cannot share the self-join optimization.",
+      "observed_failures": [
+        {
+          "query": "Q23",
+          "regression": "0.51x",
+          "problem": "Self-join on store_sales was split into separate UNION branches, each requiring its own full self-join, doubling execution time.",
+          "type": "SELF_JOIN_SPLIT"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "AVOID_OR_TO_UNION_ON_SELF_JOINS",
+          "description": "If a query contains a self-join (same table aliased twice), or_to_union is risky because the self-join must typically remain in a single query block to share the scan."
+        }
+      ],
+      "override_conditions": [
+        "The OR conditions are on a column NOT involved in the self-join predicate",
+        "The self-join aliases have independent WHERE filters that make each branch selective",
+        "EXPLAIN shows the self-join is already executed multiple times in baseline"
+      ],
+      "prompt_instruction": "DEFAULT: Avoid or_to_union when the query contains a self-join (same table with different aliases). Splitting forces each branch to independently perform the self-join (observed 0.51x on Q23). HOWEVER: if the OR conditions target a column not involved in the self-join predicate, or if each alias already has independent selective filters, splitting may still help. The exploration worker MAY attempt this with written reasoning about why the structural context differs from Q23."
+    },
+    {
+      "id": "REMOVE_REPLACED_CTES",
+      "severity": "HIGH",
+      "description": "When creating replacement CTEs, always remove the original CTEs from the WITH clause. Leaving dead/unused CTEs causes unnecessary materialization overhead.",
+      "failure_rate": "Contributed to 0.49x and 0.68x regressions",
+      "observed_failures": [
+        {
+          "query": "Q31",
+          "regression": "0.49x (99ms -> 201ms)",
+          "problem": "Created new store_sales_agg and web_sales_agg CTEs but left the original ss and ws CTEs in the WITH clause. Both old and new CTEs coexist, wasting materialization.",
+          "type": "DEAD_CTE_OVERHEAD"
+        },
+        {
+          "query": "Q74",
+          "regression": "0.68x (493ms -> 724ms)",
+          "problem": "Created 4 new year-specific CTEs but left the original year_total, year_total_store, year_total_web CTEs. Total of 8 CTEs instead of 4.",
+          "type": "DEAD_CTE_OVERHEAD"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "REPLACE_NOT_APPEND",
+          "description": "When your rewrite replaces a CTE with a new version, the original CTE node must be removed or overwritten. Do not define both the old and new CTE."
+        }
+      ],
+      "prompt_instruction": "When creating replacement CTEs, overwrite the original by using the same node_id in your rewrite_sets, or ensure the original is removed from the WITH clause. Every CTE in the final query should be actively used \u2014 dead CTEs still get materialized and waste resources (caused 0.49x on Q31, 0.68x on Q74)."
+    },
+    {
+      "id": "UNION_CTE_SPLIT_MUST_REPLACE",
+      "severity": "HIGH",
+      "description": "When splitting a UNION into separate CTEs, the original UNION must be eliminated. Creating CTEs that duplicate the UNION branches while keeping the original UNION doubles the work.",
+      "observed_failures": [
+        {
+          "query": "multiple",
+          "problem": "UNION branches were extracted into CTEs but the original UNION ALL remained in the main query, causing each branch to be computed twice.",
+          "type": "DUPLICATE_UNION"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "CTE_SPLIT_REPLACES_UNION",
+          "description": "When applying union_cte_split, the final query must reference the CTEs instead of the original UNION. The total number of UNION ALL operations should not increase."
+        }
+      ],
+      "prompt_instruction": "When applying union_cte_split (splitting UNION into CTEs), the original UNION must be eliminated from the main query. The main query should reference the split CTEs, not duplicate the UNION branches. If the rewritten query has more UNION ALL operations than the original, the rewrite is incorrect."
+    },
+    {
+      "id": "DECORRELATE_MUST_FILTER_FIRST",
+      "severity": "MEDIUM",
+      "description": "When decorrelating a subquery into a JOIN, the replacement JOIN must include a selective filter. A decorrelation that produces an unfiltered cross-product is worse than the original correlated subquery.",
+      "observed_failures": [
+        {
+          "query": "multiple",
+          "problem": "Correlated subquery was converted to JOIN without carrying over the original WHERE filters, producing a much larger intermediate result than the correlated version.",
+          "type": "UNFILTERED_DECORRELATION"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "DECORRELATE_PRESERVES_FILTERS",
+          "description": "When converting a correlated subquery to a JOIN + GROUP BY CTE, all WHERE conditions from the original subquery must be preserved in the CTE or JOIN condition. The replacement must not produce more rows than the original correlated subquery."
+        }
+      ],
+      "prompt_instruction": "When decorrelating a correlated subquery into a JOIN, ensure all original WHERE filters are preserved in the replacement CTE or JOIN condition. A decorrelation without selective filters creates a cross-product that is larger than the original per-row correlated execution. The replacement CTE must filter to at most the same cardinality as the original subquery."
+    },
+    {
+      "id": "DIMENSION_CTE_SAME_COLUMN_OR",
+      "severity": "MEDIUM",
+      "description": "Do not extract dimension CTE filters when the WHERE clause has OR conditions on the same column. Same-column ORs are efficiently handled by the optimizer in a single scan; CTE extraction adds overhead without benefit.",
+      "observed_failures": [
+        {
+          "query": "Q37",
+          "regression": "0.89x",
+          "problem": "OR conditions on item.i_current_price ranges were extracted into separate CTEs, adding CTE materialization overhead without improving selectivity.",
+          "type": "SAME_COLUMN_OR_CTE"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "KEEP_SAME_COLUMN_OR_INLINE",
+          "description": "When OR conditions filter the same column (e.g., i_current_price BETWEEN X AND Y OR i_current_price BETWEEN A AND B), keep them inline in WHERE. Only extract dimension CTEs when filters span different columns or tables."
+        }
+      ],
+      "prompt_instruction": "Do not create dimension CTEs to isolate OR conditions that filter the same column. The optimizer handles same-column ORs efficiently in a single scan. Only apply dimension_cte_isolate when filters span different columns or different dimension tables."
+    },
+    {
+      "id": "EARLY_FILTER_CTE_BEFORE_CHAIN",
+      "severity": "MEDIUM",
+      "description": "Early filter CTEs must be referenced by the main query chain. An orphaned CTE that pre-filters data but is never joined back into the main query wastes materialization effort.",
+      "observed_failures": [
+        {
+          "query": "multiple",
+          "problem": "Early filter CTEs were created but not referenced in subsequent JOINs, resulting in wasted CTE materialization plus the original unfiltered joins remaining.",
+          "type": "ORPHANED_FILTER_CTE"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "FILTER_CTE_MUST_BE_REFERENCED",
+          "description": "Every early_filter CTE must be referenced by at least one downstream CTE or the main query. If a filter CTE is created, the original unfiltered table reference must be replaced with the CTE reference."
+        }
+      ],
+      "prompt_instruction": "When creating an early_filter CTE, ensure it is actually referenced in the main query chain. The original unfiltered table reference must be replaced with the CTE reference. Do not create CTEs that filter a table if the main query still joins the original unfiltered table \u2014 this adds overhead without benefit."
+    },
+    {
+      "id": "EXPLICIT_JOINS",
+      "severity": "MEDIUM",
+      "description": "Convert comma-separated implicit joins to explicit JOIN ... ON syntax. This gives the optimizer better join-order freedom.",
+      "constraint_rules": [
+        {
+          "rule": "PREFER_EXPLICIT_JOIN",
+          "description": "When the original query uses comma-separated tables with WHERE conditions for joining, convert to explicit JOIN ... ON syntax."
+        }
+      ],
+      "prompt_instruction": "Convert comma-separated implicit joins to explicit JOIN ... ON syntax. This gives the optimizer better join-order freedom."
+    },
+    {
+      "id": "MIN_BASELINE_THRESHOLD",
+      "severity": "MEDIUM",
+      "overridable": true,
+      "description": "Be conservative with CTE-based transforms on queries with very short baseline runtimes. CTE materialization overhead can dominate when the query is already fast.",
+      "failure_rate": "Caused 0.14x-0.59x regressions on queries under 50ms",
+      "observed_failures": [
+        {
+          "query": "Q25",
+          "regression": "0.50x (31ms -> 62ms)",
+          "baseline_ms": 31,
+          "transform": "prefetch_fact_join with 6 CTEs",
+          "type": "CTE_OVERHEAD_ON_FAST_QUERY"
+        },
+        {
+          "query": "Q90",
+          "regression": "0.59x (16ms -> 27ms)",
+          "baseline_ms": 16,
+          "transform": "multi_dimension_prefetch with 4 CTEs + UNION ALL",
+          "type": "CTE_OVERHEAD_ON_FAST_QUERY"
+        },
+        {
+          "query": "Q16",
+          "regression": "0.14x (18ms -> 126ms)",
+          "baseline_ms": 18,
+          "transform": "materialize_cte with 2 full-scan CTEs",
+          "type": "CTE_OVERHEAD_ON_FAST_QUERY"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "CHECK_BASELINE_RUNTIME",
+          "description": "If the Execution Plan shows estimated or actual runtime under 50ms, prefer minimal rewrites. DuckDB already optimizes simple star-join patterns efficiently."
+        }
+      ],
+      "override_conditions": [
+        "The transform reduces scan count (e.g., 3 scans \u2192 1 scan) even on a fast query",
+        "The query is a component of a larger pipeline where cumulative savings matter",
+        "The transform simplifies the query structure without adding CTEs (e.g., pushdown, decorrelate)"
+      ],
+      "prompt_instruction": "DEFAULT: If baseline is under 100ms, prefer minimal rewrites. CTE materialization overhead (hash tables, intermediate storage) can exceed filtering benefit on fast queries. HOWEVER: transforms that reduce scan count without adding CTEs (pushdown, decorrelate) may still help. The exploration worker MAY attempt structural changes on fast queries if the transform is scan-reducing, not CTE-adding."
+    },
+    {
+      "id": "PREFETCH_MULTI_FACT_CHAIN",
+      "severity": "MEDIUM",
+      "overridable": true,
+      "description": "Prefer limiting cascading fact-table CTEs to 2. Each additional CTE materializes a large intermediate result.",
+      "observed_failures": [
+        {
+          "query": "Q4",
+          "regression": "0.78x",
+          "problem": "3 cascading fact-table CTEs (store_sales -> catalog_sales -> web_sales) created excessive intermediate materialization.",
+          "type": "FACT_CHAIN_OVERHEAD"
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "PREFER_2_OR_FEWER_FACT_CTES",
+          "description": "When pre-joining fact tables with filtered dimensions in CTEs, 2 cascading fact CTEs is safe. A third adds risk of excessive materialization."
+        }
+      ],
+      "override_conditions": [
+        "Each fact CTE has highly selective filters (<5% of rows survive), keeping intermediate sizes small",
+        "The 3rd CTE reads from a dimension-filtered result, not a raw fact table",
+        "The query already has 3+ separate fact table scans in baseline \u2014 chaining cannot be worse"
+      ],
+      "prompt_instruction": "DEFAULT: Limit to 2 cascading fact-table CTEs. A 3rd CTE caused 0.78x on Q4 from excessive materialization. HOWEVER: if each CTE applies highly selective filters (<5% row survival), the intermediate results stay small. The exploration worker MAY try a 3-CTE chain if filters are selective and baseline already has 3+ separate scans."
+    },
+    {
+      "id": "SINGLE_PASS_AGGREGATION_LIMIT",
+      "severity": "MEDIUM",
+      "overridable": true,
+      "description": "Prefer limiting single-pass aggregation to 8 CASE branches. Beyond 8, CASE evaluation overhead may reduce benefit.",
+      "observed_failures": [
+        {
+          "query": "Q88",
+          "note": "8 CASE branches (time slices) was the maximum tested that still showed improvement (6.28x). More branches are untested, not proven harmful.",
+          "type": "CASE_BRANCH_LIMIT"
+        }
+      ],
+      "observed_successes": [
+        {
+          "query": "Q88",
+          "speedup": "6.28x",
+          "context": "8 CASE branches consolidating 8 separate time-bucket subqueries into a single scan."
+        },
+        {
+          "query": "Q9",
+          "speedup": "4.47x",
+          "context": "5 CASE branches consolidating repeated store_sales scans."
+        }
+      ],
+      "constraint_rules": [
+        {
+          "rule": "PREFER_8_OR_FEWER_CASE_BRANCHES",
+          "description": "When consolidating repeated scans into CASE WHEN aggregates, 8 or fewer branches is well-tested. More branches are untested territory."
+        }
+      ],
+      "override_conditions": [
+        "The original query has 9-12 repeated scans on the same fact table (high consolidation value)",
+        "Each CASE branch is a simple equality check (low per-row overhead)",
+        "The fact table is large (>1M rows) so scan reduction dominates CASE evaluation cost"
+      ],
+      "prompt_instruction": "DEFAULT: Use at most 8 CASE branches for single_pass_aggregation (tested up to 8 at 6.28x on Q88). HOWEVER: 9-12 branches with simple equality checks on large fact tables may still net positive. The exploration worker MAY try 9-12 branches if the scan reduction value is high. Beyond 12 branches is not recommended."
+    }
+  ],
+  "regression_warnings": [],
+  "strategy_leaderboard": null,
+  "query_archetype": null,
+  "resource_envelope": null,
+  "exploit_algorithm_text": "# Snowflake Dialect Knowledge\n\n## Metadata\n- dialect: `snowflake`\n- version: `2026-02-17-format-v1`\n- source_of_truth:\n  - engine_profile: `constraints/engine_profile_snowflake.json`\n  - transforms: `knowledge/transforms.json`\n  - examples: `examples/snowflake/*.json`\n- generated_from: `hybrid`\n- last_updated: `2026-02-17`\n\n## Engine Strengths (Do Not Fight)\n| Strength ID | Summary | Implication | Evidence |\n|---|---|---|---|\n| `MICRO_PARTITION_PRUNING` | Clustered filter predicates prune partitions early. | Avoid wrapping filter columns in functions when pruning is critical. | `engine_profile_snowflake.json` |\n| `COLUMN_PRUNING` | Only referenced columns are read through query graph. | Keep projections narrow; avoid unnecessary wide intermediate selects. | `engine_profile_snowflake.json` |\n| `PREDICATE_PUSHDOWN` | Filters push into storage and single-ref CTE paths. | Do not duplicate already-effective filters blindly. | `engine_profile_snowflake.json` |\n| `CORRELATED_DECORRELATION` | Simple EXISTS/IN correlation often decorrelates to joins. | Reserve manual decorrelation for scalar aggregate correlation cases. | `engine_profile_snowflake.json` |\n| `SEMI_JOIN` | EXISTS patterns get early-stop semi-join behavior. | Protect EXISTS from materialization rewrites. | `engine_profile_snowflake.json` |\n| `JOIN_FILTER` | Join-filter pushdown commonly appears on star-schema joins. | Avoid plan-shape rewrites that remove effective join filters without reason. | `engine_profile_snowflake.json`, `benchmarks/snowflake_tpcds/explains/*.json` |\n| `COST_BASED_JOIN_ORDER` | Join ordering is generally cost-driven and robust. | Prefer cardinality reduction over forced join-order plans. | `engine_profile_snowflake.json` |\n| `QUALIFY_OPTIMIZATION` | QUALIFY is native and efficient for window filtering. | Prefer QUALIFY-form filter placement where semantics permit. | `engine_profile_snowflake.json` |\n\n## Global Guards\n| Guard ID | Rule | Severity | Fail Action | Source |\n|---|---|---|---|---|\n| `G_SF_EXISTS_PROTECTED` | Never materialize `EXISTS/NOT EXISTS` into broad CTE branches. | `BLOCKER` | `SKIP_TRANSFORM` | `SEMI_JOIN` strength |\n| `G_SF_FILTER_FUNCTION_WRAP` | Do not wrap partition/filter keys in functions when pruning matters. | `HIGH` | `SKIP_TRANSFORM` | `MICRO_PARTITION_PRUNING` strength |\n| `G_SF_JOINFILTER_PRESERVE` | Avoid destructive shape rewrites when join-filter behavior is already strong. | `MEDIUM` | `REQUIRE_MANUAL_REVIEW` | `JOIN_FILTER` strength |\n| `G_SF_UNION_BRANCH_LIMIT` | Keep UNION ALL branch count modest for branch-level scan costs. | `MEDIUM` | `DOWNRANK_TO_EXPLORATION` | legacy playbook |\n| `G_SF_CTE_REUSE_RULE` | Single-ref CTEs tend to inline; multi-ref CTEs need explicit reason. | `MEDIUM` | `DOWNRANK_TO_EXPLORATION` | legacy playbook |\n| `G_SF_NOTIN_NULL_SAFETY` | Use NULL-safe anti-join semantics (prefer NOT EXISTS to unsafe NOT IN patterns). | `HIGH` | `REQUIRE_MANUAL_REVIEW` | legacy playbook |\n| `G_SF_LOW_BASELINE_SKIP_HEAVY` | If baseline is low (`<100ms`), skip structural rewrite churn. | `MEDIUM` | `DOWNRANK_TO_EXPLORATION` | legacy playbook |\n\n## Decision Gates (Normative Contract)\n| Gate ID | Scope | Type | Severity | Check | Pass Criteria | Fail Action | Evidence Required |\n|---|---|---|---|---|---|---|---|\n| `DG_TYPE_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Gate type validity | One of `SQL_PATTERN`, `PLAN_SIGNAL`, `RUNTIME_CONTEXT`, `SEMANTIC_RISK` | `REQUIRE_MANUAL_REVIEW` | gate row schema |\n| `DG_SEVERITY_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Severity validity | One of `BLOCKER`, `HIGH`, `MEDIUM` | `REQUIRE_MANUAL_REVIEW` | gate row schema |\n| `DG_FAIL_ACTION_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Fail action validity | One of `SKIP_PATHOLOGY`, `SKIP_TRANSFORM`, `DOWNRANK_TO_EXPLORATION`, `REQUIRE_MANUAL_REVIEW` | `REQUIRE_MANUAL_REVIEW` | gate row schema |\n| `DG_BLOCKER_POLICY` | global | `RUNTIME_CONTEXT` | `BLOCKER` | Any blocker failed | Failed blocker always blocks that pattern/transform path | `SKIP_PATHOLOGY` | failed gate log |\n| `DG_MIN_PATTERN_GATES` | pattern | `RUNTIME_CONTEXT` | `HIGH` | Gate coverage | Each pattern has at least 1 `SEMANTIC_RISK`, 1 `PLAN_SIGNAL`, 1 `RUNTIME_CONTEXT` gate | `REQUIRE_MANUAL_REVIEW` | pattern gate table |\n| `DG_EVIDENCE_BINDING` | global | `RUNTIME_CONTEXT` | `HIGH` | Claim traceability | Quantitative claims map to example IDs or benchmark artifacts | `REQUIRE_MANUAL_REVIEW` | evidence table row |\n\n## Gap-Driven Optimization Patterns\n\n### Pattern ID: `CORRELATED_SUBQUERY_PARALYSIS` (`HIGH`)\n- Goal: `DECORRELATE`\n- Detect: correlated scalar aggregate subquery re-scans fact table per outer row.\n- Preferred transforms: `sf_inline_decorrelate`, `sf_shared_scan_decorrelate`.\n\n#### Decision Gates for `CORRELATED_SUBQUERY_PARALYSIS`\n| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |\n|---|---|---|---|---|---|---|\n| `G_SF_CORR_SCALAR_REQUIRED` | `SQL_PATTERN` | `BLOCKER` | Correlated scalar aggregate exists | AVG/SUM/COUNT scalar correlation present | `SKIP_PATHOLOGY` | SQL + parse |\n| `G_SF_CORR_SIMPLE_EXISTS_SKIP` | `PLAN_SIGNAL` | `HIGH` | Already simple decorrelation class | Skip manual rewrite when simple EXISTS/IN already optimized | `SKIP_TRANSFORM` | EXPLAIN shape |\n| `G_SF_CORR_FACT_CONTEXT` | `RUNTIME_CONTEXT` | `MEDIUM` | Fact-table involvement | Inner query actually touches fact-table path | `DOWNRANK_TO_EXPLORATION` | SQL relation map |\n| `G_SF_CORR_SEMANTIC_KEYS` | `SEMANTIC_RISK` | `HIGH` | Correlation key and aggregate semantics preserved | Correlation predicates and aggregate semantics unchanged | `REQUIRE_MANUAL_REVIEW` | rewrite diff |\n\n#### Evidence Table\n| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |\n|---|---|---|---|---:|---:|---:|---|\n| `sf_inline_decorrelate` | `n/a` | `MEDIUM` | `3x3 (discard warmup, average last 2)` | `69414.7` | `2995.5` | `23.17x` | `WIN` |\n| `sf_shared_scan_decorrelate` | `n/a` | `MEDIUM` | `3x3 (discard warmup, average last 2)` | `8024.6` | `1026.1` | `7.82x` | `WIN` |\n\n#### Failure Modes\n| Pattern | Impact | Triggered Gate | Mitigation |\n|---|---|---|---|\n| none observed in curated examples | `n/a` | `n/a` | keep blocker gates enforced |\n\n### Pattern ID: `PREDICATE_TRANSITIVITY_FAILURE` (`n/a in engine_profile`)\n- Goal: `SK_PUSHDOWN`\n- Detect: date_dim filter exists but sold_date_sk range is not pushed into fact scans, often across UNION ALL or multi-fact comma-join shapes.\n- Preferred transforms: `sf_sk_pushdown_union_all`, `sf_sk_pushdown_multi_fact`.\n\n#### Decision Gates for `PREDICATE_TRANSITIVITY_FAILURE`\n| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |\n|---|---|---|---|---|---|---|\n| `G_SF_SK_DATE_FILTER_REQUIRED` | `SQL_PATTERN` | `BLOCKER` | Date filter on date_dim exists | Date filter plus sold_date_sk join path present | `SKIP_PATHOLOGY` | SQL parse |\n| `G_SF_SK_SCAN_PRESSURE` | `PLAN_SIGNAL` | `HIGH` | Fact scan pressure | Fact scan appears broad enough to justify pushdown | `DOWNRANK_TO_EXPLORATION` | EXPLAIN table scan stats |\n| `G_SF_SK_COMPUTE_BOUND_SKIP` | `RUNTIME_CONTEXT` | `HIGH` | Compute-bound workload | Skip when dominant cost is compute-heavy aggregate/rollup path | `SKIP_TRANSFORM` | operator profile |\n| `G_SF_SK_RANGE_SEMANTICS` | `SEMANTIC_RISK` | `HIGH` | Date key range correctness | Date_sk range derived from same predicate domain as original query | `REQUIRE_MANUAL_REVIEW` | range derivation audit |\n\n#### Evidence Table\n| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |\n|---|---|---|---|---:|---:|---:|---|\n| `sf_sk_pushdown_union_all` | `Q2` | `X-Small` | `5x trimmed mean (discard min/max, average middle 3)` | `229847.3` | `107982.0` | `2.13x` | `WIN` |\n| `sf_sk_pushdown_3fact` | `Q56` | `X-Small` | `5x trimmed mean (discard min/max, average middle 3)` | `10233.6` | `8729.9` | `1.17x` | `WIN` |\n\n#### Failure Modes\n| Pattern | Impact | Triggered Gate | Mitigation |\n|---|---|---|---|\n| Wide-range pushdown gave neutral result | `0.97x` (legacy note) | `G_SF_SK_SCAN_PRESSURE` | require strong scan-pressure evidence |\n| Compute-bound rollup path timed out | timeout (legacy note) | `G_SF_SK_COMPUTE_BOUND_SKIP` | skip pushdown-only strategy on compute-bound plans |\n\n## Pruning Guide\n| Plan shows | Skip |\n|---|---|\n| No correlated scalar aggregate pattern | `CORRELATED_SUBQUERY_PARALYSIS` |\n| Correlation is simple EXISTS/IN already optimized | `CORRELATED_SUBQUERY_PARALYSIS` |\n| No date_dim filter or no sold_date_sk join linkage | `PREDICATE_TRANSITIVITY_FAILURE` |\n| Low scan pressure on fact tables | `PREDICATE_TRANSITIVITY_FAILURE` |\n| Dominant compute-bound aggregate/rollup path | `PREDICATE_TRANSITIVITY_FAILURE` |\n| Baseline < 100ms | most structural rewrite paths |\n\n## Regression Registry\n| Severity | Transform | Speedup | Query | Root Cause |\n|---|---|---:|---|---|\n| `INFO` | `sf_sk_pushdown_union_all` | `0.97x` | `Q17` | wide date range reduced pruning benefit (legacy playbook note) |\n| `INFO` | `sf_sk_pushdown_union_all` | `timeout` | `Q67` | compute-bound rollup path, not scan-bound (legacy playbook note) |\n\n## Notes\n- `PREDICATE_TRANSITIVITY_FAILURE` is represented in transforms and examples, but is not yet listed in `engine_profile_snowflake.json` gaps.\n- Consider promoting this pattern into the Snowflake engine profile to keep profile and playbook fully aligned.\n",
+  "detected_transforms": "[TransformMatch(id='sf_sk_pushdown_multi_fact', overlap_ratio=1.0, matched_features=['DATE_DIM', 'MULTI_TABLE_5+'], missing_features=[], total_required=2, gap='PREDICATE_TRANSITIVITY_FAILURE', engines=['snowflake'], contraindications=[]), TransformMatch(id='sf_sk_pushdown_union_all', overlap_ratio=0.6666666666666666, matched_features=['DATE_DIM', 'MULTI_CHANNEL'], missing_features=['UNION'], total_required=3, gap='PREDICATE_TRANSITIVITY_FAILURE', engines=['snowflake'], contraindications=[]), TransformMatch(id='sf_inline_decorrelate', overlap_ratio=0.25, matched_features=['DATE_DIM'], missing_features=['AGG_AVG', 'CORRELATED_SUB', 'SCALAR_AGG_SUB'], total_required=4, gap='CORRELATED_SUBQUERY_PARALYSIS', engines=['snowflake'], contraindications=[]), TransformMatch(id='sf_shared_scan_decorrelate', overlap_ratio=0.25, matched_features=['CTE'], missing_features=['AGG_AVG', 'CORRELATED_SUB', 'SCALAR_AGG_SUB_CTE'], total_required=4, gap='CORRELATED_SUBQUERY_PARALYSIS', engines=['snowflake'], contraindications=[])]",
+  "qerror_analysis": "QErrorAnalysis(signals=[], max_q_error=1.0, severity='ACCURATE', direction='ACCURATE', locus='PROJECTION', magnitude='MINOR', structural_flags=['ESTIMATE_ONLY'], pathology_candidates=[])"
+}

@@ -507,7 +507,7 @@ queries get 13× more R1 reasoning each.
 
 | File | Mode | What |
 |------|------|------|
-| `beam_wide_prompts.py` | Wide | `build_wide_scout_prompt()`, `build_wide_strike_prompt()`, `build_wide_sniper_prompt()` |
+| `beam_prompts.py` | Beam | `build_beam_analyst_prompt()`, `build_beam_editor_strike_prompt()`, `build_beam_worker_prompt()` |
 | `beam_focused_prompts.py` | Focused | `build_focused_analyst_prompt()`, `build_focused_strike_prompt()`, `build_focused_sniper_prompt()` |
 | `beam_router.py` | Both | `classify_workload()` — routes queries to wide/focused |
 | `beam_front_gate.py` | Wide | `filter_applicable_transforms()` — wraps `detect_transforms()` with threshold + contraindication logic |

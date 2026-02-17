@@ -1,4 +1,4 @@
-"""Q-Error analysis for EXPLAIN ANALYZE plans (DuckDB + PostgreSQL).
+"""Q-Error analysis for EXPLAIN plans (DuckDB + PostgreSQL + Snowflake).
 
 Extracts cardinality estimation errors (Q-Error), derives categorical
 variables (DIRECTION, LOCUS, MAGNITUDE), routes to pathology candidates,
@@ -17,12 +17,19 @@ Supported formats:
     node["Actual Total Time"] - node["Actual Startup Time"] = self-time (ms)
     node["Plans"]            = child nodes (recursive)
 
+  Snowflake (EXPLAIN USING JSON):
+    plan_json["Operations"] is a list of operator dictionaries.
+    Snowflake EXPLAIN is estimate-only here (no per-node actual rows), so
+    cardinality Q-Error signals are unavailable; we emit structural routing
+    flags instead.
+
 Q-Error = max(estimated/actual, actual/estimated), symmetric, ≥ 1.0.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -104,6 +111,26 @@ _LOCUS_MAP: Dict[str, str] = {
     "Gather Merge": "PROJECTION",
     "BitmapAnd": "FILTER",
     "BitmapOr": "FILTER",
+    # ── Snowflake operation names ──
+    "TableScan": "SCAN",
+    "InnerJoin": "JOIN",
+    "LeftOuterJoin": "JOIN",
+    "RightOuterJoin": "JOIN",
+    "FullOuterJoin": "JOIN",
+    "SemiJoin": "JOIN",
+    "AntiJoin": "JOIN",
+    "JoinFilter": "JOIN",
+    "Aggregate": "AGGREGATE",
+    "GroupingSets": "AGGREGATE",
+    "Filter": "FILTER",
+    "Result": "PROJECTION",
+    "Sort": "PROJECTION",
+    "SortWithLimit": "PROJECTION",
+    "Limit": "PROJECTION",
+    "WithClause": "CTE",
+    "WithReference": "CTE",
+    "UnionAll": "PROJECTION",
+    "Generator": "PROJECTION",
 }
 
 # ── Routing table: (locus, direction) → pathology candidates ─────────────
@@ -288,6 +315,8 @@ def _detect_plan_format(plan_json) -> str:
     Returns "duckdb", "postgres", or "unknown".
     """
     if isinstance(plan_json, dict):
+        if "Operations" in plan_json:
+            return "snowflake"
         if "children" in plan_json or "operator_name" in plan_json:
             return "duckdb"
         if "Plan" in plan_json or "Node Type" in plan_json:
@@ -297,6 +326,29 @@ def _detect_plan_format(plan_json) -> str:
         if isinstance(first, dict) and ("Plan" in first or "Node Type" in first):
             return "postgres"
     return "unknown"
+
+
+def _route_from_structural_flags(structural_flags: list[str]) -> list[str]:
+    """Map structural flags to pathology candidates with stable ordering."""
+    flag_to_paths = {
+        "EST_ZERO": ["P0"],
+        "EST_ONE_NONLEAF": ["P0", "P1"],
+        "DELIM_SCAN": ["P2"],
+        "CORRELATED_SUBPLAN": ["P2"],
+        "REPEATED_TABLE": ["P1"],
+        "LEFT_JOIN": ["P5"],
+        "INTERSECT_EXCEPT": ["P6"],
+        "MULTI_CTE": ["P7"],
+        "ESTIMATE_ONLY": [],
+    }
+    routed: list[str] = []
+    seen: set[str] = set()
+    for flag in structural_flags:
+        for p in flag_to_paths.get(flag, []):
+            if p not in seen:
+                routed.append(p)
+                seen.add(p)
+    return routed
 
 
 def analyze_plan_qerror(plan_json, dialect: Optional[str] = None) -> QErrorAnalysis:
@@ -346,6 +398,10 @@ def analyze_plan_qerror(plan_json, dialect: Optional[str] = None) -> QErrorAnaly
         # PG: raw might be {"Plan": {...}, "Execution Time": ...} or the Plan node itself
         plan_root = raw.get("Plan", raw)
         _walk_pg_nodes(plan_root, signals)
+    elif fmt == "snowflake":
+        # Snowflake EXPLAIN JSON here is estimate-only; no per-node actual rows
+        # to compute Q-Error. Fall back to structural routing signals.
+        signals = []
     else:
         # DuckDB: top-level has 'children' (list of operator trees)
         children = raw.get("children", [])
@@ -357,7 +413,13 @@ def analyze_plan_qerror(plan_json, dialect: Optional[str] = None) -> QErrorAnaly
 
     if not signals:
         analysis = QErrorAnalysis()
-        analysis.structural_flags = extract_structural_flags(plan_json)
+        analysis.structural_flags = extract_structural_flags(plan_json, dialect=fmt)
+        if fmt == "snowflake":
+            # Snowflake EXPLAIN JSON is estimate-only in this workflow; ensure
+            # the prompt renders the routing section even when no other flags match.
+            if "ESTIMATE_ONLY" not in analysis.structural_flags:
+                analysis.structural_flags.insert(0, "ESTIMATE_ONLY")
+        analysis.pathology_candidates = _route_from_structural_flags(analysis.structural_flags)
         return analysis
 
     # Sort by Q-Error descending
@@ -401,22 +463,10 @@ def analyze_plan_qerror(plan_json, dialect: Optional[str] = None) -> QErrorAnaly
                 seen.add(p)
 
     # Add structural flag-based routing
-    for flag in structural_flags:
-        if flag == "DELIM_SCAN" and "P2" not in seen:
-            pathology_set.append("P2")
-            seen.add("P2")
-        elif flag == "REPEATED_TABLE" and "P1" not in seen:
-            pathology_set.append("P1")
-            seen.add("P1")
-        elif flag == "EST_ZERO" and "P0" not in seen:
-            pathology_set.append("P0")
-            seen.add("P0")
-        elif flag == "INTERSECT_EXCEPT" and "P6" not in seen:
-            pathology_set.append("P6")
-            seen.add("P6")
-        elif flag == "LEFT_JOIN" and "P5" not in seen:
-            pathology_set.append("P5")
-            seen.add("P5")
+    for p in _route_from_structural_flags(structural_flags):
+        if p not in seen:
+            pathology_set.append(p)
+            seen.add(p)
 
     return QErrorAnalysis(
         signals=signals,
@@ -526,6 +576,97 @@ def _walk_structural_pg(node: dict, flags: list[str], tables_seen: dict[str, int
         _walk_structural_pg(child, flags, tables_seen)
 
 
+_ROW_COUNT_RE = re.compile(r"rowCount:\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+
+
+def _flatten_snowflake_ops(plan_json: dict) -> list[dict]:
+    """Flatten Snowflake plan_json['Operations'] into a single list."""
+    ops: list[dict] = []
+    groups = plan_json.get("Operations", [])
+    if not isinstance(groups, list):
+        return ops
+    for group in groups:
+        if isinstance(group, list):
+            for op in group:
+                if isinstance(op, dict):
+                    ops.append(op)
+        elif isinstance(group, dict):
+            ops.append(group)
+    return ops
+
+
+def _extract_sf_row_count(op: dict) -> Optional[int]:
+    """Extract rowCount from Snowflake operator expressions if present."""
+    exprs = op.get("expressions", [])
+    if not isinstance(exprs, list):
+        return None
+    for expr in exprs:
+        m = _ROW_COUNT_RE.search(str(expr))
+        if m:
+            try:
+                return int(float(m.group(1)))
+            except Exception:
+                return None
+    return None
+
+
+def _walk_structural_snowflake(plan_json: dict, flags: list[str], tables_seen: dict[str, int]) -> None:
+    """Collect structural proxy signals from Snowflake EXPLAIN JSON."""
+    ops = _flatten_snowflake_ops(plan_json)
+    if not ops:
+        return
+
+    children_by_parent: dict[int, list[int]] = {}
+    cte_ref_counts: dict[str, int] = {}
+
+    for op in ops:
+        op_id = op.get("id")
+        for parent in op.get("parentOperators", []) or []:
+            if isinstance(parent, int) and isinstance(op_id, int):
+                children_by_parent.setdefault(parent, []).append(op_id)
+
+    for op in ops:
+        op_name = str(op.get("operation", ""))
+        op_id = op.get("id")
+        row_est = _extract_sf_row_count(op)
+        has_children = isinstance(op_id, int) and op_id in children_by_parent
+
+        # EST_ZERO / EST_ONE_NONLEAF from Snowflake rowCount annotations.
+        if row_est == 0 and op_name not in ("Result", "Limit", "SortWithLimit", "Sort"):
+            if "EST_ZERO" not in flags:
+                flags.append("EST_ZERO")
+        if row_est == 1 and has_children and op_name not in ("Limit", "SortWithLimit", "Result"):
+            if "EST_ONE_NONLEAF" not in flags:
+                flags.append("EST_ONE_NONLEAF")
+
+        # JOIN class signals.
+        if op_name in ("LeftOuterJoin", "RightOuterJoin", "FullOuterJoin"):
+            if "LEFT_JOIN" not in flags:
+                flags.append("LEFT_JOIN")
+        if op_name in ("Intersect", "Except"):
+            if "INTERSECT_EXCEPT" not in flags:
+                flags.append("INTERSECT_EXCEPT")
+
+        # Table scan repetition.
+        if op_name == "TableScan":
+            objects = op.get("objects", []) or []
+            for obj in objects:
+                table = str(obj).split(".")[-1].strip()
+                if table:
+                    tables_seen[table] = tables_seen.get(table, 0) + 1
+
+        # CTE reuse signal from WithReference aliases.
+        if op_name == "WithReference":
+            exprs = op.get("expressions", []) or []
+            alias = str(exprs[0]).strip() if exprs else ""
+            if alias:
+                cte_ref_counts[alias] = cte_ref_counts.get(alias, 0) + 1
+
+    if any(cnt >= 2 for cnt in cte_ref_counts.values()):
+        if "MULTI_CTE" not in flags:
+            flags.append("MULTI_CTE")
+
+
 def extract_structural_flags(plan_json, dialect: Optional[str] = None) -> list[str]:
     """Extract EXPLAIN-only proxy signals (no execution needed).
 
@@ -549,6 +690,8 @@ def extract_structural_flags(plan_json, dialect: Optional[str] = None) -> list[s
         fmt = "postgres"
     elif fmt.lower() == "duckdb":
         fmt = "duckdb"
+    elif fmt.lower() == "snowflake":
+        fmt = "snowflake"
     else:
         fmt = _detect_plan_format(raw)
 
@@ -558,6 +701,8 @@ def extract_structural_flags(plan_json, dialect: Optional[str] = None) -> list[s
     if fmt == "postgres":
         plan_root = raw.get("Plan", raw)
         _walk_structural_pg(plan_root, flags, tables_seen)
+    elif fmt == "snowflake":
+        _walk_structural_snowflake(raw, flags, tables_seen)
     else:
         children = raw.get("children", [])
         if children:
@@ -626,6 +771,7 @@ def format_qerror_for_prompt(analysis: QErrorAnalysis) -> str:
     if analysis.structural_flags:
         lines.append("Structural signals:")
         flag_actions = {
+            "ESTIMATE_ONLY": "Snowflake EXPLAIN is estimate-only here (no per-node actual rows) — use structural routing + query-map row flow",
             "EST_ZERO": "blind to CTE/subquery stats → push predicate into CTE (P0, P7)",
             "EST_ONE_NONLEAF": "planner guessing on non-leaf node → check P0 (predicate pushback), P1 (repeated scans). Only P2 (decorrelation) if nested loops + correlated subquery confirmed in EXPLAIN",
             "DELIM_SCAN": "correlated subquery the optimizer couldn't decorrelate → P2",

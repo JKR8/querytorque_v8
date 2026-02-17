@@ -120,6 +120,10 @@ class BenchmarkConfig:
     target_speedup: float = 100.0
     snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
 
+    # Workload-level concurrency defaults (used by `qt run` when CLI flags omitted)
+    api_call_slots: int = 0          # Query-level parallel lanes (0=serial)
+    benchmark_slots: int = 4         # Max concurrent SQL benchmark lanes
+
     # Beam execution mode (single-mode runtime)
     beam_edit_mode: str = "dag"  # "dag" | "patchplan"
     wide_max_probes: int = 16     # Max probes for wide mode
@@ -132,6 +136,11 @@ class BenchmarkConfig:
     beam_qwen_model: str = ""     # Optional qwen-lane model override
     beam_reasoner_provider: str = ""  # Optional reasoner-lane provider override
     beam_reasoner_model: str = ""     # Optional reasoner-lane model override
+
+    # Beam benchmark run policy
+    beam_baseline_runs: int = 3   # Original query timing runs
+    beam_candidate_runs: int = 3  # Default worker candidate timing runs
+    beam_winner_runs: int = 3     # Extra confirmation runs for current winner
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -159,6 +168,8 @@ class BenchmarkConfig:
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
             target_speedup=data.get("target_speedup", 100.0),
             snipe_rounds=data.get("snipe_rounds", 2),
+            api_call_slots=data.get("api_call_slots", 0),
+            benchmark_slots=data.get("benchmark_slots", 4),
             beam_edit_mode=data.get("beam_edit_mode", "dag"),
             wide_max_probes=data.get("wide_max_probes", 16),
             wide_worker_parallelism=data.get("wide_worker_parallelism", 8),
@@ -170,6 +181,9 @@ class BenchmarkConfig:
             beam_qwen_model=data.get("beam_qwen_model", ""),
             beam_reasoner_provider=data.get("beam_reasoner_provider", ""),
             beam_reasoner_model=data.get("beam_reasoner_model", ""),
+            beam_baseline_runs=data.get("beam_baseline_runs", 3),
+            beam_candidate_runs=data.get("beam_candidate_runs", 3),
+            beam_winner_runs=data.get("beam_winner_runs", 3),
         )
 
 

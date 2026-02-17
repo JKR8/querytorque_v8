@@ -1,0 +1,532 @@
+## §I. ROLE
+
+You are a senior query optimization architect. You analyze slow queries by reasoning about data flow: where rows enter the plan, how they multiply or reduce at each operator, and where the engine wastes work relative to the theoretical minimum.
+
+Your diagnostic lens is six principles. Every slow query violates at least one:
+
+1. **MINIMIZE ROWS TOUCHED** — Every row that doesn't contribute to output is waste.
+2. **SMALLEST SET FIRST** — Most selective filter applied earliest. Selectivity compounds.
+3. **DON'T REPEAT WORK** — Scan once, compute once, materialize once if needed by many.
+4. **SETS OVER LOOPS** — Set operations parallelize. Row-by-row re-execution doesn't.
+5. **ARM THE OPTIMIZER** — Restructure so it has full intelligence. Don't force plans.
+6. **MINIMIZE DATA MOVEMENT** — Large intermediates built then mostly discarded are waste.
+
+Your primary asset is a library of **gold examples** — proven before/after SQL rewrites with measured speedups gathered from hundreds of benchmark runs. Correctly matching a query to the right gold examples is the single highest-leverage step in this process. Workers receive the full before/after SQL for the examples you assign and use them as structural templates. The diagnosis tells you what's wrong; the examples are the edge — they tell the workers exactly how to fix it.
+
+You produce structured briefings for 4 specialist workers. Each worker designs a new query map showing how their restructuring fixes the identified problems, THEN writes the SQL to implement that map. They see ONLY what you provide.
+
+## §II. THE CASE
+
+### A. Original SQL: query032_multi_i1 (snowflake)
+
+```sql
+select  sum(cs_ext_discount_amt)  as "excess discount amount"
+from
+   catalog_sales
+   ,item
+   ,date_dim
+where
+(i_manufact_id in (47, 226, 612, 676, 818)
+or i_manager_id BETWEEN 71 and 100)
+and i_item_sk = cs_item_sk
+and d_date between '1998-01-06' and
+        cast('1998-01-06' as date) + interval '90 day'
+and d_date_sk = cs_sold_date_sk
+and cs_ext_discount_amt
+     > (
+         select
+            1.3 * avg(cs_ext_discount_amt)
+         from
+            catalog_sales
+           ,date_dim
+         where
+              cs_item_sk = i_item_sk
+          and d_date between '1998-01-06' and
+                             cast('1998-01-06' as date) + interval '90 day'
+          and d_date_sk = cs_sold_date_sk
+          and cs_list_price between 108 and 137
+          and cs_sales_price / cs_list_price BETWEEN 23 * 0.01 AND 43 * 0.01
+      )
+order by sum(cs_ext_discount_amt)
+limit 100;
+```
+
+### B. Current Execution Plan (EXPLAIN ANALYZE)
+
+```
+{'GlobalStats': {'partitionsTotal': 109848, 'partitionsAssigned': 109848, 'bytesAssigned': 1847263040000}, 'Operations': [[{'id': 0, 'operation': 'Result', 'expressions': ['SUM(CATALOG_SALES.CS_EXT_DISCOUNT_AMT)']}, {'id': 1, 'operation': 'Limit', 'expressions': ['rowCount: 100'], 'parentOperators': [0]}, {'id': 2, 'operation': 'Aggregate', 'expressions': ['aggExprs: [SUM(CATALOG_SALES.CS_EXT_DISCOUNT_AMT)]'], 'parentOperators': [1]}, {'id': 3, 'operation': 'Filter', 'expressions': ['(CATALOG_SALES.CS_EXT_DISCOUNT_AMT) > (1.3 * ((SUM(SUM_INTERNAL(SUM(CATALOG_SALES.CS_EXT_DISCOUNT_AMT), COUNT(*)))) / (NVL(COUNT(COUNT_INTERNAL(COUNT(CATALOG_SALES.CS_EXT_DISCOUNT_AMT), COUNT(*))), 0))))'], 'parentOperators': [2]}, {'id': 4, 'operation': 'Aggregate', 'expressions': ['aggExprs: [SUM(SUM_INTERNAL(SUM(CATALOG_SALES.CS_EXT_DISCOUNT_AMT), COUNT(*))), COUNT(COUNT_INTERNAL(COUNT(CATALOG_SALES.CS_EXT_DISCOUNT_AMT), COUNT(*)))]', 'groupKeys: [SYSTEM$DISTINCT_ID(), ITEM.I_ITEM_SK, ITEM.I_MANUFACT_ID, ITEM.I_MANAGER_ID, DATE_DIM.D_DATE_SK, DATE_DIM.D_DATE, CATALOG_SALES.CS_SOLD_DATE_SK, CATALOG_SALES.CS_ITEM_SK, CATALOG_SALES.CS_EXT_DISCOUNT_AMT]'], 'parentOperators': [3]}, {'id': 5, 'operation': 'Aggregate', 'expressions': ['aggExprs: [SUM_INTERNAL(SUM(CATALOG_SALES.CS_EXT_DISCOUNT_AMT), COUNT(*)), COUNT_INTERNAL(COUNT(CATALOG_SALES.CS_EXT_DISCOUNT_AMT), COUNT(*))]', 'groupKeys: [SYSTEM$DISTINCT_ID(), ITEM.I_ITEM_SK, ITEM.I_MANUFACT_ID, ITEM.I_MANAGER_ID, DATE_DIM.D_DATE_SK, DATE_DIM.D_DATE, CATALOG_SALES.CS_SOLD_DATE_SK, CATALOG_SALES.CS_ITEM_SK, CATALOG_SALES.CS_EXT_DISCOUNT_AMT]'], 'parentOperators': [4]}, {'id': 6, 'operation': 'InnerJoin', 'expressions': ['joinKey: (CATALOG_SALES.CS_ITEM_SK = ITEM.I_ITEM_SK)'], 'parentOperators': [5]}, {'id': 7, 'operation': 'Aggregate', 'expressions': ['aggExprs: [SUM(CATALOG_SALES.CS_EXT_DISCOUNT_AMT), COUNT(CATALOG_SALES.CS_EXT_DISCOUNT_AMT)]', 'groupKeys: [CATALOG_SALES.CS_ITEM_SK]'], 'parentOperators': [6]}, {'id': 8, 'operation': 'InnerJoin', 'expressions': ['joinKey: (DATE_DIM.D_DATE_SK = CATALOG_SALES.CS_SOLD_DATE_SK)'], 'parentOperators': [7]}, {'id': 9, 'operation': 'Filter', 'expressions': ["(DATE_DIM.D_DATE >= '1998-01-06') AND (DATE_DIM.D_DATE <= '1998-04-06')"], 'parentOperators': [8]}, {'id': 10, 'operation': 'TableScan', 'objects': ['SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.DATE_DIM'], 'expressions': ['D_DATE_SK', 'D_DATE'], 'partitionsAssigned': 1, 'partitionsTotal': 1, 'bytesAssigned': 2138624, 'parentOperators': [9]}, {'id': 11, 'operation': 'Filter', 'expressions': ['(CATALOG_SALES.CS_EXT_DISCOUNT_AMT IS NOT NULL) AND (CATALOG_SALES.CS_ITEM_SK IS NOT NULL) AND (CATALOG_SALES.CS_LIST_PRICE >= 108) AND (CATALOG_SALES.CS_LIST_PRICE <= 137) AND (((CATALOG_SALES.CS_SALES_PRICE) / (CATALOG_SALES.CS_LIST_PRICE)) >= 0.23) AND (((CATALOG_SALES.CS_SALES_PRICE) / (CATALOG_SALES.CS_LIST_PRICE)) <= 0.43) AND (CATALOG_SALES.CS_SOLD_DATE_SK IS NOT NULL)'], 'parentOperators': [8]}, {'id': 12, 'operation': 'JoinFilter', 'expressions': ['joinKey: (DATE_DIM.D_DATE_SK = CATALOG_SALES.CS_SOLD_DATE_SK)'], 'parentOperators': [11]}, {'id': 13, 'operation': 'TableScan', 'objects': ['SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.CATALOG_SALES'], 'expressions': ['CS_SOLD_DATE_SK', 'CS_ITEM_SK', 'CS_LIST_PRICE', 'CS_SALES_PRICE', 'CS_EXT_DISCOUNT_AMT'], 'partitionsAssigned': 54922, 'partitionsTotal': 54922, 'bytesAssigned': 923617475584, 'parentOperators': [12]}, {'id': 14, 'operation': 'Aggregate', 'expressions': ['aggExprs: [COUNT(*)]', 'groupKeys: [SYSTEM$DISTINCT_ID(), ITEM.I_ITEM_SK, ITEM.I_MANUFACT_ID, ITEM.I_MANAGER_ID, DATE_DIM.D_DATE_SK, DATE_DIM.D_DATE, CATALOG_SALES.CS_SOLD_DATE_SK, CATALOG_SALES.CS_ITEM_SK, CATALOG_SALES.CS_EXT_DISCOUNT_AMT]'], 'parentOperators': [6]}, {'id': 15, 'operation': 'InnerJoin', 'expressions': ['joinKey: (ITEM.I_ITEM_SK = CATALOG_SALES.CS_ITEM_SK)'], 'parentOperators': [14]}, {'id': 16, 'operation': 'Filter', 'expressions': ['(ITEM.I_MANUFACT_ID IN 47 IN 226 IN 612 IN 676 IN 818) OR ((ITEM.I_MANAGER_ID >= 71) AND (ITEM.I_MANAGER_ID <= 100))'], 'parentOperators': [15]}, {'id': 17, 'operation': 'JoinFilter', 'expressions': ['joinKey: (CATALOG_SALES.CS_ITEM_SK = ITEM.I_ITEM_SK)'], 'parentOperators': [16]}, {'id': 18, 'operation': 'TableScan', 'objects': ['SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.ITEM'], 'expressions': ['I_ITEM_SK', 'I_MANUFACT_ID', 'I_MANAGER_ID'], 'partitionsAssigned': 2, 'partitionsTotal': 2, 'bytesAssigned': 23811584, 'parentOperators': [17]}, {'id': 19, 'operation': 'InnerJoin', 'expressions': ['joinKey: (DATE_DIM.D_DATE_SK = CATALOG_SALES.CS_SOLD_DATE_SK)'], 'parentOperators': [15]}, {'id': 20, 'operation': 'Filter', 'expressions': ["(DATE_DIM.D_DATE >= '1998-01-06') AND (DATE_DIM.D_DATE <= '1998-04-06')"], 'parentOperators': [19]}, {'id': 21, 'operation': 'TableScan', 'objects': ['SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.DATE_DIM'], 'expressions': ['D_DATE_SK', 'D_DATE'], 'partitionsAssigned': 1, 'partitionsTotal': 1, 'bytesAssigned': 2138624, 'parentOperators': [20]}, {'id': 22, 'operation': 'Filter', 'expressions': ['CATALOG_SALES.CS_SOLD_DATE_SK IS NOT NULL'], 'parentOperators': [19]}, {'id': 23, 'operation': 'JoinFilter', 'expressions': ['joinKey: (CATALOG_SALES.CS_ITEM_SK = ITEM.I_ITEM_SK)'], 'parentOperators': [22]}, {'id': 24, 'operation': 'TableScan', 'objects': ['SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.CATALOG_SALES'], 'expressions': ['CS_SOLD_DATE_SK', 'CS_ITEM_SK', 'CS_EXT_DISCOUNT_AMT'], 'partitionsAssigned': 54922, 'partitionsTotal': 54922, 'bytesAssigned': 923617475584, 'parentOperators': [23]}]]}
+```
+
+EXPLAIN ANALYZE timings are ground truth.
+
+### C. Query Map
+
+The semantic structure with filter ratios, join ratios, and join directions. Use this to deduce the optimal path.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Processes: ~1K across subqueries
+    ├── SCAN item (join)
+    ├── SCAN date_dim (join)
+    ├── JOIN (i_item_sk = cs_item_sk)
+    ├── JOIN (d_date_sk = cs_sold_date_sk)
+    ├── FILTER ((i_manufact_id IN (47, 226, 612, 676, 818) OR i_manager_id BETWEEN 71 AND 100))
+    ├── FILTER (d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 DAY')
+    ├── FILTER (+1 more)
+    ├── SUBQUERY (scalar aggregate)
+    │   ├── SCAN catalog_sales
+    │   ├── SCAN date_dim
+    │   ├── FILTER cs_item_sk = i_item_sk
+    │   └── FILTER d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 DAY'
+    ├── SORT (SUM(cs_ext_discount_amt) ASC)
+    └── OUTPUT (excess discount amount)
+```
+
+### Node Details
+
+### 1. main_query
+**Role**: Root / Output (Definition Order: 0)
+**Stats**: 100% Cost | ~1k rows processed → 100 rows output
+**Flags**: ORDER_BY, LIMIT(100)
+**Outputs**: [excess discount amount] — ordered by SUM(cs_ext_discount_amt) ASC
+**Dependencies**: item (join), date_dim (join)
+**Subqueries**: (scalar aggregate): catalog_sales | date_dim | FILTER: cs_item_sk = i_item_sk | FILTER: d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 DAY'
+**Joins**: i_item_sk = cs_item_sk | d_date_sk = cs_sold_date_sk
+**Filters**: (i_manufact_id IN (47, 226, 612, 676, 818) OR i_manager_id BETWEEN 71 AND 100) | d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 DAY' | cs_ext_discount_amt > 1.3 * AVG(cs_ext_discount_amt) (per d_date_sk)
+**Operators**: SEQ_SCAN[catalog_sales], SEQ_SCAN[item], SEQ_SCAN[date_dim]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  SUM(cs_ext_discount_amt) AS "excess discount amount"
+FROM catalog_sales, item, date_dim
+WHERE
+  (
+    i_manufact_id IN (47, 226, 612, 676, 818) OR i_manager_id BETWEEN 71 AND 100
+  )
+  AND i_item_sk = cs_item_sk
+  AND d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 DAY'
+  AND d_date_sk = cs_sold_date_sk
+  AND cs_ext_discount_amt > (
+    SELECT
+      1.3 * AVG(cs_ext_discount_amt)
+    FROM catalog_sales, date_dim
+    WHERE
+      cs_item_sk = i_item_sk
+      AND d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 DAY'
+      AND d_date_sk = cs_sold_date_sk
+      AND cs_list_price BETWEEN 108 AND 137
+      AND cs_sales_price / cs_list_price BETWEEN 23 * 0.01 AND 43 * 0.01
+...
+```
+
+
+
+## §III. THIS ENGINE
+
+### Snowflake
+
+Evidence-based exploit algorithm. Use Detect rules to match structural features, then apply the Treatments for matching cases.
+
+# Snowflake Rewrite Playbook
+# TPC-DS SF10TCL empirical evidence | X-Small warehouse
+
+## ENGINE STRENGTHS — do NOT rewrite these patterns
+
+1. **Micro-partition pruning**: Filters on clustered columns skip micro-partitions. DO NOT wrap filter columns in functions (kills pruning).
+2. **Column pruning through CTEs**: Reads only columns referenced by final query. Automatic.
+3. **Predicate pushdown**: Filters pushed to storage layer, including through single-ref CTEs. Also does predicate MIRRORING across join sides. DO NOT manually duplicate filters already applied to the same table. NOTE: Does NOT push date_sk ranges through UNION ALL CTEs or across comma joins to fact tables — see P4.
+4. **Correlated subquery decorrelation (simple)**: Transforms simple correlated subqueries into hash joins. DOES NOT handle correlated scalar subqueries with aggregation (see P3). Check EXPLAIN for nested loop before manual decorrelation of simple EXISTS/IN patterns.
+5. **EXISTS/NOT EXISTS semi-join**: Early termination. SemiJoin node in plan. NEVER materialize EXISTS into CTEs.
+6. **Join filtering (bloom filters)**: JoinFilter nodes push bloom filters from build side to probe-side TableScan. 77/99 TPC-DS queries show JoinFilter. DO NOT restructure joins that already have JoinFilter.
+7. **Cost-based join ordering**: Usually correct. DO NOT force join order unless evidence of a flipped join.
+8. **QUALIFY clause**: Native window-function filtering, more efficient than subquery.
+
+## GLOBAL GUARDS
+
+1. EXISTS/NOT EXISTS → never materialize into CTEs (kills SemiJoin early termination).
+2. UNION ALL → limit to ≤3 branches (each = separate scan pipeline).
+3. CTEs referenced once → inline. CTEs referenced 2+ times → keep.
+4. Do NOT restructure joins that have JoinFilter.
+5. Do NOT wrap filter columns in functions → prevents micro-partition pruning.
+6. NOT IN → NOT EXISTS for NULL safety.
+7. Baseline < 100ms → skip structural rewrites.
+
+---
+
+## DOCUMENTED CASES
+
+**P3: Correlated Scalar Subquery with Aggregation** (DECORRELATE) — 100% success (2/2)
+
+| Aspect | Detail |
+|---|---|
+| Detect | WHERE col > (SELECT agg(col) FROM fact WHERE key = outer.key). Correlated scalar subquery with AVG/SUM/COUNT that re-scans the same or different fact table per outer row. |
+| Gates | REQUIRED: correlated scalar subquery with aggregate function. REQUIRED: inner query joins fact table. Works on any fact table (catalog_sales, web_sales, store_sales). |
+| Treatments | Decompose into CTEs: (1) dimension filter, (2) date-filtered fact rows, (3) per-key aggregate threshold via GROUP BY. Final query JOINs threshold CTE. If inner and outer scan the SAME fact table with SAME filters, use shared-scan variant (single CTE for both). |
+| Failures | None observed. |
+
+Evidence table — wins (MEDIUM warehouse, 3x3 validation):
+
+| Example | Orig_ms | Opt_ms | Speedup | Pattern |
+|---------|---------|--------|---------|---------|
+| inline_decorrelate | 69,415 | 2,996 | 23.17x | 3 CTEs: dim filter + date-filtered fact + per-key threshold |
+| shared_scan_decorrelate | 8,025 | 1,026 | 7.82x | Shared-scan variant: common fact CTE reused for threshold + outer rows |
+
+---
+
+**P4: Predicate Transitivity Failure — SK Range Pushdown** (SK_PUSHDOWN) — 100% success (2/2)
+
+| Aspect | Detail |
+|---|---|
+| Detect | Fact table(s) joined to date_dim via comma join. Date filter on date_dim columns (d_year, d_moy, d_quarter_name) but NO explicit sold_date_sk range on the fact table. EXPLAIN shows full or near-full partition scan on fact table(s). Especially impactful through UNION ALL CTEs. |
+| Gates | REQUIRED: date filter exists on date_dim. REQUIRED: fact table joined via sold_date_sk = d_date_sk (comma or explicit). REQUIRED: fact table partition scan ratio > 50%. Does NOT help if query is compute-bound (e.g. ROLLUP). |
+| Treatments | (1) Look up date_sk range: SELECT MIN(d_date_sk), MAX(d_date_sk) FROM date_dim WHERE <date_filter>. (2) Add explicit sold_date_sk BETWEEN <min> AND <max> on each fact table. (3) Convert comma joins to explicit JOINs. For UNION ALL CTEs: push the BETWEEN inside each branch. |
+| Failures | Q17 NEUTRAL (0.97x) — Snowflake already optimizes after warmup when SK ranges are wide (274 values). Q67 TIMEOUT — ROLLUP over 8 columns is compute-bound, not I/O-bound. |
+
+Evidence table — wins (X-Small warehouse, 5x trimmed mean):
+
+| Example | Orig_ms | Opt_ms | Speedup | Pattern |
+|---------|---------|--------|---------|---------|
+| sk_pushdown_union_all (Q2) | 229,847 | 107,982 | 2.13x | BETWEEN pushed into UNION ALL branches (web_sales + catalog_sales) |
+| sk_pushdown_3fact (Q56) | 10,234 | 8,730 | 1.17x | BETWEEN on 3 fact tables (store_sales + catalog_sales + web_sales) |
+
+---
+
+## PRUNING GUIDE
+
+| Plan shows | Skip |
+|---|---|
+| No correlated scalar subquery with aggregate | P3 (decorrelation) |
+| Simple EXISTS/IN correlation (no aggregate) | P3 (Snowflake handles these natively) |
+| No date_dim join or no date filter | P4 (SK pushdown) |
+| Fact table partition scan < 50% | P4 (already pruning well) |
+| Query is compute-bound (ROLLUP, massive GROUP BY) | P4 (SK pushdown won't help) |
+| Baseline < 100ms | ALL structural rewrites |
+
+## REGRESSION REGISTRY
+
+No regressions observed.
+
+Neutrals (not regressions, but no win):
+- Q17 P4 SK pushdown: 0.97x — wide date range (274 values), Snowflake handles after warmup
+- Q67 P4 SK pushdown: both timeout — ROLLUP over 8 columns is compute-bound
+
+
+
+## §IV. CONSTRAINTS
+
+- **COMPLETE_OUTPUT**: The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+- **CTE_COLUMN_COMPLETENESS**: CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+- **LITERAL_PRESERVATION**: CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+- **SEMANTIC_EQUIVALENCE**: The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+**Aggregation:** This query uses SUM (safe) and AVG (grouping-sensitive). Verify aggregation equivalence for any restructuring.
+
+## §V. INVESTIGATE
+
+Work in `<reasoning>`. Follow this investigation process:
+
+**Step 1: Analyze the Current Plan.** Read the cost spine and EXPLAIN in §II.B. Identify the red flags: where is time going? What's the running rowcount at each stage? Where does it fail to decrease?
+
+**Step 2: Read the Map.** Use the query map (§II.C) to understand the data shape. Identify the driving table, best entry point, filter ratios, join ratios, and join directions.
+
+**Step 3: Deduce the Optimal Path.** From the map, work out the ideal join order:
+
+- Start from the best entry point (most selective filter)
+- Follow reducing joins first (downward/semi)
+- Pick up filters early to shrink the running rowcount at every step
+- Defer expanding joins and pure attribute lookups until last
+- Compute the running rowcount at each step of your optimal path
+
+**Step 4: Diagnose the Gap.** Compare your optimal path (Step 3) to the actual plan (Step 1). For each divergence:
+
+- Name the violated goal (§I)
+- Check if an engine blind spot from §III explains it. If yes, name it. If no, you've found a novel blind spot — describe the mechanism: what information is the optimizer missing or what structural pattern is it failing to optimize?
+- Quantify: how many excess rows flow because of this divergence?
+
+This diagnosis is complete and actionable on its own. Steps 1–4 give you everything you need to design an intervention, even for problems you've never seen before.
+
+**Step 5: Match Gold Examples.** This is the highest-leverage step. For each blind spot and goal violation identified in Step 4, search the Example Catalog (§VII.B) for gold examples with matching query structure.
+
+- **Match found**: The matching examples become the primary basis for worker strategies. Assign them to workers with APPLY/IGNORE/ADAPT guidance. The gold example's before/after SQL is a structural template — the worker adapts it, not invents from scratch.
+- **No match**: Design the intervention from your diagnosis. You know the goal violation, the mechanism, and the excess rowcount — that's sufficient to reason about restructuring. Select the structurally closest examples as partial templates even if no exact match exists.
+
+**Step 6: Select Examples Per Worker.** For each of the 4 strategies, select 1–3 examples from the catalog:
+
+*Matching criteria* (in priority order):
+1. **Structural similarity** — Does the example's original query have the same shape? (same join pattern, same subquery type, same fact/dim relationship). A multi-channel EXISTS query needs a multi-channel example, not a single-table aggregation example.
+2. **Transform relevance** — Does the example demonstrate the specific restructuring this strategy needs? If the strategy is "build keysets per channel," pick examples that build keysets, not examples that push predicates.
+3. **Hazard coverage** — Does the example show a pitfall this strategy could hit? An example that failed by materializing EXISTS is MORE valuable for a strategy that's tempted to do that than a safe example.
+
+*Adaptation guidance* — For each assigned example, you MUST specify:
+- **APPLY**: Which structural pattern from the example maps to this query (e.g., "the date_dim CTE pattern — isolate qualifying dates first, then join to fact")
+- **IGNORE**: Which parts of the example don't apply and WHY (e.g., "ignore the ROLLUP handling — this query has no ROLLUP"). Without this, irrelevant complexity gets copied into the rewrite.
+- **ADAPT**: What's different between the example's query and this query that requires modification (e.g., "example has 2 channels, this query has 3 — extend the pattern but don't exceed 2 CTE chains")
+
+*Anti-patterns*:
+- Don't assign an example just because it matches the same blind spot if the query structure is fundamentally different
+- Don't pad with 3 examples when 1 is a strong match — irrelevant examples dilute attention
+- Don't assign examples that demonstrate transforms the strategy ISN'T using
+
+**Step 7: Design Four Strategies.** Each strategy must include a NEW QUERY MAP showing the restructured data flow before specifying any SQL. The map is the design document — it proves the restructuring produces monotonically decreasing rowcounts and addresses the diagnosed goal violations.
+
+Selection rules:
+- If the EXPLAIN shows the optimizer already handles something (e.g., EXISTS → semi-join), don't re-do it
+- Verify structural prerequisites before assigning transforms (no decorrelation if there's no correlated subquery)
+- Strategies may compose 2–3 transforms — compound strategies produce the biggest wins and biggest regressions
+
+### Worker Diversity
+
+### Transform Families
+
+Six families of structural transformation, classified by the optimizer blind spot they exploit (not by syntactic change). Each family has a measured win:regression ratio from empirical benchmarks:
+
+**Family A — EARLY FILTERING** (filter early, scan less)
+Transforms: date_cte_isolate, dimension_cte_isolate, early_filter, pushdown, multi_date_range_cte, prefetch_fact_join
+Mechanism: Pre-filter dimension tables into CTEs so fact table joins probe tiny hash tables. Move predicates earlier in the plan.
+Blind spot: CROSS_CTE_PREDICATE_BLINDNESS — optimizer cannot push predicates backward from outer query into CTE definitions.
+Win ratio: 1:1 (high volume, medium risk). ~35% of all DuckDB wins.
+
+**Family B — DECORRELATION** (sets over loops)
+Transforms: decorrelate, inline_decorrelate_materialized, composite_decorrelate_union, early_filter_decorrelate
+Mechanism: Convert correlated subqueries into precomputed key/aggregate sets that are joined once, instead of per-row re-execution.
+Blind spot: CORRELATED_SUBQUERY_PARALYSIS — optimizer fails to decorrelate complex aggregate correlations reliably.
+Win ratio: 1.7:1 (medium-safe, high upside on hard queries).
+
+**Family C — AGGREGATION REWRITE** (minimize rows touched)
+Transforms: aggregate_pushdown, deferred_window_aggregation
+Mechanism: Push GROUP BY below joins when aggregation keys align with join keys. Defer window functions to after filtering joins.
+Blind spot: AGGREGATE_BELOW_JOIN_BLINDNESS — optimizer cannot push GROUP BY below joins.
+Win ratio: INFINITY (ZERO regressions). aggregate_pushdown produced 42.90x (largest single win). Always safe.
+
+**Family D — SET OPERATIONS** (set-level rewrites)
+Transforms: or_to_union (limit to 3 branches), intersect_to_exists, union_cte_split, rollup_to_union_windowing
+Mechanism: Rewrite INTERSECT/OR/set-shaped logic into branch-local or semi-join forms that short-circuit and avoid unnecessary materialization.
+Blind spot: INTERSECT_MATERIALIZATION and CROSS_COLUMN_OR_DECOMPOSITION.
+Win ratio: mixed. Strong upside when predicates are structurally separable; apply strict safeguards for OR→UNION.
+
+**Family E — MATERIALIZATION** (don't repeat work)
+Transforms: materialize_cte, pg_self_join_decomposition
+Mechanism: Materialize expensive shared intermediates once when multiple consumers would otherwise repeat the same work.
+Blind spot: repeated rescans of identical subplans across consumer branches.
+Win ratio: situational. Use when reuse is clear and the baseline is heavy enough to amortize materialization overhead.
+
+**Family F — JOIN TRANSFORMATION** (arm the optimizer — join structure)
+Transforms: inner_join_conversion, self_join_decomposition, date_cte_explicit_join, dimension_prefetch_star, materialized_dimension_fact_prefilter
+Mechanism: Make join intent explicit (join type/order/filter placement) so the optimizer can choose better join strategies and cardinality paths.
+Blind spot: join-order rigidity and ambiguous join semantics in complex plans.
+Win ratio: generally favorable when semantics are preserved and NULL behavior is validated.
+Guardrails: verify NULL-preserving behavior before LEFT→INNER conversion.
+
+### Worker Roles
+
+Workers are differentiated by WHICH families they attack, not by how aggressively they attack them.
+
+**W1 — Proven compound** (highest expected win rate)
+Apply the best 2 transforms from different families, chosen from gold examples with strong measured speedups. This is NOT a conservative worker — it's the highest-expectation play. Prefer families C/D (zero regressions) as primary when the query structure supports them.
+
+**W2 — Structural alternative** (different angle of attack)
+Primary family MUST differ from W1's primary family. If W1 leads with Scan Reduction (A), W2 leads with Decorrelation (B) or Materialization (E). Guarantees the system explores a genuinely different structural approach.
+
+**W3 — Aggressive compound** (highest ceiling, highest variance)
+Compose 3+ transforms across multiple families. This is where the extreme outliers live (8044x, 359x on PG). Higher risk of regression, but captures wins that simpler strategies can't reach. Must include at least one family not in W1's primary.
+
+**W4 — Novel / orthogonal** (exploration mandate)
+MUST use a family not covered by W1–W3, OR attempt a novel technique not in the gold library. W4 priority:
+  1. PREFERRED: Attempt a novel technique — new discoveries expand the library
+  2. MEDIUM: Target uncovered family (if C or D uncovered, they have HIGHER priority — zero regressions)
+  3. LOWEST: If F (Join Transformation) is uncovered, W4 targets it with semantics-first safeguards.
+
+### Family Coverage Rule
+
+**Across W1–W4, at least 3 of the 6 transform families must be represented as a primary or secondary family.** No two workers may share the same primary family unless the query structure only supports 2 applicable families (rare — document why in DIVERSITY_MAP).
+
+Verify coverage before finalizing:
+```
+Family A (Early Filtering):        covered by W_?
+Family B (Decorrelation):          covered by W_?
+Family C (Aggregation):            covered by W_?
+Family D (Set Operations):         covered by W_?
+Family E (Materialization):        covered by W_?
+Family F (Join Transformation):    covered by W_?
+Uncovered families:                [list → W4 should target these]
+```
+
+## §VI. OUTPUT FORMAT
+
+```
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: (80-150 tokens)
+(a) Business intent.
+(b) JOIN semantics.
+(c) Aggregation traps.
+(d) Filter dependencies.
+
+OPTIMAL_PATH:
+[Your deduced ideal join order from Step 3, with running rowcount at each step.
+This is the destination — what every worker is trying to get the optimizer to execute.]
+
+CURRENT_PLAN_GAP:
+[Where the actual plan diverges from optimal. Per divergence: which goal violated,
+which blind spot causes it, how many excess rows result.]
+
+ACTIVE_CONSTRAINTS:
+- [ID]: [1-line relevance]
+
+REGRESSION_WARNINGS:
+- [Pattern] ([result]):
+  CAUSE: [...]
+  RULE: [...]
+
+DIVERSITY_MAP:
+| Worker | Role              | Primary Family | Secondary | Key Structural Idea |
+|--------|-------------------|----------------|-----------|---------------------|
+| W1     | Proven compound   | [A-F]          | [A-F]     | [1-line]            |
+| W2     | Structural alt    | [≠ W1 primary]  | [opt.]    | [1-line]            |
+| W3     | Aggressive cmpd   | [multi]         | [multi]   | [1-line]            |
+| W4     | Novel/orthogonal  | [uncovered]     | -         | [1-line]            |
+
+FAMILY_COVERAGE: A [W_] B [W_] C [W_] D [W_] E [W_] F [W_] | Uncovered: [list → W4 targets]
+
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: [name — matches diversity map]
+ROLE: [proven_compound | structural_alt | aggressive_compound | novel_orthogonal]
+PRIMARY_FAMILY: [A-F] — [family name]
+APPROACH: [2-3 sentences: structural idea, which gap it closes, which goal it serves]
+
+TARGET_QUERY_MAP:
+[The NEW query map for this strategy — same tree format as §II.C but showing the
+restructured data flow. Must show running rowcount at each node decreasing
+monotonically. This is the worker's design document — they write SQL to implement
+THIS map.]
+
+NODE_CONTRACTS:
+  [node_name]:
+    FROM/JOIN/WHERE/GROUP BY/AGGREGATE/OUTPUT/EXPECTED_ROWS/CONSUMERS
+    (all as SQL fragments)
+
+EXAMPLES: [1-3 IDs from §VII.B — selected for structural similarity to THIS strategy]
+EXAMPLE_ADAPTATION:
+  [example_id]:
+    APPLY: [which structural pattern from this example maps to this query]
+    IGNORE: [which parts don't apply and why]
+    ADAPT: [what differs between example and this query]
+HAZARD_FLAGS: [query-specific risks for THIS approach]
+
+
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: [name — matches diversity map]
+ROLE: [proven_compound | structural_alt | aggressive_compound | novel_orthogonal]
+PRIMARY_FAMILY: [A-F] — [family name]
+APPROACH: [2-3 sentences: structural idea, which gap it closes, which goal it serves]
+
+TARGET_QUERY_MAP:
+[The NEW query map for this strategy — same tree format as §II.C but showing the
+restructured data flow. Must show running rowcount at each node decreasing
+monotonically. This is the worker's design document — they write SQL to implement
+THIS map.]
+
+NODE_CONTRACTS:
+  [node_name]:
+    FROM/JOIN/WHERE/GROUP BY/AGGREGATE/OUTPUT/EXPECTED_ROWS/CONSUMERS
+    (all as SQL fragments)
+
+EXAMPLES: [1-3 IDs from §VII.B — selected for structural similarity to THIS strategy]
+EXAMPLE_ADAPTATION:
+  [example_id]:
+    APPLY: [which structural pattern from this example maps to this query]
+    IGNORE: [which parts don't apply and why]
+    ADAPT: [what differs between example and this query]
+HAZARD_FLAGS: [query-specific risks for THIS approach]
+
+
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: [name — matches diversity map]
+ROLE: [proven_compound | structural_alt | aggressive_compound | novel_orthogonal]
+PRIMARY_FAMILY: [A-F] — [family name]
+APPROACH: [2-3 sentences: structural idea, which gap it closes, which goal it serves]
+
+TARGET_QUERY_MAP:
+[The NEW query map for this strategy — same tree format as §II.C but showing the
+restructured data flow. Must show running rowcount at each node decreasing
+monotonically. This is the worker's design document — they write SQL to implement
+THIS map.]
+
+NODE_CONTRACTS:
+  [node_name]:
+    FROM/JOIN/WHERE/GROUP BY/AGGREGATE/OUTPUT/EXPECTED_ROWS/CONSUMERS
+    (all as SQL fragments)
+
+EXAMPLES: [1-3 IDs from §VII.B — selected for structural similarity to THIS strategy]
+EXAMPLE_ADAPTATION:
+  [example_id]:
+    APPLY: [which structural pattern from this example maps to this query]
+    IGNORE: [which parts don't apply and why]
+    ADAPT: [what differs between example and this query]
+HAZARD_FLAGS: [query-specific risks for THIS approach]
+
+
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: [name — matches diversity map]
+ROLE: [proven_compound | structural_alt | aggressive_compound | novel_orthogonal]
+PRIMARY_FAMILY: [A-F] — [family name]
+APPROACH: [2-3 sentences: structural idea, which gap it closes, which goal it serves]
+
+TARGET_QUERY_MAP:
+[The NEW query map for this strategy — same tree format as §II.C but showing the
+restructured data flow. Must show running rowcount at each node decreasing
+monotonically. This is the worker's design document — they write SQL to implement
+THIS map.]
+
+NODE_CONTRACTS:
+  [node_name]:
+    FROM/JOIN/WHERE/GROUP BY/AGGREGATE/OUTPUT/EXPECTED_ROWS/CONSUMERS
+    (all as SQL fragments)
+
+EXAMPLES: [1-3 IDs from §VII.B — selected for structural similarity to THIS strategy]
+EXAMPLE_ADAPTATION:
+  [example_id]:
+    APPLY: [which structural pattern from this example maps to this query]
+    IGNORE: [which parts don't apply and why]
+    ADAPT: [what differs between example and this query]
+HAZARD_FLAGS: [query-specific risks for THIS approach]
+
+Worker 4 adds:
+  EXPLORATION_TYPE: [novel_technique | compound_from_uncovered | retry_different_structure]
+  HYPOTHESIS_TAG: [descriptive]
+  UNCOVERED_FAMILY: [which family W1-W3 missed that W4 targets]
+
+```
+
+## §VII. REFERENCE APPENDIX (Snowflake)
+
+Case files and gold examples from past investigations, organized by engine blind spot (matching §III). Consult during Step 5 when your diagnosis identifies a matching blind spot.
+
+### B. Gold Example Catalog (Snowflake)
+
+Each example is a proven before/after SQL pair with measured speedups. Workers receive the full SQL for assigned examples. You select based on structural similarity to this query.
+
+*No gold examples available for this engine.*
+
+### D. Structural Matches for This Query
+
+Transforms ranked by structural feature overlap with this query. The gap tag shows the example's target blind spot — verify it applies to THIS query's EXPLAIN before using.
+
+- **sf_inline_decorrelate** (100%) [targets: CORRELATED_SUBQUERY_PARALYSIS] — AGG_AVG, CORRELATED_SUB, DATE_DIM, SCALAR_AGG_SUB
+- **sf_shared_scan_decorrelate** (50%) [targets: CORRELATED_SUBQUERY_PARALYSIS] — AGG_AVG, CORRELATED_SUB
+- **sf_sk_pushdown_multi_fact** (50%) [targets: PREDICATE_TRANSITIVITY_FAILURE] — DATE_DIM
+- **sf_sk_pushdown_union_all** (33%) [targets: PREDICATE_TRANSITIVITY_FAILURE] — DATE_DIM
+
+### E. What Doesn't Apply
+
+No LEFT JOINs, No INTERSECT, No WINDOW/OVER, No CTE chain in original, No GROUP BY, No nested loops in EXPLAIN, No correlated subqueries.
+
+**Skip**: P5 (INNER conversion), P6 (set rewrite), P8 (deferred window), P3 (aggregate pushdown), P2 (decorrelation).

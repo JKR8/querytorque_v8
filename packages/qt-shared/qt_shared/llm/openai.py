@@ -43,8 +43,16 @@ class OpenAIClient:
 
         logger.debug("Sending request to OpenAI API (prompt=%d chars)", len(prompt))
         start_time = time.time()
+        timeout_s = max(
+            60,
+            int(os.environ.get("QT_OPENAI_TIMEOUT_SECONDS", "600") or 600),
+        )
         with llm_call_guard():
-            client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=timeout_s,
+            )
 
             # Kimi K2.5 via OpenRouter supports up to 128k context, 8k output
             # GPT-4o supports 128k context, 16k output
@@ -57,6 +65,7 @@ class OpenAIClient:
                 ],
                 "max_tokens": max_tokens,
                 "temperature": 0.0,
+                "timeout": timeout_s,
             }
 
             # OpenRouter DeepSeek-V3.2 thinking mode:

@@ -1,13 +1,127 @@
-"""qt prepare — generate analyst prompts + context (no LLM calls)."""
+"""qt prepare — generate beam-runtime analyst prompts + context (no LLM calls)."""
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import click
+
+
+def _parse_speedup_value(value: Any) -> Optional[float]:
+    """Parse numeric speedup from values like '2.13x'."""
+    if isinstance(value, (int, float)):
+        val = float(value)
+        return val if val > 0 else None
+    if value is None:
+        return None
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(value))
+    if not m:
+        return None
+    try:
+        parsed = float(m.group(1))
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _load_cached_classification(bench_dir: Path, query_id: str):
+    """Load optional pre-computed pathology classification."""
+    path = bench_dir / "classifications.json"
+    if not path.exists():
+        return None
+    try:
+        from ..patches.pathology_classifier import (
+            ClassificationResult,
+            PathologyMatch,
+        )
+
+        data = json.loads(path.read_text())
+        entry = data.get(query_id)
+        if not isinstance(entry, dict):
+            return None
+        matches = [
+            PathologyMatch(
+                pathology_id=str(m.get("pathology_id", "?")),
+                name=str(m.get("name", "")),
+                confidence=float(m.get("confidence", 0.0)),
+                evidence=str(m.get("evidence", "")),
+                recommended_transform=str(m.get("transform", "")),
+            )
+            for m in (entry.get("llm_matches") or [])
+            if isinstance(m, dict)
+        ]
+        return ClassificationResult(
+            query_id=query_id,
+            matches=matches,
+            reasoning=str(entry.get("reasoning", "")),
+        )
+    except Exception:
+        return None
+
+
+def _build_sample_probe(
+    detected_transforms: list[Any],
+    transform_by_id: Dict[str, Dict[str, Any]],
+    dialect: str,
+):
+    """Build one realistic sample probe for prepare-time worker/compiler prompts."""
+    from ..patches.beam_prompts import ProbeSpec, _load_gold_example_for_family
+
+    detected = detected_transforms or []
+    chosen = next((m for m in detected if getattr(m, "overlap_ratio", 0.0) >= 0.30), None)
+    if chosen is None and detected:
+        chosen = detected[0]
+
+    transform_id = str(getattr(chosen, "id", "") or "date_cte_isolate")
+    tmeta = transform_by_id.get(transform_id, {})
+    family = str(tmeta.get("family", "A"))
+    principle = str(tmeta.get("principle") or "Apply a targeted single-transform rewrite")
+    overlap = float(getattr(chosen, "overlap_ratio", 0.5) if chosen else 0.5)
+    confidence = max(0.4, min(0.9, overlap))
+
+    gates_checked = []
+    if chosen is not None:
+        gates_checked.append(f"feature_overlap={overlap:.0%}")
+        matched = list(getattr(chosen, "matched_features", []) or [])
+        if matched:
+            gates_checked.append("matched_features=" + ", ".join(str(x) for x in matched[:4]))
+        missing = list(getattr(chosen, "missing_features", []) or [])
+        if missing:
+            gates_checked.append("missing_features=" + ", ".join(str(x) for x in missing[:3]))
+    else:
+        gates_checked.append("no_detected_transform; using fallback seed")
+
+    gold_example = _load_gold_example_for_family(family, dialect) if family else None
+    rec_examples = []
+    if isinstance(gold_example, dict) and gold_example.get("id"):
+        rec_examples.append(str(gold_example["id"]))
+
+    probe = ProbeSpec(
+        probe_id="sample_p01",
+        transform_id=transform_id,
+        family=family,
+        target=principle,
+        confidence=confidence,
+        gold_example_id=str(gold_example.get("id")) if isinstance(gold_example, dict) else None,
+        recommended_examples=rec_examples,
+        node_contract={
+            "from": ["final_select"],
+            "where": "dominant runtime hotspot",
+            "output_preservation": "exact rowset and aggregates",
+        },
+        gates_checked=gates_checked,
+        expected_explain_delta=f"Lower dominant operator cost via {transform_id}.",
+        recommended_patch_ops=[],
+        phase=1,
+        exploration=False,
+        exploration_hypothesis="",
+    )
+    return probe, gold_example, tmeta
 
 
 @click.command()
@@ -39,9 +153,9 @@ def prepare(
     evidence: bool,
     patch_mode: bool,
 ) -> None:
-    """Generate analyst briefing prompts deterministically (no LLM calls).
+    """Generate beam analyst prompts deterministically (no LLM calls).
 
-    Runs Phases 1-3: parse logical tree, gather analyst context, build prompt.
+    Runs Phases 1-3: parse logical tree, gather analyst context, build runtime prompt.
     Output is saved under benchmark/prepared/<timestamp>/.
     """
     from ._common import (
@@ -81,7 +195,17 @@ def prepare(
 
     # Lazy imports — keep `qt --help` fast
     from ..pipeline import Pipeline
-    from ..prompts import build_analyst_briefing_prompt
+    from ..patches.beam_prompt_builder import (
+        load_gold_examples,
+        build_beam_compiler_prompt,
+        _load_engine_intelligence,
+    )
+    from ..patches.beam_prompts import (
+        build_beam_analyst_prompt,
+        build_beam_worker_prompt,
+    )
+    from ..detection import detect_transforms, load_transforms
+    from ..patches.pathology_classifier import build_intelligence_brief
 
     if bootstrap:
         import os
@@ -125,43 +249,158 @@ def prepare(
                 query_id=qid, sql=sql, dialect=dialect, engine=engine,
             )
 
-            prompt = build_analyst_briefing_prompt(
+            # Build IR node map for runtime beam analyst prompt contract.
+            from ..ir import build_script_ir, render_ir_node_map, Dialect
+            dialect_map = {
+                "duckdb": Dialect.DUCKDB,
+                "postgres": Dialect.POSTGRES,
+                "snowflake": Dialect.SNOWFLAKE,
+            }
+            ir_dialect = dialect_map.get(dialect, Dialect.DUCKDB)
+            script_ir = build_script_ir(sql, ir_dialect)
+            ir_node_map_text = render_ir_node_map(script_ir)
+
+            # Keep prepare aligned with beam runtime templates.
+            gold_examples = load_gold_examples(dialect)
+            engine_knowledge = _load_engine_intelligence(dialect) or ""
+            explain_text = ctx_data.get("explain_plan_text") or ""
+            qerror_analysis = ctx_data.get("qerror_analysis")
+
+            # Runtime-aligned intelligence brief (AST detection + cached classification).
+            transforms_catalog = load_transforms()
+            transform_by_id = {
+                str(t.get("id")): t for t in transforms_catalog
+                if isinstance(t, dict) and t.get("id")
+            }
+            detected_transforms = detect_transforms(
+                sql, transforms_catalog, dialect=dialect,
+            )
+            classification = _load_cached_classification(bench_dir, qid)
+            intelligence_brief = build_intelligence_brief(
+                detected_transforms,
+                classification,
+                runtime_dialect=dialect,
+            ) or (ctx_data.get("plan_scanner_text") or "")
+
+            prompt = build_beam_analyst_prompt(
                 query_id=qid,
-                sql=sql,
-                explain_plan_text=ctx_data.get("explain_plan_text"),
-                dag=dag,
-                costs=costs,
-                semantic_intents=ctx_data.get("semantic_intents"),
-                constraints=ctx_data.get("constraints", []),
+                original_sql=sql,
+                explain_text=explain_text,
+                ir_node_map=ir_node_map_text,
+                gold_examples=gold_examples,
                 dialect=dialect,
-                engine_profile=ctx_data.get("engine_profile"),
-                resource_envelope=ctx_data.get("resource_envelope"),
-                exploit_algorithm_text=ctx_data.get("exploit_algorithm_text"),
-                plan_scanner_text=ctx_data.get("plan_scanner_text"),
-                mode=mode,
-                detected_transforms=ctx_data.get("detected_transforms"),
-                qerror_analysis=ctx_data.get("qerror_analysis"),
-                matched_examples=ctx_data.get("matched_examples"),
+                intelligence_brief=intelligence_brief,
+                importance_stars=2,
+                schema_context="",
+                engine_knowledge=engine_knowledge,
+                qerror_analysis=qerror_analysis,
             )
 
-            # IR node map for patch mode (optional)
-            ir_node_map_text = None
-            if patch_mode:
-                try:
-                    from ..ir import build_script_ir, render_ir_node_map, Dialect
-                    dialect_map = {"duckdb": Dialect.DUCKDB, "postgres": Dialect.POSTGRES,
-                                   "snowflake": Dialect.SNOWFLAKE}
-                    ir_dialect = dialect_map.get(dialect, Dialect.DUCKDB)
-                    script_ir = build_script_ir(sql, ir_dialect)
-                    ir_node_map_text = render_ir_node_map(script_ir)
-                except Exception as e:
-                    console.print(f"  {status_prefix} [yellow]IR build failed: {e}[/yellow]")
+            # Emit one realistic worker+compiler sample prompt per query so
+            # prepare output can validate all runtime prompt render paths.
+            sample_probe, sample_gold_example, sample_tmeta = _build_sample_probe(
+                detected_transforms, transform_by_id, dialect,
+            )
+            sample_hypothesis = (
+                "Primary hotspot likely responds to a single-transform rewrite "
+                f"({sample_probe.transform_id}) based on detected features."
+            )
+            sample_do_not_do = [
+                "do not change projection semantics",
+                "do not alter grouping cardinality",
+                "do not introduce unfiltered wide CTE materialization",
+            ]
+            sample_gold_dag = None
+            if isinstance(sample_gold_example, dict):
+                sample_gold_dag = (
+                    sample_gold_example.get("dag_example")
+                    or sample_gold_example.get("dag")
+                )
 
+            worker_qwen_prompt = build_beam_worker_prompt(
+                original_sql=sql,
+                ir_node_map=ir_node_map_text,
+                current_dag_map="",
+                hypothesis=sample_hypothesis,
+                probe=sample_probe,
+                gold_dag_example=sample_gold_dag,
+                dialect=dialect,
+                schema_context="",
+                equivalence_tier="exact",
+                reasoning_trace=[],
+                qerror_analysis=qerror_analysis,
+                engine_knowledge=engine_knowledge,
+                do_not_do=sample_do_not_do,
+                worker_lane="qwen",
+            )
+            worker_reasoner_prompt = build_beam_worker_prompt(
+                original_sql=sql,
+                ir_node_map=ir_node_map_text,
+                current_dag_map="",
+                hypothesis=sample_hypothesis,
+                probe=sample_probe,
+                gold_dag_example=sample_gold_dag,
+                dialect=dialect,
+                schema_context="",
+                equivalence_tier="exact",
+                reasoning_trace=[],
+                qerror_analysis=qerror_analysis,
+                engine_knowledge=engine_knowledge,
+                do_not_do=sample_do_not_do,
+                worker_lane="reasoner",
+            )
+
+            sample_sql = ""
+            sample_speedup = None
+            if isinstance(sample_gold_example, dict):
+                sample_sql = str(sample_gold_example.get("optimized_sql") or "").strip()
+                sample_speedup = _parse_speedup_value(sample_gold_example.get("verified_speedup"))
+            if not sample_sql:
+                sample_sql = sql
+
+            sample_strike_results = [
+                {
+                    "probe_id": sample_probe.probe_id,
+                    "transform_id": sample_probe.transform_id,
+                    "family": sample_probe.family,
+                    "status": "WIN" if sample_speedup and sample_speedup >= 1.05 else "PASS",
+                    "failure_category": "none",
+                    "speedup": sample_speedup,
+                    "error": "",
+                    "explain_text": explain_text,
+                    "sql": sample_sql,
+                    "description": str(sample_tmeta.get("principle") or sample_probe.target),
+                }
+            ]
+            compiler_sample_prompt = build_beam_compiler_prompt(
+                query_id=qid,
+                original_sql=sql,
+                explain_text=explain_text,
+                ir_node_map=ir_node_map_text,
+                all_5_examples=gold_examples,
+                dialect=dialect,
+                strike_results=sample_strike_results,
+                intelligence_brief=intelligence_brief,
+                importance_stars=2,
+                schema_context="",
+                engine_knowledge=engine_knowledge,
+                dispatch_hypothesis=sample_hypothesis,
+                dispatch_reasoning_trace=[
+                    f"{sample_probe.transform_id} selected as top detected sample transform.",
+                ],
+                equivalence_tier="exact",
+                qerror_analysis=qerror_analysis,
+            )
+
+            # Keep optional IR artifact behavior for downstream consumers.
+            if patch_mode:
+                (out / "context" / f"{qid}_ir_node_map.txt").write_text(ir_node_map_text)
             # Save outputs
             (out / "prompts" / f"{qid}.txt").write_text(prompt)
+            (out / "prompts" / f"{qid}_worker_qwen_sample.txt").write_text(worker_qwen_prompt)
+            (out / "prompts" / f"{qid}_worker_reasoner_sample.txt").write_text(worker_reasoner_prompt)
+            (out / "prompts" / f"{qid}_compiler_sample.txt").write_text(compiler_sample_prompt)
             (out / "original" / f"{qid}.sql").write_text(sql)
-            if ir_node_map_text:
-                (out / "context" / f"{qid}_ir_node_map.txt").write_text(ir_node_map_text)
 
             # Evidence bundle (optional)
             if evidence:
@@ -205,8 +444,13 @@ def prepare(
                 "engine": engine,
                 "dialect": dialect,
                 "prompt_tokens": len(prompt.split()),
+                "worker_qwen_sample_tokens": len(worker_qwen_prompt.split()),
+                "worker_reasoner_sample_tokens": len(worker_reasoner_prompt.split()),
+                "compiler_sample_tokens": len(compiler_sample_prompt.split()),
                 "has_explain": ctx_data.get("explain_plan_text") is not None,
                 "has_plan_scanner": ctx_data.get("plan_scanner_text") is not None,
+                "has_worker_samples": True,
+                "has_compiler_sample": True,
                 "n_matched_examples": len(ctx_data.get("matched_examples", [])),
                 "n_constraints": len(ctx_data.get("constraints", [])),
                 "query_archetype": ctx_data.get("query_archetype"),

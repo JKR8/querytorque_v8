@@ -1,156 +1,214 @@
-# DuckDB Rewrite Playbook
-# TPC-DS SF1–SF10 field intelligence
+# DuckDB Dialect Knowledge
 
-## ENGINE STRENGTHS — do NOT rewrite
+## Metadata
+- dialect: `duckdb`
+- version: `2026-02-17-format-v1`
+- source_of_truth:
+  - engine_profile: `constraints/engine_profile_duckdb.json`
+  - transforms: `knowledge/transforms.json`
+  - examples: `examples/duckdb/*.json`
+- generated_from: `hybrid`
+- last_updated: `2026-02-17`
 
-1. **Predicate pushdown**: filter inside scan node → leave it.
-2. **Same-column OR**: handled natively in one scan. Splitting = lethal (0.23x observed).
-3. **Hash join selection**: sound for 2–4 tables. Reduce inputs, not order.
-4. **CTE inlining**: single-ref CTEs inlined automatically (zero overhead).
-5. **Columnar projection**: only referenced columns read.
-6. **Parallel aggregation**: scans and aggregations parallelized across threads.
-7. **EXISTS semi-join**: early termination. **Never materialize** (0.14x observed).
+## Engine Strengths (Do Not Fight)
+| Strength ID | Summary | Implication | Evidence |
+|---|---|---|---|
+| `INTRA_SCAN_PREDICATE_PUSHDOWN` | Pushes WHERE filters into scan nodes. | If the selective filter is already at scan, do not add rewrite-only CTE layers. | `engine_profile_duckdb.json` |
+| `SAME_COLUMN_OR` | OR on same column is handled in one scan. | Do not split same-column OR into UNION branches. | `0.23x`, `0.59x` regressions |
+| `HASH_JOIN_SELECTION` | Hash join choice is generally reliable. | Reduce input cardinality first; do not force manual join reordering by default. | `engine_profile_duckdb.json` |
+| `CTE_INLINING` | Single-reference CTEs are inlined. | Single-use CTEs are often free; multi-ref CTEs still need care. | `engine_profile_duckdb.json` |
+| `COLUMNAR_PROJECTION` | Only referenced columns are read. | Prefer narrow projections; avoid `SELECT *` in staging CTEs. | `engine_profile_duckdb.json` |
+| `PARALLEL_AGGREGATION` | Scans and aggregates parallelize well. | Keep large aggregate work in engine-native grouped form. | `engine_profile_duckdb.json` |
+| `EXISTS_SEMI_JOIN` | EXISTS/NOT EXISTS uses semi-join early-stop. | Never materialize EXISTS paths into wide CTEs. | `0.14x`, `0.54x` regressions |
 
-## GLOBAL GUARDS
+## Global Guards
+| Guard ID | Rule | Severity | Fail Action | Source |
+|---|---|---|---|---|
+| `G_EXISTS_NO_MATERIALIZE` | Never materialize `EXISTS/NOT EXISTS` into standalone CTE scans. | `BLOCKER` | `SKIP_TRANSFORM` | `EXISTS_SEMI_JOIN`, regressions |
+| `G_OR_SAME_COLUMN_NO_UNION` | Do not rewrite same-column OR into UNION ALL. | `BLOCKER` | `SKIP_TRANSFORM` | `SAME_COLUMN_OR`, regressions |
+| `G_LOW_BASELINE_SKIP_HEAVY` | If baseline is low (`<100ms`), skip structural CTE-heavy rewrites. | `MEDIUM` | `DOWNRANK_TO_EXPLORATION` | legacy playbook |
+| `G_MAX_FACT_CHAIN` | Avoid 3+ cascading fact-table CTE chains. | `HIGH` | `SKIP_PATHOLOGY` | `0.78x`, `0.50x` regressions |
+| `G_NO_ORPHANED_CTE` | Remove original CTE bodies when split variants replace them. | `HIGH` | `REQUIRE_MANUAL_REVIEW` | `0.49x`, `0.68x` regressions |
+| `G_DIM_CROSSJOIN_HARD_STOP` | Never cross-join 3+ filtered dimension CTEs. | `BLOCKER` | `SKIP_TRANSFORM` | `0.0076x` regression |
+| `G_EXPLICIT_JOIN_STYLE` | Convert comma joins to explicit `JOIN ... ON`. | `MEDIUM` | `DOWNRANK_TO_EXPLORATION` | legacy playbook |
 
-1. EXISTS/NOT EXISTS → never materialize (0.14x, 0.54x — semi-join destroyed)
-2. Same-column OR → never split to UNION (0.23x, 0.59x — native OR handling)
-3. Baseline < 100ms → skip CTE-based rewrites (overhead exceeds savings)
-4. 3+ fact table joins → do not pre-materialize facts (locks join order)
-5. Every CTE MUST have a WHERE clause (0.85x observed)
-6. No orphaned CTEs — remove original after splitting (0.49x, 0.68x — double materialization)
-7. No cross-joining 3+ dimension CTEs (0.0076x — Cartesian product)
-8. Max 2 cascading fact-table CTE chains (0.78x observed)
-9. Convert comma joins to explicit JOIN...ON
-10. NOT EXISTS → NOT IN breaks with NULLs — preserve EXISTS form
+## Decision Gates (Normative Contract)
+| Gate ID | Scope | Type | Severity | Check | Pass Criteria | Fail Action | Evidence Required |
+|---|---|---|---|---|---|---|---|
+| `DG_TYPE_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Gate type validity | One of `SQL_PATTERN`, `PLAN_SIGNAL`, `RUNTIME_CONTEXT`, `SEMANTIC_RISK` | `REQUIRE_MANUAL_REVIEW` | gate row schema |
+| `DG_SEVERITY_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Severity validity | One of `BLOCKER`, `HIGH`, `MEDIUM` | `REQUIRE_MANUAL_REVIEW` | gate row schema |
+| `DG_FAIL_ACTION_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Fail action validity | One of `SKIP_PATHOLOGY`, `SKIP_TRANSFORM`, `DOWNRANK_TO_EXPLORATION`, `REQUIRE_MANUAL_REVIEW` | `REQUIRE_MANUAL_REVIEW` | gate row schema |
+| `DG_BLOCKER_POLICY` | global | `RUNTIME_CONTEXT` | `BLOCKER` | Any blocker failed | Failed blocker always blocks that pattern/transform path | `SKIP_PATHOLOGY` | failed gate log |
+| `DG_MIN_PATTERN_GATES` | pattern | `RUNTIME_CONTEXT` | `HIGH` | Gate coverage | Each pattern has at least 1 `SEMANTIC_RISK`, 1 `PLAN_SIGNAL`, 1 `RUNTIME_CONTEXT` gate | `REQUIRE_MANUAL_REVIEW` | pattern gate table |
+| `DG_EVIDENCE_BINDING` | global | `RUNTIME_CONTEXT` | `HIGH` | Claim traceability | Quantitative claims map to example IDs or benchmark artifacts | `REQUIRE_MANUAL_REVIEW` | evidence table row |
 
----
+## Gap-Driven Optimization Patterns
 
-## DOCUMENTED CASES
+### Pattern ID: `CROSS_CTE_PREDICATE_BLINDNESS` (`HIGH`)
+- Goal: `SMALLEST_SET_FIRST`
+- Detect: row counts are flat through CTE chain then drop late.
+- Preferred transforms: `date_cte_isolate`, `multi_dimension_prefetch`, `self_join_decomposition`, `prefetch_fact_join`.
 
-Cases ordered by safety (zero-regression cases first, then by decreasing risk).
+#### Decision Gates for `CROSS_CTE_PREDICATE_BLINDNESS`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_CROSS_CTE_FILTER_RATIO` | `PLAN_SIGNAL` | `HIGH` | Late filter selectivity ratio | Strong if `>5:1`; moderate if `2:1-5:1` and baseline high | `DOWNRANK_TO_EXPLORATION` | plan row-flow |
+| `G_CROSS_CTE_FACT_COUNT` | `RUNTIME_CONTEXT` | `BLOCKER` | Fact-table fanout risk | 1 fact safe, 2 careful, 3+ blocked | `SKIP_PATHOLOGY` | join graph |
+| `G_CROSS_CTE_SEMANTIC` | `SEMANTIC_RISK` | `HIGH` | Existing CTE already filtered | Skip when target predicate already pushed | `SKIP_TRANSFORM` | SQL predicate map |
 
-**P0: Predicate Chain Pushback** (SMALLEST SET FIRST) — ~35% of wins
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `date_cte_isolate` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `4.00x` | `WIN` |
+| `multi_dimension_prefetch` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `2.71x` | `WIN` |
+| `self_join_decomposition` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `4.76x` | `WIN` |
 
-| Aspect | Detail |
-|---|---|
-| Detect | Row counts flat through CTE chain, sharp drop at late filter. 2+ stage CTE chain + late predicate with columns available earlier. |
-| Gates | Filter ratio >5:1 strong, 2:1–5:1 moderate if baseline >200ms, <2:1 skip. 1 fact = safe, 2 = careful, 3+ = STOP (0.50x). ROLLUP/WINDOW downstream: CAUTION (0.85x). CTE already filtered on this predicate: skip (0.71x). |
-| Treatments | date_cte_isolate (12 wins, 1.34x avg), prefetch_fact_join (4 wins, 1.89x avg), multi_dimension_prefetch (3 wins, 1.55x avg), multi_date_range_cte (3 wins, 1.42x avg), shared_dimension_multi_channel (1 win, 1.40x), self_join_decomposition (1 win, 4.76x) |
-| Failures | 0.0076x (3 dim CTE cross-join → Cartesian), 0.50x (3-fact join lock), 0.85x (ROLLUP blocked), 0.71x (over-decomposed) |
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| 3-dimension cross join | `0.0076x` | `G_CROSS_CTE_FACT_COUNT` | Join each filtered dimension directly to fact path |
+| 3-way fact chain lock | `0.50x` | `G_CROSS_CTE_FACT_COUNT` | Limit to <=2 fact-chain layers |
+| Over-decomposition of already filtered CTE | `0.71x` | `G_CROSS_CTE_SEMANTIC` | Skip if predicate already present upstream |
 
-**P1: Repeated Scans of Same Table** (DON'T REPEAT WORK) — ZERO REGRESSIONS
+### Pattern ID: `REDUNDANT_SCAN_ELIMINATION` (`HIGH`)
+- Goal: `DONT_REPEAT_WORK`
+- Detect: repeated scans of same table with identical joins but bucketed predicates.
+- Preferred transforms: `single_pass_aggregation`, `channel_bitmap_aggregation`.
 
-| Aspect | Detail |
-|---|---|
-| Detect | N separate SEQ_SCAN nodes on same table, identical joins, different bucket filters. |
-| Gates | Identical join structure across all subqueries, max 8 branches, COUNT/SUM/AVG/MIN/MAX only (not STDDEV/VARIANCE/PERCENTILE). |
-| Treatments | single_pass_aggregation (8 wins, 1.88x avg), channel_bitmap_aggregation (1 win, 6.24x) |
-| Failures | None observed. |
+#### Decision Gates for `REDUNDANT_SCAN_ELIMINATION`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_REPEAT_SCAN_STRUCTURAL_MATCH` | `SQL_PATTERN` | `HIGH` | Join skeleton equivalence across branches | Same join keys and table path | `SKIP_TRANSFORM` | AST compare |
+| `G_REPEAT_SCAN_BRANCH_COUNT` | `RUNTIME_CONTEXT` | `MEDIUM` | Branch count | <=8 branches | `DOWNRANK_TO_EXPLORATION` | branch count |
+| `G_REPEAT_SCAN_AGG_SAFE` | `SEMANTIC_RISK` | `BLOCKER` | Aggregate compatibility | Safe with `COUNT/SUM/AVG/MIN/MAX`; avoid variance-style aggregates | `SKIP_PATHOLOGY` | select list audit |
 
-**P3: Aggregation After Join** (MINIMIZE ROWS TOUCHED) — ZERO REGRESSIONS
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `single_pass_aggregation` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `4.47x` | `WIN` |
+| `channel_bitmap_aggregation` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `6.24x` | `WIN` |
 
-| Aspect | Detail |
-|---|---|
-| Detect | GROUP BY input rows >> distinct keys, aggregate node sits after join. |
-| Gates | GROUP BY keys ⊇ join keys (CORRECTNESS). Reconstruct AVG from SUM/COUNT when pre-aggregating for ROLLUP. |
-| Treatments | aggregate_pushdown, star_join_prefetch. 3 wins (1.3x–42.9x, avg 15.3x). |
-| Failures | None observed. |
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| none observed in curated examples | `n/a` | `n/a` | Keep branch and aggregate gates enforced |
 
-**P5: LEFT JOIN + NULL-Eliminating WHERE** (ARM THE OPTIMIZER) — ZERO REGRESSIONS
+### Pattern ID: `CORRELATED_SUBQUERY_PARALYSIS` (`LOW`)
+- Goal: `SETS_OVER_LOOPS`
+- Detect: nested loop style repeated aggregate evaluation by outer-row correlation.
+- Preferred transforms: `decorrelate`, `composite_decorrelate_union`.
 
-| Aspect | Detail |
-|---|---|
-| Detect | LEFT JOIN + WHERE on right-table column (proves right non-null). |
-| Gates | No CASE WHEN IS NULL / COALESCE on right-table column. |
-| Treatments | inner_join_conversion. 2 wins (1.9x–3.4x, avg 2.7x). |
-| Failures | None observed. |
+#### Decision Gates for `CORRELATED_SUBQUERY_PARALYSIS`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_CORR_EXISTS_PROTECTED` | `SEMANTIC_RISK` | `BLOCKER` | EXISTS-path decorrelation | EXISTS/NOT EXISTS stays protected | `SKIP_PATHOLOGY` | SQL form + plan |
+| `G_CORR_ALREADY_DECORRELATED` | `PLAN_SIGNAL` | `HIGH` | Correlation already flattened | Skip if hash join already on correlation key | `SKIP_TRANSFORM` | EXPLAIN nodes |
+| `G_CORR_OUTER_SIZE` | `RUNTIME_CONTEXT` | `MEDIUM` | Outer cardinality after filters | If outer set small, decorrelation optional | `DOWNRANK_TO_EXPLORATION` | row count estimate |
 
-**P6: INTERSECT Materializing Both Sides** (SETS OVER LOOPS) — ZERO REGRESSIONS
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `decorrelate` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `2.92x` | `WIN` |
+| `composite_decorrelate_union` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `2.42x` | `WIN` |
 
-| Aspect | Detail |
-|---|---|
-| Detect | INTERSECT between 10K+ row result sets. |
-| Gates | Both sides >1K rows. |
-| Treatments | intersect_to_exists, multi_intersect_exists_cte. 1 win (2.7x). Related: semi_join_exists (1.67x). |
-| Failures | None observed. |
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| EXISTS path rewritten as materialized branch | `0.34x`, `0.14x` | `G_CORR_EXISTS_PROTECTED` | Preserve semi-join style EXISTS |
+| Already decorrelated shape rewritten again | `0.71x` | `G_CORR_ALREADY_DECORRELATED` | Skip if plan already uses join-style decorrelation |
 
-**P8: Window Functions in CTEs Before Join** (MINIMIZE ROWS TOUCHED) — ZERO REGRESSIONS
+### Pattern ID: `AGGREGATE_BELOW_JOIN_BLINDNESS` (`HIGH`)
+- Goal: `MINIMIZE_ROWS_TOUCHED`
+- Detect: aggregate appears after high-cardinality join fanout.
+- Preferred transforms: `aggregate_pushdown`, star-join prefilter variants.
 
-| Aspect | Detail |
-|---|---|
-| Detect | N WINDOW nodes inside CTEs, same ORDER BY key, CTEs then joined. |
-| Gates | Not LAG/LEAD (depends on pre-join row order), not ROWS BETWEEN with specific frame. SUM() OVER() naturally skips NULLs. |
-| Treatments | deferred_window_aggregation. 1 win (1.4x). |
-| Failures | None observed. |
+#### Decision Gates for `AGGREGATE_BELOW_JOIN_BLINDNESS`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_AGG_KEY_COMPAT` | `SEMANTIC_RISK` | `BLOCKER` | Grouping-key compatibility | Group keys remain compatible with join keys | `SKIP_PATHOLOGY` | grouping/join key map |
+| `G_AGG_FANOUT` | `PLAN_SIGNAL` | `HIGH` | Join-to-aggregate compression opportunity | Large compression opportunity exists | `SKIP_TRANSFORM` | row-flow stats |
+| `G_AGG_BASELINE` | `RUNTIME_CONTEXT` | `MEDIUM` | Baseline runtime significance | Prefer when baseline is materially high | `DOWNRANK_TO_EXPLORATION` | baseline ms |
 
-**P7: Self-Joined CTE Materialized for All Values** (SMALLEST SET FIRST)
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `aggregate_pushdown` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `42.90x` | `WIN` |
 
-| Aspect | Detail |
-|---|---|
-| Detect | CTE joined to itself with different WHERE per arm (e.g., period=1 vs period=2). |
-| Gates | 2–4 discriminator values, MUST remove original combined CTE after splitting. |
-| Treatments | self_join_decomposition (1 win, 4.76x), union_cte_split (2 wins, 1.72x avg), rollup_to_union_windowing (1 win, 2.47x) |
-| Failures | 0.49x (orphaned CTE → double materialization), 0.68x (orphaned variant) |
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| none observed in curated examples | `n/a` | `n/a` | Keep key-compatibility blocker mandatory |
 
-**P2: Correlated Subquery Nested Loop** (SETS OVER LOOPS)
+### Pattern ID: `LEFT_JOIN_FILTER_ORDER_RIGIDITY` (`HIGH`)
+- Goal: `ARM_THE_OPTIMIZER`
+- Detect: LEFT JOIN plus right-table filter that proves non-null right side.
+- Preferred transforms: `inner_join_conversion`.
 
-| Aspect | Detail |
-|---|---|
-| Detect | Nested loop, inner re-executes aggregate per outer row. If EXPLAIN shows hash join on correlation key → already decorrelated → STOP. |
-| Gates | NEVER decorrelate EXISTS (0.34x, 0.14x — semi-join destroyed). Preserve ALL WHERE filters. Check if Phase 1 reduced outer to <1000 rows (nested loop may be fast enough). |
-| Treatments | decorrelate (3 wins, 2.45x avg), composite_decorrelate_union (1 win, 2.42x) |
-| Failures | 0.34x (semi-join destroyed), 0.71x (already decorrelated) |
+#### Decision Gates for `LEFT_JOIN_FILTER_ORDER_RIGIDITY`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_LEFTJOIN_NULL_SEMANTICS` | `SEMANTIC_RISK` | `BLOCKER` | Null-sensitive expression usage | No null-preserving CASE/COALESCE dependency on right side | `SKIP_PATHOLOGY` | expression audit |
+| `G_LEFTJOIN_PROOF` | `PLAN_SIGNAL` | `HIGH` | Null-eliminating right-side predicate | Proof present in WHERE predicates | `SKIP_TRANSFORM` | predicate map |
+| `G_LEFTJOIN_RUNTIME` | `RUNTIME_CONTEXT` | `MEDIUM` | Runtime payoff | Prioritize when join dominates runtime | `DOWNRANK_TO_EXPLORATION` | operator costs |
 
-**P9: Shared Subexpression Executed Multiple Times** (DON'T REPEAT WORK)
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `inner_join_conversion` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `3.44x` | `WIN` |
 
-| Aspect | Detail |
-|---|---|
-| Detect | Identical subtrees with identical costs scanning same tables. HARD STOP: EXISTS/NOT EXISTS → NEVER materialize (0.14x). |
-| Gates | NOT EXISTS, subquery is expensive (joins/aggregates), CTE must have WHERE. |
-| Treatments | materialize_cte. 1 win (1.4x). |
-| Failures | 0.14x (EXISTS materialized → semi-join destroyed), 0.54x (correlated EXISTS pairs broken) |
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| none observed in curated examples | `n/a` | `n/a` | keep null-semantics blocker enforced |
 
-**P4: Cross-Column OR Forcing Full Scan** (MINIMIZE ROWS TOUCHED) — HIGHEST VARIANCE
+### Pattern ID: `CROSS_COLUMN_OR_DECOMPOSITION` (`MEDIUM`)
+- Goal: `MINIMIZE_ROWS_TOUCHED`
+- Detect: OR across different columns with very high filter discard.
+- Preferred transforms: `or_to_union`.
 
-| Aspect | Detail |
-|---|---|
-| Detect | Single scan, OR across DIFFERENT columns, 70%+ rows discarded. CRITICAL: same column in all OR arms → STOP (engine handles natively). |
-| Gates | Max 3 branches, cross-column only, no self-join, no nested OR (multiplicative expansion). |
-| Treatments | or_to_union. 4 wins (1.4x–6.3x, avg 3.1x). |
-| Failures | 0.23x (9 branches from nested OR), 0.41x (nested OR expansion), 0.59x (same-col split), 0.51x (self-join re-executed per branch) |
+#### Decision Gates for `CROSS_COLUMN_OR_DECOMPOSITION`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_OR_CROSS_COLUMN_ONLY` | `SQL_PATTERN` | `BLOCKER` | OR column shape | Cross-column OR only; same-column OR blocked | `SKIP_PATHOLOGY` | predicate parse |
+| `G_OR_BRANCH_LIMIT` | `RUNTIME_CONTEXT` | `HIGH` | Branch explosion risk | <=3 union branches | `SKIP_TRANSFORM` | branch count |
+| `G_OR_NO_SELF_JOIN_MULTIPLY` | `SEMANTIC_RISK` | `HIGH` | Self-join plus union branch multiplier | No multiplicative re-execution pattern | `REQUIRE_MANUAL_REVIEW` | join graph |
 
----
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `or_to_union` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `3.17x` | `WIN` |
 
-## PRUNING GUIDE
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| Nested OR expansion to 9 branches | `0.23x` | `G_OR_BRANCH_LIMIT` | hard cap branch count |
+| Same-column OR split | `0.59x` | `G_OR_CROSS_COLUMN_ONLY` | keep as native OR |
+| Self-join repeated per branch | `0.51x` | `G_OR_NO_SELF_JOIN_MULTIPLY` | avoid branch split or require manual review |
 
+## Pruning Guide
 | Plan shows | Skip |
 |---|---|
-| No nested loops | P2 (decorrelation) |
-| Each table appears once | P1 (repeated scans) |
-| No LEFT JOIN | P5 (INNER conversion) |
-| No OR predicates | P4 (OR decomposition) |
-| No GROUP BY | P3 (aggregate pushdown) |
-| No WINDOW/OVER | P8 (deferred window) |
-| No INTERSECT/EXCEPT | P6 (set rewrite) |
-| Baseline < 50ms | ALL CTE-based transforms |
-| Row counts monotonically decreasing | P0 (predicate pushback) |
+| No nested loops | `CORRELATED_SUBQUERY_PARALYSIS` |
+| Each table appears once | `REDUNDANT_SCAN_ELIMINATION` |
+| No LEFT JOIN | `LEFT_JOIN_FILTER_ORDER_RIGIDITY` |
+| No OR predicates | `CROSS_COLUMN_OR_DECOMPOSITION` |
+| No GROUP BY | `AGGREGATE_BELOW_JOIN_BLINDNESS` |
+| Baseline < 50ms | all CTE-heavy structural rewrites |
+| Row counts already decrease early | `CROSS_CTE_PREDICATE_BLINDNESS` |
 
-## REGRESSION REGISTRY
+## Regression Registry
+| Severity | Transform | Speedup | Query | Root Cause |
+|---|---|---:|---|---|
+| `CATASTROPHIC` | `dimension_cte_isolate` | `0.0076x` | `n/a` | 3-dimension Cartesian cross-join |
+| `CATASTROPHIC` | `materialize_cte` | `0.14x` | `n/a` | semi-join short-circuit destroyed |
+| `SEVERE` | `or_to_union` | `0.23x` | `n/a` | nested OR branch explosion |
+| `SEVERE` | `decorrelate` | `0.34x` | `n/a` | protected EXISTS/semi-join path rewritten |
+| `MAJOR` | `union_cte_split` | `0.49x` | `n/a` | orphaned original CTE retained |
+| `MAJOR` | `date_cte_isolate` | `0.50x` | `n/a` | fact join-order lock |
+| `MODERATE` | `or_to_union` | `0.59x` | `n/a` | same-column OR split |
+| `MODERATE` | `decorrelate` | `0.71x` | `n/a` | already decorrelated plan rewritten |
+| `MINOR` | `multi_dimension_prefetch` | `0.77x` | `n/a` | forced suboptimal join order |
 
-| Severity | Transform | Result | Root cause |
-|----------|-----------|--------|------------|
-| CATASTROPHIC | dimension_cte_isolate | 0.0076x | Cross-joined 3 dim CTEs: Cartesian product |
-| CATASTROPHIC | materialize_cte | 0.14x | Materialized EXISTS → semi-join destroyed |
-| SEVERE | or_to_union | 0.23x | 9 UNION branches from nested OR |
-| SEVERE | decorrelate | 0.34x | LEFT JOIN was already semi-join |
-| MAJOR | union_cte_split | 0.49x | Original CTE kept → double materialization |
-| MAJOR | date_cte_isolate | 0.50x | 3-way fact join locked optimizer order |
-| MAJOR | or_to_union | 0.51x | Self-join re-executed per branch |
-| MAJOR | semantic_rewrite | 0.54x | Correlated EXISTS pairs broken |
-| MODERATE | or_to_union | 0.59x | Split same-column OR |
-| MODERATE | union_cte_split | 0.68x | Original CTE kept alongside split |
-| MODERATE | decorrelate | 0.71x | Pre-aggregated ALL stores when only subset needed |
-| MODERATE | prefetch_fact_join | 0.78x | 3rd cascading CTE chain |
-| MINOR | multi_dimension_prefetch | 0.77x | Forced suboptimal join order |
-| MINOR | date_cte_isolate | 0.85x | CTE blocked ROLLUP pushdown |
+## Notes
+- Additional low-priority patterns also tracked in profile: `INTERSECT_MATERIALIZATION`, `WINDOW_BEFORE_JOIN`, `UNION_CTE_SELF_JOIN_DECOMPOSITION`, `SHARED_SUBEXPRESSION`.
+- Config tuning is separate from SQL rewrite guidance.

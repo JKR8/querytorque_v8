@@ -5,7 +5,7 @@ import json
 from types import SimpleNamespace
 
 from qt_sql.patches.beam_router import assign_importance_stars
-from qt_sql.patches.beam_wide_prompts import (
+from qt_sql.patches.beam_prompts import (
     ProbeSpec,
     build_beam_editor_strike_prompt,
     build_beam_analyst_prompt,
@@ -245,7 +245,7 @@ def test_editor_strike_prompt_injects_selected_transform() -> None:
 
 def test_compiler_template_matches_runtime_evidence_contract() -> None:
     text = (TEMPLATE_DIR / "beam_compiler_v3.txt").read_text(encoding="utf-8")
-    assert "Beam Compiler" in text
+    assert "Principal SQL Optimization Reviewer" in text
     assert "DAG Output Contract (MUST follow)" in text
     assert "top-level value may be:" in text
     assert "changed nodes MUST include full executable SQL in `sql`" in text
@@ -266,6 +266,9 @@ def test_analyst_template_has_strict_schema_and_invalid_boundary_examples() -> N
     assert "## Input Contract" in text
     assert "## Decision Priority Ladder" in text
     assert "## Probe-count Policy (deterministic)" in text
+    assert "## Gold Example Routing Policy" in text
+    assert "set `gold_example_id` to the best-fit gold id" in text
+    assert "Diversity rule for non-gold probes" in text
     assert "### Complexity evidence score (CES)" in text
     assert "Top-level schema:" in text
     assert "Dispatch schema:" in text
@@ -310,7 +313,7 @@ def test_v3_templates_avoid_sql_ellipsis_placeholders() -> None:
 
 
 def test_append_shot_results_for_compiler_allows_one_or_two_plans() -> None:
-    base_prompt = "You are the Beam Compiler.\nYour task: produce one or two optimization attempts."
+    base_prompt = "You are a Principal SQL Optimization Reviewer.\nYour task: produce one or two optimization attempts."
     patches = [
         SimpleNamespace(
             patch_id="s1",
