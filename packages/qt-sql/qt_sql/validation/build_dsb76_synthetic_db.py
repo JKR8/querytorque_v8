@@ -2502,6 +2502,93 @@ def _mv_recipe_query094(
     return inserted > 0
 
 
+def _mv_recipe_query102(
+    conn: duckdb.DuckDBPyConnection,
+    qctx: QueryContext,
+    global_tables: Dict[str, Dict[str, Any]],
+) -> bool:
+    sql = str(qctx.get("sql_duckdb", ""))
+    year = int(_mv_first_filter_value(qctx, global_tables, "date_dim", "d_year", 2001))
+    category = str(_mv_first_filter_value(qctx, global_tables, "item", "i_category", "Children"))
+    state = str(_mv_first_filter_value(qctx, global_tables, "customer_address", "ca_state", "TX"))
+
+    manager_ids = [int(x) for x in re.findall(r"i_manager_id\s+in\s*\(([^)]+)\)", sql, flags=re.IGNORECASE)[:1] for x in re.findall(r"\d+", x)]
+    manager_id = manager_ids[0] if manager_ids else 21
+
+    m_ws = re.search(
+        r"ws_wholesale_cost\s+between\s+([0-9]+(?:\.[0-9]+)?)\s+and\s+([0-9]+(?:\.[0-9]+)?)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    if m_ws:
+        ws_low = float(m_ws.group(1))
+        ws_high = float(m_ws.group(2))
+    else:
+        ws_low, ws_high = 35.0, 55.0
+    ws_wholesale = (ws_low + ws_high) / 2.0
+
+    base_date = f"{year}-01-01"
+    within_30d = f"{year}-01-15"
+
+    inserted = 0
+    inserted += _mv_insert_rows(
+        conn,
+        global_tables,
+        "date_dim",
+        [
+            {"d_date_sk": 99701, "d_year": year, "d_date": base_date},
+            {"d_date_sk": 99702, "d_year": year, "d_date": within_30d},
+        ],
+    )
+    inserted += _mv_insert_rows(conn, global_tables, "store", [{"s_store_sk": 99702, "s_state": state}])
+    inserted += _mv_insert_rows(conn, global_tables, "warehouse", [{"w_warehouse_sk": 99703, "w_state": state}])
+    inserted += _mv_insert_rows(conn, global_tables, "item", [{"i_item_sk": 99704, "i_category": category, "i_manager_id": manager_id}])
+    inserted += _mv_insert_rows(conn, global_tables, "customer_demographics", [{"cd_demo_sk": 99705, "cd_gender": "M", "cd_marital_status": "S", "cd_education_status": "College"}])
+    inserted += _mv_insert_rows(conn, global_tables, "household_demographics", [{"hd_demo_sk": 99706, "hd_vehicle_count": 1}])
+    inserted += _mv_insert_rows(conn, global_tables, "customer_address", [{"ca_address_sk": 99707, "ca_state": state}])
+    inserted += _mv_insert_rows(
+        conn,
+        global_tables,
+        "customer",
+        [{
+            "c_customer_sk": 99708,
+            "c_current_cdemo_sk": 99705,
+            "c_current_hdemo_sk": 99706,
+            "c_current_addr_sk": 99707,
+        }],
+    )
+    inserted += _mv_insert_rows(
+        conn,
+        global_tables,
+        "store_sales",
+        [{
+            "ss_item_sk": 99704,
+            "ss_sold_date_sk": 99701,
+            "ss_customer_sk": 99708,
+            "ss_quantity": 1,
+        }],
+    )
+    inserted += _mv_insert_rows(
+        conn,
+        global_tables,
+        "web_sales",
+        [{
+            "ws_item_sk": 99704,
+            "ws_sold_date_sk": 99702,
+            "ws_bill_customer_sk": 99708,
+            "ws_warehouse_sk": 99703,
+            "ws_wholesale_cost": ws_wholesale,
+        }],
+    )
+    inserted += _mv_insert_rows(
+        conn,
+        global_tables,
+        "inventory",
+        [{"inv_warehouse_sk": 99703, "inv_item_sk": 99704, "inv_date_sk": 99701, "inv_quantity_on_hand": 2}],
+    )
+    return inserted > 0
+
+
 def _apply_mvrows_recipe(
     conn: duckdb.DuckDBPyConnection,
     qctx: QueryContext,
@@ -2538,6 +2625,8 @@ def _apply_mvrows_recipe(
         return _mv_recipe_query091(conn, qctx, global_tables)
     if qname.startswith("query094_"):
         return _mv_recipe_query094(conn, qctx, global_tables)
+    if qname.startswith("query102_"):
+        return _mv_recipe_query102(conn, qctx, global_tables)
     return False
 
 
