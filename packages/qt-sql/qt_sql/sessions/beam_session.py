@@ -2,7 +2,7 @@
 
 BEAM pipeline:
 1. Analyst (R1) → 8-16 independent transform probes
-2. Workers (qwen/reasoner, parallel) → DAG JSON per probe
+2. Workers (qwen/reasoner, parallel) → TREE JSON per probe
 3. Validate (structural + equivalence + benchmark)
 4. R1 Compiler shot 1 always; shot 2 only on retryable syntax/error paths
 """
@@ -573,7 +573,7 @@ class BeamSession(OptimizationSession):
         return None
 
     def _extract_tree_candidates(self, response: str) -> List[Dict[str, Any]]:
-        """Parse DAG plan candidates from worker/compiler output."""
+        """Parse tree plan candidates from worker/compiler output."""
         payload = self._extract_json_value(response)
         if payload is None:
             return []
@@ -594,19 +594,8 @@ class BeamSession(OptimizationSession):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if isinstance(item.get("dag"), dict):
+            if isinstance(item.get("tree"), dict):
                 candidates.append(item)
-                continue
-            if isinstance(item.get("nodes"), list) or isinstance(item.get("nodes"), dict):
-                # Allow bare DAG object (without enclosing "dag").
-                candidates.append(
-                    {
-                        "plan_id": item.get("plan_id"),
-                        "family": item.get("family"),
-                        "transform": item.get("transform"),
-                        "dag": item,
-                    }
-                )
         return candidates
 
     def _extract_tree_outputs(self, sql_text: str) -> List[str]:
@@ -635,11 +624,11 @@ class BeamSession(OptimizationSession):
             return []
 
     def _extract_tree_sources(self, sql_text: str, known_nodes: List[str]) -> List[str]:
-        """Extract dependencies on known DAG node ids from table references."""
-        if not known_nodes:
+        """Extract table/node sources referenced by a SQL fragment."""
+        if not sql_text:
             return []
-        known = {str(x).lower(): str(x) for x in known_nodes}
-        deps: List[str] = []
+        known = {str(x).lower(): str(x) for x in known_nodes if str(x).strip()}
+        out: List[str] = []
         try:
             import sqlglot
             from sqlglot import exp
@@ -649,23 +638,22 @@ class BeamSession(OptimizationSession):
                 if not name:
                     continue
                 key = name.lower()
-                if key in known and known[key] not in deps:
-                    deps.append(known[key])
+                canonical = known.get(key, name)
+                if canonical not in out:
+                    out.append(canonical)
         except Exception:
             return []
-        return deps
+        return out
 
     def _build_base_tree(self, sql_text: str) -> Dict[str, Any]:
-        """Build a lightweight DAG from query CTEs + final select."""
+        """Build a lightweight tree from query CTEs + final select."""
         base = {
-            "order": ["final_select"],
-            "final_node_id": "final_select",
+            "root_node_id": "final_select",
             "nodes": [
                 {
                     "node_id": "final_select",
-                    "deps": [],
-                    "grain": [],
-                    "keys": {},
+                    "parent_node_id": None,
+                    "sources": [],
                     "outputs": self._extract_tree_outputs(sql_text),
                     "sql": sql_text.strip().rstrip(";"),
                 }
@@ -690,15 +678,17 @@ class BeamSession(OptimizationSession):
             cte_ids.append(name)
 
         nodes: List[Dict[str, Any]] = []
+        cte_sources: Dict[str, List[str]] = {}
         for idx, cte in enumerate(ctes):
             node_id = cte_ids[idx]
             cte_sql = (cte.this.sql(dialect=self.dialect) or "").strip().rstrip(";")
+            sources = self._extract_tree_sources(cte_sql, cte_ids)
+            cte_sources[node_id] = sources
             nodes.append(
                 {
                     "node_id": node_id,
-                    "deps": self._extract_tree_sources(cte_sql, cte_ids),
-                    "grain": [],
-                    "keys": {},
+                    "parent_node_id": "final_select",
+                    "sources": sources,
                     "outputs": self._extract_tree_outputs(cte_sql),
                     "sql": cte_sql,
                 }
@@ -707,62 +697,87 @@ class BeamSession(OptimizationSession):
         final_ast = ast.copy()
         final_ast.set("with", None)
         final_sql = (final_ast.sql(dialect=self.dialect) or sql_text).strip().rstrip(";")
+        final_sources = self._extract_tree_sources(final_sql, cte_ids)
+
+        # Derive a single parent per CTE from first downstream consumer.
+        consumers: Dict[str, List[str]] = {nid: [] for nid in cte_ids}
+        for upstream in cte_ids:
+            for downstream in cte_ids:
+                if upstream != downstream and upstream in cte_sources.get(downstream, []):
+                    consumers[upstream].append(downstream)
+            if upstream in final_sources:
+                consumers[upstream].append("final_select")
+
+        parent_by_node: Dict[str, str] = {}
+        for nid in cte_ids:
+            options = consumers.get(nid, [])
+            if "final_select" in options:
+                parent_by_node[nid] = "final_select"
+            elif options:
+                parent_by_node[nid] = sorted(options)[0]
+            else:
+                parent_by_node[nid] = "final_select"
+
+        for node in nodes:
+            node_id = str(node.get("node_id", "")).strip()
+            if node_id in parent_by_node:
+                node["parent_node_id"] = parent_by_node[node_id]
+
         nodes.append(
             {
                 "node_id": "final_select",
-                "deps": self._extract_tree_sources(final_sql, cte_ids),
-                "grain": [],
-                "keys": {},
+                "parent_node_id": None,
+                "sources": final_sources,
                 "outputs": self._extract_tree_outputs(final_sql),
                 "sql": final_sql,
             }
         )
         return {
-            "order": cte_ids + ["final_select"],
-            "final_node_id": "final_select",
+            "root_node_id": "final_select",
             "nodes": nodes,
         }
 
-    def _render_tree_for_prompt(self, dag: Dict[str, Any]) -> str:
-        """Render compact DAG spec for prompt context."""
+    def _render_tree_for_prompt(self, tree: Dict[str, Any]) -> str:
+        """Render compact tree spec for prompt context."""
         lines = [
-            "## Base DAG Spec",
-            "Use this as the authoritative node graph for rewrite proposals.",
+            "## Base Tree Spec",
+            "Use this as the authoritative node tree for rewrite proposals.",
             "",
         ]
-        for node in dag.get("nodes", []):
+        for node in tree.get("nodes", []):
             if not isinstance(node, dict):
                 continue
             node_id = str(node.get("node_id", "")).strip()
-            deps = node.get("deps") or []
+            parent = node.get("parent_node_id")
+            sources = node.get("sources") or []
             outs = node.get("outputs") or []
             lines.append(f"node: {node_id}")
-            lines.append(f"  deps: {deps}")
+            lines.append(f"  parent_node_id: {parent}")
+            lines.append(f"  sources: {sources}")
             lines.append(f"  outputs: {outs}")
             lines.append("  sql: OMITTED")
             lines.append("")
-        lines.append(f"order: {dag.get('order', [])}")
-        lines.append(f"final_node_id: {dag.get('final_node_id', 'final_select')}")
+        lines.append(f"root_node_id: {tree.get('root_node_id', 'final_select')}")
         return "\n".join(lines)
 
     @staticmethod
-    def _worker_tree_mode_suffix(base_dag_spec: str) -> str:
-        """Worker DAG-mode runtime contract (takes precedence over template text)."""
+    def _worker_tree_mode_suffix(base_tree_spec: str) -> str:
+        """Worker tree-mode runtime contract (takes precedence over template text)."""
         parts = [
-            "## Runtime Override: DAG Mode (Takes Precedence)",
+            "## Runtime Override: TREE Mode (Takes Precedence)",
             "Ignore any conflicting output-shape instructions above.",
-            "Output mode is DAG JSON; keep the full schema from the worker template.",
+            "Output mode is TREE JSON; keep the full schema from the worker template.",
             "Worker constraints:",
             "- exactly ONE changed node",
             "- changed node must include full executable SQL in `sql`",
             "- unchanged nodes should omit `sql`",
             "- first character must be `{` (no prose/markdown)",
         ]
-        if base_dag_spec:
+        if base_tree_spec:
             parts.extend(
                 [
                     "",
-                    base_dag_spec,
+                    base_tree_spec,
                 ]
             )
         return "\n".join(parts)
@@ -788,25 +803,25 @@ class BeamSession(OptimizationSession):
         )
 
     @staticmethod
-    def _compiler_tree_mode_suffix(base_dag_spec: str) -> str:
-        """Compiler DAG-mode runtime contract (takes precedence over template text)."""
+    def _compiler_tree_mode_suffix(base_tree_spec: str) -> str:
+        """Compiler tree-mode runtime contract (takes precedence over template text)."""
         return (
-            "## Runtime Override: DAG Mode (Takes Precedence)\n"
+            "## Runtime Override: TREE Mode (Takes Precedence)\n"
             "Ignore any conflicting output-shape instructions above.\n"
             "Compiler may output ONE or TWO attempts.\n"
             "No constraint on number of changed nodes.\n"
             "Output must be JSON object or JSON array (length 1-2), no prose/markdown.\n"
-            "Each attempt should include `plan_id` and `dag`; include full SQL for changed nodes.\n\n"
+            "Each attempt should include `plan_id` and `tree`; include full SQL for changed nodes.\n\n"
             "Accepted example:\n"
             "[\n"
-            "  {\"plan_id\": \"snipe_p1\", \"hypothesis\": \"...\", \"dag\": {\"order\": [\"...\"], \"nodes\": [{\"node_id\":\"...\",\"changed\":true,\"sql\":\"SELECT ...\"}]}}\n"
+            "  {\"plan_id\": \"snipe_p1\", \"hypothesis\": \"...\", \"tree\": {\"root_node_id\": \"final_select\", \"nodes\": [{\"node_id\":\"final_select\",\"parent_node_id\":null,\"sources\":[],\"changed\":true,\"sql\":\"SELECT ...\"}]}}\n"
             "]\n\n"
-            f"{base_dag_spec}"
+            f"{base_tree_spec}"
         )
 
     @staticmethod
     def _append_tree_shot_results(base_prompt: str, patches: List[AppliedPatch]) -> str:
-        """Append shot results with DAG-mode compiler instructions."""
+        """Append shot results with tree-mode compiler instructions."""
         lines = [base_prompt, "", "## Shot 1 Results", ""]
         lines.append("| # | Transform | Speedup | Status | Error |")
         lines.append("|---|-----------|---------|--------|-------|")
@@ -819,8 +834,8 @@ class BeamSession(OptimizationSession):
         lines.extend(
             [
                 "",
-                "## Shot 2 — DAG Mode",
-                "Return one or two DAG attempts as JSON (object or array).",
+                "## Shot 2 — TREE Mode",
+                "Return one or two tree attempts as JSON (object or array).",
                 "No changed-node-count constraints.",
                 "Preserve semantics and literals.",
             ]
@@ -834,10 +849,10 @@ class BeamSession(OptimizationSession):
         *,
         strict_single_change: bool,
     ) -> Tuple[Optional[str], Optional[str]]:
-        """Compile a DAG candidate into executable SQL."""
-        dag = candidate.get("dag")
-        if not isinstance(dag, dict):
-            return None, "Missing `dag` object"
+        """Compile a tree candidate into executable SQL."""
+        tree = candidate.get("tree")
+        if not isinstance(tree, dict):
+            return None, "Missing `tree` object"
 
         base_nodes = {}
         for node in base_tree.get("nodes", []):
@@ -848,57 +863,133 @@ class BeamSession(OptimizationSession):
             if node_id and sql:
                 base_nodes[node_id] = sql.rstrip(";")
 
-        order = dag.get("order")
-        if not isinstance(order, list) or not order:
-            order = list(base_tree.get("order") or [])
-        order = [str(x).strip() for x in order if str(x).strip()]
-        if not order:
-            return None, "DAG order is empty"
-
-        final_node_id = str(
-            dag.get("final_node_id")
-            or base_tree.get("final_node_id")
-            or order[-1]
-        ).strip()
-        if not final_node_id:
-            return None, "Missing final_node_id"
-
-        node_items = dag.get("nodes")
+        root_node_id = str(tree.get("root_node_id") or "").strip()
+        node_items = tree.get("nodes")
         if isinstance(node_items, dict):
             node_items = list(node_items.values())
         if not isinstance(node_items, list):
-            node_items = []
+            return None, "Tree nodes must be a list"
+        if not root_node_id:
+            return None, "Missing root_node_id"
+
+        seen_node_ids: List[str] = []
+        node_map: Dict[str, Dict[str, Any]] = {}
+        for item in node_items:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("node_id") or "").strip()
+            if not node_id:
+                continue
+            if node_id in node_map:
+                return None, f"Duplicate tree node_id `{node_id}`"
+            node_map[node_id] = item
+            seen_node_ids.append(node_id)
+        if root_node_id not in node_map:
+            return None, f"root_node_id `{root_node_id}` missing from nodes"
 
         changed_count = 0
         for item in node_items:
             if not isinstance(item, dict):
                 continue
-            node_id = str(item.get("node_id") or item.get("id") or "").strip()
+            node_id = str(item.get("node_id") or "").strip()
             if not node_id:
                 continue
+            parent_node_id = item.get("parent_node_id")
+            if node_id == root_node_id:
+                if parent_node_id is not None:
+                    return None, "Root node must use parent_node_id = null"
+            else:
+                if not isinstance(parent_node_id, str) or parent_node_id.strip() == "":
+                    return None, f"Node `{node_id}` missing parent_node_id"
+                if parent_node_id not in node_map:
+                    return None, f"Node `{node_id}` has unknown parent `{parent_node_id}`"
+
+            sources = item.get("sources")
+            if not isinstance(sources, list):
+                return None, f"Node `{node_id}` missing sources list"
+
             sql_text = item.get("sql")
             changed = bool(item.get("changed"))
-            if isinstance(sql_text, str) and sql_text.strip():
+            if changed and (not isinstance(sql_text, str) or not sql_text.strip()):
+                return None, f"Changed node `{node_id}` missing sql"
+            if (not changed) and isinstance(sql_text, str) and sql_text.strip():
+                return None, f"Unchanged node `{node_id}` must omit sql"
+
+            if changed and isinstance(sql_text, str) and sql_text.strip():
                 base_nodes[node_id] = sql_text.strip().rstrip(";")
-                changed = True
+
             if changed:
                 changed_count += 1
 
         if strict_single_change and changed_count != 1:
-            return None, f"Worker DAG must change exactly one node (got {changed_count})"
+            return None, f"Worker tree must change exactly one node (got {changed_count})"
 
-        for node_id in order:
+        # Validate acyclic + connected parent links from root.
+        children: Dict[str, List[str]] = {nid: [] for nid in node_map}
+        for nid, item in node_map.items():
+            parent = item.get("parent_node_id")
+            if isinstance(parent, str) and parent in children:
+                children[parent].append(nid)
+
+        visited: Dict[str, int] = {}
+
+        def _dfs(node_id: str) -> bool:
+            state = visited.get(node_id, 0)
+            if state == 1:
+                return False
+            if state == 2:
+                return True
+            visited[node_id] = 1
+            for child_id in children.get(node_id, []):
+                if not _dfs(child_id):
+                    return False
+            visited[node_id] = 2
+            return True
+
+        if not _dfs(root_node_id):
+            return None, "Tree contains a parent cycle"
+        if len(visited) != len(node_map):
+            return None, "Tree is disconnected from root_node_id"
+
+        # Build dependency graph among non-root nodes using sources references.
+        cte_ids = [nid for nid in seen_node_ids if nid != root_node_id]
+        dep_map: Dict[str, List[str]] = {}
+        for nid in cte_ids:
+            item = node_map[nid]
+            refs = []
+            for src in item.get("sources", []):
+                src_id = str(src).strip()
+                if src_id in cte_ids and src_id != nid:
+                    refs.append(src_id)
+            dep_map[nid] = list(dict.fromkeys(refs))
+
+        # Kahn topological sort with stable insertion order.
+        indegree: Dict[str, int] = {nid: 0 for nid in cte_ids}
+        for nid in cte_ids:
+            for dep in dep_map.get(nid, []):
+                indegree[nid] += 1
+        queue: List[str] = [nid for nid in cte_ids if indegree[nid] == 0]
+        topo: List[str] = []
+        while queue:
+            nid = queue.pop(0)
+            topo.append(nid)
+            for child in cte_ids:
+                if nid in dep_map.get(child, []):
+                    indegree[child] -= 1
+                    if indegree[child] == 0:
+                        queue.append(child)
+        if len(topo) != len(cte_ids):
+            return None, "Tree sources include a dependency cycle"
+
+        for node_id in cte_ids + [root_node_id]:
             if node_id not in base_nodes:
-                return None, f"Missing SQL for DAG node `{node_id}`"
-        if final_node_id not in base_nodes:
-            return None, f"Missing SQL for final node `{final_node_id}`"
+                return None, f"Missing SQL for tree node `{node_id}`"
 
-        final_sql = base_nodes[final_node_id].strip().rstrip(";")
-        cte_ids = [nid for nid in order if nid != final_node_id]
+        final_sql = base_nodes[root_node_id].strip().rstrip(";")
         if not cte_ids:
             return final_sql + ";", None
 
-        with_parts = [f"{nid} AS ({base_nodes[nid].strip().rstrip(';')})" for nid in cte_ids]
+        with_parts = [f"{nid} AS ({base_nodes[nid].strip().rstrip(';')})" for nid in topo]
         if final_sql.lower().startswith("with "):
             # Final node already carries a complete WITH query.
             return final_sql + ";", None
@@ -909,7 +1000,7 @@ class BeamSession(OptimizationSession):
         response: str,
         base_tree: Dict[str, Any],
     ) -> Optional[str]:
-        """Apply worker DAG response and return SQL if valid."""
+        """Apply worker tree response and return SQL if valid."""
         candidates = self._extract_tree_candidates(response)
         if not candidates:
             return None
@@ -925,7 +1016,7 @@ class BeamSession(OptimizationSession):
         *,
         prefix: str,
     ) -> List[AppliedPatch]:
-        """Apply compiler DAG response (1-2 attempts) into AppliedPatch objects."""
+        """Apply compiler tree response (1-2 attempts) into AppliedPatch objects."""
         candidates = self._extract_tree_candidates(response)
         if not candidates:
             return []
@@ -934,7 +1025,7 @@ class BeamSession(OptimizationSession):
         for idx, candidate in enumerate(candidates[:2], start=1):
             plan_id = str(candidate.get("plan_id") or f"{prefix}_{idx}")
             family = str(candidate.get("family") or "?")
-            transform = str(candidate.get("transform") or "dag_rewrite")
+            transform = str(candidate.get("transform") or "tree_rewrite")
             sql, err = self._compile_tree_candidate_sql(
                 candidate, base_tree, strict_single_change=False
             )
@@ -948,7 +1039,7 @@ class BeamSession(OptimizationSession):
                 raw_plan=candidate,
             )
             if not sql:
-                patch.apply_error = err or "Failed to parse/apply DAG plan"
+                patch.apply_error = err or "Failed to parse/apply tree plan"
             patches.append(patch)
         return patches
 
@@ -1080,10 +1171,10 @@ class BeamSession(OptimizationSession):
         if tree_mode:
             return (
                 base_prompt
-                + "\n\n## RETRY — Output Shape Failure (DAG Mode)\n"
-                + "Your previous output was not parseable as DAG JSON.\n"
+                + "\n\n## RETRY — Output Shape Failure (TREE Mode)\n"
+                + "Your previous output was not parseable as TREE JSON.\n"
                 + "Return JSON object or JSON array (length 1-2) only.\n"
-                + "Each attempt must include a `dag` object with `nodes` and `order`.\n"
+                + "Each attempt must include a `tree` object with `root_node_id` and `nodes`.\n"
                 + "No markdown/prose."
             )
         return (
@@ -1615,8 +1706,8 @@ class BeamSession(OptimizationSession):
                 gold_tree_example = None
                 if gold_ex:
                     gold_tree_example = (
-                        gold_ex.get("dag_example")
-                        or gold_ex.get("dag")
+                        gold_ex.get("tree_example")
+                        or gold_ex.get("tree")
                     )
 
                 worker_prompt = build_beam_worker_prompt(
@@ -1805,10 +1896,10 @@ class BeamSession(OptimizationSession):
                     "explain_text": p.explain_text,
                     "sql": p.output_sql,
                     "raw_plan": p.raw_plan,
-                    "dag": (
-                        p.raw_plan.get("dag")
+                    "tree": (
+                        p.raw_plan.get("tree")
                         if isinstance(p.raw_plan, dict)
-                        and isinstance(p.raw_plan.get("dag"), dict)
+                        and isinstance(p.raw_plan.get("tree"), dict)
                         else p.raw_plan
                     ),
                     "description": p.description or "",
@@ -2177,9 +2268,9 @@ class BeamSession(OptimizationSession):
         *,
         tree_base: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Parse a BEAM worker response and apply to IR/DAG → SQL.
+        """Parse a BEAM worker response and apply to IR/tree → SQL.
 
-        DAG mode parses a DAG candidate and compiles executable SQL from
+        TREE mode parses a tree candidate and compiles executable SQL from
         base + changed nodes. PatchPlan mode remains supported for legacy
         flows and applies plans to a copy of script IR.
 
@@ -2225,7 +2316,7 @@ class BeamSession(OptimizationSession):
                                 break
             return None
 
-        # DAG mode: parse DAG candidate first.
+        # TREE mode: parse tree candidate first.
         if tree_base is not None:
             sql = self._apply_tree_worker_response(response, tree_base)
             if sql and sql.strip():
