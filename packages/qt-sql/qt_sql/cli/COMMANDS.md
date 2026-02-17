@@ -55,13 +55,13 @@ qt run postgres_dsb_76 --resume                     # resume from checkpoint
 qt run duckdb_tpcds --scenario duckdb_embedded      # with scenario card
 qt run postgres_dsb_76 --engine-version 17          # explicit engine version
 qt run duckdb_tpcds --output-contract               # emit QueryOutputContract JSON
-qt run duckdb_tpcds --concurrency 4                 # parallel generation (4 threads)
+qt run duckdb_tpcds --concurrency 25 --benchmark-concurrency 4  # parallel queries + 4 benchmark lanes
 qt run postgres_dsb_76 --config-boost               # SET LOCAL tuning on winners
 ```
 
-Options: `--query/-q`, `--mode` (`oneshot`/`fleet`), `--max-iterations`, `--target-speedup`, `--single-iteration`, `--resume`, `--output-dir/-o`, `--concurrency`, `--config-boost`, `--bootstrap`, `--scenario`, `--engine-version`, `--output-contract`, `--dry-run` (fleet only)
+Options: `--query/-q`, `--mode` (`oneshot`/`fleet`), `--max-iterations`, `--target-speedup`, `--single-iteration`, `--resume`, `--output-dir/-o`, `--concurrency`, `--benchmark-concurrency`, `--launch-interval-seconds`, `--config-boost`, `--bootstrap`, `--scenario`, `--engine-version`, `--output-contract`, `--dry-run` (fleet only)
 
-Output: `benchmark/runs/run_<timestamp>/` with per-query results + `summary.json` + `checkpoint.json`
+Output: `benchmark/runs/run_<mode>_<timestamp>/` with per-query `result.json` (includes `api_call_costs`, `beam_cost_usd`), `progress.json` (live total beam cost), `summary.json` (final total beam cost), and `checkpoint.json`. Per-query beam sessions also write `llm_calls.jsonl` + `llm_cost_summary.json`.
 
 Wraps: `Pipeline.run_optimization_session()`
 

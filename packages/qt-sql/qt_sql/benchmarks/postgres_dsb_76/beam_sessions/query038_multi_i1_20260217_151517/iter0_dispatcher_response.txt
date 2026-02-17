@@ -1,0 +1,191 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 8,
+    "early_stop": true,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Performance dominated by materialization/sorting of three large distinct sets for INTERSECT operations. Repeated dimension scans and comma-joins prevent optimization. EXISTS conversion and dimension isolation should reduce work.",
+    "reasoning_trace": [
+      "Cost spine shows 3x (Sort → Unique) for each channel (115s total)",
+      "Nested loops amplify work: 366 date_dim rows × large fact scans",
+      "Comma-joins prevent optimal join planning (COMMA_JOIN_WEAKNESS)",
+      "Late filtering on customer/dates despite small dimension sizes"
+    ],
+    "cost_spine": ["Sort → Unique (store_sales)", "Sort → Unique (catalog_sales)", "Sort → Unique (web_sales)", "SetOp"],
+    "hotspots": [
+      {"op": "Sort", "why": "Distinct operation materialization", "evidence": "store_sales branch time=51406ms"},
+      {"op": "SetOp", "why": "INTERSECT materializes full result sets", "evidence": "SetOp time=115295ms"}
+    ],
+    "do_not_do": ["or_to_union (no OR conditions)", "cte_materialization_fence (single-use CTEs)"]
+  },
+  "probe_summary_schema": [
+    "probe_id", "transform_id", "family", "status", "speedup", "expected_explain_delta", "ops_used", "confidence", "exploration", "failure_reason", "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT with EXISTS subqueries. Outer query: store_sales branch. EXISTS subqueries: catalog_sales/web_sales branches matching (c_last_name, c_first_name, d_date).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": [
+          "d_month_seq BETWEEN 1200 AND 1211",
+          "c_birth_month IN (1,2,5,12)",
+          "ss_list_price BETWEEN 193 AND 252",
+          "ss_wholesale_cost BETWEEN 35 AND 55"
+        ],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "LIMIT 100 semantics"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "EXISTS avoids materializing full distinct sets. PostgreSQL semi-join optimization should handle EXISTS efficiently per SEMI_JOIN_EXISTS strength.",
+      "confidence": 0.75,
+      "expected_explain_delta": "NestedLoop→Unique replaced by SemiJoin. SetOp removed.",
+      "recommended_patch_ops": ["replace_body", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs: filtered_date (d_date_sk, d_date), filtered_cust (c_customer_sk, c_first_name, c_last_name). Rewrite all branches with explicit JOINs to CTEs.",
+      "node_contract": {
+        "from_must_include": ["filtered_date", "filtered_cust"],
+        "where_must_preserve": [
+          "list_price BETWEEN 193 AND 252",
+          "wholesale_cost BETWEEN 35 AND 55"
+        ],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date"]
+      },
+      "gates_checked": ["unfiltered_cte:FAIL", "cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.90,
+      "expected_explain_delta": "SeqScan→NestLoop replaced by CTE scans + HashJoin. Reduced dimension rescans.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "target": "Combine p01+p02: EXISTS with pre-materialized dimension CTEs. Outer query uses filtered_date/filtered_cust CTEs.",
+      "node_contract": {
+        "from_must_include": ["filtered_date", "filtered_cust", "store_sales"],
+        "where_must_preserve": [
+          "ss_list_price BETWEEN 193 AND 252",
+          "ss_wholesale_cost BETWEEN 35 AND 55"
+        ],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "unfiltered_cte:FAIL"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension isolation + EXISTS could compound benefits. CTE reuse aligns with PostgreSQL materialization strength.",
+      "confidence": 0.80,
+      "expected_explain_delta": "CTE scans + SemiJoin. No sorts/uniques for branches.",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create CTEs: filtered_date (all dates), filtered_cust (all customers). Reference in all branches. Keep comma-joins.",
+      "node_contract": {
+        "from_must_include": ["filtered_date", "filtered_cust"],
+        "where_must_preserve": [
+          "list_price BETWEEN 193 AND 252",
+          "wholesale_cost BETWEEN 35 AND 55"
+        ],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date"]
+      },
+      "gates_checked": ["unfiltered_cte:FAIL", "cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Dimension reuse should help despite comma-joins. Pre-filtered CTEs reduce rescans.",
+      "confidence": 0.70,
+      "expected_explain_delta": "Reduced dimension scans. Same join topology.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Per branch: create date_dim CTE with filter. Replace date_dim scan with CTE reference.",
+      "node_contract": {
+        "from_must_include": ["date_cte"],
+        "where_must_preserve": [
+          "c_birth_month IN (1,2,5,12)",
+          "list_price BETWEEN 193 AND 252",
+          "wholesale_cost BETWEEN 35 AND 55"
+        ],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Isolating small date_dim (366 rows) should create tiny hash tables. Works even with comma-joins.",
+      "confidence": 0.85,
+      "expected_explain_delta": "SeqScan→NestLoop → CTE scan + HashJoin in branches.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Per branch: create customer CTE with birth_month filter. Replace customer scan with CTE reference.",
+      "node_contract": {
+        "from_must_include": ["cust_cte"],
+        "where_must_preserve": [
+          "d_month_seq BETWEEN 1200 AND 1211",
+          "list_price BETWEEN 193 AND 252",
+          "wholesale_cost BETWEEN 35 AND 55"
+        ],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Customer filter reduces rows early. Index scan on customer could be avoided with materialized CTE.",
+      "confidence": 0.80,
+      "expected_explain_delta": "IndexScan→NestLoop → CTE scan + HashJoin in branches.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize each channel result as CTE (store_agg, catalog_agg, web_agg). Perform INTERSECT on CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_agg", "catalog_agg", "web_agg"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "INTERSECT semantics"]
+      },
+      "gates_checked": ["unfiltered_cte:FAIL", "over_deep_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL MATERIALIZED CTEs could reuse results. Avoids recomputing branches during INTERSECT.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Unique→Sort replaced by CTE scans. SetOp remains.",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Per branch: pre-filter date_dim/customer in CTEs before joining with fact tables.",
+      "node_contract": {
+        "from_must_include": ["date_cte", "cust_cte"],
+        "where_must_preserve": [
+          "list_price BETWEEN 193 AND 252",
+          "wholesale_cost BETWEEN 35 AND 55"
+        ],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering should reduce fact table probes. Works independently per branch.",
+      "confidence": 0.75,
+      "expected_explain_delta": "Reduced rows in Nested Loop. Earlier filtering in branches.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR conditions in query"},
+    {"transform_id": "aggregate_pushdown", "family": "C", "reason": "No GROUP BY aggregates to push"},
+    {"transform_id": "pg_self_join_decomposition", "family": "E", "reason": "No self-join pattern"}
+  ]
+}

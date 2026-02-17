@@ -1,0 +1,202 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 2,
+    "probe_count": 10,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Query performance bottleneck likely stems from correlated subquery re-execution per row (nested loop pattern) and comma-join syntax limiting optimizer choices. Decorrelation via materialized CTEs and explicit join conversion should reduce row amplification.",
+    "reasoning_trace": [
+      "Correlated scalar subquery computes per-item thresholds causing potential nested loop",
+      "Comma-join syntax may prevent optimal join order selection",
+      "OR condition on item table may block efficient index usage"
+    ],
+    "cost_spine": ["Correlated Subquery → Main Join"],
+    "hotspots": [
+      {"op": "Correlated Subquery", "why": "Per-row re-execution of aggregate", "evidence": "Expected nested loop from SQL structure"}
+    ],
+    "do_not_do": ["or_to_union (same-column OR)", "materialize_simple_exists"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Replace correlated subquery with 3 MATERIALIZED CTEs: (1) filtered date_dim, (2) precomputed item thresholds, (3) main fact data. Join threshold CTE in main WHERE clause.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item", "date_dim"],
+        "where_must_preserve": ["ws_ext_discount_amt > threshold_value", "d_date range", "ws_wholesale_cost range"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt)", "ORDER BY/LIMIT semantics"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Nested Loop → Hash Join on threshold CTE, reduced loops count",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma-joins to explicit INNER JOINs. Pre-filter item/date_dim into CTEs before joining with web_sales.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_item_sk=ws_item_sk", "d_date_sk=ws_sold_date_sk", "all original filters"],
+        "output_must_preserve": ["Original SELECT columns and aggregation"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma-join → Explicit JOIN, smaller dimension hash tables",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "wrap_query_with_cte"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Combine dimension pre-filtering and decorrelation: create CTEs for filtered dimensions + precomputed thresholds before main join.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "prefiltered_item_cte", "prefiltered_date_cte"],
+        "where_must_preserve": ["ws_ext_discount_amt > threshold_value"],
+        "output_must_preserve": ["Exact result set with original ordering"]
+      },
+      "gates_checked": ["no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Reduced dimension scan costs + decorrelated threshold join",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split item OR condition into UNION ALL: Branch1 (i_manufact_id) and Branch2 (i_category). Preserve original join conditions.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim"],
+        "where_must_preserve": ["d_date range", "ws_wholesale_cost range"],
+        "output_must_preserve": ["Same sum(ws_ext_discount_amt) result"]
+      },
+      "gates_checked": ["same_column_or:FAIL", "bitmap_or_capable:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Cross-column OR may block bitmap scans; EXPLAIN may show sequential scan on item",
+      "confidence": 0.6,
+      "expected_explain_delta": "Seq Scan → Index Scans on each UNION branch",
+      "recommended_patch_ops": ["replace_body", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Materialize filtered date_dim range into CTE before joining with web_sales.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_cte"],
+        "where_must_preserve": ["d_date_sk=ws_sold_date_sk", "ws_wholesale_cost range"],
+        "output_must_preserve": ["Original aggregation logic"]
+      },
+      "gates_checked": ["index_only_scan_capable:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Small date_dim may still benefit from materialization when joined multiple times",
+      "confidence": 0.7,
+      "expected_explain_delta": "Reduced date_dim scan cost in both main/subquery",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create CTEs for both filtered item and date_dim before joining with web_sales.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item_cte", "date_cte"],
+        "where_must_preserve": ["i_item_sk=ws_item_sk", "d_date_sk=ws_sold_date_sk"],
+        "output_must_preserve": ["Aggregation semantics"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "confidence": 0.65,
+      "expected_explain_delta": "Smaller hash tables for both dimensions in join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Shared web_sales CTE with base filters, compute thresholds from filtered subset. Join back in main query.",
+      "node_contract": {
+        "from_must_include": ["shared_ws_cte", "item", "date_dim"],
+        "where_must_preserve": ["ws_ext_discount_amt > computed_threshold"],
+        "output_must_preserve": ["Original result ordering and aggregation"]
+      },
+      "gates_checked": ["non_native_transform:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared scan may reduce redundant I/O despite portability risk",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single web_sales scan instead of two",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize base web_sales with date/wholesale filters into CTE for reuse in main/subquery.",
+      "node_contract": {
+        "from_must_include": ["ws_base_cte", "item", "date_dim"],
+        "where_must_preserve": ["Original item/dim conditions"],
+        "output_must_preserve": ["Exact aggregation result"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "confidence": 0.75,
+      "expected_explain_delta": "Reduced web_sales scan count",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered web_sales+date_dim join for threshold calculation reuse.",
+      "node_contract": {
+        "from_must_include": ["prejoined_ws_date_cte", "item"],
+        "where_must_preserve": ["ws_ext_discount_amt > threshold"],
+        "output_must_preserve": ["ORDER BY/LIMIT correctness"]
+      },
+      "gates_checked": ["no_self_join:WARN"],
+      "exploration": true,
+      "confidence": 0.68,
+      "expected_explain_delta": "Materialized CTE for shared join pattern",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate web_sales thresholds per item before joining with dimensions.",
+      "node_contract": {
+        "from_must_include": ["item", "date_dim", "ws_agg_cte"],
+        "where_must_preserve": ["ws_ext_discount_amt > precomputed_avg"],
+        "output_must_preserve": ["Accurate discount sum"]
+      },
+      "gates_checked": ["aggregation_equivalence:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Aggregate below join in plan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "No INTERSECT in query"},
+    {"transform_id": "rollup_to_union_windowing", "family": "D", "reason": "No ROLLUP in query"}
+  ]
+}

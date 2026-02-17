@@ -1,0 +1,298 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Cost spine dominated by Nested Loop joins with repeated scans of store_sales/date_dim. Materializing shared scans via CTEs and converting comma joins to explicit JOIN syntax should reduce redundant processing and improve join planning.",
+    "reasoning_trace": [
+      "Materialize node consuming 14.9s indicates expensive CTE/materialization patterns",
+      "Duplicate Index Only Scans on store_sales/date_dim across sb/sc subqueries",
+      "Late application of store/item filters in main WHERE clause",
+      "Comma-join syntax limiting optimizer's join reordering capabilities"
+    ],
+    "cost_spine": [
+      "Nested Loop → Aggregate → Nested Loop → Index Only Scan (store_sales)",
+      "Materialize → Merge Join → Sort → Nested Loop"
+    ],
+    "hotspots": [
+      {
+        "op": "Nested Loop",
+        "why": "437k rows processed in both subquery branches",
+        "evidence": "time=19.7s/13.6s across two instances"
+      },
+      {
+        "op": "Materialize",
+        "why": "CTE materialization fence",
+        "evidence": "time=14.9s for single materialization"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union (no OR conditions present)",
+      "exists_to_in (preserve semi-join optimizations)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Replace sa/sb/sc subqueries with materialized CTE chain: 1) Base sales CTE with store/item/date filters and revenue sums 2) sb CTE computing avg(revenue) per store 3) sc CTE reusing base sales data",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": [
+          "d_month_seq BETWEEN 1195 AND 1195+11",
+          "ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.48"
+        ],
+        "output_must_preserve": ["sb.ave calculation semantics", "sc.revenue values"]
+      },
+      "gates_checked": ["no_double_scans:PASS", "cte_reuse:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.95,
+      "expected_explain_delta": "Merge duplicate store_sales/date_dim scans into single CTE scan, eliminate Materialize node",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "pg_self_join_decomposition_ex1"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create filtered_store and filtered_item CTEs with s_state/i_manager_id filters before main joins",
+      "node_contract": {
+        "from_must_include": ["store", "item"],
+        "where_must_preserve": [
+          "s_state IN ('IA','IL','NC')",
+          "i_manager_id BETWEEN 80 AND 84"
+        ],
+        "output_must_preserve": ["All original dimension columns needed by SELECT/ORDER BY"]
+      },
+      "gates_checked": ["index_available:PASS (store._dta_index_store_6_885578193__k25_k1)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.88,
+      "expected_explain_delta": "Earlier Index Scans on store/item with reduced rows",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "dimension_prefetch_pg_ex2"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs between sales CTEs and filtered dimensions",
+      "node_contract": {
+        "from_must_include": ["filtered_store", "filtered_item", "sb", "sc"],
+        "where_must_preserve": [
+          "sb.ss_store_sk = sc.ss_store_sk",
+          "s_store_sk = sc.ss_store_sk",
+          "i_item_sk = sc.ss_item_sk"
+        ],
+        "output_must_preserve": ["Join semantics for revenue threshold logic"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Explicit JOIN syntax enabling better hash join planning",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"],
+      "gold_example_id": "date_cte_explicit_join_pg3"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push ss_sales_price/ss_list_price ratio filter into base sales CTE WHERE clause",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": [
+          "ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.48"
+        ],
+        "output_must_preserve": ["Revenue calculation accuracy"]
+      },
+      "gates_checked": ["predicate_transitivity:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "Earlier ratio filter reducing store_sales scan rows",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "gold_example_id": "early_filter_ratio_pg4"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Materialize date_dim filter into CTE before joining with store_sales",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1195 AND 1195+11"],
+        "output_must_preserve": ["d_date_sk for join correctness"]
+      },
+      "gates_checked": ["small_dimension:PASS (366 rows)"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may benefit from explicit dimension isolation despite native index scan efficiency",
+      "confidence": 0.65,
+      "expected_explain_delta": "Single date_dim scan reused across both sales subqueries",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "date_cte_isolate_duckdb_ex5"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage CTEs: 1) filtered_date 2) filtered_store_sales 3) joined with dimensions",
+      "node_contract": {
+        "from_must_include": ["filtered_date", "filtered_store_sales"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["All revenue calculation columns"]
+      },
+      "gates_checked": ["runtime_cte_materialization:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL MATERIALIZED CTEs may outperform inline subqueries despite DuckDB-centric design",
+      "confidence": 0.55,
+      "expected_explain_delta": "Reduced store_sales scan time via progressive filtering",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "prefetch_fact_join_duckdb_ex6"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Force MATERIALIZED keyword on base sales CTE to prevent inlining",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq filter", "price ratio condition"],
+        "output_must_preserve": ["Revenue aggregation correctness"]
+      },
+      "gates_checked": ["cte_reuse_count:PASS (2 references)"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit materialization may help PostgreSQL's optimizer avoid duplicate work",
+      "confidence": 0.60,
+      "expected_explain_delta": "MATERIALIZED keyword appearing in CTE definition",
+      "recommended_patch_ops": ["modify_cte_materialized"],
+      "gold_example_id": "materialize_cte_pg7"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales at item/store level before joining with date_dim",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["Revenue sum accuracy"]
+      },
+      "gates_checked": ["join_key_compatibility:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate moved below date_dim join in EXPLAIN",
+      "recommended_patch_ops": ["replace_from", "modify_group_by"],
+      "gold_example_id": "aggregate_pushdown_ex8"
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit comma joins to explicit INNER JOIN syntax",
+      "node_contract": {
+        "from_must_include": ["store", "item", "sb", "sc"],
+        "where_must_preserve": [
+          "sb.ss_store_sk = sc.ss_store_sk",
+          "s_store_sk = sc.ss_store_sk",
+          "i_item_sk = sc.ss_item_sk"
+        ],
+        "output_must_preserve": ["Join semantics"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Explicit JOIN nodes in EXPLAIN output",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"],
+      "gold_example_id": "inner_join_conversion_pg9"
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Combine sb/sc aggregates into single CTE using CASE statements",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["d_month_seq filter", "price ratio condition"],
+        "output_must_preserve": ["sb.ave and sc.revenue calculation accuracy"]
+      },
+      "gates_checked": ["aggregate_compatibility:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass aggregation may reduce store_sales scans despite PostgreSQL's CTE materialization",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fewer Aggregate nodes in EXPLAIN",
+      "recommended_patch_ops": ["insert_cte", "replace_select"],
+      "gold_example_id": "single_pass_agg_duckdb_ex10"
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push store/item filters into CTE definitions despite lack of correlation",
+      "node_contract": {
+        "from_must_include": ["store", "item"],
+        "where_must_preserve": [
+          "s_state IN ('IA','IL','NC')",
+          "i_manager_id BETWEEN 80 AND 84"
+        ],
+        "output_must_preserve": ["All required dimension columns"]
+      },
+      "gates_checked": ["predicate_pushdown_possible:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Earlier index scans on store/item in EXPLAIN",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "early_filter_decorrelate_pg11"
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create consolidated date_dim CTE reused across all sales subqueries",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1195 AND 1195+11"],
+        "output_must_preserve": ["d_date_sk for join correctness"]
+      },
+      "gates_checked": ["multiple_references:PASS (2+ usages)"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared dimension extraction may help despite PostgreSQL's index scan efficiency",
+      "confidence": 0.68,
+      "expected_explain_delta": "Single date_dim scan in EXPLAIN",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "shared_dimension_pg12"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR conditions present in query"
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query"
+    }
+  ]
+}

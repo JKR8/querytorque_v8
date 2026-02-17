@@ -1,0 +1,205 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "PostgreSQL is performing a full scan of the materialized CTE for each row during the correlated subquery execution, causing nested loop amplification. The comma-join syntax prevents optimal join planning. Transform families B (decorrelation) and F (join topology) should reduce CTE rescans and improve join efficiency.",
+    "reasoning_trace": [
+      "Correlated subquery in WHERE clause forces per-row CTE scans",
+      "Comma-join syntax limits optimizer's join reordering capabilities",
+      "Late application of state filter (OH) on customer_address"
+    ],
+    "cost_spine": [
+      "CTE materialization → Correlated subquery (Nested Loop) → Main query joins"
+    ],
+    "hotspots": [
+      {
+        "op": "Correlated subquery",
+        "why": "Nested loop with full CTE scan per row",
+        "evidence": "Inferred from query structure: ctr_total_return > (SELECT AVG(...) WHERE ctr1.ctr_state=ctr2.ctr_state)"
+      },
+      {
+        "op": "Comma joins",
+        "why": "Prevents explicit join condition analysis",
+        "evidence": "FROM clause uses comma-separated tables without explicit JOIN syntax"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union (BITMAP_OR_SCAN strength)",
+      "exists_to_in (SEMI_JOIN_EXISTS strength)",
+      "restructure_inner_joins (INNER_JOIN_REORDERING strength)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Replace correlated subquery with MATERIALIZED CTE ctr_state_avg containing precomputed state averages, then JOIN to ctr1",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1"],
+        "where_must_preserve": ["ctr1.ctr_state = 'OH'", "ca_address_sk = c_current_addr_sk", "ctr1.ctr_customer_sk = c_customer_sk"],
+        "output_must_preserve": ["All SELECT columns", "ORDER BY clause", "LIMIT 100"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.92,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join to materialized ctr_state_avg CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "gold_example_id": "decorr_scalar_agg"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert CTE comma-joins to explicit INNER JOINs: catalog_returns JOIN date_dim ON ... JOIN customer_address ON ...",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["cr_returned_date_sk = d_date_sk", "d_year = 2002", "cr_returning_addr_sk = ca_address_sk"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_state", "ctr_total_return"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.88,
+      "expected_explain_delta": "Explicit JOIN syntax enabling better hash join planning",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"],
+      "gold_example_id": "explicit_join_rewrite"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter date_dim (d_year=2002) into filtered_date CTE before joining with catalog_returns",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim"],
+        "where_must_preserve": ["cr_returned_date_sk = d_date_sk", "d_year = 2002"],
+        "output_must_preserve": ["All CTE output columns"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may push filter into CTE despite CROSS_CTE_PREDICATE_BLINDNESS gap",
+      "confidence": 0.65,
+      "expected_explain_delta": "Index scan on date_dim replacing sequential scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "dimension_prefilter"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert main query comma-joins to explicit INNER JOINs with JOIN...ON syntax",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1", "customer", "customer_address"],
+        "where_must_preserve": ["ca_address_sk = c_current_addr_sk", "ctr1.ctr_customer_sk = c_customer_sk", "ctr1.ctr_state = 'OH'"],
+        "output_must_preserve": ["All SELECT columns"]
+      },
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Better cardinality estimates in EXPLAIN output",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"],
+      "gold_example_id": "main_query_explicit_joins"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter customer_address (ca_state='OH') into filtered_ca CTE before main query joins",
+      "node_contract": {
+        "from_must_include": ["customer_address"],
+        "where_must_preserve": ["ca_state = 'OH'"],
+        "output_must_preserve": ["All customer_address columns"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Early state filter may overcome CROSS_CTE_PREDICATE_BLINDNESS despite being portability candidate",
+      "confidence": 0.6,
+      "expected_explain_delta": "Reduced rows in customer_address join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "state_prefilter"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_returns by cr_returning_customer_sk/cr_returning_addr_sk before joining with dimensions",
+      "node_contract": {
+        "from_must_include": ["catalog_returns"],
+        "where_must_preserve": ["cr_returned_date_sk = d_date_sk", "d_year = 2002"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_state", "ctr_total_return"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Reduction before dimension joins may compensate for portability gap",
+      "confidence": 0.55,
+      "expected_explain_delta": "Smaller hash table in CTE aggregation step",
+      "recommended_patch_ops": ["insert_cte", "replace_body"],
+      "gold_example_id": "fact_preagg"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Alternative decorrelation: Precompute state averages in standalone CTE before main query",
+      "node_contract": {
+        "from_must_include": ["customer_total_return"],
+        "where_must_preserve": ["ctr1.ctr_total_return > 1.2 * ctr_state_avg.avg_return"],
+        "output_must_preserve": ["All SELECT columns"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "General decorrelation may work despite portability candidate status",
+      "confidence": 0.7,
+      "expected_explain_delta": "Elimination of correlated subquery node",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "gold_example_id": "general_decorr"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Snowflake-style decorrelation: Compute CTE and state averages in single shared scan",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["d_year=2002"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_state", "ctr_total_return"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared scan pattern may transfer despite engine differences",
+      "confidence": 0.5,
+      "expected_explain_delta": "Single CTE producing both detail and aggregate results",
+      "recommended_patch_ops": ["insert_cte", "replace_body"],
+      "gold_example_id": "snowflake_shared_scan"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "regression registry: BITMAP_OR_SCAN strength"
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query"
+    }
+  ]
+}

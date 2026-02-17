@@ -1,0 +1,246 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by Nested Loop (42437ms) and Hash Join (42700ms) processing 389k rows from store_returns. Late filtering on date_dim d1 and item causes full fact scans. Explicit JOIN syntax and dimension isolation should reduce intermediate rows and enable better join planning.",
+    "reasoning_trace": [
+      "Nested Loop between date_dim d1 and store_returns amplifies rows to 389k",
+      "Hash Join with item occurs before store_sales join, missing early reduction",
+      "Comma joins prevent optimal join reordering (COMMA_JOIN_WEAKNESS gap)",
+      "d2.d_date BETWEEN condition creates non-equi join after large result set"
+    ],
+    "cost_spine": [
+      "Nested Loop (d1→store_returns) → Hash Join (item) → Nested Loop (store_sales) → Gather"
+    ],
+    "hotspots": [
+      {"op": "Nested Loop", "why": "d1×store_returns row amplification", "evidence": "rows=389199, time=42437ms"},
+      {"op": "Hash Join", "why": "late item join on large intermediate", "evidence": "rows=74035, time=42700ms"}
+    ],
+    "do_not_do": [
+      "or_to_union (bitmap_or_scan strength)",
+      "exists_to_materialized_cte (semi_join_exists strength)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert all comma joins to explicit INNER JOIN syntax. Pre-filter selective dimensions (d1, item, hd, ca) into CTEs before joining with fact tables.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "web_sales", "date_dim d1", "date_dim d2", "item", "customer", "customer_address", "household_demographics"],
+        "where_must_preserve": ["ss_ticket_number = sr_ticket_number", "sr_item_sk = ws_item_sk", "d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["c_customer_sk", "c_first_name", "c_last_name", "COUNT(*) AS cnt", "ORDER BY cnt"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "cte_materialization_fence:CAUTION"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Bitmap scans replaced by hash joins, reduced rows in Nested Loop",
+      "recommended_patch_ops": ["replace_from", "insert_cte"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered d1 (d_year=2000) and d2 (d_date range) as CTEs. Use explicit JOINs between date CTEs and fact tables.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "web_sales", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["sr_returned_date_sk = d1_cte.d_date_sk", "ws_sold_date_sk = d2_cte.d_date_sk"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "non_equi_join_input_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Eliminated sequential scans on date_dim, reduced nested loop rows",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create CTEs for filtered dimensions (d1, item, hd) and pre-join with store_returns before joining with store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "item", "date_dim d1"],
+        "where_must_preserve": ["sr_item_sk = i_item_sk", "sr_returned_date_sk = d1.d_date_sk"],
+        "output_must_preserve": ["All necessary keys for subsequent joins"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Hash Join replaced Nested Loop, lower row count before store_sales join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push d1 filter into CTE definition. Pre-join store_returns with d1_cte before main query.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim d1"],
+        "where_must_preserve": ["sr_returned_date_sk = d1.d_date_sk", "d1.d_year = 2000"],
+        "output_must_preserve": ["All store_returns columns needed for joins"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Eliminated per-row d1 scans, reduced store_returns input rows",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create CTE for household_demographics (hd_income_band_sk BETWEEN 8 AND 14) and join early with customer.",
+      "node_contract": {
+        "from_must_include": ["customer", "household_demographics"],
+        "where_must_preserve": ["c_current_hdemo_sk = hd_demo_sk", "hd_buy_potential = '501-1000'"],
+        "output_must_preserve": ["c_customer_sk for subsequent joins"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering hd reduces customer join early. DuckDB pattern may transfer if CTE materialization helps PG optimizer.",
+      "confidence": 0.7,
+      "expected_explain_delta": "Reduced rows before store_sales join, faster customer index scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Build CTE chain: 1) Filter d1, item, hd 2) Pre-join with store_returns 3) Join result with store_sales and customer.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "store_sales", "date_dim d1", "item", "household_demographics"],
+        "where_must_preserve": ["ss_ticket_number = sr_ticket_number", "ss_item_sk = sr_item_sk"],
+        "output_must_preserve": ["All columns for web_sales and d2 join"]
+      },
+      "gates_checked": ["inner_join_reordering:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may overcome COMMA_JOIN_WEAKNESS. DuckDB's CTE join order may transfer if PG materializes intermediates.",
+      "confidence": 0.65,
+      "expected_explain_delay_reason": "Potential join order regression risk",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Materialize d2 range as CTE using d1 min/max: WHERE d_date BETWEEN (SELECT MIN(d_date) FROM d1) AND (SELECT MAX(d_date) + 90 FROM d1)",
+      "node_contract": {
+        "from_must_include": ["date_dim d2"],
+        "where_must_preserve": ["d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["d2.d_date_sk for web_sales join"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Precomputed d2 range eliminates per-row BETWEEN calculation. DuckDB pattern may work if PG can inline CTE.",
+      "confidence": 0.75,
+      "expected_explain_delta": "Eliminated nested loop for d2 range calculation",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create shared CTE for item (i_category filter) referenced by both store and web sales paths.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "web_sales", "item"],
+        "where_must_preserve": ["ss_item_sk = i_item_sk", "sr_item_sk = i_item_sk", "ws_item_sk = i_item_sk"],
+        "output_must_preserve": ["i_item_sk for all fact joins"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared item scan avoids redundant filtering. DuckDB pattern may transfer if PG materializes CTE once.",
+      "confidence": 0.68,
+      "expected_explain_delta": "Single item scan instead of multiple probes",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_returns by sr_ticket_number, sr_item_sk before joining with store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_returns"],
+        "where_must_preserve": ["All store_returns filters"],
+        "output_must_preserve": ["sr_ticket_number", "sr_item_sk for join keys"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Reduction before join may lower nested loop cost. DuckDB pattern may work if PG can push aggregates.",
+      "confidence": 0.6,
+      "expected_explain_delta": "Aggregate node below store_sales join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize store_sales with ss_sales_price/ss_list_price filter into CTE before joining with store_returns.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sales_price / ss_list_price BETWEEN 0.76 AND 0.96"],
+        "output_must_preserve": ["ss_ticket_number", "ss_item_sk", "ss_customer_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Store_sales filter applied before join, reduced probe rows",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add d_date_sk BETWEEN filter to store_returns and web_sales CTEs using d1/d2 surrogate keys.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "web_sales", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["sr_returned_date_sk BETWEEN low_sk AND high_sk", "ws_sold_date_sk BETWEEN low_sk AND high_sk"],
+        "output_must_preserve": ["All fact columns for subsequent joins"]
+      },
+      "gates_checked": ["predicate_transitivity_failure:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Date surrogate key pushdown may work despite Snowflake origin. PG bitmap scans could leverage range if CTE inlined.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Index scan on date_sk for fact tables",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Combine d1, item, hd filters into single CTE, then join with store_returns in one step.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim d1", "item", "household_demographics"],
+        "where_must_preserve": ["All dimension filters"],
+        "output_must_preserve": ["Keys for store_sales and customer joins"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension filtering may compound selectivity. DuckDB pattern may transfer if PG can hash multiple small dimensions.",
+      "confidence": 0.7,
+      "expected_explain_delta": "Single join with multiple dimensions instead of nested loops",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "regression registry: bitmap-or capable and no OR condition present"},
+    {"transform_id": "decorrelate", "family": "B", "reason": "no correlated subqueries detected in plan"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "no INTERSECT operations in query"}
+  ]
+}

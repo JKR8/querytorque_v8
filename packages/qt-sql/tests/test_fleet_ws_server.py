@@ -152,6 +152,72 @@ class TestClientMessageHandling:
         server._handle_client_message({})
         assert not server.triage_gate.is_set()
 
+    def test_config_update_stores_runtime_config(self, server):
+        server._handle_client_message(
+            {
+                "type": "config_update",
+                "config": {
+                    "source_mode": "git",
+                    "benchmark_dir": "/tmp/bench",
+                    "db_dsn": "postgresql://example",
+                    "use_blackboard_history": False,
+                },
+            }
+        )
+        assert server.runtime_config.get("source_mode") == "git"
+        assert server.runtime_config.get("benchmark_dir") == "/tmp/bench"
+        assert server.runtime_config.get("use_blackboard_history") is False
+
+    def test_editor_strike_routes_to_strike_mode(self, server, monkeypatch):
+        called = {}
+
+        def fake_run(query_id, sql, max_iterations, strategy="", run_type="beam"):
+            called["query_id"] = query_id
+            called["sql"] = sql
+            called["max_iterations"] = max_iterations
+            called["strategy"] = strategy
+            called["run_type"] = run_type
+
+        monkeypatch.setattr(server, "_run_editor_session", fake_run)
+        server._handle_client_message(
+            {
+                "type": "editor_strike",
+                "query_id": "q1",
+                "sql": "SELECT 1",
+                "strategy": "decorrelate",
+                "max_iterations": 5,
+            }
+        )
+
+        assert called["query_id"] == "q1"
+        assert called["strategy"] == "decorrelate"
+        assert called["max_iterations"] == 1
+        assert called["run_type"] == "strike"
+
+    def test_editor_beam_routes_to_beam_mode(self, server, monkeypatch):
+        called = {}
+
+        def fake_run(query_id, sql, max_iterations, strategy="", run_type="beam"):
+            called["query_id"] = query_id
+            called["sql"] = sql
+            called["max_iterations"] = max_iterations
+            called["strategy"] = strategy
+            called["run_type"] = run_type
+
+        monkeypatch.setattr(server, "_run_editor_session", fake_run)
+        server._handle_client_message(
+            {
+                "type": "editor_beam",
+                "query_id": "q2",
+                "sql": "SELECT 2",
+                "max_iterations": 3,
+            }
+        )
+
+        assert called["query_id"] == "q2"
+        assert called["max_iterations"] == 3
+        assert called["run_type"] == "beam"
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app creation

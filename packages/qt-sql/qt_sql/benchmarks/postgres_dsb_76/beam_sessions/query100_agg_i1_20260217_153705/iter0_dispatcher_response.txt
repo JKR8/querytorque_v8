@@ -1,0 +1,272 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Execution dominated by nested loops joining large intermediate results (77.9K rows) with dimension tables. Late filtering on customer_demographics and item2 causes high row amplification. Explicit join syntax and dimension pre-filtering should enable better join planning and reduce nested loops.",
+    "reasoning_trace": [
+      "Cost spine: Nested Loop (77K rows) → Nested Loop (3.5K rows) → Nested Loop (192 rows)",
+      "Merge Join (77.9K rows) shows early filtering on date_dim but late joins to customer/cd",
+      "Nested Loop on customer_demographics (0 rows/loop) suggests filter mismatch or cardinality error",
+      "Comma joins prevent optimizer from reordering joins effectively"
+    ],
+    "cost_spine": ["Merge Join → Nested Loop (customer) → Nested Loop (cd) → Nested Loop (s2) → Nested Loop (item2)"],
+    "hotspots": [
+      {"op": "Nested Loop (customer)", "why": "77.9K loops × index scans", "evidence": "rows=77K, time=25.7s"},
+      {"op": "Nested Loop (cd)", "why": "Filter applied too late", "evidence": "rows=3.5K, time=49.4s"},
+      {"op": "Comma joins", "why": "Prevents join reordering", "evidence": "FROM clause with 8 comma-joined tables"}
+    ],
+    "do_not_do": ["or_to_union (no OR conditions)", "intersect_to_exists (no set ops)"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and isolate filtered date_dim in CTE. Preserve join condition between date_dim and store_sales.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales s1"],
+        "where_must_preserve": ["d.d_date_sk = s1.ss_sold_date_sk", "d.d_year BETWEEN 1998 AND 1999"],
+        "output_must_preserve": ["item1.i_item_sk", "item2.i_item_sk", "COUNT(*)"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT", "no_cte_materialization_fence:CAUTION"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Explicit JOIN syntax replacing comma joins; CTE scan for date_dim; reduced nested loops",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs for all selective dimensions (customer, customer_demographics, item1, item2) with filters applied before main joins.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_demographics", "item item1", "item item2"],
+        "where_must_preserve": [
+          "cd_marital_status = 'S'", 
+          "cd_education_status = 'College'",
+          "item1.i_category IN ('Electronics','Jewelry')",
+          "item2.i_manager_id BETWEEN 81 AND 100"
+        ],
+        "output_must_preserve": ["s1.ss_ticket_number", "s1.ss_item_sk", "s2.ss_item_sk"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT", "small_dimension:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Multiple CTE scans; hash joins replacing nested loops; reduced row counts in Merge Join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize base sales data (s1 + dimensions) in CTE before self-joining for item pairs to avoid repeated dimension scans.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "date_dim", "customer", "customer_address", "customer_demographics"],
+        "where_must_preserve": [
+          "s1.ss_sold_date_sk = d_date_sk",
+          "s1.ss_customer_sk = c_customer_sk",
+          "c_current_addr_sk = ca_address_sk",
+          "c_current_cdemo_sk = cd_demo_sk"
+        ],
+        "output_must_preserve": ["s1.ss_ticket_number", "s1.ss_item_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION", "multi_reference:VALID"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "CTE scan replacing base tables; faster nested loop on s2",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax while preserving all original join conditions.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "store_sales s2", "item item1", "item item2"],
+        "where_must_preserve": [
+          "s1.ss_ticket_number = s2.ss_ticket_number",
+          "s1.ss_item_sk = item1.i_item_sk",
+          "s2.ss_item_sk = item2.i_item_sk",
+          "item1.i_item_sk < item2.i_item_sk"
+        ],
+        "output_must_preserve": ["s1.ss_ticket_number", "item1.i_item_sk", "item2.i_item_sk"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT", "null_producing_join:PASS"],
+      "exploration": false,
+      "confidence": 0.95,
+      "expected_explain_delta": "Explicit JOIN syntax; improved join order in EXPLAIN",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter store_sales in CTE using list_price conditions before joining to dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "store_sales s2"],
+        "where_must_preserve": [
+          "s1.ss_list_price BETWEEN 108 AND 122",
+          "s2.ss_list_price BETWEEN 108 AND 122"
+        ],
+        "output_must_preserve": ["ss_ticket_number", "ss_item_sk", "ss_sold_date_sk", "ss_customer_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "List price filter pushdown may reduce fact table rows earlier despite PG's predicate blindness gap",
+      "confidence": 0.6,
+      "expected_explain_delta": "CTE scans on store_sales; reduced rows in Merge Join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate ticket-item pairs in CTE before joining to dimensions to reduce row multiplicity.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "store_sales s2"],
+        "where_must_preserve": ["s1.ss_ticket_number = s2.ss_ticket_number"],
+        "output_must_preserve": ["s1.ss_item_sk", "s2.ss_item_sk", "COUNT(*)"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Early aggregation may reduce rows before dimension joins despite PG's aggregation pushdown limitations",
+      "confidence": 0.5,
+      "expected_explain_delta": "Aggregate node below joins; reduced dimension join costs",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Combine customer + customer_demographics into single CTE with joined filters to reduce nested loops.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_demographics"],
+        "where_must_preserve": [
+          "c_current_cdemo_sk = cd_demo_sk",
+          "cd_marital_status = 'S'",
+          "cd_education_status = 'College'"
+        ],
+        "output_must_preserve": ["c_customer_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension CTE may enable hash join instead of nested loop despite PG's predicate blindness",
+      "confidence": 0.65,
+      "expected_explain_delta": "Single CTE replacing customer+cd tables; eliminated nested loop between them",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage fact-dimension joins in CTE chain: date_dim → store_sales → customer → customer_demographics.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales s1", "customer", "customer_demographics"],
+        "where_must_preserve": [
+          "s1.ss_sold_date_sk = d_date_sk",
+          "s1.ss_customer_sk = c_customer_sk",
+          "c_current_cdemo_sk = cd_demo_sk"
+        ],
+        "output_must_preserve": ["s1.ss_ticket_number", "s1.ss_item_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may overcome PG's predicate blindness despite materialization fence risk",
+      "confidence": 0.55,
+      "expected_explain_delta": "CTE chain replacing base tables; reduced rows before self-join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered item1 and item2 in CTEs with manager_id/category filters before joining to sales.",
+      "node_contract": {
+        "from_must_include": ["item item1", "item item2"],
+        "where_must_preserve": [
+          "item1.i_category IN ('Electronics','Jewelry')",
+          "item2.i_manager_id BETWEEN 81 AND 100"
+        ],
+        "output_must_preserve": ["i_item_sk"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "CTE scans replacing item tables; faster index lookups",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Convert customer_address join to pre-materialized CTE to avoid nested loop.",
+      "node_contract": {
+        "from_must_include": ["customer_address"],
+        "where_must_preserve": ["c_current_addr_sk = ca_address_sk"],
+        "output_must_preserve": ["c_customer_sk"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:CAUTION"],
+      "exploration": false,
+      "confidence": 0.7,
+      "expected_explain_delta": "CTE scan replacing customer_address; eliminated nested loop",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate customer_demographics into CTE with marital/education filters to push before customer join.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics"],
+        "where_must_preserve": [
+          "cd_marital_status = 'S'",
+          "cd_education_status = 'College'"
+        ],
+        "output_must_preserve": ["cd_demo_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Early isolation may enable hash join despite PG's predicate blindness gap",
+      "confidence": 0.6,
+      "expected_explain_delta": "CTE scan replacing cd table; earlier filter application",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize date_dim filtered by year range in CTE to avoid repeated scans.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year BETWEEN 1998 AND 1999"],
+        "output_must_preserve": ["d_date_sk"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "CTE scan replacing date_dim; faster dimension lookup",
+      "recommended_patch_ops": ["insert_cte"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR conditions in query"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "No set operations in query"},
+    {"transform_id": "decorrelate", "family": "B", "reason": "No correlated subqueries in query"}
+  ]
+}

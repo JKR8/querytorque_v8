@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional
 class OptimizationMode(str, Enum):
     """Optimization mode selection."""
     BEAM = "beam"           # Automated search: analyst → N workers → validate → snipe
-    REASONING = "reasoning"  # Analyst-only 2-shot reasoning loop
 
 
 class ValidationStatus(str, Enum):
@@ -109,6 +108,7 @@ class BenchmarkConfig:
     workers_state_0: int
     workers_state_n: int
     promote_threshold: float
+    explain_policy: str = "cache"  # "cache" (no collect) | "explain" (collect missing)
     race_min_runtime_ms: float = 2000.0   # Race only triggers if original >= this
     race_min_margin: float = 0.05         # Candidate must beat original by this fraction
 
@@ -117,22 +117,21 @@ class BenchmarkConfig:
     semantic_sample_pct: float = 2.0  # TABLESAMPLE percentage
     semantic_timeout_ms: int = 30_000  # 30s max per mini query
 
-    # Tiered patch mode (analyst + worker split) — legacy flag
-    tiered_patch_enabled: bool = False
-    # Legacy per-role model fields (deprecated; global pipeline model is authoritative)
-    analyst_model: Optional[str] = None
-    worker_model: Optional[str] = None
     target_speedup: float = 100.0
     snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
 
-    # Beam execution mode (single-mode runtime; legacy values tolerated)
-    beam_mode: str = "beam"       # canonical: "beam" | "reasoning" (legacy: "wide", "auto", "focused")
-    enable_reasoning_mode: bool = False  # Safety gate: reasoning path disabled unless explicitly enabled
+    # Beam execution mode (single-mode runtime)
+    beam_edit_mode: str = "patchplan"  # "patchplan" | "dag"
     wide_max_probes: int = 16     # Max probes for wide mode
     wide_worker_parallelism: int = 8  # Max concurrent worker LLM calls per query in beam mode
-    focused_max_sorties: int = 5  # Legacy field (unused in single-mode runtime)
-    wide_dispatcher_model: Optional[str] = None  # Legacy override field (deprecated)
-    wide_worker_model: Optional[str] = None  # Legacy override field (deprecated)
+    beam_llm_provider: str = ""   # Optional BEAM-only provider override
+    beam_llm_model: str = ""      # Optional BEAM-only model override
+    beam_qwen_workers: int = 8    # Number of qwen worker probes to execute
+    beam_reasoner_workers: int = 0  # Number of reasoner worker probes to execute
+    beam_qwen_provider: str = ""  # Optional qwen-lane provider override
+    beam_qwen_model: str = ""     # Optional qwen-lane model override
+    beam_reasoner_provider: str = ""  # Optional reasoner-lane provider override
+    beam_reasoner_model: str = ""     # Optional reasoner-lane model override
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -148,6 +147,7 @@ class BenchmarkConfig:
             scale_factor=data.get("scale_factor", 10),
             timeout_seconds=data.get("timeout_seconds", 300),
             validation_method=data.get("validation_method", "race"),
+            explain_policy=data.get("explain_policy", "cache"),
             n_queries=data.get("n_queries", 99),
             workers_state_0=data.get("workers_state_0", 5),
             workers_state_n=data.get("workers_state_n", 1),
@@ -157,18 +157,19 @@ class BenchmarkConfig:
             semantic_validation_enabled=data.get("semantic_validation_enabled", False),
             semantic_sample_pct=data.get("semantic_sample_pct", 2.0),
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
-            tiered_patch_enabled=data.get("tiered_patch_enabled", False),
-            analyst_model=data.get("analyst_model"),
-            worker_model=data.get("worker_model"),
             target_speedup=data.get("target_speedup", 100.0),
             snipe_rounds=data.get("snipe_rounds", 2),
-            beam_mode=data.get("beam_mode", "beam"),
-            enable_reasoning_mode=data.get("enable_reasoning_mode", False),
+            beam_edit_mode=data.get("beam_edit_mode", "patchplan"),
             wide_max_probes=data.get("wide_max_probes", 16),
             wide_worker_parallelism=data.get("wide_worker_parallelism", 8),
-            focused_max_sorties=data.get("focused_max_sorties", 5),
-            wide_dispatcher_model=data.get("wide_dispatcher_model"),
-            wide_worker_model=data.get("wide_worker_model"),
+            beam_llm_provider=data.get("beam_llm_provider", ""),
+            beam_llm_model=data.get("beam_llm_model", ""),
+            beam_qwen_workers=data.get("beam_qwen_workers", 8),
+            beam_reasoner_workers=data.get("beam_reasoner_workers", 0),
+            beam_qwen_provider=data.get("beam_qwen_provider", ""),
+            beam_qwen_model=data.get("beam_qwen_model", ""),
+            beam_reasoner_provider=data.get("beam_reasoner_provider", ""),
+            beam_reasoner_model=data.get("beam_reasoner_model", ""),
         )
 
 

@@ -83,9 +83,67 @@ test.describe("Dashboard", () => {
     await expect(helpLink).toHaveAttribute("target", "_blank");
   });
 
-  test("has three tabs", async ({ page }) => {
+  test("has four tabs", async ({ page }) => {
     await page.goto("/");
-    await expect(page.locator(".tab-btn")).toHaveCount(3);
+    await expect(page.locator(".tab-btn")).toHaveCount(4);
+    await expect(page.locator('.tab-btn[data-tab="done"]')).toContainText("Results");
+  });
+
+  test("keeps estimated savings stable when dispatch starts", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForTimeout(500);
+
+    const triageSavings = (await page.locator("#triage-savings").textContent())?.trim();
+    await page.locator("#btn-approve").click();
+
+    await expect(page.locator("#view-execution")).toHaveClass(/active/);
+    await expect(page.locator("#exec-savings")).toHaveText(triageSavings || "");
+  });
+
+  test("execution view shows backend console activity", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForTimeout(500);
+    await page.locator("#btn-approve").click();
+
+    await expect(page.locator("#view-execution")).toHaveClass(/active/);
+    await expect(page.locator("#backend-console")).toBeVisible();
+    await expect(page.locator("#backend-console")).toContainText(/Run start requested|Sending approve/i);
+    await expect(page.locator("#backend-console-badge")).toHaveText(/live|connecting/i);
+  });
+
+  test("config modal exposes blackboard history toggle", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForTimeout(250);
+
+    await page.locator(".header-config-btn").click();
+    const toggle = page.locator("#cfg-use-blackboard");
+    await expect(toggle).toBeVisible();
+    await expect(toggle).toBeChecked();
+
+    await toggle.uncheck();
+    await page.locator('button:has-text("Save Settings")').click();
+    await expect(page.locator("#config-summary")).toContainText("history:off");
+  });
+
+  test("editor shows live step feedback when optimization is started", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForTimeout(500);
+
+    await page.locator('.tab-btn[data-tab="editor"]').click();
+    const firstQuery = await page.locator("#editor-query-select option").nth(1).getAttribute("value");
+    expect(firstQuery).toBeTruthy();
+    await page.selectOption("#editor-query-select", firstQuery!);
+
+    await page.locator("#btn-beam").click();
+    await expect(page.locator("#editor-spinner")).toHaveClass(/active/);
+    await expect(page.locator("#editor-results-content")).toContainText(/Beam requested|request dispatched|Request accepted/i);
+
+    // The e2e fixture server has no benchmark_dir; backend reports an error, which
+    // still validates that step-level feedback and completion state are surfaced.
+    await expect(page.locator("#editor-results-content")).toContainText(/Optimization failed|Error:/i, {
+      timeout: 20_000,
+    });
+    await expect(page.locator("#editor-spinner")).not.toHaveClass(/active/, { timeout: 20_000 });
   });
 });
 

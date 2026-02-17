@@ -6,7 +6,13 @@ import time
 
 import pytest
 
-from qt_sql.fleet.event_bus import EventBus, EventType, FleetEvent, forensic_to_fleet_c2
+from qt_sql.fleet.event_bus import (
+    EventBus,
+    EventType,
+    FleetEvent,
+    forensic_to_fleet_c2,
+    triage_to_fleet_c2,
+)
 from qt_sql.dashboard.models import ForensicQuery, ForensicTransformMatch, QErrorEntry
 from qt_sql.fleet.orchestrator import TriageResult, SurveyResult
 
@@ -39,6 +45,13 @@ class TestFleetEvent:
     def test_default_data(self):
         ev = FleetEvent(type=EventType.TRIAGE_READY)
         assert ev.data == {}
+
+    def test_to_json_with_string_event_type(self):
+        """FleetEvent should serialize safely even when type is a raw string."""
+        ev = FleetEvent(type="query_complete", data={"qid": "q9"})
+        parsed = json.loads(ev.to_json())
+        assert parsed["type"] == "query_complete"
+        assert parsed["data"]["qid"] == "q9"
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +106,14 @@ class TestEventBus:
         assert len(events) == 2
         assert events[0].data["idx"] == 0
         assert events[1].data["idx"] == 1
+
+    def test_emit_normalizes_known_string_event_type(self):
+        bus = EventBus()
+        bus.emit("query_complete", query_id="q1")
+        ev = bus.get_event(timeout=1.0)
+        assert ev is not None
+        assert ev.type == EventType.QUERY_COMPLETE
+        assert ev.data["query_id"] == "q1"
 
     def test_thread_safety(self):
         """Multiple threads emitting concurrently should not raise."""
@@ -239,3 +260,29 @@ class TestForensicToFleetC2:
         result = forensic_to_fleet_c2([fq], [tr])
         # Should not raise
         json.dumps(result)
+
+
+class TestTriageToFleetC2:
+    def test_includes_prior_history_fields(self):
+        survey = SurveyResult(query_id="q1", runtime_ms=1000)
+        triaged = [
+            TriageResult(
+                query_id="q1",
+                sql="SELECT * FROM original",
+                bucket="MEDIUM",
+                priority_score=6.0,
+                max_iterations=2,
+                survey=survey,
+                prior_best_speedup=1.7,
+                prior_best_sql="SELECT * FROM prior",
+                prior_source="beam_sessions",
+                prior_reference="beam_sessions/query_1_20260216_010203/iter0_result.txt",
+            )
+        ]
+        data = triage_to_fleet_c2(triaged)
+        assert len(data) == 1
+        entry = data[0]
+        assert entry["seed_source"] == "beam_sessions"
+        assert entry["seed_speedup"] == 1.7
+        assert entry["detail"]["prior_best_speedup"] == 1.7
+        assert entry["detail"]["prior_source"] == "beam_sessions"

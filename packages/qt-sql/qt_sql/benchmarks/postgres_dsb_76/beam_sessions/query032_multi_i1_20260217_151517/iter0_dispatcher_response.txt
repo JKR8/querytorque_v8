@@ -1,0 +1,205 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 2,
+    "probe_count": 10,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The correlated subquery in the WHERE clause likely causes nested loop re-execution per outer row. Comma joins may prevent efficient join planning. OR conditions on item may block index scans.",
+    "reasoning_trace": [
+      "Correlated scalar subquery with aggregation forces per-row execution",
+      "Comma-join syntax prevents explicit join order control",
+      "Multi-column OR condition may prevent bitmap index scans"
+    ],
+    "cost_spine": ["Correlated Subquery Execution → Main Join"],
+    "hotspots": [
+      {"op": "Correlated Subquery", "why": "Per-row re-execution amplification", "evidence": "Subquery computes AVG() per outer row item"}
+    ],
+    "do_not_do": ["or_to_union (unless EXPLAIN shows OR blocks index usage)"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Replace correlated subquery with MATERIALIZED CTEs: 1) filtered_dates CTE, 2) item_avg_discount CTE with GROUP BY cs_item_sk, 3) main query JOINs threshold CTE",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_item_sk = cs_item_sk", "d_date_sk = cs_sold_date_sk", "d_date BETWEEN..."],
+        "output_must_preserve": ["SUM(cs_ext_discount_amt)", "ORDER BY/LIMIT semantics"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Nested Loop → Hash Join with precomputed aggregate CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Create filtered_dates CTE and convert comma joins to explicit INNER JOINs with ON clauses",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id...", "i_manager_id...", "cs_ext_discount_amt > ..."],
+        "output_must_preserve": ["Original SELECT expression"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins → Explicit JOIN syntax with better cardinality estimates",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_items CTE with OR condition, then JOIN in main query",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_date BETWEEN...", "cs_ext_discount_amt > ..."],
+        "output_must_preserve": ["All original columns"]
+      },
+      "gates_checked": [],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Early item table reduction before main join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Combine p01+p03: filtered_items CTE + decorrelated threshold CTE without MATERIALIZED keyword",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_date_sk = cs_sold_date_sk", "cs_ext_discount_amt > threshold"],
+        "output_must_preserve": ["Original aggregation and ordering"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may optimize better without MATERIALIZED fence for small dimension CTEs",
+      "confidence": 0.7,
+      "expected_explain_delta": "CTE inlining instead of materialization for small dimensions",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR condition into UNION ALL branches: 1) i_manufact_id IN(...) 2) i_manager_id BETWEEN...",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_date BETWEEN...", "cs_ext_discount_amt > ..."],
+        "output_must_preserve": ["Same result cardinality and aggregation"]
+      },
+      "gates_checked": ["same_column_or:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "OR condition on different columns may block bitmap index scans",
+      "confidence": 0.4,
+      "expected_explain_delta": "OR condition → Index scans per UNION branch",
+      "recommended_patch_ops": ["replace_body", "wrap_query_with_cte_pair"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create both filtered_dates AND filtered_items CTEs before main join",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "filtered_items", "filtered_dates"],
+        "where_must_preserve": ["cs_ext_discount_amt > ..."],
+        "output_must_preserve": ["Original SELECT expression"]
+      },
+      "gates_checked": [],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Compound selectivity from both dimension CTEs",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Portable version: Create threshold CTE with GROUP BY without PostgreSQL MATERIALIZED hint",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["Original join conditions"],
+        "output_must_preserve": ["Aggregation semantics"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portable decorrelation may work despite PostgreSQL CTE fencing",
+      "confidence": 0.6,
+      "expected_explain_delta": "Nested Loop → Hash Join with threshold CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate subquery into main aggregation using CASE expressions",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_date BETWEEN..."],
+        "output_must_preserve": ["Same excess discount calculation"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Avoid subquery entirely by computing threshold in main aggregation",
+      "confidence": 0.5,
+      "expected_explain_delta": "Eliminate subquery execution completely",
+      "recommended_patch_ops": ["replace_select", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create prefiltered_catalog CTE with date join and price filters before item join",
+      "node_contract": {
+        "from_must_include": ["prefiltered_catalog", "item"],
+        "where_must_preserve": ["i_manufact_id...", "i_manager_id...", "cs_ext_discount_amt > ..."],
+        "output_must_preserve": ["Original SELECT expression"]
+      },
+      "gates_checked": [],
+      "exploration": false,
+      "confidence": 0.7,
+      "expected_explain_delta": "Reduce fact table rows before expensive item condition",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Snowflake pattern: shared_catalog CTE for date+price filters, then derive threshold",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["Original join conditions"],
+        "output_must_preserve": ["Aggregation semantics"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared scan pattern may transfer despite engine differences",
+      "confidence": 0.3,
+      "expected_explain_delta": "Single catalog scan instead of correlated execution",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "pg_self_join_decomposition", "family": "E", "reason": "No self-join pattern detected"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "No INTERSECT operations present"},
+    {"transform_id": "rollup_to_union_windowing", "family": "D", "reason": "No ROLLUP aggregation"}
+  ]
+}

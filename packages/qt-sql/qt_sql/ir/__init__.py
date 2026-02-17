@@ -109,8 +109,10 @@ def render_ir_node_map(script_ir: ScriptIR) -> str:
     # Footer
     lines.append("")
     lines.append(
-        "Patch operations: insert_cte, replace_expr_subtree, "
-        "replace_where_predicate, replace_from, delete_expr_subtree"
+        "Patch operations (core+advanced): insert_cte, replace_expr_subtree, "
+        "replace_where_predicate, replace_from, delete_expr_subtree, "
+        "replace_body, replace_join_condition, replace_select, "
+        "replace_block_with_cte_pair, wrap_query_with_cte"
     )
     lines.append('Target: by_node_id (statement, e.g. "{}") + by_anchor_hash (expression)'.format(
         script_ir.statements[0].id if script_ir.statements else "S0"

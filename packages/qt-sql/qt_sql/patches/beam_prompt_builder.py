@@ -1,4 +1,4 @@
-"""Build compact beam/reasoning prompts with dialect-first knowledge guidance."""
+"""Build compact BEAM prompts with dialect-first knowledge guidance."""
 
 from functools import lru_cache
 from pathlib import Path
@@ -10,7 +10,7 @@ from qt_sql.prompter import _load_engine_profile
 
 logger = logging.getLogger(__name__)
 PROMPT_TEMPLATES_DIR = (
-    Path(__file__).resolve().parent.parent / "prompts" / "samples" / "V3"
+    Path(__file__).resolve().parent.parent / "prompts" / "templates" / "V3"
 )
 
 
@@ -26,7 +26,7 @@ def _safe_md_cell(value: Any) -> str:
 
 @lru_cache(maxsize=8)
 def _load_prompt_template(filename: str) -> str:
-    """Load a prompt template from prompts/samples/V3."""
+    """Load a prompt template from prompts/templates/V3."""
     path = PROMPT_TEMPLATES_DIR / filename
     if not path.exists():
         logger.warning("Prompt template missing: %s", path)
@@ -227,7 +227,7 @@ def format_family_section(
     if insight:
         lines.append(f"**Pattern**: {_compact_text(insight, max_len=260)}")
 
-    # Analyst and sniper/reasoning use the same compact card; no embedded SQL blobs.
+    # Analyst and compiler use the same compact card; no embedded SQL blobs.
     if analyst_only:
         return "\n".join(lines)
 
@@ -400,17 +400,7 @@ For each target capture:
 - expected EXPLAIN delta (ops, loops, rows)"""
 
 
-def _build_reasoning_diversity_rules_section() -> str:
-    return """## Orthogonality Rules
-
-Two candidate plans must be meaningfully different:
-- distinct rewrite shape, not a minor variation of the same predicate edit
-- distinct primary lever when possible (cardinality reduction, remove repeated work, reduce row width, reduce sort/agg footprint)
-- if both plans target the same hotspot, use different mechanisms and explain why both are credible
-- avoid duplicate source scans, unfiltered CTE introduction, and known regression moves"""
-
-
-def _build_sniper_combination_rules_section() -> str:
+def _build_compiler_combination_rules_section() -> str:
     return """## Combination Rules
 
 - Non-overlapping targets compose cleanly.
@@ -551,386 +541,7 @@ pathology is detected, your primary target SHOULD address it.""")
     return static, dynamic, n_families
 
 
-# ── Reasoning Prompt Builder (R1 2-shot, outputs 2 PatchPlans) ──────────
-
-def build_reasoning_prompt(
-    query_id: str,
-    original_sql: str,
-    explain_text: str,
-    ir_node_map: str,
-    all_5_examples: Dict[str, Dict[str, Any]],
-    dialect: str,
-    intelligence_brief: str = "",
-) -> str:
-    """Build the R1 reasoning prompt — full intelligence, outputs 2 PatchPlans.
-
-    Cache-friendly structure:
-      CACHED: Role + playbook + gold examples + task spec + marker
-      MISS:   Query SQL + EXPLAIN + IR + intelligence brief
-
-    Used as shot 1 in REASONING mode. The same prompt prefix is reused
-    in shot 2 (via append_shot_results) for cache-hit efficiency.
-    """
-    engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
-    reasoning_template = _load_prompt_template("reasoning_analyst_v1.txt")
-    use_template = bool(reasoning_template)
-
-    if use_template:
-        role_text = reasoning_template.replace("<target_dialect>", engine_name)
-        phase_a_items = None
-        phase_b_items = None
-        extra_static_sections = []
-    else:
-        role_text = (
-            f"You are the Reasoning Analyst for SQL optimization on {engine_name}. "
-            "Your task is to reason from plan evidence, identify the primary bottleneck, "
-            "and propose **exactly 2 independent patch plans** with different optimization shapes.\n\n"
-            "Each patch plan must:\n"
-            "- Be atomic (steps applied sequentially: s1 → s2 → s3 → ...)\n"
-            "- Transform the original query using patch operations\n"
-            "- Preserve semantic equivalence (same rows, columns, ordering)\n"
-            "- Follow the patterns shown in reference examples below"
-        )
-        phase_a_items = [
-            "Dialect Profile",
-            "Optimization Families (with decision gates)",
-            "EXPLAIN Analysis Procedure",
-            "Target REL Node Specification",
-            "Orthogonality Rules",
-            "Regression Registry",
-            "Aggregation Equivalence Rules",
-            "Task Contract",
-        ]
-        phase_b_items = [
-            "Query SQL",
-            "Execution Plan",
-            "IR Structure",
-            "Detected Patterns (if available)",
-        ]
-        extra_static_sections = [
-            _build_explain_analysis_procedure_section(),
-            _build_target_rel_node_spec_section(),
-            _build_reasoning_diversity_rules_section(),
-            _build_regression_registry_section(),
-            _build_aggregation_equivalence_rules_section(),
-        ]
-
-    static, dynamic, n_families = _build_prompt_body(
-        query_id, original_sql, explain_text, ir_node_map,
-        all_5_examples, dialect, role_text,
-        include_patch_plans=True,
-        intelligence_brief=intelligence_brief,
-        phase_a_items=phase_a_items,
-        phase_b_items=phase_b_items,
-        extra_static_sections=extra_static_sections,
-        use_custom_prelude=use_template,
-    )
-
-    # Task spec in static prefix (system instructions)
-    static.append("""## Reasoning Process
-
-1. Run EXPLAIN analysis procedure.
-2. Convert top bottlenecks into explicit target subtrees.
-3. Route each target to candidate families and apply decision gates.
-4. Design 2 orthogonal plans and enforce regression and semantic guards.""")
-    static.append(_build_patchplan_task_section(n_plans=2))
-
-    # Cache boundary
-    static.append(
-        "---\n\n"
-        "## Cache Boundary\n"
-        "Everything below is query-specific input.\n\n"
-        "## Query to Analyze"
-    )
-
-    return "\n\n".join(static + dynamic)
-
-
-# ── Worker Prompt Builder (for qwen code-generation) ──────────────────────
-
-def build_worker_patch_prompt(
-    original_sql: str,
-    ir_node_map: str,
-    target: Dict[str, Any],
-    gold_patch_plan: Dict[str, Any],
-    dialect: str,
-    dialect_constraints: str = "",
-    worker_role: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Build focused worker prompt for converting a target IR into a PatchPlan JSON.
-
-    Args:
-        original_sql: Full original SQL
-        ir_node_map: Current IR node map (from render_ir_node_map)
-        target: AnalystTarget dict (family, target_ir, hypothesis, etc.)
-        gold_patch_plan: The patch_plan field from the recommended gold example
-        dialect: SQL dialect
-        dialect_constraints: Optional dialect-specific rules
-        worker_role: Optional worker role dict (key, name, focus, description)
-
-    Returns:
-        Worker prompt string (~2K tokens)
-    """
-    target_ir = target.get("target_ir", "")
-    hypothesis = target.get("hypothesis", "")
-    family = target.get("family", "?")
-    transform = target.get("transform", "unknown")
-    node_contract = target.get("node_contract")
-    gates_checked = target.get("gates_checked")
-    reasoning_worker_template = _load_prompt_template("reasoning_worker_v1.txt")
-
-    lines: List[str] = []
-
-    if reasoning_worker_template:
-        lines.append(reasoning_worker_template.replace("<target_dialect>", dialect))
-        lines.append("")
-        if worker_role:
-            role_key = worker_role.get("key", "W?")
-            role_name = worker_role.get("name", "Worker")
-            role_focus = worker_role.get("focus", "")
-            lines.append(
-                f"**Worker specialization**: {role_key} \"{role_name}\" — {role_focus}"
-            )
-            lines.append("")
-    else:
-        lines = [
-            "## Role",
-            "",
-        ]
-
-        # Add worker specialization context if available
-        if worker_role:
-            role_key = worker_role.get("key", "W?")
-            role_name = worker_role.get("name", "Worker")
-            role_focus = worker_role.get("focus", "")
-            role_desc = worker_role.get("description", "")
-            lines.append(
-                f"You are **{role_key} \"{role_name}\"** — {role_focus}. "
-                f"{role_desc}"
-            )
-            lines.append("")
-
-        lines.extend([
-            "Transform this SQL query from its CURRENT IR structure to a TARGET IR structure "
-            "using patch operations. Output a single PatchPlan JSON.",
-            "",
-            "## Prompt Map",
-            "",
-            "### Phase A — Cached Instructions",
-            "A1. Patch operations",
-            "A2. Verification checklist",
-            "A3. Gold pattern reference",
-            "A4. Output rules",
-            "",
-            "### Phase B — Probe-Specific Input",
-            "B1. Probe assignment",
-            "B2. Original SQL",
-            "B3. Current IR node map",
-            "B4. Target IR",
-            "",
-        ])
-
-    lines.extend([
-        f"**Family**: {family} — {transform}",
-        f"**Hypothesis**: {hypothesis}",
-        "",
-        "## Probe Assignment",
-        "",
-    ])
-
-    if node_contract:
-        lines.extend([
-            "**Node Contract:**",
-            "```json",
-            json.dumps(node_contract, indent=2),
-            "```",
-            "",
-        ])
-    if gates_checked:
-        gate_lines = gates_checked if isinstance(gates_checked, list) else [str(gates_checked)]
-        lines.append("**Gates checked**: " + "; ".join(str(g) for g in gate_lines[:6]))
-        lines.append("")
-
-    lines.extend([
-        "## Cache Boundary",
-        "",
-        "## Original SQL",
-        "",
-        f"```sql\n{original_sql}\n```",
-        "",
-        "## Current IR Node Map",
-        "",
-        f"```\n{ir_node_map}\n```",
-        "",
-        "## Target IR (what the optimized query should look like)",
-        "",
-        f"```\n{target_ir}\n```",
-        "",
-        "## Patch Operations",
-        "",
-        "| Op | Description | Payload |",
-        "|----|-------------|---------|",
-        "| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |",
-        "| replace_from | Replace the FROM clause | from_sql |",
-        "| replace_where_predicate | Replace the WHERE clause | expr_sql |",
-        "| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |",
-        "| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |",
-        "| delete_expr_subtree | Remove a specific expression | (target only, no payload) |",
-        "| replace_join_condition | Replace a JOIN condition expression | expr_sql (+ by_anchor_hash) |",
-        "| replace_select | Replace the SELECT projection list | sql_fragment |",
-        "| replace_block_with_cte_pair | Replace block using CTE-integrated SQL fragment | sql_fragment |",
-        "| wrap_query_with_cte | Add wrapper CTE to statement | cte_name, cte_query_sql |",
-        "",
-        "## Gold Pattern Reference",
-        "",
-    ])
-
-    if isinstance(gold_patch_plan, dict):
-        step_ops = [
-            _normalize_patch_op_name(s.get("op"))
-            for s in gold_patch_plan.get("steps", [])
-            if isinstance(s, dict) and s.get("op")
-        ]
-        cte_names = [
-            s.get("payload", {}).get("cte_name")
-            for s in gold_patch_plan.get("steps", [])
-            if isinstance(s, dict)
-            and isinstance(s.get("payload"), dict)
-            and s.get("payload", {}).get("cte_name")
-        ]
-        lines.append(f"- `plan_id`: `{gold_patch_plan.get('plan_id', 'gold')}`")
-        if step_ops:
-            lines.append(f"- `step_ops`: {' -> '.join(step_ops[:8])}")
-        if cte_names:
-            lines.append(f"- `ctes`: {', '.join(f'`{c}`' for c in cte_names[:6])}")
-        lines.append("- Reuse pattern structure, not literal table/column names.")
-        lines.append("")
-
-    if dialect_constraints:
-        lines.extend([
-            f"## Dialect Constraints ({dialect.upper()})",
-            "",
-            dialect_constraints,
-            "",
-        ])
-
-    lines.extend([
-        "## Instructions",
-        "",
-        "Verification checklist before output:",
-        "- Every new CTE is filtered (no unbounded materialization).",
-        "- No orphaned CTEs/tables remain after replacement.",
-        "- EXISTS semantics are preserved unless the target explicitly requires anti-join decorrelation.",
-        "- If join topology changes, maintain multiplicity discipline (distinct keyset, grouping, or uniqueness proof).",
-        "- Same-column OR logic is not split to UNION branches.",
-        "- Downstream consumers have all required projected columns.",
-        "",
-        "Adapt the gold example pattern to match the ORIGINAL SQL above.",
-        "Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names "
-        "and structure.",
-        f"Preferred approach: insert_cte (x2-3) + replace_from or replace_body.",
-        "All SQL in payloads must be complete, executable fragments (no ellipsis).",
-        f"Use dialect: \"{dialect}\" in the output.",
-        "Target all steps at by_node_id: \"S0\" (the main statement).",
-        "",
-        "Output contract:",
-        "- first character must be `{` (no leading whitespace/newlines)",
-        "- output only a JSON object (no markdown/prose/explanation)",
-        "- never emit `payload.sql`; use `payload.sql_fragment` for replace_body/replace_select/replace_block_with_cte_pair",
-    ])
-
-    return "\n".join(lines)
-
-
-def build_worker_retry_prompt(worker_prompt: str, error_msg: str) -> str:
-    """Append error context to a worker prompt for retry."""
-    return (
-        worker_prompt
-        + f"\n\n## RETRY — Previous patch failed:\n{error_msg}\n\n"
-        "Fix the error. Output ONLY the corrected JSON object.\n"
-        "First character must be `{` with no leading whitespace.\n"
-        "Never emit payload.sql; use payload.sql_fragment where SQL fragments are required."
-    )
-
-
-def build_worker_semantic_retry_prompt(
-    worker_prompt: str,
-    sem_result,
-    original_sql: str,
-    rewrite_sql: str,
-) -> str:
-    """Append semantic validation errors to a worker prompt for retry.
-
-    Args:
-        worker_prompt: Original worker prompt.
-        sem_result: SemanticValidationResult with diagnostic fields.
-        original_sql: Original query SQL.
-        rewrite_sql: The rewritten SQL that failed semantic validation.
-
-    Returns:
-        Prompt with semantic error context appended.
-    """
-    from ..validation.sql_differ import SQLDiffer
-
-    lines = [
-        worker_prompt,
-        "",
-        "## RETRY — Semantic validation FAILED",
-        "",
-        f"The patch produced SQL that returns DIFFERENT results from the original.",
-        "",
-    ]
-
-    # Error summary
-    if sem_result.errors:
-        lines.append("**Errors:**")
-        for err in sem_result.errors:
-            lines.append(f"- {err}")
-        lines.append("")
-
-    # Row count diff
-    if sem_result.row_count_diff:
-        rcd = sem_result.row_count_diff
-        lines.append(
-            f"**Row count mismatch** (on {rcd.sample_pct}% sample): "
-            f"original={rcd.original_count}, rewrite={rcd.rewrite_count} "
-            f"(diff={rcd.diff:+d})"
-        )
-        lines.append("")
-
-    # Value diffs
-    if sem_result.value_diffs:
-        formatted = SQLDiffer.format_value_diffs(sem_result.value_diffs)
-        if formatted:
-            lines.append("**Value differences:**")
-            lines.append(formatted)
-            lines.append("")
-
-    # Column mismatch
-    if sem_result.column_mismatch:
-        cm = sem_result.column_mismatch
-        if cm.missing:
-            lines.append(f"**Missing columns**: {', '.join(cm.missing)}")
-        if cm.extra:
-            lines.append(f"**Extra columns**: {', '.join(cm.extra)}")
-        lines.append("")
-
-    # SQL diff
-    sql_diff = SQLDiffer.unified_diff(original_sql, rewrite_sql)
-    if sql_diff:
-        lines.append("**SQL diff (original → rewrite):**")
-        lines.append("```diff")
-        lines.append(sql_diff)
-        lines.append("```")
-        lines.append("")
-
-    lines.append("Fix the semantic error. Output ONLY the corrected JSON object.")
-    lines.append("First character must be `{` with no leading whitespace.")
-    lines.append("Never emit payload.sql; use payload.sql_fragment where SQL fragments are required.")
-    return "\n".join(lines)
-
-
-def build_beam_sniper_prompt(
+def build_beam_compiler_prompt(
     query_id: str,
     original_sql: str,
     explain_text: str,
@@ -946,8 +557,8 @@ def build_beam_sniper_prompt(
     dispatch_reasoning_trace: Optional[List[str]] = None,
     equivalence_tier: str = "",
 ) -> str:
-    """Build sniper prompt from beam_sniper_v3 template + dynamic tail."""
-    template = _load_prompt_template("beam_sniper_v3.txt")
+    """Build compiler prompt from beam_compiler_v3 template + dynamic tail."""
+    template = _load_prompt_template("beam_compiler_v3.txt")
     stars = max(1, min(3, int(importance_stars or 1)))
     star_label = "*" * stars
 
@@ -973,11 +584,11 @@ def build_beam_sniper_prompt(
     if engine_knowledge:
         dynamic.append(f"## Engine-Specific Knowledge\n{engine_knowledge}")
     if dispatch_hypothesis:
-        dynamic.append(f"## Dispatcher Hypothesis\n{dispatch_hypothesis}")
+        dynamic.append(f"## Analyst Hypothesis\n{dispatch_hypothesis}")
     if dispatch_reasoning_trace:
         trace_lines = "\n".join(f"- {str(x)}" for x in dispatch_reasoning_trace[:5] if x)
         if trace_lines:
-            dynamic.append(f"## Dispatcher Reasoning Trace\n{trace_lines}")
+            dynamic.append(f"## Analyst Reasoning Trace\n{trace_lines}")
     if equivalence_tier:
         dynamic.append(f"## Equivalence Tier\n- {equivalence_tier}")
     if intelligence_brief:
@@ -1037,79 +648,7 @@ def build_beam_sniper_prompt(
     return "\n\n".join(
         [
             "## Role",
-            "You are the Beam Sniper. Output exactly two PatchPlan JSON objects in one JSON array.",
-            "## Cache Boundary",
-            "Everything below is query-specific input.",
-        ]
-        + dynamic
-    )
-
-
-def build_reasoning_sniper_prompt(
-    query_id: str,
-    original_sql: str,
-    explain_text: str,
-    ir_node_map: str,
-    dialect: str,
-    attempt_results: List[Dict[str, Any]],
-    importance_stars: int = 2,
-    analyst_hypothesis: str = "",
-    engine_knowledge: str = "",
-    intelligence_brief: str = "",
-) -> str:
-    """Build dedicated REASONING sniper prompt from template + dynamic evidence."""
-    template = _load_prompt_template("reasoning_sniper_v1.txt")
-    stars = max(1, min(3, int(importance_stars or 1)))
-    star_label = "*" * stars
-
-    dynamic: List[str] = [
-        f"## Query ID\n{query_id}",
-        (
-            "## Runtime Dialect Contract\n"
-            f"- target_dialect: {dialect}\n"
-            "- runtime_dialect_is_source_of_truth: true\n"
-            "- follow runtime engine profile when conflicts exist"
-        ),
-        (
-            "## Importance\n"
-            f"- importance_stars: {stars}\n"
-            f"- importance_label: {star_label}"
-        ),
-        f"## Original SQL\n```sql\n{original_sql}\n```",
-        f"## Original Plan\n```\n{explain_text}\n```",
-        f"## IR Structure + Anchor Hashes\n```\n{ir_node_map}\n```",
-    ]
-    if analyst_hypothesis:
-        dynamic.append(f"## Analyst Hypothesis\n{analyst_hypothesis}")
-    if engine_knowledge:
-        dynamic.append(f"## Engine-Specific Knowledge\n{engine_knowledge}")
-    if intelligence_brief:
-        dynamic.append(f"## Additional Intelligence\n{intelligence_brief}")
-
-    bda_lines = [
-        "## Prior Attempt Outcomes\n",
-        "| Attempt | Family | Transform | Status | Speedup | Error |",
-        "|---------|--------|-----------|--------|---------|-------|",
-    ]
-    for a in attempt_results:
-        speedup = a.get("speedup")
-        speedup_str = f"{speedup:.2f}x" if isinstance(speedup, (int, float)) else "-"
-        bda_lines.append(
-            f"| {_safe_md_cell(a.get('patch_id', '?'))} | "
-            f"{_safe_md_cell(a.get('family', '?'))} | "
-            f"{_safe_md_cell(a.get('transform', '?'))} | "
-            f"{_safe_md_cell(a.get('status', '?'))} | "
-            f"{speedup_str} | {_safe_md_cell(a.get('error', ''))} |"
-        )
-    dynamic.append("\n".join(bda_lines))
-
-    if template:
-        return f"{template}\n\n" + "\n\n".join(dynamic)
-
-    return "\n\n".join(
-        [
-            "## Role",
-            "You are the Reasoning Sniper. Output exactly two PatchPlan JSON objects in one JSON array.",
+            "You are the Beam Compiler. Output one DAG object or a JSON array with exactly two DAG objects.",
             "## Cache Boundary",
             "Everything below is query-specific input.",
         ]
@@ -1126,54 +665,6 @@ def _summarize_top_plan_nodes(explain_text: str, max_nodes: int = 2) -> str:
         return "-"
     top = ops[:max(1, max_nodes)]
     return "; ".join(f"{name} ({time_ms:.0f}ms)" for name, time_ms, _ in top)
-
-
-# ── Shared PatchPlan Task Section ──────────────────────────────────────────
-
-def _build_patchplan_task_section(n_plans: int = 2) -> str:
-    """Build shared compact output contract for PatchPlan JSON."""
-    return f"""Output exactly **{n_plans} patch plans** as a JSON array.
-
-Tier-0 Output Contract (hard fail):
-- response must be valid JSON
-- first character must be `[` (no leading whitespace/newlines)
-- top-level value must be an array of exactly {n_plans} objects
-- no markdown fences, prose, or commentary
-- never emit key `sql`; use `sql_fragment` for SQL fragments
-
-Required per plan:
-- `plan_id`, `family`, `transform`, `hypothesis`, `target_ir`, `dialect`, `steps`
-- optional: `based_on` as a string (use comma-separated IDs for multiple sources; never an array)
-- `steps[]` item: `step_id`, `op`, `target`, optional `payload`
-- `target.by_node_id` MUST be `"S0"` (use `by_anchor_hash` only when needed)
-
-Allowed `op` values:
-- `insert_cte`
-- `replace_from`
-- `replace_where_predicate`
-- `replace_body`
-- `replace_expr_subtree`
-- `delete_expr_subtree`
-- `replace_join_condition`
-- `replace_select`
-- `replace_block_with_cte_pair`
-- `wrap_query_with_cte`
-
-Semantic guards (MUST preserve):
-- all WHERE/HAVING/ON logic
-- all literals exactly
-- columns/aliases/ORDER BY/LIMIT
-- row count and semantics
-- no orphaned CTEs or duplicated source scans after replacement
-
-Rules:
-- output exactly {n_plans} plans
-- each plan must use a different strategy (`family` + `transform`)
-- payload SQL fragments must be complete/executable (no ellipsis)
-- `replace_body`, `replace_select`, and `replace_block_with_cte_pair` must put SQL in `payload.sql_fragment`
-- cite EXPLAIN evidence in `hypothesis`
-
-Output ONLY JSON array."""
 
 
 # ── Helper: Load Gold Examples ─────────────────────────────────────────────
@@ -1573,7 +1064,7 @@ def append_shot_results(
     can be reused. Only results + new task are appended.
 
     Args:
-        base_prompt: The shot 1 prompt (from build_reasoning_prompt or build_beam_sniper_prompt).
+        base_prompt: The shot 1 prompt (from build_beam_compiler_prompt).
         patches: List of AppliedPatch objects from shot 1 validation.
         explains: Dict mapping patch_id → EXPLAIN text for shot 1 patches.
 
@@ -1619,80 +1110,21 @@ def append_shot_results(
     # Shot 2 task
     lines.extend(
         [
-            "## Shot 2 — Design Exactly Two Sniper Plans",
+            "## Shot 2 — Design One or Two Compiler Plans",
             "",
             "Build on shot 1 results:",
             "1. Start from the strongest verified evidence in the BDA table.",
             "2. Refine the best winner or correct the most promising near-miss failure.",
-            "3. Produce a second materially different pathway for the remaining hotspot.",
+            "3. Optionally produce a second materially different pathway for the remaining hotspot.",
             "",
-            "If only one pathway is defensible, the second plan may be an explicit pass-through",
-            "with `steps: []` and a hypothesis that explains why further rewrite is unjustified.",
+            "If only one pathway is defensible, return a single plan.",
             "",
             "Output policy:",
-            "- Output JSON array with exactly TWO objects.",
-            "- Follow the sniper contract in the base prompt.",
+            "- Output one DAG object, or a JSON array with exactly two DAG objects.",
+            "- Follow the compiler contract in the base prompt.",
         ]
     )
 
-    return "\n".join(lines)
-
-
-def append_reasoning_shot_results(
-    base_prompt: str,
-    patches: List[Any],
-    explains: Dict[str, str],
-) -> str:
-    """Append shot results for REASONING mode (always two-plan output)."""
-    lines = [base_prompt, "", "## Shot 1 Results", ""]
-    lines.append("| # | Family | Transform | Speedup | Status | Error |")
-    lines.append("|---|--------|-----------|---------|--------|-------|")
-
-    for p in patches:
-        speedup_str = (
-            f"{p.speedup:.2f}x"
-            if getattr(p, "speedup", None) is not None
-            else "-"
-        )
-        status = _safe_md_cell(getattr(p, "status", "?"))
-        error = _safe_md_cell(getattr(p, "apply_error", "") or "")
-        family = _safe_md_cell(getattr(p, "family", "?"))
-        transform = _safe_md_cell(getattr(p, "transform", "?"))
-        patch_id = _safe_md_cell(getattr(p, "patch_id", "?"))
-        lines.append(
-            f"| {patch_id} | {family} | {transform} | "
-            f"{speedup_str} | {status} | {error} |"
-        )
-
-    lines.append("")
-
-    for p in patches:
-        pid = getattr(p, "patch_id", "?")
-        speedup = getattr(p, "speedup", None)
-        status = getattr(p, "status", "?")
-        if pid in explains and explains[pid]:
-            speedup_str = f"{speedup:.2f}x" if speedup is not None else "?"
-            lines.append(f"### {pid} EXPLAIN ({speedup_str} {status}):")
-            lines.append(f"```\n{explains[pid].strip()}\n```")
-            lines.append("")
-        elif getattr(p, "apply_error", None):
-            lines.append(f"### {pid} Error:")
-            lines.append(p.apply_error)
-            lines.append("")
-
-    lines.extend(
-        [
-            "## Shot 2 — Design 2 More Patch Plans",
-            "",
-            "Build on shot 1 results:",
-            "1. Refine or extend the strongest verified winner (or fix its remaining bottleneck).",
-            "2. Propose a second orthogonal strategy targeting a different mechanism.",
-            "",
-            "If all shot 1 plans failed, diagnose failure modes and produce two fundamentally different strategies.",
-            "",
-        ]
-    )
-    lines.append(_build_patchplan_task_section(n_plans=2))
     return "\n".join(lines)
 
 

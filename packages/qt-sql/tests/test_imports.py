@@ -141,11 +141,11 @@ class TestQtSqlSessionImports:
     def test_import_sessions(self):
         """Test sessions package import."""
         from qt_sql.sessions import (
-            SwarmSession,
-            OneshotSession,
+            BeamSession,
+            OptimizationSession,
         )
-        assert SwarmSession is not None
-        assert OneshotSession is not None
+        assert BeamSession is not None
+        assert OptimizationSession is not None
 
 
 class TestQtSqlValidationImports:

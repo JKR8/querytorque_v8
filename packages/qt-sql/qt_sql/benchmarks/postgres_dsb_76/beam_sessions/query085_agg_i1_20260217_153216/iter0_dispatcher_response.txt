@@ -1,0 +1,288 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Nested loops dominate runtime (3551ms) due to late dimension filtering and comma-join syntax. Pre-filtering dimensions via CTEs and converting to explicit joins should enable hash joins. OR conditions may prevent index usage.",
+    "reasoning_trace": [
+      "Cost spine: Nested Loop → Nested Loop → Nested Loop → Index Scan on web_sales (14361 rows, 2034ms)",
+      "Late filtering on customer_demographics after large fact joins",
+      "Comma-join syntax prevents optimal join ordering",
+      "OR conditions on cd1/ca_state may block index scans"
+    ],
+    "cost_spine": [
+      "Index Only Scan on date_dim → Index Scan on web_sales → Index Scan on web_returns → Nested Loop (customer_address) → Nested Loop (cd1) → Nested Loop (web_page) → Nested Loop (cd2) → Nested Loop (reason) → Aggregate"
+    ],
+    "hotspots": [
+      {"op": "Nested Loop", "why": "7-level amplification", "evidence": "time=3551ms, rows=14361→9"},
+      {"op": "Index Scan on web_sales", "why": "late dimension filtering", "evidence": "rows=14361, time=2034ms"}
+    ],
+    "do_not_do": ["or_to_union (same-column OR)", "materialize_exists_simple"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert all comma joins to explicit INNER JOINs. Pre-filter date_dim (d_year=2000), reason, web_page into CTEs. Preserve original join conditions.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns", "web_page", "cd1", "cd2", "customer_address", "date_dim", "reason"],
+        "where_must_preserve": ["ws_sales_price conditions", "ws_net_profit conditions", "cd1/cd2 equality conditions"],
+        "output_must_preserve": ["substring(r_reason_desc,1,20)", "avg(ws_quantity)", "avg(wr_refunded_cash)", "avg(wr_fee)", "ORDER BY/LIMIT"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop → Hash Join, reduced row counts in date_dim/reason CTEs",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Materialize date_dim filter (d_year=2000) into CTE. Join CTE early with web_sales before other tables.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["ws_sold_date_sk = d_date_sk", "d_year=2000"],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows late date_dim filtering; CTE may enable early fact reduction despite PostgreSQL's CTE fences",
+      "confidence": 0.7,
+      "expected_explain_delta": "Reduced rows in web_sales scan (Index Scan → 14361 rows)",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter customer_demographics OR conditions into cd1_cte. Apply before joining with web_returns.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1"],
+        "where_must_preserve": [
+          "(cd_marital_status='S' AND cd_education_status='College')",
+          "(cd_marital_status='W' AND cd_education_status='Unknown')",
+          "(cd_marital_status='M' AND cd_education_status='Secondary')"
+        ],
+        "output_must_preserve": ["wr_refunded_cdemo_sk join condition"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduced loops in cd1 Index Scan (0.277ms → lower)",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate web_sales/web_returns by (ws_item_sk, ws_order_number) before joining dimensions. Preserve AVG() calculations.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns"],
+        "where_must_preserve": ["ws_item_sk = wr_item_sk", "ws_order_number = wr_order_number"],
+        "output_must_preserve": ["avg(ws_quantity)", "avg(wr_refunded_cash)", "avg(wr_fee)"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregate after 7-way join; pushdown may reduce rows early despite join multiplicity risks",
+      "confidence": 0.65,
+      "expected_explain_delta": "Aggregate node below joins, reduced input rows to Nested Loops",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split cd1 OR conditions into 3 UNION ALL branches. Apply only to customer_demographics filters.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1"],
+        "where_must_preserve": [
+          "cd1.cd_marital_status = cd2.cd_marital_status",
+          "cd1.cd_education_status = cd2.cd_education_status"
+        ],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["regression_registry:OR_condition_split:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "OR conditions on different columns may prevent index scans; EXPLAIN shows no bitmap scan",
+      "confidence": 0.6,
+      "expected_explain_delta": "Index Scan → BitmapOr/Union scans in branches",
+      "recommended_patch_ops": ["replace_where_predicate", "wrap_query_with_cte_pair"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize filtered web_sales (d_year=2000 + price conditions) before joining returns. Preserve net_profit OR conditions.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim"],
+        "where_must_preserve": ["ws_sales_price conditions", "ws_net_profit conditions"],
+        "output_must_preserve": ["ws_item_sk", "ws_order_number", "ws_quantity"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Reduced rows in web_sales Index Scan (14361 → lower)",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize cd1+cd2 status pairs into CTE. Join twice via (marital_status, education_status) keys.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2"],
+        "where_must_preserve": [
+          "cd1.cd_marital_status = cd2.cd_marital_status",
+          "cd1.cd_education_status = cd2.cd_education_status"
+        ],
+        "output_must_preserve": ["wr_refunded_cdemo_sk", "wr_returning_cdemo_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Two cd Index Scans → single CTE scan + hash joins",
+      "recommended_patch_ops": ["insert_cte", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Prefilter all dimensions (date_dim, reason, web_page, cd1, customer_address) into CTEs before joining facts.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "reason", "web_page", "cd1", "customer_address"],
+        "where_must_preserve": ["d_year=2000", "cd1 OR conditions", "ca_state conditions"],
+        "output_must_preserve": ["all join keys"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Multiple dimension scans → CTE scans, reduced nested loop depth",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage CTEs: 1) date_dim 2) date_dim+web_sales 3) +web_returns. Preserve OR conditions in final WHERE.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns", "date_dim"],
+        "where_must_preserve": ["ws_sales_price conditions", "ws_net_profit conditions"],
+        "output_must_preserve": ["ws_item_sk", "ws_order_number", "wr_refunded_cash"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Progressive reduction may overcome PostgreSQL CTE fences; plan shows high row amplification",
+      "confidence": 0.65,
+      "expected_explain_delta": "Shorter join tree, earlier row reduction",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate date_dim into CTE, convert to explicit INNER JOIN with web_sales. Keep other joins explicit.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "web_sales"],
+        "where_must_preserve": ["ws_sold_date_sk = d_date_sk", "d_year=2000"],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop → Hash Join between web_sales and date_cte",
+      "recommended_patch_ops": ["insert_cte", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered web_sales (d_year=2000 + price conditions) and customer_address (ca_states) into CTEs before main join.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "customer_address"],
+        "where_must_preserve": ["ws_sales_price conditions", "ca_state conditions"],
+        "output_must_preserve": ["ws_item_sk", "ca_address_sk"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduced input to customer_address join (Index Scan → 0.15ms)",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create shared cd_cte for both cd1/cd2 references. Join via (marital_status, education_status).",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2"],
+        "where_must_preserve": [
+          "cd1.cd_marital_status = cd2.cd_marital_status",
+          "cd1.cd_education_status = cd2.cd_education_status"
+        ],
+        "output_must_preserve": ["wr_refunded_cdemo_sk", "wr_returning_cdemo_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Two cd Index Scans → single CTE scan",
+      "recommended_patch_ops": ["insert_cte", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push cd1 filters into CTE, decorrelate cd2 join via precomputed status keys. Preserve equality conditions.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2"],
+        "where_must_preserve": [
+          "cd1.cd_marital_status = cd2.cd_marital_status",
+          "cd1.cd_education_status = cd2.cd_education_status"
+        ],
+        "output_must_preserve": ["wr_refunded_cdemo_sk", "wr_returning_cdemo_sk"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Nested Loop → Hash Join on status keys",
+      "recommended_patch_ops": ["insert_cte", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Materialize cd1 status groups into CTE, join cd2 via keys. Use MATERIALIZED hint for CTE.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2"],
+        "where_must_preserve": ["cd1 OR conditions", "cd1.cd_marital_status = cd2.cd_marital_status"],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "cd2 Index Scan → Hash Join with materialized CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_join_condition"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "regression registry: same-column OR prohibited for PostgreSQL"},
+    {"transform_id": "sf_sk_pushdown_multi_fact", "family": "A", "reason": "engine_specific: Snowflake-only transform"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "no INTERSECT in query"}
+  ]
+}

@@ -1,0 +1,262 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by Merge Join (45.6s) and Nested Loops feeding into it. Late filtering on large tables and comma-join weakness cause full scans. Early dimension filtering and explicit joins should reduce work.",
+    "reasoning_trace": [
+      "Merge Join consumes 45.6s processing 10k rows from prior Nested Loops",
+      "Nested Loop on store_sales (13k rows) × item (786 rows) causes 10M+ row amplification",
+      "Comma-join syntax prevents optimal join ordering and predicate pushdown",
+      "Non-equi join (inv_quantity_on_hand >= ss_quantity) processes unfiltered inputs"
+    ],
+    "cost_spine": ["Merge Join → Nested Loop → Hash Join → Index Scan store_sales"],
+    "hotspots": [
+      {"op": "Merge Join", "why": "handles amplified row volume from nested loops", "evidence": "time=45674ms, rows=10090"},
+      {"op": "Nested Loop", "why": "store_sales × item scan multiplication", "evidence": "loops=122, rows=1.6M"}
+    ],
+    "do_not_do": ["or_to_union", "intersect_to_exists", "materialize_simple_exists"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-joins to explicit INNER JOIN syntax. Isolate date_dim d1 filter into CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim d1"],
+        "where_must_preserve": ["ss_sold_date_sk = d1.d_date_sk", "d1.d_year = 2001"],
+        "output_must_preserve": ["all original columns", "GROUP BY keys"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Merge Join replaced by Hash Join, reduced row count in Nested Loop",
+      "recommended_patch_ops": ["replace_from", "insert_cte"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs for filtered dimensions: item, customer_address, date_dim d1",
+      "node_contract": {
+        "from_must_include": ["item", "customer_address", "date_dim d1"],
+        "where_must_preserve": [
+          "i_category IN ('Children','Jewelry','Men')", 
+          "i_manager_id IN (21,22,38,39,46,47,66,67,74,93)",
+          "ca_state IN ('AZ','KS','OH','TX','WA')",
+          "d1.d_year=2001"
+        ],
+        "output_must_preserve": ["all join keys"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Seq Scans replaced by Index Scans on dimensions, smaller hash tables"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize pre-joined store_sales with dimensions before non-equi inventory join",
+      "node_contract": {
+        "from_must_include": ["store_sales", "inventory"],
+        "where_must_preserve": ["inv_quantity_on_hand >= ss_quantity", "inv_item_sk = ss_item_sk"],
+        "output_must_preserve": ["ss_customer_sk", "ss_item_sk"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Reduced input rows for non-equi join, faster BitmapHeapScan"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered store_sales+dimensions CTE before joining web_sales",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales"],
+        "where_must_preserve": ["ws_item_sk = ss_item_sk"],
+        "output_must_preserve": ["all GROUP BY columns"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Eliminated redundant store_sales scans, faster Gather"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push d2 date range filter into CTE correlated with d1",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '30 day')"],
+        "output_must_preserve": ["d2.d_date_sk"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Nested Loop on d2 replaced by Hash Join"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_item_sk before joining dimensions",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sold_date_sk = d1.d_date_sk"],
+        "output_must_preserve": ["ss_item_sk", "ss_customer_sk"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows high row amplification from store_sales scan; pre-aggregation may reduce join work",
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced rows in Nested Loop from 1.6M to thousands"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Combine item/customer_address/household_demographics into single prefetch CTE",
+      "node_contract": {
+        "from_must_include": ["item", "customer_address", "household_demographics"],
+        "where_must_preserve": [
+          "i_category IN (...)",
+          "ca_state IN (...)",
+          "i_manager_id IN (...)"
+        ],
+        "output_must_preserve": ["i_item_sk", "ca_address_sk", "hd_demo_sk"]
+      },
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may benefit from DuckDB-style multi-dimension prefetch since all filters are independent",
+      "confidence": 0.6,
+      "expected_explain_delta": "Fewer hash tables in Nested Loop, faster joins"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert warehouse JOIN to INNER JOIN since s_state=w_state filter exists",
+      "node_contract": {
+        "from_must_include": ["warehouse", "store"],
+        "where_must_preserve": ["s_state = w_state"],
+        "output_must_preserve": ["w_warehouse_sk"]
+      },
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Eliminated NULL-handling in warehouse join"
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage store_sales joins: dim CTE → fact CTE → remaining joins",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim d1", "item"],
+        "where_must_preserve": ["ss_sold_date_sk=d1.d_date_sk", "ss_item_sk=i_item_sk"],
+        "output_must_preserve": ["ss_customer_sk", "ss_quantity"]
+      },
+      "exploration": false,
+      "confidence": 0.78,
+      "expected_explain_delta": "Flatter join tree, earlier row reduction"
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add d_date_sk range filter to web_sales based on d1 CTE",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim d1"],
+        "where_must_preserve": ["ws_sold_date_sk BETWEEN d1.d_date_sk AND (d1.d_date_sk + 30)"],
+        "output_must_preserve": ["ws_bill_customer_sk"]
+      },
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake technique may work in PG via d_date_sk range derived from d_date condition",
+      "confidence": 0.55,
+      "expected_explain_delta": "BitmapIndexScan on web_sales with date range"
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Isolate household_demographics CTE despite no filter",
+      "node_contract": {
+        "from_must_include": ["household_demographics"],
+        "where_must_preserve": [],
+        "output_must_preserve": ["hd_demo_sk", "hd_vehicle_count"]
+      },
+      "exploration": false,
+      "confidence": 0.7,
+      "expected_explain_delta": "Eliminated redundant Seq Scan on household_demographics"
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "deferred_window_aggregation",
+      "family": "C",
+      "target": "Delay customer_demographics join until after initial aggregation",
+      "node_contract": {
+        "from_must_include": ["customer_demographics"],
+        "where_must_preserve": ["c_current_cdemo_sk = cd_demo_sk"],
+        "output_must_preserve": ["cd_gender", "cd_marital_status"]
+      },
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Smaller dataset for customer_demographics join"
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create shared CTE for item/customer filters used by both store_sales/web_sales",
+      "node_contract": {
+        "from_must_include": ["item", "customer"],
+        "where_must_preserve": [
+          "i_category IN (...)",
+          "i_manager_id IN (...)",
+          "c_current_addr_sk = ca_address_sk"
+        ],
+        "output_must_preserve": ["i_item_sk", "c_customer_sk"]
+      },
+      "exploration": true,
+      "exploration_hypothesis": "Shared dimension scan elimination may work despite PG CTE fences",
+      "confidence": 0.5,
+      "expected_explain_delta": "Single item/customer scan instead of multiple"
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Materialize d2 date range as CTE parameterized by d1",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_date BETWEEN d1.d_date AND (d1.d_date + 30)"],
+        "output_must_preserve": ["d2.d_date_sk"]
+      },
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Eliminated redundant date_dim scan for d2"
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "reason": "No OR conditions in query"},
+    {"transform_id": "rollup_to_union_windowing", "reason": "No ROLLUP in GROUP BY"},
+    {"transform_id": "intersect_to_exists", "reason": "No INTERSECT operations"}
+  ]
+}

@@ -1,0 +1,232 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Cost spine dominated by Nested Loop (42.5s) scanning store_sales via index. Late OR condition filters prevent predicate pushdown to store_sales. Transform families A (early filtering), B (decorrelation), and D (OR→UNION) should reduce store_sales scans by pushing dimension filters early.",
+    "reasoning_trace": [
+      "Nested Loop scans store_sales 168K rows (42.5s) due to late OR condition application",
+      "Comma-join syntax prevents predicate pushdown to store_sales (COMMA_JOIN_WEAKNESS gap)",
+      "OR conditions on hd_dep_count/cd_marital_status and ca_state/ss_net_profit block bitmap scans",
+      "High row amplification (365 loops × 461 rows) from unfiltered store_sales access"
+    ],
+    "cost_spine": ["Nested Loop (store_sales+date_dim) → Hash Join → Nested Loop → Gather → Aggregate"],
+    "hotspots": [
+      {"op": "Index Only Scan on store_sales", "why": "Late OR filter application", "evidence": "rows=168134, time=42588ms, loops=365"},
+      {"op": "Hash Join", "why": "Joining unfiltered store_sales to dimensions", "evidence": "rows=18795, time=42657ms"}
+    ],
+    "do_not_do": ["or_to_union for second OR condition (non-disjoint ca_state values risk duplication)"]
+  },
+  "probe_summary_schema": [
+    "probe_id", "transform_id", "family", "status", "speedup", "expected_explain_delta", "ops_used", 
+    "confidence", "exploration", "failure_reason", "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-join to explicit INNER JOIN syntax and isolate date_dim filter in CTE",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_year = 2001"],
+        "output_must_preserve": ["min(ss_quantity)", "min(ss_ext_sales_price)", "min(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Explicit JOIN nodes replacing comma joins, CTE scan for date_dim",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Prefilter all dimensions (store/hd/cd/ca) in CTEs before joining to store_sales",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["s_store_sk = ss_store_sk", "ss_hdemo_sk=hd_demo_sk", "cd_demo_sk = ss_cdemo_sk", "ss_addr_sk = ca_address_sk"],
+        "output_must_preserve": ["min aggregates from original SELECT"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Multiple CTE scans for dimensions, reduced rows in store_sales join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split first OR condition (hd/cd filters) into three UNION ALL branches",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics", "customer_demographics"],
+        "where_must_preserve": [
+          "Branch1: cd_marital_status='M' AND cd_education_status='2 yr Degree' AND ss_sales_price BETWEEN 100 AND 150 AND hd_dep_count=3",
+          "Branch2: cd_marital_status='S' AND cd_education_status='Primary' AND ss_sales_price BETWEEN 50 AND 100 AND hd_dep_count=1",
+          "Branch3: cd_marital_status='W' AND cd_education_status='Primary' AND ss_sales_price BETWEEN 150 AND 200 AND hd_dep_count=1"
+        ],
+        "output_must_preserve": ["min aggregates from original SELECT"]
+      },
+      "gates_checked": ["no_bitmap_or_scan:EXPLAIN_EVIDENCE", "disjoint_branches:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "UNION ALL replacing OR, index scans per branch",
+      "recommended_patch_ops": ["replace_where_predicate", "wrap_query_with_cte"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Precompute store_sales keys satisfying first OR condition via CTE with GROUP BY ss_item_sk,ss_ticket_number",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics", "customer_demographics"],
+        "where_must_preserve": ["ss_hdemo_sk=hd_demo_sk", "cd_demo_sk = ss_cdemo_sk"],
+        "output_must_preserve": ["min(ss_quantity)", "min(ss_ext_sales_price)", "min(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["no_semi_join_exists:EXPLAIN_EVIDENCE", "group_by_keys_compatible:PASS"],
+      "exploration": true,
+      "confidence": 0.75,
+      "expected_explain_delta": "CTE materialization for key set, semi-join to store_sales",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Prefilter cd/hd dimensions in CTE, decorrelate first OR condition into semi-join with store_sales",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics", "customer_demographics"],
+        "where_must_preserve": ["cd_marital_status IN ('M','S','W')", "hd_dep_count IN (1,3)"],
+        "output_must_preserve": ["min(ss_ext_wholesale_cost)", "original OR condition semantics"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:EXPLAIN_EVIDENCE", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "CTEs for filtered dimensions, hash semi-join replacing nested loop",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Precompute store_sales keys satisfying second OR condition (ca_state filters) via CTE",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_address"],
+        "where_must_preserve": ["ss_addr_sk = ca_address_sk", "ca_country = 'United States'"],
+        "output_must_preserve": ["min(ss_quantity)", "min(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["no_semi_join_exists:EXPLAIN_EVIDENCE", "group_by_keys_compatible:PASS"],
+      "exploration": true,
+      "confidence": 0.7,
+      "expected_explain_delta": "CTE for ca_state keys, semi-join to store_sales",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Prefilter ALL dimensions (date/store/hd/cd/ca) in CTEs before joining to store_sales",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sold_date_sk IN (SELECT d_date_sk FROM date_cte)", "ss_store_sk IN (SELECT s_store_sk FROM store_cte)"],
+        "output_must_preserve": ["all min aggregates"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:EXPLAIN_EVIDENCE", "cte_materialization_fence:WARNING"],
+      "exploration": true,
+      "confidence": 0.65,
+      "expected_explain_delta": "Multiple CTE scans, reduced store_sales rows via semi-joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate household_demographics filter (hd_dep_count) into CTE before store_sales join",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics"],
+        "where_must_preserve": ["ss_hdemo_sk=hd_demo_sk", "hd_dep_count IN (1,3)"],
+        "output_must_preserve": ["min(ss_quantity)", "min(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:EXPLAIN_EVIDENCE", "unfiltered_cte:PASS"],
+      "exploration": true,
+      "confidence": 0.78,
+      "expected_explain_delta": "CTE scan for hd, earlier filter application",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split second OR condition (ca_state filters) into three UNION ALL branches with explicit JOINs",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_address"],
+        "where_must_preserve": [
+          "Branch1: ca_state IN ('GA','KY','SD') AND ss_net_profit BETWEEN 100 AND 200",
+          "Branch2: ca_state IN ('AR','IN','VA') AND ss_net_profit BETWEEN 150 AND 300",
+          "Branch3: ca_state IN ('KS','OH','SD') AND ss_net_profit BETWEEN 50 AND 250"
+        ],
+        "output_must_preserve": ["min(ss_ext_wholesale_cost)", "min(ss_quantity)"]
+      },
+      "gates_checked": ["no_bitmap_or_scan:EXPLAIN_EVIDENCE", "same_col_or:EXPLAIN_EVIDENCE"],
+      "exploration": true,
+      "confidence": 0.6,
+      "expected_explain_delta": "UNION ALL replacing OR, state-specific index scans",
+      "recommended_patch_ops": ["replace_where_predicate", "wrap_query_with_cte"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Materialize correlated hd/cd filters in CTE with GROUP BY ss_item_sk,ss_ticket_number",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics", "customer_demographics"],
+        "where_must_preserve": ["cd_marital_status", "hd_dep_count", "ss_sales_price ranges"],
+        "output_must_preserve": ["original min aggregates"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:EXPLAIN_EVIDENCE", "group_by_keys_compatible:PASS"],
+      "exploration": false,
+      "confidence": 0.82,
+      "expected_explain_delta": "MATERIALIZED CTE, single evaluation replacing per-row subquery",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize store_sales with first OR condition filters in CTE, then apply second OR condition",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sales_price ranges", "cd_marital_status", "hd_dep_count"],
+        "output_must_preserve": ["min(ss_ext_sales_price)", "min(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["cte_materialization_fence:EXPLAIN_EVIDENCE", "no_double_scan:WARNING"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "CTE scan for pre-filtered store_sales, reduced join cardinality",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push cd_education_status and cd_marital_status filters to customer_demographics scan",
+      "node_contract": {
+        "from_must_include": ["customer_demographics"],
+        "where_must_preserve": ["cd_education_status IN ('2 yr Degree','Primary')", "cd_marital_status IN ('M','S','W')"],
+        "output_must_preserve": ["all min aggregates"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:EXPLAIN_EVIDENCE", "no_group_by:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Earlier filter on customer_demographics, reduced rows to join",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "aggregate_pushdown", "family": "C", "reason": "No GROUP BY in query, single-row aggregate"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "No INTERSECT operations in original query"}
+  ]
+}

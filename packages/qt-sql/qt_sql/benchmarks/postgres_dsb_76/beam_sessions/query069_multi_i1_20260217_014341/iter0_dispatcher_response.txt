@@ -1,0 +1,190 @@
+### EXPLAIN Analysis
+**Cost Spine**:  
+The highest cost operator is the outer `Nested Loop` (25.7 seconds) joining the filtered customer set (1,105 rows) with materialized anti-join results for `web_sales` (83K rows) and `catalog_sales` (310K rows). This loop dominates 95% of runtime.
+
+**Bottleneck Hypothesis**:  
+The nested loop anti-join rechecks 1105 outer rows against large materialized sets (83K+310K rows) for `NOT EXISTS` conditions. This is inefficient because:
+1. Materialized anti-joins aren't indexed for probe-side lookups
+2. Repeated scans occur on `date_dim` (3x) with identical filters
+3. Comma-joins prevent predicate pushdown to dimension tables
+
+**Scan Count**:  
+- `date_dim`: 3 scans  
+- `catalog_sales`: 1 scan  
+- `web_sales`: 1 scan  
+- `store_sales`: 1 scan  
+
+---
+
+### Hypothesis
+The root bottleneck is **correlated anti-join paralysis** (Family B gap) combined with **comma-join weakness** (Family F gap). The nested loop re-execution pattern and poor cardinality estimates from comma-joins force full materialization of anti-join sets. Priority transforms:
+1. Decouple anti-joins via CTE decorrelation (Family B)
+2. Replace comma-joins with explicit JOINs (Family F)
+3. Reuse filtered date dimension (Family E)
+
+---
+
+### Probes (Transforms)
+```json
+{
+  "explain_analysis": {
+    "cost_spine": "Nested Loop (25.7s) joining 1105 rows with materialized anti-joins (83K+310K rows)",
+    "bottleneck_hypothesis": "Correlated anti-joins force full materialization due to nested loop rechecks. Poor cardinality estimates from comma-joins prevent optimization.",
+    "scan_count": {"date_dim": 3}
+  },
+  "hypothesis": "Correlated anti-join paralysis + comma-join weakness causing nested loop materialization",
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "S0-WHERE-da... (anti-join subtree)",
+      "node_contract": {
+        "from": "Convert NOT EXISTS to LEFT JOIN + NULL check",
+        "where": "Anti-join conditions moved to JOIN ON",
+        "output": ["c_customer_sk"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "outer_side_small:PASS"],
+      "phase": 2,
+      "exploration": false,
+      "confidence": 0.95,
+      "recommended_examples": ["early_filter_decorrelate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "S0-WHERE-da... (date_dim filters)",
+      "node_contract": {
+        "from": "Extract date_dim scan",
+        "where": "d_year=2002 AND d_moy BETWEEN 10-12",
+        "output": ["d_date_sk"]
+      },
+      "gates_checked": ["late_filter:PASS", "reused_scan:PASS"],
+      "phase": 1,
+      "exploration": false,
+      "confidence": 0.85,
+      "recommended_examples": ["pg_date_cte_explicit_join"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "S0-FROM (comma-join chain)",
+      "node_contract": {
+        "from": "Replace commas with explicit JOIN ON",
+        "where": "c_current_addr_sk=ca_address_sk, cd_demo_sk=c_current_cdemo_sk",
+        "output": ["c.*", "ca.*", "cd.*"]
+      },
+      "gates_checked": ["comma_join_detected:PASS", "join_graph_untangled:PASS"],
+      "phase": 3,
+      "exploration": false,
+      "confidence": 0.90,
+      "recommended_examples": ["pg_explicit_join_materialized"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "S0-WHERE-da... (ca_state, cd_* filters)",
+      "node_contract": {
+        "from": "Materialize filtered dimensions",
+        "where": "ca_state IN + cd_* IN conditions",
+        "output": ["Filtered ca/cd columns"]
+      },
+      "gates_checked": ["late_filter:PASS", "dimension_size:PASS"],
+      "phase": 1,
+      "exploration": false,
+      "confidence": 0.80,
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "E",
+      "target": "S0-FROM (dimension tables)",
+      "node_contract": {
+        "from": "CTE for ca/cd filters",
+        "where": "Pre-apply all dimension constraints",
+        "output": ["Pre-joined dimension keys"]
+      },
+      "gates_checked": ["repeated_scan:PASS", "expensive_dimension:PASS"],
+      "phase": 1,
+      "exploration": false,
+      "confidence": 0.75,
+      "recommended_examples": ["multi_dimension_prefetch"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "decorrelate_shared_scan",
+      "family": "B",
+      "target": "S0-WHERE-da... (all sales subqueries)",
+      "node_contract": {
+        "from": "Consolidate date_dim scans",
+        "where": "Share date_cte across subqueries",
+        "output": ["c_customer_sk", "sale_type"]
+      },
+      "gates_checked": ["common_filters:PASS", "correlation_key:PASS"],
+      "phase": 2,
+      "exploration": false,
+      "confidence": 0.88,
+      "recommended_examples": ["pg_shared_scan_decorrelate"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "S0-WHERE-da... (NOT EXISTS chain)",
+      "node_contract": {
+        "from": "Convert AND-NOT-EXISTS to NOT EXISTS",
+        "where": "Preserve anti-join semantics",
+        "output": ["c_customer_sk"]
+      },
+      "gates_checked": ["set_operation_detected:PASS", "small_sides:FAIL"],
+      "phase": 2,
+      "exploration": true,
+      "confidence": 0.65,
+      "exploration_hypothesis": "Anti-joins might collapse to single NOT EXISTS if sale_types are mutually exclusive"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialized_anti_join",
+      "family": "E",
+      "target": "S0-WHERE-da... (catalog_sales NOT EXISTS)",
+      "node_contract": {
+        "from": "Materialize anti-join keys",
+        "where": "Precompute NOT IN set",
+        "output": ["cs_ship_customer_sk"]
+      },
+      "gates_checked": ["large_anti_join:PASS", "single_use:FAIL"],
+      "phase": 1,
+      "exploration": true,
+      "confidence": 0.60,
+      "exploration_hypothesis": "Materializing smallest anti-join first might break correlation chain"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "early_aggregate",
+      "family": "C",
+      "reason": "gate failed: GROUP BY keys incompatible with join keys"
+    },
+    {
+      "transform_id": "cte_materialize_all",
+      "family": "E",
+      "reason": "gate failed: CTE would be unfiltered (orphan risk)"
+    }
+  ]
+}
+```
+
+### Key Insights
+1. **Primary Win**: Decorrelation (p01/p06) eliminates nested-loop materialization by converting anti-joins to indexed lookups
+2. **Combo Effect**: Explicit joins (p03) + date CTE (p02) improve cardinality estimates for hash joins
+3. **Safety**: All probes avoid regression traps (no EXISTS→IN conversion, no OR splitting)
+4. **Exploration**: p07/p08 test anti-join consolidation if initial decorrelation underperforms
+
+Ranked by phase:  
+- **Phase 1 (Row Reduction)**: p02, p04, p05, p08  
+- **Phase 2 (Redundancy)**: p01, p06, p07  
+- **Phase 3 (Topology)**: p03

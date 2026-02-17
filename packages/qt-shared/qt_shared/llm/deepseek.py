@@ -3,6 +3,8 @@
 import logging
 import time
 
+from .rate_limit import llm_call_guard
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,20 +44,20 @@ class DeepSeekClient:
 
         logger.debug("Sending request to DeepSeek API (prompt=%d chars)", len(prompt))
         start_time = time.time()
+        with llm_call_guard():
+            client = OpenAI(api_key=self.api_key, base_url=self.DEEPSEEK_BASE_URL)
 
-        client = OpenAI(api_key=self.api_key, base_url=self.DEEPSEEK_BASE_URL)
+            # DeepSeek chat supports max 8192 output tokens
+            # DeepSeek reasoner supports up to 16384
+            max_tokens = 16384 if "reasoner" in self.model else 8192
 
-        # DeepSeek chat supports max 8192 output tokens
-        # DeepSeek reasoner supports up to 16384
-        max_tokens = 16384 if "reasoner" in self.model else 8192
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=max_tokens,
-        )
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_tokens,
+            )
 
         duration = time.time() - start_time
         DeepSeekClient.last_duration = duration
@@ -73,6 +75,9 @@ class DeepSeekClient:
                 "prompt_cache_hit_tokens": getattr(u, 'prompt_cache_hit_tokens', 0),
                 "prompt_cache_miss_tokens": getattr(u, 'prompt_cache_miss_tokens', 0),
             }
+            explicit_cost = getattr(u, "cost", None)
+            if isinstance(explicit_cost, (int, float)):
+                self.last_usage["cost_usd"] = float(explicit_cost)
             DeepSeekClient.last_usage = self.last_usage
 
         # R1 reasoner: final answer should be in content, reasoning chain in reasoning_content.

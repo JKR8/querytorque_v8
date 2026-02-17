@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Iterable
 
 import click
 
@@ -35,6 +36,15 @@ import click
               help="Custom output directory (default: benchmark/runs/<timestamp>).")
 @click.option("--concurrency", type=int, default=0,
               help="Parallel query concurrency (0=serial).")
+@click.option("--benchmark-concurrency", type=int, default=4, show_default=True,
+              help="Max concurrent benchmark lanes in patch-parallel mode.")
+@click.option(
+    "--launch-interval-seconds",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Stagger query launches in patch-parallel mode to improve provider cache locality.",
+)
 @click.option("--config-boost", "config_boost", is_flag=True,
               help="Run config boost (SET LOCAL tuning) on winners after validation.")
 @click.option("--bootstrap", is_flag=True,
@@ -66,6 +76,8 @@ def run(
     resume: bool,
     output_dir: str | None,
     concurrency: int,
+    benchmark_concurrency: int,
+    launch_interval_seconds: float,
     config_boost: bool,
     bootstrap: bool,
     scenario: str,
@@ -97,6 +109,12 @@ def run(
     if dry_run and mode != "fleet":
         print_error("--dry-run is only valid with --mode fleet.")
         raise SystemExit(2)
+    if benchmark_concurrency < 1:
+        print_error("--benchmark-concurrency must be >= 1.")
+        raise SystemExit(2)
+    if launch_interval_seconds < 0:
+        print_error("--launch-interval-seconds must be >= 0.")
+        raise SystemExit(2)
 
     # Beam is the canonical tiered analyst/worker/snipe flow.
     patch_mode = True
@@ -118,16 +136,37 @@ def run(
         out = Path(output_dir)
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = bench_dir / "runs" / f"run_{ts}"
+        out = bench_dir / "runs" / f"run_{mode}_{ts}"
     out.mkdir(parents=True, exist_ok=True)
 
     # Checkpoint support
     checkpoint_path = out / "checkpoint.json"
     completed_ids: set[str] = set()
-    if resume and checkpoint_path.exists():
-        cp = json.loads(checkpoint_path.read_text())
-        completed_ids = set(cp.get("completed", []))
-        console.print(f"  Resuming: {len(completed_ids)} already completed")
+    results: list[dict] = []
+    allowed_ids = set(query_ids)
+    if resume:
+        recovered = _load_existing_results(out, allowed_ids)
+        results = list(recovered)
+        completed_ids = {r["query_id"] for r in recovered}
+
+        if checkpoint_path.exists():
+            cp = json.loads(checkpoint_path.read_text())
+            checkpoint_completed = set(cp.get("completed", []))
+            completed_ids |= (checkpoint_completed & allowed_ids)
+
+        # Heal checkpoint from discovered artifacts.
+        _write_checkpoint(checkpoint_path, completed_ids)
+        console.print(
+            f"  Resuming: {len(completed_ids)} completed recovered "
+            f"from checkpoint/results"
+        )
+
+    _write_progress_snapshot(
+        out=out,
+        total=len(query_ids),
+        results=results,
+        errors=[],
+    )
 
     from ..pipeline import Pipeline
     from ..schemas import OptimizationMode
@@ -309,6 +348,9 @@ def run(
             "total": len(query_ids),
             "completed": len(results),
             "elapsed_seconds": round(elapsed, 1),
+            "total_beam_cost_usd": 0.0,
+            "total_beam_cost_priced_calls": 0,
+            "total_beam_cost_unpriced_calls": 0,
             "results": results,
         }
         (out / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -335,11 +377,10 @@ def run(
                       f"{f', scenario={scenario}' if scenario else ''}"
                       f"{f', version={engine_version}' if engine_version else ''}")
 
-    results = []
     errors = []
     t0 = time.time()
 
-    # Parallel tiered beam: LLM concurrent, benchmark serialized
+    # Parallel tiered beam: LLM concurrent, benchmark with bounded concurrency
     if concurrency > 0 and patch_mode:
         _run_patch_parallel(
             pipeline=pipeline,
@@ -351,6 +392,9 @@ def run(
             max_iterations=iters,
             target_speedup=target_speedup,
             concurrency=concurrency,
+            benchmark_concurrency=benchmark_concurrency,
+            launch_interval_seconds=launch_interval_seconds,
+            total_queries=len(query_ids),
             results=results,
             errors=errors,
             console=console,
@@ -367,6 +411,7 @@ def run(
             target_speedup=target_speedup,
             n_workers=n_workers,
             mode_enum=mode_map[mode],
+            total_queries=len(query_ids),
             results=results,
             errors=errors,
             console=console,
@@ -396,14 +441,20 @@ def run(
             console.print("  --config-boost: skipped (requires PostgreSQL DSN)")
 
     # Summary
+    cost_summary = _summarize_costs(results)
     summary = {
         "benchmark": bench_dir.name,
         "mode": mode,
         "concurrency": concurrency,
+        "benchmark_concurrency": benchmark_concurrency,
+        "launch_interval_seconds": launch_interval_seconds,
         "total": len(query_ids),
         "completed": len(results),
         "errors": len(errors),
         "elapsed_seconds": round(elapsed, 1),
+        "total_beam_cost_usd": cost_summary["total_beam_cost_usd"],
+        "total_beam_cost_priced_calls": cost_summary["total_beam_cost_priced_calls"],
+        "total_beam_cost_unpriced_calls": cost_summary["total_beam_cost_unpriced_calls"],
         "results": results,
         "error_details": [{"query_id": qid, "error": msg} for qid, msg in errors],
     }
@@ -435,6 +486,11 @@ def run(
 
     console.print()
     print_success(f"Completed {len(results)}/{len(query_ids)} in {elapsed:.1f}s → {out}")
+    console.print(
+        f"  Beam cost: ${cost_summary['total_beam_cost_usd']:.6f} "
+        f"(priced calls={cost_summary['total_beam_cost_priced_calls']}, "
+        f"unpriced calls={cost_summary['total_beam_cost_unpriced_calls']})"
+    )
     if errors:
         print_error(f"{len(errors)} errors")
         raise SystemExit(2)
@@ -452,6 +508,7 @@ def _run_serial(
     target_speedup,
     n_workers,
     mode_enum,
+    total_queries,
     results,
     errors,
     console,
@@ -485,12 +542,28 @@ def _run_serial(
             )
 
             _save_query_result(result, qid, out, checkpoint_path, completed_ids, results)
+            _write_progress_snapshot(
+                out=out,
+                total=total_queries,
+                results=results,
+                errors=errors,
+            )
             speedup = getattr(result, "best_speedup", None) or getattr(result, "speedup", None)
             status_str = getattr(result, "status", "?")
-            console.print(f"[green]{status_str}[/green] {speedup or '?'}x")
+            beam_cost = getattr(result, "beam_cost_usd", 0.0) or 0.0
+            console.print(
+                f"[green]{status_str}[/green] {speedup or '?'}x "
+                f"(beam_cost=${beam_cost:.6f})"
+            )
 
         except Exception as e:
             errors.append((qid, str(e)))
+            _write_progress_snapshot(
+                out=out,
+                total=total_queries,
+                results=results,
+                errors=errors,
+            )
             console.print(f"[red]ERROR[/red] {e}")
 
 
@@ -505,20 +578,26 @@ def _run_patch_parallel(
     max_iterations,
     target_speedup,
     concurrency,
+    benchmark_concurrency,
+    launch_interval_seconds,
+    total_queries,
     results,
     errors,
     console,
 ) -> None:
-    """Parallel patch mode: LLM phases concurrent, benchmark serialized via shared lock.
+    """Parallel patch mode: LLM phases concurrent, benchmark in bounded parallel lanes.
 
     Each query runs its full tiered pipeline (analyst → workers → semantic retry → snipe)
-    concurrently. Only the benchmark phase (Phase 5: 3x timed runs) is serialized via a
-    shared threading.Lock to prevent timing pollution from concurrent DB load.
+    concurrently. Benchmark phases (Phase 5: 3x timed runs) share a bounded semaphore
+    to improve throughput while limiting cross-query timing interference.
     """
     import threading
     from ..schemas import OptimizationMode
 
-    benchmark_lock = threading.Lock()
+    benchmark_gate = threading.Semaphore(max(1, int(benchmark_concurrency)))
+    launch_interval_s = max(0.0, float(launch_interval_seconds))
+    launch_lock = threading.Lock()
+    next_launch_at = [0.0]
 
     # Build work items
     work_items: list[tuple[str, str]] = []
@@ -540,7 +619,8 @@ def _run_patch_parallel(
     console.print(
         f"\n{'='*60}\n"
         f"  PATCH PARALLEL: {len(work_items)} queries, "
-        f"concurrency={concurrency}, benchmark=serial\n"
+        f"concurrency={concurrency}, benchmark_concurrency={max(1, int(benchmark_concurrency))}, "
+        f"launch_interval={launch_interval_s:.1f}s\n"
         f"{'='*60}"
     )
 
@@ -548,6 +628,14 @@ def _run_patch_parallel(
 
     def _run_one(qid_sql):
         qid, sql = qid_sql
+        if launch_interval_s > 0:
+            with launch_lock:
+                now = time.monotonic()
+                wait_s = max(0.0, next_launch_at[0] - now)
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                    now = time.monotonic()
+                next_launch_at[0] = now + launch_interval_s
         return qid, pipeline.run_optimization_session(
             query_id=qid,
             sql=sql,
@@ -555,7 +643,7 @@ def _run_patch_parallel(
             target_speedup=target_speedup,
             mode=OptimizationMode.BEAM,
             patch=True,
-            benchmark_lock=benchmark_lock,
+            benchmark_lock=benchmark_gate,
         )
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -566,21 +654,38 @@ def _run_patch_parallel(
             try:
                 qid, result = future.result()
                 _save_query_result(result, qid, out, checkpoint_path, completed_ids, results)
+                _write_progress_snapshot(
+                    out=out,
+                    total=total_queries,
+                    results=results,
+                    errors=errors,
+                )
                 speedup = getattr(result, "best_speedup", None) or getattr(result, "speedup", None)
                 status_str = getattr(result, "status", "?")
                 elapsed_q = time.time() - t0
+                scoreboard = _summarize_statuses(results)
+                costboard = _summarize_costs(results)
                 console.print(
-                    f"  [{len(results)}/{len(work_items)}] {qid}: "
+                    f"  [{len(results)}/{total_queries}] {qid}: "
                     f"[green]{status_str}[/green] {speedup or '?'}x "
-                    f"({elapsed_q:.0f}s elapsed)"
+                    f"({elapsed_q:.0f}s elapsed) "
+                    f"wins={scoreboard['WIN']} improved={scoreboard['IMPROVED']} "
+                    f"neutral={scoreboard['NEUTRAL']} reg={scoreboard['REGRESSION']} "
+                    f"beam_cost=${costboard['total_beam_cost_usd']:.4f}"
                 )
             except Exception as e:
                 errors.append((qid, str(e)))
+                _write_progress_snapshot(
+                    out=out,
+                    total=total_queries,
+                    results=results,
+                    errors=errors,
+                )
                 console.print(f"  {qid}: [red]ERROR[/red] {e}")
 
     elapsed = time.time() - t0
     console.print(
-        f"\n  Patch parallel complete: {len(results)}/{len(work_items)} "
+        f"\n  Patch parallel complete: {len(results)}/{total_queries} "
         f"in {elapsed:.1f}s"
     )
 
@@ -589,19 +694,150 @@ def _save_query_result(result, qid, out, checkpoint_path, completed_ids, results
     """Save per-query result and update checkpoint."""
     query_out = out / qid
     query_out.mkdir(exist_ok=True)
-    (query_out / "result.json").write_text(
-        json.dumps(
-            result.__dict__ if hasattr(result, "__dict__") else str(result),
-            indent=2, default=str,
-        )
+    _write_json_atomic(
+        query_out / "result.json",
+        result.__dict__ if hasattr(result, "__dict__") else str(result),
     )
 
     speedup = getattr(result, "best_speedup", None) or getattr(result, "speedup", None)
     status_str = getattr(result, "status", "?")
-    results.append({"query_id": qid, "status": str(status_str), "speedup": speedup})
+    _upsert_result(
+        results,
+        {
+            "query_id": qid,
+            "status": str(status_str),
+            "speedup": speedup,
+            "beam_cost_usd": getattr(result, "beam_cost_usd", 0.0) or 0.0,
+            "beam_cost_priced_calls": getattr(result, "beam_cost_priced_calls", 0) or 0,
+            "beam_cost_unpriced_calls": getattr(result, "beam_cost_unpriced_calls", 0) or 0,
+        },
+    )
 
     completed_ids.add(qid)
-    checkpoint_path.write_text(json.dumps({
-        "completed": sorted(completed_ids),
-        "last_updated": datetime.now().isoformat(),
-    }, indent=2))
+    _write_checkpoint(checkpoint_path, completed_ids)
+
+
+def _write_json_atomic(path: Path, payload) -> None:
+    """Write JSON atomically to avoid partial files on interruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _write_checkpoint(checkpoint_path: Path, completed_ids: Iterable[str]) -> None:
+    _write_json_atomic(
+        checkpoint_path,
+        {
+            "completed": sorted(set(completed_ids)),
+            "last_updated": datetime.now().isoformat(),
+        },
+    )
+
+
+def _upsert_result(results: list[dict], new_row: dict) -> None:
+    qid = str(new_row.get("query_id", ""))
+    for i, row in enumerate(results):
+        if row.get("query_id") == qid:
+            results[i] = new_row
+            return
+    results.append(new_row)
+
+
+def _load_existing_results(out: Path, allowed_ids: set[str]) -> list[dict]:
+    loaded: list[dict] = []
+    for result_file in sorted(out.glob("*/result.json")):
+        qid = result_file.parent.name
+        if qid not in allowed_ids:
+            continue
+        try:
+            data = json.loads(result_file.read_text(encoding="utf-8"))
+            speedup = data.get("best_speedup", data.get("speedup"))
+            status = str(data.get("status", "?"))
+            loaded.append(
+                {
+                    "query_id": qid,
+                    "status": status,
+                    "speedup": speedup,
+                    "beam_cost_usd": float(data.get("beam_cost_usd", 0.0) or 0.0),
+                    "beam_cost_priced_calls": int(
+                        data.get("beam_cost_priced_calls", 0) or 0
+                    ),
+                    "beam_cost_unpriced_calls": int(
+                        data.get("beam_cost_unpriced_calls", 0) or 0
+                    ),
+                }
+            )
+        except Exception:
+            continue
+    return loaded
+
+
+def _summarize_statuses(results: list[dict]) -> dict[str, int]:
+    summary = {"WIN": 0, "IMPROVED": 0, "NEUTRAL": 0, "REGRESSION": 0, "OTHER": 0}
+    for row in results:
+        status = str(row.get("status", "OTHER")).upper()
+        if status in summary:
+            summary[status] += 1
+        else:
+            summary["OTHER"] += 1
+    return summary
+
+
+def _summarize_costs(results: list[dict]) -> dict[str, Any]:
+    total_cost = 0.0
+    priced_calls = 0
+    unpriced_calls = 0
+    for row in results:
+        beam_cost = row.get("beam_cost_usd", 0.0)
+        if isinstance(beam_cost, (int, float)):
+            total_cost += float(beam_cost)
+        priced = row.get("beam_cost_priced_calls", 0)
+        unpriced = row.get("beam_cost_unpriced_calls", 0)
+        if isinstance(priced, (int, float)):
+            priced_calls += int(priced)
+        if isinstance(unpriced, (int, float)):
+            unpriced_calls += int(unpriced)
+    return {
+        "total_beam_cost_usd": round(total_cost, 8),
+        "total_beam_cost_priced_calls": priced_calls,
+        "total_beam_cost_unpriced_calls": unpriced_calls,
+    }
+
+
+def _write_progress_snapshot(
+    *,
+    out: Path,
+    total: int,
+    results: list[dict],
+    errors: list[tuple[str, str]],
+) -> None:
+    completed_ids = {str(r.get("query_id", "")) for r in results if r.get("query_id")}
+    error_ids = {str(e[0]) for e in errors if e and e[0]}
+    summary = _summarize_statuses(results)
+    cost_summary = _summarize_costs(results)
+    winners = []
+    for r in results:
+        speedup = r.get("speedup")
+        if isinstance(speedup, (int, float)) and speedup > 1.0:
+            winners.append(
+                {
+                    "query_id": r.get("query_id"),
+                    "status": r.get("status"),
+                    "speedup": speedup,
+                    "beam_cost_usd": r.get("beam_cost_usd", 0.0),
+                }
+            )
+    winners.sort(key=lambda x: x["speedup"], reverse=True)
+    payload = {
+        "updated_at": datetime.now().isoformat(),
+        "total": total,
+        "completed": len(completed_ids),
+        "failed": len(error_ids),
+        "remaining": max(0, total - len(completed_ids) - len(error_ids)),
+        "status_counts": summary,
+        "cost": cost_summary,
+        "winners_so_far": winners[:20],
+        "errors": [{"query_id": qid, "error": msg} for qid, msg in errors[-100:]],
+    }
+    _write_json_atomic(out / "progress.json", payload)

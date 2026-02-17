@@ -1,0 +1,457 @@
+## Role
+
+You are a **Beam Worker** for SQL optimization on the target runtime dialect.
+
+You must apply **ONE specific transform** to the query and output a **PatchPlan JSON** that updates the query’s IR.
+
+One worker = one probe = one transform.
+
+---
+
+## Prompt Map (cache friendly)
+
+### Phase A — Cached Instructions (static)
+A1. Patch operations
+A2. Semantic guards (must preserve)
+A3. Anchor-hash rules (robustness requirements)
+A4. Verification checklist
+A5. PatchPlan output schema
+
+### Phase B — Probe-Specific Input (dynamic; after cache boundary)
+B1. Shared dispatcher hypothesis (short)
+B2. Probe assignment (transform + target + node contract + gates_checked)
+B3. Original SQL
+B4. Optional execution plan snippet
+B5. IR node map (S0 + anchor hashes)
+B6. Engine-specific knowledge profile (strengths, gaps, contraindications)
+
+---
+
+## Patch Operations (core + advanced)
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the full WHERE boolean expression | expr_sql |
+| replace_body | Replace entire query body | sql_fragment |
+| replace_expr_subtree | Replace a specific expression/predicate | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression/predicate | (target only, no payload) |
+| replace_join_condition | Replace a specific JOIN condition expression | expr_sql (+ by_anchor_hash) |
+| replace_select | Replace SELECT projection list | sql_fragment |
+| replace_block_with_cte_pair | Replace block using CTE-integrated SQL fragment | sql_fragment |
+| wrap_query_with_cte | Add wrapper CTE to statement | cte_name, cte_query_sql |
+
+All step targets MUST use: `{"by_node_id": "S0"}`.
+Use `by_anchor_hash` only when replacing/deleting a specific predicate/expression.
+
+Target examples:
+- Statement-level edit:
+  `{"by_node_id": "S0"}`
+- Predicate-subtree edit:
+  `{"by_node_id": "S0", "by_anchor_hash": "ab12cd34ef56ab78"}`
+
+---
+
+## Semantic Guards (MUST preserve)
+
+- Preserve ALL WHERE/HAVING/ON conditions exactly, unless the assigned transform explicitly replaces a correlated subquery with an equivalent join/anti-join.
+- Do NOT change any literal values (numbers, strings, dates, arithmetic forms).
+- Preserve SELECT columns, aliases, ORDER BY, LIMIT exactly.
+- Do NOT add new filters.
+- Do NOT leave orphaned CTEs or duplicate base scans after replacement.
+- Follow dispatcher `node_contract` precisely.
+
+If `node_contract` or `gates_checked` is missing or ambiguous:
+- Output a minimal safe failure PatchPlan with `steps: []` and hypothesis explaining what is missing.
+
+If a RETRY section is present with a gate-failure object:
+- Fix the specific gate issue first (do not redesign the transform intent).
+- Preserve all semantic guards while correcting only what failed.
+
+---
+
+## Anchor-hash rules (robustness)
+
+- `by_anchor_hash` values are produced by an external parser and are **whitespace/formatting independent**.
+- You MUST copy anchor hashes verbatim; never invent hashes.
+- If you cannot confidently identify the exact target anchor, do not use `replace_expr_subtree`.
+  Prefer `replace_where_predicate`, or output a safe no-op plan.
+
+---
+
+## Verification Checklist (self-check)
+
+- [ ] Patch steps produce a valid executable query
+- [ ] No missing tables/aliases
+- [ ] No duplicated source scans (orphan risk)
+- [ ] EXISTS / NOT EXISTS semantics preserved if rewritten
+- [ ] No same-column OR to UNION split unless EXPLAIN evidence shows OR blocks index usage and UNION branches become index scans
+- [ ] New CTEs are selective (meaningful WHERE) unless transform requires otherwise
+
+---
+
+## PatchPlan Output Schema (MUST follow)
+
+Tier-0 output contract:
+- first character must be `{` (no leading whitespace/newlines)
+- top-level value must be one JSON object
+- no markdown fences, no prose, no commentary
+
+Output JSON shape:
+{
+  "probe_id": "p01",
+  "transform_id": "decorrelate_not_exists_to_cte",
+  "family": "B",
+  "dialect": "<target_dialect>",
+  "hypothesis": "1 sentence: why this transform should reduce the plan hotspot",
+  "reasoning_trace": [
+    "Target correlated NOT EXISTS on customer_demographics",
+    "Replace per-row re-execution with one anti-join-ready CTE"
+  ],
+  "target_ir": "Short structural description of the post-patch query shape",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_customers",
+        "cte_query_sql": "SELECT c_customer_sk FROM customer WHERE c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Worked example (fully valid output):
+{
+  "probe_id": "p07",
+  "transform_id": "decorrelate_exists_to_semijoin_cte",
+  "family": "B",
+  "dialect": "postgres",
+  "hypothesis": "Replace correlated EXISTS with a precomputed distinct keyset so the planner uses one set-based join instead of per-row subquery execution.",
+  "reasoning_trace": [
+    "The EXISTS subquery depends only on customer key.",
+    "A DISTINCT keyset CTE preserves EXISTS semantics and removes repeated inner work."
+  ],
+  "target_ir": "CTE keyset plus semijoin in FROM; original non-EXISTS filters preserved in WHERE.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "store_buyers",
+        "cte_query_sql": "SELECT DISTINCT ss_customer_sk AS customer_sk FROM store_sales WHERE ss_list_price BETWEEN 80 AND 169"
+      }
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "from_sql": "customer c JOIN store_buyers sb ON sb.customer_sk = c.c_customer_sk"
+      }
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "expr_sql": "c.c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Rules:
+- Steps must be minimal and sufficient.
+- Every SQL fragment in payload MUST be complete and executable (no ellipsis).
+- Prefer `insert_cte` + `replace_from` + `replace_where_predicate` over `replace_body` unless necessary.
+- Never emit `payload.sql`; use `payload.sql_fragment` for replace_body/replace_select/replace_block_with_cte_pair.
+
+---
+
+## Cache Boundary
+Everything below is probe-specific input.
+
+## Shared Dispatcher Hypothesis
+Plan shows nested loops dominating runtime with repeated dimension rescans and correlated EXISTS execution. Decorrelating subqueries (B) and prefiltering dimensions (A) should reduce nested loop amplification. Materialization (E) and explicit joins (F) may optimize dimension reuse.
+## Runtime Dialect Contract
+- target_dialect: postgres
+- runtime_dialect_is_source_of_truth: true
+- if static examples conflict, follow runtime dialect behavior
+## Probe Assignment
+- transform_id: pg_self_join_decomposition
+- family: E
+- target: Materialize sales CTEs: Add MATERIALIZED keyword to store_sales_cte, web_sales_cte, catalog_sales_cte definitions to prevent inlining
+- phase: ?
+- exploration: no
+- dialect: postgres
+- recommended_patch_ops: `replace_expr_subtree`
+- expected_explain_delta: CTE scans show Materialize node in EXPLAIN
+- equivalence_tier: exact
+
+### Gates Checked
+cte_materialization_fence:PASS
+
+### Node Contract
+
+```json
+{
+  "from_must_include": [],
+  "where_must_preserve": [],
+  "output_must_preserve": [
+    "CTE content identical"
+  ]
+}
+```
+
+### Original SQL
+
+```sql
+select 
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  count(*) cnt1,
+  cd_purchase_estimate,
+  count(*) cnt2,
+  cd_credit_rating,
+  count(*) cnt3,
+  cd_dep_count,
+  count(*) cnt4,
+  cd_dep_employed_count,
+  count(*) cnt5,
+  cd_dep_college_count,
+  count(*) cnt6
+ from
+  customer c,customer_address ca,customer_demographics
+ where
+  c.c_current_addr_sk = ca.ca_address_sk and
+  ca_county in ('Alameda County','Lexington city','Pender County','Petroleum County','Walworth County') and
+  c.c_birth_month in (4, 5) and
+  cd_demo_sk = c.c_current_cdemo_sk
+  and cd_marital_status in ('U', 'S', 'U')
+  and cd_education_status in ('College', 'Secondary', 'College')
+  and cd_gender = 'M' and
+  exists (select *
+          from store_sales,date_dim, item
+          where c.c_customer_sk = ss_customer_sk and
+                ss_sold_date_sk = d_date_sk and
+                d_year = 1999 and
+                d_moy between 5 and 5+3 and
+                ss_item_sk = i_item_sk and
+                i_category in ('Children', 'Home', 'Women')
+                and ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 75 * 0.01
+                and i_manager_id BETWEEN 91 and 100
+                ) and
+   (exists (select *
+            from web_sales,date_dim, item
+            where c.c_customer_sk = ws_bill_customer_sk and
+                  ws_sold_date_sk = d_date_sk and
+                  d_year = 1999 and
+                  d_moy between 5 ANd 5+3 and
+                  ws_item_sk = i_item_sk and
+                  i_category in ('Children', 'Home', 'Women')
+                  and i_manager_id BETWEEN 91 and 100
+                  and ws_sales_price / ws_list_price BETWEEN 65 * 0.01 AND 75 * 0.01
+                  ) or
+    exists (select *
+            from catalog_sales,date_dim, item
+            where c.c_customer_sk = cs_ship_customer_sk and
+                  cs_sold_date_sk = d_date_sk and
+                  d_year = 1999 and
+                  d_moy between 5 and 5+3 and
+                  cs_item_sk = i_item_sk and
+                  i_category in ('Children', 'Home', 'Women')
+                  and i_manager_id BETWEEN 91 and 100
+                  and cs_sales_price / cs_list_price BETWEEN 65 * 0.01 AND 75 * 0.01
+                  ))
+ group by cd_gender,
+          cd_marital_status,
+          cd_education_status,
+          cd_purchase_estimate,
+          cd_credit_rating,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ order by cd_gender,
+          cd_marital_status,
+          cd_education_status,
+          cd_purchase_estimate,
+          cd_credit_rating,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+limit 100;
+```
+
+### Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: customer c, customer_address ca, customer_demographics
+    WHERE [ddfcc2d1d3d0da2d]: c.c_current_addr_sk = ca.ca_address_sk AND ca_county IN ('Alameda County', 'Lexington city', 'Pen...
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+    ORDER BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+
+Patch operations (core+advanced): insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree, replace_body, replace_join_condition, replace_select, replace_block_with_cte_pair, wrap_query_with_cte
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+### Dispatcher Reasoning Trace
+- Cost spine: Gather (32.4s) → Nested Loop (14.9s) → Index Scans on multiple date_dim/item copies
+- Amplification: 135k rows in store_sales loop, 59k rows in catalog_sales loop with repeated dimension rescans
+- Late selectivity: Dimension filters applied after joins, missing early reduction opportunities
+
+### Schema / Index / Stats Context
+- source: postgres
+- referenced_tables: 8
+
+| Table | Rows(est) | PK | Indexes |
+|-------|-----------|----|---------|
+| catalog_sales | 14397255 | cs_item_sk, cs_order_number | catalog_sales_pkey, _dta_index_catalog_sales_6_1301579675__k1_k16_k5_k4_3_6_18_19_2, _dta_index_catalog_sales_6_1301579675__k17_k6_k3_k5_k1_k16_12_1, _dta_index_catalog_sales_6_1301579675__k1_4_16_18_19_21_24, _dta_index_catalog_sales_6_1301579675__k3_k12_k14_k15_16_18, _dta_index_catalog_sales_6_1301579675__k1_k16_k4_18_34 |
+| customer | 500000 | c_customer_sk | customer_pkey, _dta_index_customer_6_949578421__k9_k10, _dta_index_customer_6_949578421__k1_k5, _dta_index_customer_5_949578421__k13_k5 |
+| customer_address | 250000 | ca_address_sk | customer_address_pkey |
+| customer_demographics | 1920800 | cd_demo_sk | customer_demographics_pkey |
+| date_dim | 73049 | d_date_sk | date_dim_pkey, _dta_index_date_dim_6_661577395__k7_k4_k9_k1, _dta_index_date_dim_6_661577395__k7_k9_k1, _dta_index_date_dim_6_661577395__k1_k7_k9, _dta_index_date_dim_6_661577395__k7_k11_k1, _dta_index_date_dim_6_661577395__k9_k7_k1 |
+| item | 102000 | i_item_sk | item_pkey, _dta_index_item_6_853578079__k1_2_5, _dta_index_item_6_853578079__k13_k11_k1, _dta_index_item_6_853578079__k18, _dta_index_item_6_853578079__k2_k1 |
+| store_sales | 28806628 | ss_item_sk, ss_ticket_number | store_sales_pkey, _dta_index_store_sales_6_1333579789__k1_k23_k14_k6_k8_k5_k7_3_4, _dta_index_store_sales_6_1333579789__k1_k5_k8_k3_11_13_14_20, _dta_index_store_sales_6_1333579789__k1_k3_k10_k4_k8_9_16_23, _dta_index_store_sales_6_1333579789__k4_1_3_10_11_14, _dta_index_store_sales_6_1333579789__k1_k3_k10_k4_k8_23 |
+| web_sales | 7197533 | ws_item_sk, ws_order_number | web_sales_pkey, _dta_index_web_sales_6_1269579561__k3_k18_k12_k14_16_29_34, _dta_index_web_sales_6_1269579561__k1_k4_k5_18, _dta_index_web_sales_6_1269579561__k1_8_24, _dta_index_web_sales_6_1269579561__k18_16, _dta_index_web_sales_6_1269579561__k1_k5 |
+
+### Engine-Specific Knowledge
+## Dialect Profile (POSTGRES)
+
+**Combined Intelligence Baseline**: Combined intelligence baseline from 53 validated DSB queries at SF5-SF10, plus regression registry outcomes. PostgreSQL has bitmap index scans, JIT compilation, and aggressive CTE materialization. Techniques that work on DuckDB often regress here.
+
+### Optimizer Strengths (don't fight these)
+- `BITMAP_OR_SCAN`: Avoid splitting OR conditions into UNION ALL by default. Only consider OR→UNION when EXPLAIN shows OR blocks index usage and UNION branches become index scans. 0.21x and 0.26x reg…
+- `SEMI_JOIN_EXISTS`: NEVER convert EXISTS to IN/NOT IN or materialized CTEs. 0.50x, 0.75x observed. Note: NOT EXISTS anti-join decorrelation can still be valid when replacing large correlated anti patterns.
+- `INNER_JOIN_REORDERING`: Don't restructure INNER JOIN orders. Focus on LEFT JOIN blocking or comma-join confusion.
+- `INDEX_ONLY_SCAN`: Small dimension lookups (<10K rows) may not need CTEs.
+
+### Known Gaps (exploit these)
+- `COMMA_JOIN_WEAKNESS` [HIGH] detect: FROM t1, t2, t3 WHERE t1.key = t2.key (comma joins, no explicit JOIN). Poor row estimates in EXPLAIN. | action: Convert comma-joins to explicit JOIN...ON syntax. Best when combined with date_cte_isolate.
+- `CORRELATED_SUBQUERY_PARALYSIS` [HIGH] detect: Nested loop in EXPLAIN, inner re-executes aggregate per outer row. SQL: WHERE col > (SELECT AGG FROM ... WHERE outer.key = inner.key). Hash… | action: Convert correlated WHERE to explicit CTE with GROUP BY + JOIN.
+- `NON_EQUI_JOIN_INPUT_BLINDNESS` [HIGH] detect: Expensive non-equi join (BETWEEN, <, >) with large inputs on both sides. Neither side filtered. | action: Reduce fact table input size via filtered CTE before the non-equi join.
+- `CTE_MATERIALIZATION_FENCE` [MEDIUM] detect: Large CTE + small post-filter. Multi-referenced CTE that blocks predicate pushdown. | action: Materialize STRATEGICALLY: only when CTE is expensive and reused. Avoid fencing single-use cases.
+- `CROSS_CTE_PREDICATE_BLINDNESS` [MEDIUM] detect: Sequential scan on dimension table without index condition. Late filter after large scan/join. | action: Pre-filter into CTE definition. But be more cautious than on DuckDB.
+
+### Transform Recipe
+- `transform_id`: `pg_self_join_decomposition`
+- `family`: `E`
+- `principle`: Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.
+- `expected_features`: `AGG_AVG`, `AGG_SUM`, `BETWEEN`, `DATE_DIM`, `GROUP_BY`
+
+### Gold Pattern Reference
+- `plan_id`: `gold_postgres_pg_self_join_decomposition`
+- `step_ops`: insert_cte -> insert_cte -> insert_cte -> insert_cte -> insert_cte -> replace_from -> replace_where_predicate
+- `ctes`: `date_filter`, `store_sales_revenue`, `store_avg_revenue`, `filtered_store`, `filtered_item`
+- Reuse pattern shape, not literal table/column names.
+
+
+## RETRY — Gate failure feedback (attempt 2/2)
+Your previous patch failed validation. Return a corrected PatchPlan JSON only.
+First character must be `{` and output must contain no markdown/prose.
+
+### Failure Object
+```json
+{
+  "probe_id": "p07",
+  "transform_id": "pg_self_join_decomposition",
+  "gate": "tier1_structural",
+  "status": "FAIL",
+  "error": "Tier-1: LITERAL MISMATCH: Original literals missing from rewrite \u2014 numbers: ['0.01', '3.0', '65.0', '75.0']. The rewrite changed filter values instead of preserving them."
+}
+```
+
+### Failed SQL (from attempt 1)
+```sql
+WITH date_filter AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy BETWEEN 5 AND 8), filtered_item AS (SELECT i_item_sk FROM item WHERE i_category IN ('Children', 'Home', 'Women') AND i_manager_id BETWEEN 91 AND 100), store_sales_filtered AS (SELECT ss_customer_sk, ss_item_sk, ss_sales_price, ss_list_price FROM store_sales WHERE EXISTS(SELECT 1 FROM date_filter AS df WHERE df.d_date_sk = ss_sold_date_sk) AND EXISTS(SELECT 1 FROM filtered_item AS fi WHERE fi.i_item_sk = ss_item_sk)), web_sales_filtered AS (SELECT ws_bill_customer_sk, ws_item_sk, ws_sales_price, ws_list_price FROM web_sales WHERE EXISTS(SELECT 1 FROM date_filter AS df WHERE df.d_date_sk = ws_sold_date_sk) AND EXISTS(SELECT 1 FROM filtered_item AS fi WHERE fi.i_item_sk = ws_item_sk)), catalog_sales_filtered AS (SELECT cs_ship_customer_sk, cs_item_sk, cs_sales_price, cs_list_price FROM catalog_sales WHERE EXISTS(SELECT 1 FROM date_filter AS df WHERE df.d_date_sk = cs_sold_date_sk) AND EXISTS(SELECT 1 FROM filtered_item AS fi WHERE fi.i_item_sk = cs_item_sk)) SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3, cd_dep_count, COUNT(*) AS cnt4, cd_dep_employed_count, COUNT(*) AS cnt5, cd_dep_college_count, COUNT(*) AS cnt6 FROM customer AS c JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics AS cd ON cd.cd_demo_sk = c.c_current_cdemo_sk WHERE ca.ca_county IN ('Alameda County', 'Lexington city', 'Pender County', 'Petroleum County', 'Walworth County') AND c.c_birth_month IN (4, 5) AND cd.cd_marital_status IN ('U', 'S', 'U') AND cd.education_status IN ('College', 'Secondary', 'College') AND cd.gender = 'M' AND EXISTS(SELECT 1 FROM store_sales_filtered AS ssf WHERE c.c_customer_sk = ssf.ss_customer_sk AND ssf.ss_sales_price / ssf.ss_list_price BETWEEN 0.65 AND 0.75) AND (EXISTS(SELECT 1 FROM web_sales_filtered AS wsf WHERE c.c_customer_sk = wsf.ws_bill_customer_sk AND wsf.ws_sales_price / wsf.ws_list_price BETWEEN 0.65 AND 0.75) OR EXISTS(SELECT 1 FROM catalog_sales_filtered AS csf WHERE c.c_customer_sk = csf.cs_ship_customer_sk AND csf.cs_sales_price / csf.cs_list_price BETWEEN 0.65 AND 0.75)) GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100;
+```
+
+### Previous Worker Output (attempt 1)
+```
+{
+  "probe_id": "p01",
+  "transform_id": "pg_self_join_decomposition",
+  "family": "E",
+  "dialect": "postgres",
+  "hypothesis": "Materializing shared sales CTEs will prevent repeated scans of large fact tables and reduce nested loop amplification.",
+  "reasoning_trace": [
+    "Query contains three correlated EXISTS subqueries scanning store_sales, web_sales, and catalog_sales with similar filters.",
+    "Each subquery joins date_dim and item with identical category and price ratio conditions.",
+    "Materializing filtered sales data into CTEs can eliminate repeated dimension rescans."
+  ],
+  "target_ir": "Five CTEs added: date filter, store_sales revenue, store average revenue, filtered store_sales, filtered item; main query FROM replaced to use CTEs.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "date_filter",
+        "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy BETWEEN 5 AND 8"
+      }
+    },
+    {
+      "step_id": "s2",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_item",
+        "cte_query_sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Children', 'Home', 'Women') AND i_manager_id BETWEEN 91 AND 100"
+      }
+    },
+    {
+      "step_id": "s3",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "store_sales_filtered",
+        "cte_query_sql": "SELECT ss_customer_sk, ss_item_sk, ss_sales_price, ss_list_price FROM store_sales WHERE EXISTS (SELECT 1 FROM date_filter df WHERE df.d_date_sk = ss_sold_date_sk) AND EXISTS (SELECT 1 FROM filtered_item fi WHERE fi.i_item_sk = ss_item_sk)"
+      }
+    },
+    {
+      "step_id": "s4",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "web_sales_filtered",
+        "cte_query_sql": "SELECT ws_bill_customer_sk, ws_item_sk, ws_sales_price, ws_list_price FROM web_sales WHERE EXISTS (SELECT 1 FROM date_filter df WHERE df.d_date_sk = ws_sold_date_sk) AND EXISTS (SELECT 1 FROM filtered_item fi WHERE fi.i_item_sk = ws_item_sk)"
+      }
+    },
+    {
+      "step_id": "s5",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "catalog_sales_filtered",
+        "cte_query_sql": "SELECT cs_ship_customer_sk, cs_item_sk, cs_sales_price, cs_list_price FROM catalog_sales WHERE EXISTS (SELECT 1 FROM date_filter df WHERE df.d_date_sk = cs_sold_date_sk) AND EXISTS (SELECT 1 FROM filtered_item fi WHERE fi.i_item_sk = cs_item_sk)"
+      }
+    },
+    {
+      "step_id": "s6",
+      "op": "replace_from",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "from_sql": "customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk"
+      }
+    },
+    {
+      "step_id": "s7",
+      "op": "replace_where_predicate",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "expr_sql": "ca.ca_county IN ('Alameda County','Lexington city','Pender County','Petroleum County','Walworth County') AND c.c_birth_month IN (4, 5) AND cd.cd_marital_status IN ('U', 'S', 'U') AND cd.education_status IN ('College', 'Secondary', 'College') AND cd.gender = 'M' AND EXISTS (SELECT 1 FROM store_sales_filtered ssf WHERE c.c_customer_sk = ssf.ss_customer_sk AND ssf.ss_sales_price / ssf.ss_list_price BETWEEN 0.65 AND 0.75) AND (EXISTS (SELECT 1 FROM web_sales_filtered wsf WHERE c.c_customer_sk = wsf.ws_bill_customer_sk AND wsf.ws_sales_price / wsf.ws_list_price BETWEEN 0.65 AND 0.75) OR EXISTS (SELECT 1 FROM catalog_sales_filtered csf WHERE c.c_customer_sk = csf.cs_ship_customer_sk AND csf.cs_sales_price / csf.cs_list_price BETWEEN 0.65 AND 0.75))"
+      }
+    }
+  ]
+}
+```
+
+Fix only what caused the gate failure while preserving transform intent and semantics.
+Output ONLY valid PatchPlan JSON.
+Never emit payload.sql; use payload.sql_fragment where SQL fragments are required.

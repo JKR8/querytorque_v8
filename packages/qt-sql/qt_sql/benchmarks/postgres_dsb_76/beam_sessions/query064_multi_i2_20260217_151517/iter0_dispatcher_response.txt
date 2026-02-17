@@ -1,0 +1,259 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Cost spine dominated by large sequential scans on catalog_sales (1.7M rows) and catalog_returns (2.1M rows) with late aggregation. Nested loops amplify costs through repeated dimension rescans. Early filtering and decorrelation should reduce input sizes and prevent re-execution.",
+    "reasoning_trace": [
+      "Merge Join and Aggregate on catalog tables consume 64% of total runtime (183965ms)",
+      "Nested loops show 157k iterations with dimension rescans despite indexes",
+      "Late d1.d_year filtering misses opportunity to reduce store_sales scan",
+      "Comma joins prevent optimal join reordering despite selective dimension filters"
+    ],
+    "cost_spine": [
+      "Merge Join → Aggregate → Hash Join → Seq Scan catalog_sales → Seq Scan catalog_returns"
+    ],
+    "hotspots": [
+      {"op": "Seq Scan catalog_sales", "why": "Full scan without early date filter", "evidence": "rows=1.7M, time=163161ms"},
+      {"op": "Nested Loop", "why": "157k loops with dimension rescans", "evidence": "loops=157863, time=227741ms"}
+    ],
+    "do_not_do": ["or_to_union", "exists_to_materialized_cte"]
+  },
+  "probe_summary_schema": [
+    "probe_id", "transform_id", "family", "status", "speedup", "expected_explain_delta", "ops_used", 
+    "confidence", "exploration", "failure_reason", "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Add d1.d_year IN (2000,2001) to cross_sales WHERE clause to reduce store_sales scan early",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim d1"],
+        "where_must_preserve": ["ss_sold_date_sk = d1.d_date_sk"],
+        "output_must_preserve": ["d1.d_year", "all original GROUP BY columns"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Bitmap Heap Scan on store_sales replaces Seq Scan, reduced rows in Nested Loop",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "gold_example_id": "early_filter_date"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and pre-filter selective dimensions (promotion, ad2, item) via CTEs",
+      "node_contract": {
+        "from_must_include": ["promotion", "customer_address ad2", "item"],
+        "where_must_preserve": [
+          "p_channel_email='Y'", "p_channel_tv='Y'", 
+          "ad2.ca_state IN ('KS','OH','VA')", 
+          "i_current_price BETWEEN 77 AND 87"
+        ],
+        "output_must_preserve": ["all JOIN keys and GROUP BY columns"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Hash Join replaces Nested Loop, reduced loops in dimension rescans",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "pg_explicit_join_rewrite"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales/catalog_returns in cs_ui CTE before join",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": [
+          "cs_item_sk = cr_item_sk", 
+          "cs_order_number = cr_order_number",
+          "cs_wholesale_cost BETWEEN 76 AND 96"
+        ],
+        "output_must_preserve": ["cs_item_sk", "sale", "refund", "HAVING condition"]
+      },
+      "gates_checked": ["aggregation_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may optimize two-phase aggregation better than large join+aggregate",
+      "confidence": 0.65,
+      "expected_explain_delta": "Merge Join replaced by HashAggregate in cs_ui CTE",
+      "recommended_patch_ops": ["replace_body"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered store_sales+dimensions before final aggregation",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "cs_ui"],
+        "where_must_preserve": [
+          "ss_item_sk = sr_item_sk", 
+          "ss_ticket_number = sr_ticket_number",
+          "ss_item_sk = cs_ui.cs_item_sk"
+        ],
+        "output_must_preserve": ["all GROUP BY columns"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "CTE scan replaces repeated dimension scans in Nested Loops",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate customer_demographics cd1 filter into CTE (cd_marital_status='S')",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1"],
+        "where_must_preserve": [
+          "cd1.cd_marital_status = 'S'", 
+          "cd1.cd_education_status IN ('Advanced Degree','4 yr Degree')"
+        ],
+        "output_must_preserve": ["cd1.cd_demo_sk"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may benefit from explicit materialization despite index scans",
+      "confidence": 0.7,
+      "expected_explain_delta": "Index Scan replaced by CTE scan with fewer rows",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate household_demographics hd1 filter into CTE",
+      "node_contract": {
+        "from_must_include": ["household_demographics hd1"],
+        "where_must_preserve": ["hd1.hd_income_band_sk = ib1.ib_income_band_sk"],
+        "output_must_preserve": ["hd1.hd_demo_sk"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": true,
+      "confidence": 0.68,
+      "expected_explain_delta": "Reduced rows in hd1 scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Decouple customer-current/first-sale dependencies via CTE",
+      "node_contract": {
+        "from_must_include": ["customer", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": [
+          "c_first_sales_date_sk = d2.d_date_sk", 
+          "c_first_shipto_date_sk = d3.d_date_sk"
+        ],
+        "output_must_preserve": ["c_customer_sk", "d2.d_year", "d3.d_year"]
+      },
+      "gates_checked": ["correlated_subquery:ABSENT"],
+      "exploration": true,
+      "exploration_hypothesis": "Eliminate repeated date_dim scans via pre-join",
+      "confidence": 0.62,
+      "expected_explain_delta": "Merge Join replaces Index Scans on d2/d3",
+      "recommended_patch_ops": ["insert_cte", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered item CTE before joining with store_sales",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_current_price BETWEEN 77 AND 87"],
+        "output_must_preserve": ["i_item_sk", "i_product_name"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduced rows in store_sales-item join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push ad2.ca_state filter into customer CTE",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address ad2"],
+        "where_must_preserve": [
+          "c_current_addr_sk = ad2.ca_address_sk", 
+          "ad2.ca_state IN ('KS','OH','VA')"
+        ],
+        "output_must_preserve": ["c_customer_sk"]
+      },
+      "gates_checked": ["correlated_subquery:ABSENT"],
+      "exploration": true,
+      "confidence": 0.75,
+      "expected_explain_delta": "Fewer rows in customer scan",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate store_sales aggregates in one pass",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["count(*)", "sum(ss_wholesale_cost)", "sum(ss_list_price)", "sum(ss_coupon_amt)"]
+      },
+      "gates_checked": ["aggregation_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Avoid repeated value extraction in aggregation",
+      "confidence": 0.6,
+      "expected_explain_delta": "Single Aggregate replaces multiple computations",
+      "recommended_patch_ops": ["replace_select"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage store_sales joins: filter dimensions → join with store_sales → join with others",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer", "date_dim d1"],
+        "where_must_preserve": [
+          "ss_store_sk = s_store_sk", 
+          "ss_customer_sk = c_customer_sk",
+          "ss_sold_date_sk = d1.d_date_sk"
+        ],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Progressive reduction may overcome comma join limitations",
+      "confidence": 0.55,
+      "expected_explain_delta": "Shorter pipeline in EXPLAIN",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Materialize cs_ui as MATERIALIZED CTE to prevent re-inlining",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": ["cs_item_sk = cr_item_sk", "cs_order_number = cr_order_number"],
+        "output_must_preserve": ["cs_item_sk", "sale", "refund"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL materialization fence prevents costly re-execution",
+      "confidence": 0.7,
+      "expected_explain_delta": "CTE scan shows MATERIALIZED in EXPLAIN",
+      "recommended_patch_ops": ["replace_block_with_cte_pair"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR conditions in WHERE clause"},
+    {"transform_id": "sf_sk_pushdown_multi_fact", "family": "A", "reason": "Snowflake-specific transform not applicable to PostgreSQL"}
+  ]
+}

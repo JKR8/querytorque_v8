@@ -1,0 +1,240 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Cost spine dominated by Hash Join (12979 ms) and Nested Loop with 20 iterations (5813 ms). Correlated EXISTS/NOT EXISTS subqueries cause inefficient nested loops. Transform families B (decorrelation) and F (explicit joins + prefetching) should reduce work by precomputing sets and improving join planning.",
+    "reasoning_trace": [
+      "Hash Join consumes 92% of total time with 51k web_returns rows",
+      "Nested Loop executes web_sales index scan 20 times (date_dim rows)",
+      "Correlated subqueries force re-execution; decorrelation should convert to set operations",
+      "Comma joins prevent optimal join ordering; explicit syntax required for PG optimizer"
+    ],
+    "cost_spine": ["Hash Join (12979 ms)", "Nested Loop (5813 ms)", "Seq Scan web_returns (1330 ms)", "Aggregate", "Sort"],
+    "hotspots": [
+      {"op": "Hash Join", "why": "full scan of 51k web_returns rows", "evidence": "time=12979ms, rows=2820"},
+      {"op": "Nested Loop", "why": "20 iterations of web_sales scan", "evidence": "loops=20, time=5813ms"}
+    ],
+    "do_not_do": ["or_to_union (BITMAP_OR_SCAN strength)", "exists_to_in (SEMI_JOIN_EXISTS strength)"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Replace EXISTS subquery with CTE: WITH multi_warehouse AS (SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1) THEN JOIN multi_warehouse ON ws1.ws_order_number = multi_warehouse.ws_order_number",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["ws1.ws_order_number = multi_warehouse.ws_order_number"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Nested Loop for EXISTS replaced by Hash Join with small CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Replace NOT EXISTS with CTE: WITH problem_returns AS (SELECT wr_order_number FROM web_returns WHERE wr_reason_sk IN (8,18,20,23,41) GROUP BY wr_order_number) THEN LEFT JOIN problem_returns ON ws1.ws_order_number = problem_returns.wr_order_number WHERE wr_order_number IS NULL",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["problem_returns.wr_order_number IS NULL"],
+        "output_must_preserve": ["original SELECT columns and aggregates"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "unfiltered_cte:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Hash Join on web_returns replaced by Anti Join with pre-aggregated CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Create date_cte AS (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY'), then convert comma joins to INNER JOIN date_cte ON ws1.ws_ship_date_sk = date_cte.d_date_sk",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim"],
+        "where_must_preserve": ["d_date range condition"],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["cte_reuse:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop on date_dim replaced by Hash Join with materialized CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create ca_prefilter AS (SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('MO','MT','OK','SC','TX','WI')), site_prefilter AS (SELECT web_site_sk FROM web_site WHERE web_gmt_offset >= -5). Convert joins to INNER JOIN ca_prefilter ON ws1.ws_ship_addr_sk = ca_prefilter.ca_address_sk INNER JOIN site_prefilter ON ws1.ws_web_site_sk = site_prefilter.web_site_sk",
+      "node_contract": {
+        "from_must_include": ["customer_address", "web_site"],
+        "where_must_preserve": ["ca_state filters", "web_gmt_offset filter"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["small_dimensions:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Dimension scans replaced by CTE materializations, explicit JOIN syntax",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Create ws_base AS (SELECT ws_order_number, ws_warehouse_sk, ws_ext_ship_cost, ws_net_profit FROM web_sales WHERE ws_list_price BETWEEN 253 AND 282). Replace all ws1 references with ws_base and update EXISTS subquery to use ws_base",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["ws_list_price filter"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Single web_sales materialization replacing multiple scans",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage reduction: 1) date_cte (as p03), 2) ws_prefilter AS (SELECT * FROM web_sales INNER JOIN date_cte ON ws_ship_date_sk=d_date_sk WHERE ws_list_price BETWEEN 253 AND 282), 3) Join ws_prefilter with other dimensions",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim"],
+        "where_must_preserve": ["date range", "list price filter"],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["cte_chain_depth:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: PostgreSQL CTE materialization may accelerate staged reduction despite predicate blindness risk",
+      "confidence": 0.6,
+      "expected_explain_delta": "Eliminate 20-iteration Nested Loop via pre-joined fact CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Create ws_agg AS (SELECT ws_order_number, SUM(ws_ext_ship_cost) AS ship_cost, SUM(ws_net_profit) AS profit, MAX(ws_warehouse_sk) AS warehouse_sk FROM web_sales WHERE ... GROUP BY ws_order_number). Replace original ws1 with ws_agg in main FROM",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["list price and join conditions"],
+        "output_must_preserve": ["aggregation semantics unchanged"]
+      },
+      "gates_checked": ["aggregation_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: Pre-aggregation may reduce 3.6M web_sales rows before joins if DuckDB pattern transfers",
+      "confidence": 0.5,
+      "expected_explain_delta": "Aggregate below join in plan, reduced rows entering Nested Loop",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE ...). Replace date_dim in FROM with filtered_dates",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_date range condition"],
+        "output_must_preserve": ["join semantics with web_sales"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: Isolating 20-row date_dim may enable better hash join planning",
+      "confidence": 0.7,
+      "expected_explain_delta": "date_dim scan replaced by CTE, Nested Loop becomes Hash Join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Combine p01/p02 into single CTE: order_flags AS (SELECT o.ws_order_number, EXISTS(SELECT 1 FROM web_sales w WHERE w.ws_order_number=o.ws_order_number AND w.ws_warehouse_sk <> o.ws_warehouse_sk) AS multi_wh, EXISTS(SELECT 1 FROM web_returns ...) AS has_return FROM web_sales o). Then filter WHERE multi_wh=true AND has_return=false",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["EXISTS/NOT EXISTS logic"],
+        "output_must_preserve": ["aggregation correctness"]
+      },
+      "gates_checked": ["no_double_scan:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: Shared scan decorrelation may optimize subquery processing if DuckDB pattern works in PG",
+      "confidence": 0.5,
+      "expected_explain_delta": "Single CTE replacing two subquery evaluations",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Minimal decorrelation: Create warehouse_pairs AS (SELECT DISTINCT ws_order_number FROM web_sales ws2 WHERE ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk) without early filtering",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["warehouse inequality logic"],
+        "output_must_preserve": ["EXISTS semantics"]
+      },
+      "gates_checked": ["not_simple_exists:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: Compare with p01 to isolate early filter impact",
+      "confidence": 0.7,
+      "expected_explain_delta": "Nested Loop replaced by Join with materialized CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Minimal decorrelation: Create problem_orders AS (SELECT DISTINCT wr_order_number FROM web_returns WHERE wr_reason_sk IN (8,18,20,23,41)) without additional filters",
+      "node_contract": {
+        "from_must_include": ["web_returns"],
+        "where_must_preserve": ["wr_reason_sk filter"],
+        "output_must_preserve": ["NOT EXISTS semantics"]
+      },
+      "gates_checked": ["unfiltered_cte:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: Compare with p02 to isolate early filter impact",
+      "confidence": 0.7,
+      "expected_explain_delta": "Hash Join replaced by Anti Join with unfiltered CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate aggregations: Create order_summary AS (SELECT ws_order_number, COUNT(DISTINCT ws_warehouse_sk) > 1 AS multi_wh, SUM(ws_ext_ship_cost) AS ship_cost, SUM(ws_net_profit) AS profit FROM web_sales ... GROUP BY ws_order_number). Replace main query with join to order_summary",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["multi-warehouse logic", "aggregation semantics"],
+        "output_must_preserve": ["final aggregation values"]
+      },
+      "gates_checked": ["aggregation_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: Single-pass aggregation may reduce scans if DuckDB pattern transfers",
+      "confidence": 0.4,
+      "expected_explain_delta": "Single CTE replacing multiple subqueries and main aggregations",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "regression registry: bitmap-or capable in PG"},
+    {"transform_id": "inline_decorrelate_materialized", "family": "B", "reason": "scalar subquery pattern not detected"}
+  ]
+}

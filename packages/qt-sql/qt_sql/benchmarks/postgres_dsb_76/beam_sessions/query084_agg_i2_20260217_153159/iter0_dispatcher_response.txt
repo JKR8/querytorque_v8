@@ -1,0 +1,174 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 8,
+    "early_stop": true,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by sequential scans on customer (166K rows) and customer_address (99 rows) with late filtering. Nested loops amplify row counts. Early filtering via CTEs and explicit JOIN syntax should reduce scan volumes and enable better join planning.",
+    "reasoning_trace": [
+      "Seq Scan on customer (685ms) and customer_address (248ms) dominate runtime",
+      "Late dimension filtering forces full scans despite selective conditions",
+      "Comma-join syntax prevents optimal join reordering",
+      "Nested loops amplify small row counts into expensive operations"
+    ],
+    "cost_spine": ["Seq Scan on customer → Seq Scan on customer_address → Hash Join → Nested Loop"],
+    "hotspots": [
+      {"op": "Seq Scan on customer", "why": "full table scan without pushdown", "evidence": "rows=166667, time=685ms"},
+      {"op": "Seq Scan on customer_address", "why": "late filter application", "evidence": "rows=99, time=248ms"}
+    ],
+    "do_not_do": ["or_to_union", "intersect_to_exists", "materialize_simple_exists"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma-joins to explicit INNER JOINs and wrap customer_address/income_band in CTEs with filters. Preserve join conditions and column references.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "income_band"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374"],
+        "output_must_preserve": ["c_customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'')"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "CTE scans for customer_address/income_band, explicit JOIN syntax, reduced Seq Scan rows on customer",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered customer_address as filtered_ca CTE. Convert comma-join to explicit JOIN between customer and filtered_ca.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address"],
+        "where_must_preserve": ["c_current_addr_sk = ca_address_sk", "ca_city = 'Mount Vernon'"],
+        "output_must_preserve": ["c_customer_id", "c_last_name", "c_first_name"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "CTE scan for customer_address, Index Scan on customer via c_current_addr_sk",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create CTEs for customer_address (ca_filter), income_band (ib_filter), and household_demographics (hd_filter) with respective filters before main joins.",
+      "node_contract": {
+        "from_must_include": ["customer_address", "income_band", "household_demographics"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374"],
+        "output_must_preserve": ["c_customer_id", "c_current_addr_sk", "hd_income_band_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension CTEs may create efficient hash probes despite PostgreSQL's CTE materialization fences",
+      "confidence": 0.65,
+      "expected_explain_delta": "Multiple CTE scans, reduced Nested Loop input sizes",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter customer_address and income_band in subqueries. Push conditions before customer join.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "income_band"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374"],
+        "output_must_preserve": ["c_customer_id", "c_current_addr_sk", "ib_income_band_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Inline subqueries may bypass CTE materialization while enabling predicate pushdown",
+      "confidence": 0.7,
+      "expected_explain_delta": "Filtered subquery scans, earlier row reduction before joins",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize pre-joined customer+customer_address+income_band as base_cte before joining to other tables.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "income_band"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374"],
+        "output_must_preserve": ["c_customer_id", "c_current_cdemo_sk", "c_current_hdemo_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Base CTE materialization, reduced input for subsequent joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create filtered CTEs for all dimensions (customer_address, income_band, household_demographics, customer_demographics) before main query.",
+      "node_contract": {
+        "from_must_include": ["customer_address", "income_band", "household_demographics", "customer_demographics"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374"],
+        "output_must_preserve": ["c_customer_id", "cd_demo_sk", "hd_demo_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Compound selectivity from multiple dimension filters may offset CTE materialization cost",
+      "confidence": 0.6,
+      "expected_explain_delta": "Multiple dimension CTEs, smaller hash tables for joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit joins to explicit INNER JOIN syntax and reorder tables by selectivity.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address"],
+        "where_must_preserve": ["c_current_addr_sk = ca_address_sk"],
+        "output_must_preserve": ["c_customer_id", "ca_city"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Explicit JOIN syntax, potential join order change",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage joins: 1) CTE for customer_address+income_band filters 2) CTE joining result to customer 3) Final join to store_returns.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374", "sr_cdemo_sk = cd_demo_sk"],
+        "output_must_preserve": ["c_customer_id", "customername"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may minimize large table scans despite PostgreSQL's CTE materialization",
+      "confidence": 0.68,
+      "expected_explain_delta": "Sequential CTE materialization, progressive row reduction",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR conditions in query"},
+    {"transform_id": "decorrelate", "family": "B", "reason": "No correlated subqueries"},
+    {"transform_id": "aggregate_pushdown", "family": "C", "reason": "No aggregations in query"}
+  ]
+}

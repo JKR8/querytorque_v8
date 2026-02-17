@@ -12,6 +12,7 @@ from .deepseek import DeepSeekClient
 from .gemini import GeminiAPIClient, GeminiCLIClient
 from .groq import GroqClient
 from .openai import OpenAIClient
+from .ollama import OllamaClient
 from .factory import create_llm_client
 
 # Alias for backward compatibility
@@ -27,6 +28,7 @@ __all__ = [
     "GeminiClient",
     "GroqClient",
     "OpenAIClient",
+    "OllamaClient",
     # Factory
     "create_llm_client",
 ]

@@ -1,0 +1,393 @@
+## Role
+
+You are a **Beam Worker** for SQL optimization on the target runtime dialect.
+
+You must apply **ONE specific transform** to the query and output a **PatchPlan JSON** that updates the query’s IR.
+
+One worker = one probe = one transform.
+
+---
+
+## Prompt Map (cache friendly)
+
+### Phase A — Cached Instructions (static)
+A1. Patch operations
+A2. Semantic guards (must preserve)
+A3. Anchor-hash rules (robustness requirements)
+A4. Verification checklist
+A5. PatchPlan output schema
+
+### Phase B — Probe-Specific Input (dynamic; after cache boundary)
+B1. Shared dispatcher hypothesis (short)
+B2. Probe assignment (transform + target + node contract + gates_checked)
+B3. Original SQL
+B4. Optional execution plan snippet
+B5. IR node map (S0 + anchor hashes)
+B6. Engine-specific knowledge profile (strengths, gaps, contraindications)
+
+---
+
+## Patch Operations (core + advanced)
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the full WHERE boolean expression | expr_sql |
+| replace_body | Replace entire query body | sql_fragment |
+| replace_expr_subtree | Replace a specific expression/predicate | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression/predicate | (target only, no payload) |
+| replace_join_condition | Replace a specific JOIN condition expression | expr_sql (+ by_anchor_hash) |
+| replace_select | Replace SELECT projection list | sql_fragment |
+| replace_block_with_cte_pair | Replace block using CTE-integrated SQL fragment | sql_fragment |
+| wrap_query_with_cte | Add wrapper CTE to statement | cte_name, cte_query_sql |
+
+All step targets MUST use: `{"by_node_id": "S0"}`.
+Use `by_anchor_hash` only when replacing/deleting a specific predicate/expression.
+
+Target examples:
+- Statement-level edit:
+  `{"by_node_id": "S0"}`
+- Predicate-subtree edit:
+  `{"by_node_id": "S0", "by_anchor_hash": "ab12cd34ef56ab78"}`
+
+---
+
+## Semantic Guards (MUST preserve)
+
+- Preserve ALL WHERE/HAVING/ON conditions exactly, unless the assigned transform explicitly replaces a correlated subquery with an equivalent join/anti-join.
+- Do NOT change any literal values (numbers, strings, dates, arithmetic forms).
+- Preserve SELECT columns, aliases, ORDER BY, LIMIT exactly.
+- Do NOT add new filters.
+- Do NOT leave orphaned CTEs or duplicate base scans after replacement.
+- Follow dispatcher `node_contract` precisely.
+
+If `node_contract` or `gates_checked` is missing or ambiguous:
+- Output a minimal safe failure PatchPlan with `steps: []` and hypothesis explaining what is missing.
+
+If a RETRY section is present with a gate-failure object:
+- Fix the specific gate issue first (do not redesign the transform intent).
+- Preserve all semantic guards while correcting only what failed.
+
+---
+
+## Anchor-hash rules (robustness)
+
+- `by_anchor_hash` values are produced by an external parser and are **whitespace/formatting independent**.
+- You MUST copy anchor hashes verbatim; never invent hashes.
+- If you cannot confidently identify the exact target anchor, do not use `replace_expr_subtree`.
+  Prefer `replace_where_predicate`, or output a safe no-op plan.
+
+---
+
+## Verification Checklist (self-check)
+
+- [ ] Patch steps produce a valid executable query
+- [ ] No missing tables/aliases
+- [ ] No duplicated source scans (orphan risk)
+- [ ] EXISTS / NOT EXISTS semantics preserved if rewritten
+- [ ] No same-column OR to UNION split unless EXPLAIN evidence shows OR blocks index usage and UNION branches become index scans
+- [ ] New CTEs are selective (meaningful WHERE) unless transform requires otherwise
+
+---
+
+## PatchPlan Output Schema (MUST follow)
+
+Tier-0 output contract:
+- first character must be `{` (no leading whitespace/newlines)
+- top-level value must be one JSON object
+- no markdown fences, no prose, no commentary
+
+Output JSON shape:
+{
+  "probe_id": "p01",
+  "transform_id": "decorrelate_not_exists_to_cte",
+  "family": "B",
+  "dialect": "<target_dialect>",
+  "hypothesis": "1 sentence: why this transform should reduce the plan hotspot",
+  "reasoning_trace": [
+    "Target correlated NOT EXISTS on customer_demographics",
+    "Replace per-row re-execution with one anti-join-ready CTE"
+  ],
+  "target_ir": "Short structural description of the post-patch query shape",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_customers",
+        "cte_query_sql": "SELECT c_customer_sk FROM customer WHERE c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Worked example (fully valid output):
+{
+  "probe_id": "p07",
+  "transform_id": "decorrelate_exists_to_semijoin_cte",
+  "family": "B",
+  "dialect": "postgres",
+  "hypothesis": "Replace correlated EXISTS with a precomputed distinct keyset so the planner uses one set-based join instead of per-row subquery execution.",
+  "reasoning_trace": [
+    "The EXISTS subquery depends only on customer key.",
+    "A DISTINCT keyset CTE preserves EXISTS semantics and removes repeated inner work."
+  ],
+  "target_ir": "CTE keyset plus semijoin in FROM; original non-EXISTS filters preserved in WHERE.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "store_buyers",
+        "cte_query_sql": "SELECT DISTINCT ss_customer_sk AS customer_sk FROM store_sales WHERE ss_list_price BETWEEN 80 AND 169"
+      }
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "from_sql": "customer c JOIN store_buyers sb ON sb.customer_sk = c.c_customer_sk"
+      }
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "expr_sql": "c.c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Rules:
+- Steps must be minimal and sufficient.
+- Every SQL fragment in payload MUST be complete and executable (no ellipsis).
+- Prefer `insert_cte` + `replace_from` + `replace_where_predicate` over `replace_body` unless necessary.
+- Never emit `payload.sql`; use `payload.sql_fragment` for replace_body/replace_select/replace_block_with_cte_pair.
+
+---
+
+## Cache Boundary
+Everything below is probe-specific input.
+
+## Shared Dispatcher Hypothesis
+The query's dominant hotspot is the correlated subquery re-executing per outer row in CTE comparisons (Nested Loop with 282k ms). Decorrelation via pre-computed aggregates and explicit joins should eliminate nested loops. Comma-join syntax prevents optimal join ordering.
+## Runtime Dialect Contract
+- target_dialect: postgres
+- runtime_dialect_is_source_of_truth: true
+- if static examples conflict, follow runtime dialect behavior
+## Probe Assignment
+- transform_id: materialized_dimension_fact_prefilter
+- family: F
+- target: Materialize both date_dim and store_returns filters before main join
+- phase: ?
+- exploration: no
+- dialect: postgres
+- expected_explain_delta: Hash join with pre-filtered fact CTE
+- equivalence_tier: exact
+
+### Gates Checked
+non_equi_join_input_blindness:PASS
+
+### Node Contract
+
+```json
+{
+  "from_must_include": [
+    "store_returns",
+    "date_dim"
+  ],
+  "where_must_preserve": [
+    "d_year=2002",
+    "BETWEEN condition"
+  ],
+  "output_must_preserve": [
+    "All original columns"
+  ]
+}
+```
+
+### Original SQL
+
+```sql
+with customer_total_return as
+(select sr_customer_sk as ctr_customer_sk
+,sr_store_sk as ctr_store_sk
+,sr_reason_sk as ctr_reason_sk
+,sum(SR_RETURN_AMT_INC_TAX) as ctr_total_return
+from store_returns
+,date_dim
+where sr_returned_date_sk = d_date_sk
+and d_year =2002
+and sr_return_amt / sr_return_quantity between 108 and 167
+group by sr_customer_sk
+,sr_store_sk, sr_reason_sk)
+ select  c_customer_id
+from customer_total_return ctr1
+,store
+,customer
+,customer_demographics
+where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+from customer_total_return ctr2
+where ctr1.ctr_store_sk = ctr2.ctr_store_sk
+)
+and ctr1.ctr_reason_sk BETWEEN 43 AND 46
+and s_store_sk = ctr1.ctr_store_sk
+and s_state IN ('IL', 'KY', 'TX')
+and ctr1.ctr_customer_sk = c_customer_sk
+and c_current_cdemo_sk = cd_demo_sk
+and cd_marital_status IN ('M', 'M')
+and cd_education_status IN ('Advanced Degree', 'College')
+and cd_gender = 'F'
+and c_birth_month = 2
+and c_birth_year BETWEEN 1965 AND 1971
+order by c_customer_id
+limit 100;
+```
+
+### Current IR Node Map
+
+```
+S0 [SELECT]
+  CTE: customer_total_return  (via CTE_Q_S0_customer_total_return)
+    FROM: store_returns, date_dim
+    WHERE [ddc05012d854ff26]: sr_returned_date_sk = d_date_sk AND d_year = 2002 AND sr_return_amt / sr_return_quantity BETWEEN ...
+    GROUP BY: sr_customer_sk, sr_store_sk, sr_reason_sk
+  MAIN QUERY (via Q_S0)
+    FROM: customer_total_return ctr1, store, customer, customer_demographics
+    WHERE [a05952426f9ba20b]: ctr1.ctr_total_return > (SELECT AVG(ctr_total_return) * 1.2 FROM customer_total_return AS ctr2 WH...
+    ORDER BY: c_customer_id
+
+Patch operations (core+advanced): insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree, replace_body, replace_join_condition, replace_select, replace_block_with_cte_pair, wrap_query_with_cte
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+### Dispatcher Reasoning Trace
+- CTE Scan (ctr1) correlated subquery causes nested loop re-execution
+- Comma-join syntax in main FROM clause blocks join reordering
+- Late filters on store/customer_demographics/customer tables miss early reduction
+
+### Schema / Index / Stats Context
+- source: postgres
+- referenced_tables: 5
+
+| Table | Rows(est) | PK | Indexes |
+|-------|-----------|----|---------|
+| customer | 500000 | c_customer_sk | customer_pkey, _dta_index_customer_6_949578421__k9_k10, _dta_index_customer_6_949578421__k1_k5, _dta_index_customer_5_949578421__k13_k5 |
+| customer_demographics | 1920800 | cd_demo_sk | customer_demographics_pkey |
+| date_dim | 73049 | d_date_sk | date_dim_pkey, _dta_index_date_dim_6_661577395__k7_k4_k9_k1, _dta_index_date_dim_6_661577395__k7_k9_k1, _dta_index_date_dim_6_661577395__k1_k7_k9, _dta_index_date_dim_6_661577395__k7_k11_k1, _dta_index_date_dim_6_661577395__k9_k7_k1 |
+| store | 102 | s_store_sk | store_pkey, _dta_index_store_6_885578193__k1_2_6, _dta_index_store_6_885578193__k25_k1 |
+| store_returns | 7197499 | sr_item_sk, sr_ticket_number | store_returns_pkey, _dta_index_store_returns_6_1013578649__k1_3_4_10_20, _dta_index_store_returns_6_1013578649__k5_1_3_10_11, _dta_index_store_returns_6_1013578649__k1_3_4_10 |
+
+### Engine-Specific Knowledge
+## Dialect Profile (POSTGRES)
+
+**Combined Intelligence Baseline**: Combined intelligence baseline from 53 validated DSB queries at SF5-SF10, plus regression registry outcomes. PostgreSQL has bitmap index scans, JIT compilation, and aggressive CTE materialization. Techniques that work on DuckDB often regress here.
+
+### Optimizer Strengths (don't fight these)
+- `BITMAP_OR_SCAN`: Avoid splitting OR conditions into UNION ALL by default. Only consider OR→UNION when EXPLAIN shows OR blocks index usage and UNION branches become index scans. 0.21x and 0.26x reg…
+- `SEMI_JOIN_EXISTS`: NEVER convert EXISTS to IN/NOT IN or materialized CTEs. 0.50x, 0.75x observed. Note: NOT EXISTS anti-join decorrelation can still be valid when replacing large correlated anti patterns.
+- `INNER_JOIN_REORDERING`: Don't restructure INNER JOIN orders. Focus on LEFT JOIN blocking or comma-join confusion.
+- `INDEX_ONLY_SCAN`: Small dimension lookups (<10K rows) may not need CTEs.
+
+### Known Gaps (exploit these)
+- `COMMA_JOIN_WEAKNESS` [HIGH] detect: FROM t1, t2, t3 WHERE t1.key = t2.key (comma joins, no explicit JOIN). Poor row estimates in EXPLAIN. | action: Convert comma-joins to explicit JOIN...ON syntax. Best when combined with date_cte_isolate.
+- `CORRELATED_SUBQUERY_PARALYSIS` [HIGH] detect: Nested loop in EXPLAIN, inner re-executes aggregate per outer row. SQL: WHERE col > (SELECT AGG FROM ... WHERE outer.key = inner.key). Hash… | action: Convert correlated WHERE to explicit CTE with GROUP BY + JOIN.
+- `NON_EQUI_JOIN_INPUT_BLINDNESS` [HIGH] detect: Expensive non-equi join (BETWEEN, <, >) with large inputs on both sides. Neither side filtered. | action: Reduce fact table input size via filtered CTE before the non-equi join.
+- `CTE_MATERIALIZATION_FENCE` [MEDIUM] detect: Large CTE + small post-filter. Multi-referenced CTE that blocks predicate pushdown. | action: Materialize STRATEGICALLY: only when CTE is expensive and reused. Avoid fencing single-use cases.
+- `CROSS_CTE_PREDICATE_BLINDNESS` [MEDIUM] detect: Sequential scan on dimension table without index condition. Late filter after large scan/join. | action: Pre-filter into CTE definition. But be more cautious than on DuckDB.
+
+### Transform Recipe
+- `transform_id`: `materialized_dimension_fact_prefilter`
+- `family`: `F`
+- `principle`: Staged Reduction for Non-Equi Joins: when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join. Combined selectivity dramatically cuts the search space for inequality predicates.
+- `expected_features`: `AGG_COUNT`, `AGG_SUM`, `BETWEEN`, `CASE_EXPR`, `DATE_DIM`, `GROUP_BY`, `LEFT_JOIN`
+
+### Gold Pattern Reference
+- `plan_id`: `gold_postgres_pg_explicit_join_materialized`
+- `step_ops`: insert_cte -> insert_cte+replace_from -> insert_cte+replace_from -> insert_cte+replace_from -> replace_from -> delete_expr_subtree
+- `ctes`: `date_subquery_cte`
+- Reuse pattern shape, not literal table/column names.
+
+
+## RETRY — Gate failure feedback (attempt 2/2)
+Your previous patch failed validation. Return a corrected PatchPlan JSON only.
+First character must be `{` and output must contain no markdown/prose.
+
+### Failure Object
+```json
+{
+  "probe_id": "p10",
+  "transform_id": "materialized_dimension_fact_prefilter",
+  "gate": "tier1_structural",
+  "status": "FAIL",
+  "error": "Tier-1: LITERAL MISMATCH: Original literals missing from rewrite \u2014 numbers: ['1.2']. The rewrite changed filter values instead of preserving them."
+}
+```
+
+### Failed SQL (from attempt 1)
+```sql
+WITH customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, sr_reason_sk AS ctr_reason_sk, SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2002 AND sr_return_amt / sr_return_quantity BETWEEN 108 AND 167 GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk), filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2002), filtered_store_returns AS (SELECT sr_customer_sk, sr_store_sk, sr_reason_sk, SR_RETURN_AMT_INC_TAX FROM store_returns AS sr JOIN filtered_date AS fd ON sr.sr_returned_date_sk = fd.d_date_sk WHERE sr_return_amt / sr_return_quantity BETWEEN 108 AND 167) SELECT c_customer_id FROM customer_total_return AS ctr1 JOIN store AS s ON s_store_sk = ctr1.ctr_store_sk JOIN customer AS c ON ctr1.ctr_customer_sk = c_customer_sk JOIN customer_demographics AS cd ON c_current_cdemo_sk = cd_demo_sk WHERE ctr1.ctr_reason_sk BETWEEN 43 AND 46 AND s_state IN ('IL', 'KY', 'TX') AND cd_marital_status IN ('M', 'M') AND cd_education_status IN ('Advanced Degree', 'College') AND cd_gender = 'F' AND c_birth_month = 2 AND c_birth_year BETWEEN 1965 AND 1971 ORDER BY c_customer_id LIMIT 100;
+```
+
+### Previous Worker Output (attempt 1)
+```
+{
+  "probe_id": "p01",
+  "transform_id": "materialized_dimension_fact_prefilter",
+  "family": "F",
+  "dialect": "postgres",
+  "hypothesis": "Pre-filter store_returns and date_dim into materialized CTEs to reduce row count before expensive non-equi join on sr_return_amt / sr_return_quantity.",
+  "reasoning_trace": [
+    "Non-equi filter `sr_return_amt / sr_return_quantity BETWEEN 108 AND 167` applies to full store_returns scan",
+    "Date join `sr_returned_date_sk = d_date_sk AND d_year = 2002` can be pushed into a prefiltered date CTE",
+    "Comma-join syntax blocks optimal plan; replace with explicit JOINs"
+  ],
+  "target_ir": "Two CTEs (filtered store_returns and date_dim), main query uses explicit JOINs",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_date",
+        "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002"
+      }
+    },
+    {
+      "step_id": "s2",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_store_returns",
+        "cte_query_sql": "SELECT sr_customer_sk, sr_store_sk, sr_reason_sk, SR_RETURN_AMT_INC_TAX FROM store_returns sr JOIN filtered_date fd ON sr.sr_returned_date_sk = fd.d_date_sk WHERE sr_return_amt / sr_return_quantity BETWEEN 108 AND 167"
+      }
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_from",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "from_sql": "customer_total_return ctr1 JOIN store s ON s_store_sk = ctr1.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c_customer_sk JOIN customer_demographics cd ON c_current_cdemo_sk = cd_demo_sk"
+      }
+    },
+    {
+      "step_id": "s4",
+      "op": "replace_where_predicate",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "expr_sql": "ctr1.ctr_reason_sk BETWEEN 43 AND 46 AND s_state IN ('IL', 'KY', 'TX') AND cd_marital_status IN ('M', 'M') AND cd_education_status IN ('Advanced Degree', 'College') AND cd_gender = 'F' AND c_birth_month = 2 AND c_birth_year BETWEEN 1965 AND 1971"
+      }
+    }
+  ]
+}
+```
+
+Fix only what caused the gate failure while preserving transform intent and semantics.
+Output ONLY valid PatchPlan JSON.
+Never emit payload.sql; use payload.sql_fragment where SQL fragments are required.

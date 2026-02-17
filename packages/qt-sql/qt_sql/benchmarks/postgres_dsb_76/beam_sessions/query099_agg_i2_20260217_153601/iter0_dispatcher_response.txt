@@ -1,0 +1,155 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 7,
+    "early_stop": true,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Nested Loop between date_dim and catalog_sales dominates execution time (170s) with 244 outer rows and 106 inner rows per loop. Pre-aggregating the fact table after joining with filtered date_dim should reduce rows before joining dimensions. Explicit joins may improve cardinality estimates.",
+    "reasoning_trace": [
+      "Cost spine: Index Only Scan → Nested Loop → Hash Joins → Sort → Aggregate",
+      "Nested Loop amplifies 244 date_dim scans into 25,870 catalog_sales accesses",
+      "Late filtering on small dimensions (ship_mode/warehouse) despite selective predicates"
+    ],
+    "cost_spine": ["Index Only Scan on date_dim → Nested Loop → Hash Join → Sort → Aggregate"],
+    "hotspots": [
+      {"op": "Nested Loop", "why": "High loop amplification", "evidence": "outer_rows=244, total_time=170930ms, cost=99%"}
+    ],
+    "do_not_do": ["or_to_union (no OR conditions)", "exists_cte_materialization (no EXISTS)"]
+  },
+  "probe_summary_schema": [
+    "probe_id", "transform_id", "family", "status", "speedup", "expected_explain_delta", "ops_used", "confidence", "exploration", "failure_reason", "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-join to explicit INNER JOIN syntax between all tables with precise ON conditions",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim", "warehouse", "ship_mode", "call_center"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1191 AND 1214", "cs_ship_date_sk = d_date_sk", "cs_warehouse_sk = w_warehouse_sk", "cs_ship_mode_sk = sm_ship_mode_sk", "cs_call_center_sk = cc_call_center_sk", "cs_list_price BETWEEN 244 AND 273", "sm_type = 'LIBRARY'", "cc_class = 'medium'", "w_gmt_offset = -5"],
+        "output_must_preserve": ["All original SELECT expressions", "GROUP BY keys", "ORDER BY/LIMIT"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "no_outer_joins:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.95,
+      "expected_explain_delta": "Hash Join instead of Nested Loop; better cardinality estimates in join order",
+      "recommended_patch_ops": ["replace_from"],
+      "gold_example_id": "postgres_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales joined with date_dim in CTE before joining other dimensions",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1191 AND 1214", "cs_ship_date_sk = d_date_sk", "cs_list_price BETWEEN 244 AND 273"],
+        "output_must_preserve": ["cs_warehouse_sk", "cs_ship_mode_sk", "cs_call_center_sk", "SUM(CASE...) for all duration buckets"]
+      },
+      "gates_checked": ["agg_equivalence_rules:PASS", "no_window_functions:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing reduced fact set before dimension joins may avoid repeating date filters",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate node moves below joins; reduced rows in Hash Joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "duckdb_agg_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all dimensions into CTEs before joining with catalog_sales",
+      "node_contract": {
+        "from_must_include": ["date_dim", "warehouse", "ship_mode", "call_center"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1191 AND 1214", "sm_type = 'LIBRARY'", "cc_class = 'medium'", "w_gmt_offset = -5"],
+        "output_must_preserve": ["d_date_sk", "w_warehouse_sk", "sm_ship_mode_sk", "cc_call_center_sk", "w_warehouse_name", "sm_type", "cc_name"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "small_dimension_sizes:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "CTE scans for dimensions; smaller hash tables in joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "postgres_dimension_prefetch"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered date_dim and catalog_sales join first in CTE",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1191 AND 1214", "cs_ship_date_sk = d_date_sk", "cs_list_price BETWEEN 244 AND 273"],
+        "output_must_preserve": ["cs_warehouse_sk", "cs_ship_mode_sk", "cs_call_center_sk", "cs_sold_date_sk", "cs_ship_date_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION", "non_equi_join_input_blindness:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.8,
+      "expected_explain_delta": "Materialized CTE for date-fact join; reduced input for subsequent joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "postgres_staged_reduction"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate ship_mode/warehouse/call_center into CTEs with filters applied early",
+      "node_contract": {
+        "from_must_include": ["ship_mode", "warehouse", "call_center"],
+        "where_must_preserve": ["sm_type = 'LIBRARY'", "w_gmt_offset = -5", "cc_class = 'medium'"],
+        "output_must_preserve": ["sm_ship_mode_sk", "w_warehouse_sk", "cc_call_center_sk", "w_warehouse_name", "sm_type", "cc_name"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "small_row_counts:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may not push filters into comma-joins; CTEs force early filtering",
+      "confidence": 0.7,
+      "expected_explain_delta": "Seq Scan replaced with CTE scan; smaller hash tables",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "duckdb_dimension_cte"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize base fact-dimension join as CTE before aggregation",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1191 AND 1214", "cs_ship_date_sk = d_date_sk"],
+        "output_must_preserve": ["All columns needed for subsequent joins/aggregates"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION", "no_self_join:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.9,
+      "expected_explain_delta": "Materialized CTE scan; reduced recomputation in aggregation",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "postgres_cte_materialize"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Apply cs_list_price filter directly in catalog_sales scan condition",
+      "node_contract": {
+        "from_must_include": ["catalog_sales"],
+        "where_must_preserve": ["cs_list_price BETWEEN 244 AND 273"],
+        "output_must_preserve": ["All catalog_sales columns used in joins/aggregates"]
+      },
+      "gates_checked": ["predicate_transitivity_failure:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.9,
+      "expected_explain_delta": "IndexScan with IndexCond on cs_list_price; fewer heap fetches",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "gold_example_id": "universal_early_filter"
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR conditions in query"},
+    {"transform_id": "decorrelate", "family": "B", "reason": "No correlated subqueries"}
+  ]
+}

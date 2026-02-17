@@ -15,6 +15,12 @@ python3 validator.py your_query.sql --target-rows 1000 --min-rows 800 --max-rows
 python3 validator.py your_query.sql --target-rows 1000 --output results.json
 ```
 
+## MVROWS One-Row Eval
+
+For one-row witness detection vs SF100 oracle labels, see:
+
+- `research/synthetic_validator/README_MVROWS_ONE_ROW.md`
+
 ## How It Works
 
 1. **Schema Extraction** (SQLGlot AST): Parses SQL to identify all tables and columns

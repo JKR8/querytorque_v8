@@ -1,0 +1,176 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 8,
+    "early_stop": true,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by best_ss_customer CTE materialization (79.6s) and frequent_ss_items CTE computation (15.4s). Nested loops with high row amplification in store_sales scans indicate decorrelation and early filtering opportunities. Comma joins prevent optimal join planning.",
+    "reasoning_trace": [
+      "best_ss_customer CTE consumes 81% of total time due to full store_sales scan without date filters",
+      "frequent_ss_items CTE shows late filtering on item after large store_sales scan",
+      "Comma joins in all CTEs block PostgreSQL's join reordering",
+      "UNION ALL branches reuse expensive CTEs but scan them multiple times"
+    ],
+    "cost_spine": [
+      "CTE Scan best_ss_customer (79.6s) → Hash Join in main query (79.7s) → frequent_ss_items CTE (15.4s)"
+    ],
+    "hotspots": [
+      {"op": "CTE Scan best_ss_customer", "why": "full store_sales scan without date filters", "evidence": "time=79657ms, rows=24387"},
+      {"op": "Seq Scan on item", "why": "late filter after large store_sales join", "evidence": "time=817ms, rows=6872"}
+    ],
+    "do_not_do": [
+      "or_to_union (bitmap_or_scan strength)",
+      "exists_to_materialized_cte (semi_join_exists strength)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs in frequent_ss_items CTE. Add JOIN ON clauses for all join predicates.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year=1998", "i_manager_id BETWEEN 81 AND 100", "i_category IN"],
+        "output_must_preserve": ["itemdesc", "item_sk", "solddate", "cnt"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with reordered joins",
+      "recommended_patch_ops": ["replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Precompute store_sales aggregates for 1998 in best_ss_customer. Replace full scan with filtered aggregate CTE joined to customer.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer"],
+        "where_must_preserve": ["c_birth_year BETWEEN 1934 AND 1940"],
+        "output_must_preserve": ["c_customer_sk", "ssales"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Index Scan on store_sales replaced by CTE scan with reduced rows",
+      "recommended_patch_ops": ["replace_body", "insert_cte"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "For main query's UNION branches: create date_dim CTE filtered for d_year=1998+d_moy=10, convert comma joins to explicit INNER JOINs.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["d_year=1998", "d_moy=10", "cs_wholesale_cost BETWEEN 11 AND 21"],
+        "output_must_preserve": ["cs_quantity*cs_list_price"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Gather + Nested Loop replaced by Hash Join with date_cte",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_item_sk/ss_sold_date_sk before joining with dimensions in frequent_ss_items CTE",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sold_date_sk IN (date_dim CTE)"],
+        "output_must_preserve": ["count(*)>4"]
+      },
+      "gates_checked": ["no_group_by:FAIL"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may benefit from reduced join cardinality despite portability candidate status",
+      "confidence": 0.75,
+      "expected_explain_delta": "Hash Join replaced by smaller Aggregation then nested loop",
+      "recommended_patch_ops": ["replace_body", "insert_cte"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize best_ss_customer CTE as WITH MATERIALIZED to prevent re-execution in UNION branches",
+      "node_contract": {
+        "from_must_include": ["best_ss_customer"],
+        "where_must_preserve": [],
+        "output_must_preserve": ["c_customer_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Multiple CTE Scans replaced by single materialization",
+      "recommended_patch_ops": ["replace_expr_subtree"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter item table for i_manager_id/i_category before joining with store_sales in frequent_ss_items",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_manager_id BETWEEN 81 AND 100", "i_category IN"],
+        "output_must_preserve": ["i_item_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.87,
+      "expected_explain_delta": "Seq Scan on item with smaller rows and earlier filter",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create shared date_dim CTE for d_year=1998+d_moy=10, reference in both UNION branches",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year=1998", "d_moy=10"],
+        "output_must_preserve": ["d_date_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Redundant date_dim scans in UNION branches could be consolidated",
+      "confidence": 0.78,
+      "expected_explain_delta": "Two IndexOnlyScan on date_dim replaced by single CTE scan",
+      "recommended_patch_ops": ["insert_cte", "replace_expr_subtree"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert best_ss_customer comma join to explicit INNER JOIN syntax",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer"],
+        "where_must_preserve": ["ss_customer_sk = c_customer_sk"],
+        "output_must_preserve": ["c_customer_sk", "ssales"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.83,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with better cardinality estimate",
+      "recommended_patch_ops": ["replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "regression registry: bitmap_or_scan strength in PostgreSQL"},
+    {"transform_id": "materialize_cte", "family": "E", "reason": "CTE already materialized by default in PostgreSQL"}
+  ]
+}

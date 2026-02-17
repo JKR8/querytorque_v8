@@ -27,13 +27,14 @@ class EventType(str, Enum):
 
 @dataclass
 class FleetEvent:
-    type: EventType
+    type: EventType | str
     data: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
 
     def to_json(self) -> str:
+        event_type = self.type.value if isinstance(self.type, EventType) else str(self.type)
         return json.dumps({
-            "type": self.type.value,
+            "type": event_type,
             "data": self.data,
             "timestamp": self.timestamp,
         }, default=str)
@@ -45,9 +46,15 @@ class EventBus:
     def __init__(self, maxsize: int = 1000) -> None:
         self._queue: queue.Queue[FleetEvent] = queue.Queue(maxsize=maxsize)
 
-    def emit(self, event_type: EventType, **data: Any) -> None:
+    def emit(self, event_type: EventType | str, **data: Any) -> None:
         """Non-blocking put. Drop event if queue is full."""
-        event = FleetEvent(type=event_type, data=data)
+        normalized_type: EventType | str = event_type
+        if isinstance(event_type, str):
+            try:
+                normalized_type = EventType(event_type)
+            except ValueError:
+                normalized_type = event_type
+        event = FleetEvent(type=normalized_type, data=data)
         try:
             self._queue.put_nowait(event)
         except queue.Full:
@@ -133,6 +140,8 @@ def triage_to_fleet_c2(
             "outcome": None,
             "speedup": None,
             "out_transform": "",
+            "seed_source": t.prior_source if t.prior_best_sql else "",
+            "seed_speedup": t.prior_best_speedup,
             "detail": {
                 "cost_rank": rank_map.get(t.query_id, 0),
                 "pct_of_total": pct_map.get(t.query_id, 0.0),
@@ -143,6 +152,9 @@ def triage_to_fleet_c2(
                 "explain": getattr(t.survey, "explain_text", ""),
                 "actual_rows": getattr(t.survey, "actual_rows", 0),
                 "timing_source": getattr(t.survey, "timing_source", ""),
+                "prior_best_speedup": t.prior_best_speedup,
+                "prior_source": t.prior_source,
+                "prior_reference": t.prior_reference,
             },
         }
         result.append(entry)

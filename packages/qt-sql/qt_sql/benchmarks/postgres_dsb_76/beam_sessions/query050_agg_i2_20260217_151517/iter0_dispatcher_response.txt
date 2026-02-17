@@ -1,0 +1,230 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Execution plan shows dominant Nested Loop (50s) and Gather Merge (50s) consuming 100s total. Late d1 range filtering and comma joins prevent early row reduction. Transform families A (filter push) and F (join topology) should isolate date dimensions and convert to explicit joins.",
+    "reasoning_trace": [
+      "Cost spine: Nested Loop (50s) → Gather Merge (50s) → Sort (50s)",
+      "d2 scan yields 16 rows but amplifies to 58k store_returns rows",
+      "d1 range condition applied late after expensive joins",
+      "Comma joins prevent optimal join reordering (COMMA_JOIN_WEAKNESS gap)"
+    ],
+    "cost_spine": ["Nested Loop (50s)", "Gather Merge (50s)", "Sort (50s)"],
+    "hotspots": [
+      {"op": "Nested Loop", "why": "Row amplification from d2→store_returns", "evidence": "Input: 16 rows → Output: 58k rows, time=50s"},
+      {"op": "Gather Merge", "why": "Parallel sort/merge of 81k rows", "evidence": "Rows=81k, time=50s"}
+    ],
+    "do_not_do": ["or_to_union", "exists_to_in", "cte_materialization_fence:single_use"]
+  },
+  "probe_summary_schema": [
+    "probe_id", "transform_id", "family", "status", "speedup", "expected_explain_delta", "ops_used", "confidence", "exploration", "failure_reason", "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create d2_cte (d_year=1999,d_moy=7) and d1_cte (EXISTS join with d2_cte for d_date range). Replace comma joins with explicit INNER JOINs using CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["ss_ticket_number=sr_ticket_number", "ss_item_sk=sr_item_sk", "ss_store_sk=s_store_sk", "ss_customer_sk=sr_customer_sk"],
+        "output_must_preserve": ["All SELECT columns", "GROUP BY keys", "ORDER BY keys", "LIMIT 100"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "cte_materialization_fence:CAUTION"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join. Reduced rows in store_sales scan.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize d2_cte (d_year=1999,d_moy=7). Convert comma joins to explicit JOIN syntax. Push d1 range condition into JOIN ON clause.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d1.d_date BETWEEN (d2.d_date - interval '120 day') AND d2.d_date"],
+        "output_must_preserve": ["Original SELECT structure"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Bitmap Heap Scan on d1 replaced by Index Scan. Lowered Gather Merge cost.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Prefilter store_sales via subquery: WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN (d2.d_date - '120 days') AND d2.d_date)",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["d2.d_year=1999", "d2.d_moy=7"],
+        "output_must_preserve": ["All CASE expressions"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may push filter into store_sales scan despite portability candidate status. Plan shows late selectivity.",
+      "confidence": 0.7,
+      "expected_explain_delta": "Reduced rows in initial store_sales scan. Lowered Nested Loop input.",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create d2_cte (d_year=1999,d_moy=7) and d1_cte (filtered by d2_cte date range). Pre-join CTEs with store_sales/returns in FROM clause.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns"],
+        "where_must_preserve": ["ss_sold_date_sk=d1.d_date_sk", "sr_returned_date_sk=d2.d_date_sk"],
+        "output_must_preserve": ["GROUP BY keys", "Aggregation logic"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARNING"],
+      "exploration": true,
+      "exploration_hypothesis": "DuckDB pattern may transfer: prefiltered CTEs reduce fact table scans. Runtime doesn't contraindicate.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Fewer rows in store_returns Index Scan. Lowered nested loop cost.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize d2_cte and filtered store_returns (sr_returned_date_sk IN d2_cte). Use in main FROM with explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year=1999", "d2.d_moy=7"],
+        "output_must_preserve": ["All store_returns joins"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Eliminated repeated d2 scans. Lowered Gather Merge input rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales/store_returns by ss_store_sk before joining with store. Preserve date difference buckets in CASE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns"],
+        "where_must_preserve": ["ss_ticket_number=sr_ticket_number", "ss_item_sk=sr_item_sk"],
+        "output_must_preserve": ["CASE expressions", "GROUP BY granularity"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:WARNING"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate may work: pre-aggregation reduces rows before expensive store join.",
+      "confidence": 0.6,
+      "expected_explain_delta": "Aggregate node below store join. Fewer rows in sort.",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate date buckets into single store_sales scan. Add flag column for date ranges in SELECT.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["d1.d_date BETWEEN (d2.d_date - '120 days') AND d2.d_date"],
+        "output_must_preserve": ["All date bucket definitions"]
+      },
+      "gates_checked": ["redundant_scan_elimination:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "DuckDB pattern applicable: single scan reduces I/O. Runtime doesn't contraindicate.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Eliminated duplicate scans. Lowered Nested Loop rows.",
+      "recommended_patch_ops": ["replace_select", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize store_sales + d1 join as CTE. Reuse in store_returns join.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim d1"],
+        "where_must_preserve": ["ss_sold_date_sk=d1.d_date_sk"],
+        "output_must_preserve": ["Join semantics"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARNING"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "CTE scan replaces store_sales+d1 rescan. Lowered loop count.",
+      "recommended_patch_ops": ["insert_cte", "replace_block_with_cte_pair"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert all comma joins to explicit INNER JOIN. Preserve ON conditions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["All original join conditions"],
+        "output_must_preserve": ["Result cardinality"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Improved join order in EXPLAIN. Lowered nested loop cost.",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add ss_sold_date_sk BETWEEN min_d1 AND max_d1 to store_sales WHERE. Compute min/max from d2 date range.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["d2.d_year=1999", "d2.d_moy=7"],
+        "output_must_preserve": ["Aggregation logic"]
+      },
+      "gates_checked": ["predicate_transitivity_failure:WARNING"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake pattern may transfer: direct fact table filter reduces rows early. Plan shows late d1 filtering.",
+      "confidence": 0.5,
+      "expected_explain_delta": "Index Scan instead of Seq Scan on store_sales. Fewer rows in join.",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Convert d1 range condition to CTE: SELECT d_date_sk FROM date_dim WHERE EXISTS (SELECT 1 FROM d2_cte WHERE d_date BETWEEN ...)",
+      "node_contract": {
+        "from_must_include": ["date_dim d1"],
+        "where_must_preserve": ["d2.d_date - interval '120 day'", "d2.d_date"],
+        "output_must_preserve": ["d1.d_date_sk references"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Eliminated correlated Nested Loop. Hash Join instead.",
+      "recommended_patch_ops": ["insert_cte", "replace_expr_subtree"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate all CASE expressions into single SUM with conditional flags. Preserve bucket logic.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns"],
+        "where_must_preserve": ["sr_returned_date_sk - ss_sold_date_sk"],
+        "output_must_preserve": ["Bucket definitions"]
+      },
+      "gates_checked": ["redundant_scan_elimination:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "DuckDB pattern may transfer: single aggregation pass reduces compute. Runtime doesn't contraindicate.",
+      "confidence": 0.6,
+      "expected_explain_delta": "Fewer Aggregate nodes. Lowered CPU time.",
+      "recommended_patch_ops": ["replace_select"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR conditions in query"},
+    {"transform_id": "inline_decorrelate_materialized", "family": "B", "reason": "No scalar subqueries in query"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "No INTERSECT operations"}
+  ]
+}

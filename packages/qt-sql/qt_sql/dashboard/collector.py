@@ -119,6 +119,8 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
     # Load q-error data (keyed by normalized query ID)
     qerror_map = _load_qerror_data(benchmark_dir)
 
+    benchmark_cfg = _load_json(benchmark_dir / "config.json") or {}
+
     # Build per-query ForensicQuery objects
     forensic_queries: List[ForensicQuery] = []
     pattern_entries: List[Tuple[str, float, str, Dict[str, float]]] = []
@@ -128,6 +130,7 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
         qid = normalize_qid(raw_qid)
         sql = sql_path.read_text().strip()
         runtime_ms = load_explain_timing(benchmark_dir, raw_qid, engine)
+        spill = load_explain_spill_signals(benchmark_dir, raw_qid)
         bucket = _bucket_runtime(runtime_ms)
 
         # AST detection
@@ -166,6 +169,9 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
         # Priority score (PLAN.md §4.3)
         weight = _RUNTIME_WEIGHTS.get(bucket, 0)
         priority_score = weight * (1.0 + tractability + top_overlap)
+        if spill["detected"]:
+            # Spilling queries tend to be high-confidence config or rewrite opportunities.
+            priority_score *= 1.15
 
         # Q-error (join by normalized ID)
         qerror = qerror_map.get(qid)
@@ -174,6 +180,10 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
         structural_flags: List[str] = []
         if qerror and qerror.structural_flags:
             structural_flags = [f for f in qerror.structural_flags.split("|") if f]
+        if spill["remote"]:
+            structural_flags.append("SPILL_REMOTE")
+        elif spill["local"]:
+            structural_flags.append("SPILL_LOCAL")
 
         # EXPLAIN text for drawer
         has_explain, explain_text = _load_explain_text(benchmark_dir, raw_qid)
@@ -192,6 +202,9 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
             structural_flags=structural_flags,
             has_explain=has_explain,
             explain_text=explain_text,
+            spill_detected=spill["detected"],
+            spill_remote=spill["remote"],
+            spill_local=spill["local"],
         )
         forensic_queries.append(fq)
         pattern_entries.append((qid, runtime_ms, bucket, pattern_overlaps))
@@ -246,6 +259,8 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
 
     # Resource profile (PG only)
     resource_profile = _load_resource_profile(benchmark_dir, engine)
+    config_snapshot = _load_engine_config_snapshot(benchmark_dir, engine, benchmark_cfg)
+    spill_summary = _compute_spill_summary(by_runtime)
 
     return ForensicSummary(
         total_queries=len(forensic_queries),
@@ -262,12 +277,100 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
         resource_profile=resource_profile,
         dominant_pathology=dominant_pathology,
         estimated_opportunity_ms=round(estimated_opportunity, 1),
+        config_snapshot=config_snapshot,
+        spill_summary=spill_summary,
     )
 
 
 # ---------------------------------------------------------------------------
 # Forensic data loaders
 # ---------------------------------------------------------------------------
+
+def _explain_json_paths(benchmark_dir: Path, query_id: str) -> List[Path]:
+    return [
+        benchmark_dir / "explains" / f"{query_id}.json",
+        benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+        benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+    ]
+
+
+def _load_explain_json(benchmark_dir: Path, query_id: str) -> Optional[dict]:
+    for path in _explain_json_paths(benchmark_dir, query_id):
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def load_explain_spill_signals(benchmark_dir: Path, query_id: str) -> Dict[str, Any]:
+    """Best-effort spill detection from cached EXPLAIN artifacts."""
+    data = _load_explain_json(benchmark_dir, query_id)
+    if not data:
+        return {"detected": False, "remote": False, "local": False, "evidence": ""}
+
+    remote = False
+    local = False
+    evidence: List[str] = []
+
+    def _scan_obj(obj: Any) -> None:
+        nonlocal remote, local
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key = str(k).lower()
+                if isinstance(v, (int, float)):
+                    if v > 0 and any(tok in key for tok in (
+                        "bytes_spilled_remote", "remote_spill", "spilled_remote",
+                    )):
+                        remote = True
+                        evidence.append(f"{k}={v}")
+                    if v > 0 and any(tok in key for tok in (
+                        "bytes_spilled_local", "local_spill", "spilled_local",
+                        "temp_blks_written", "temp_dir_size", "system_peak_temp_dir_size",
+                    )):
+                        local = True
+                        evidence.append(f"{k}={v}")
+                _scan_obj(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _scan_obj(item)
+
+    _scan_obj(data)
+
+    text = " ".join(
+        str(data.get(k, "")) for k in ("plan_text", "vital_signs", "note")
+    ).lower()
+    if "bytes_spilled_remote" in text or "remote spill" in text:
+        remote = True
+        evidence.append("plan_text:remote_spill")
+    if any(tok in text for tok in ("external merge", "temp written", "spill", "disk")):
+        local = True
+        evidence.append("plan_text:local_spill")
+
+    return {
+        "detected": bool(remote or local),
+        "remote": bool(remote),
+        "local": bool(local or remote),
+        "evidence": "; ".join(evidence[:4]),
+    }
+
+
+def _compute_spill_summary(queries: List[ForensicQuery]) -> Dict[str, Any]:
+    spilled = [q for q in queries if q.spill_detected]
+    remote = [q for q in spilled if q.spill_remote]
+    local = [q for q in spilled if q.spill_local and not q.spill_remote]
+    top = sorted(spilled, key=lambda q: -max(q.runtime_ms, 0))[:6]
+    return {
+        "queries_with_spill": len(spilled),
+        "queries_with_remote_spill": len(remote),
+        "queries_with_local_spill": len(local),
+        "top_queries": [q.query_id for q in top],
+    }
+
 
 def _load_qerror_data(benchmark_dir: Path) -> Dict[str, QErrorEntry]:
     """Load q-error analysis, return dict keyed by normalized query ID."""
@@ -360,16 +463,9 @@ def _compute_gap_matches(
 
 def _load_explain_text(benchmark_dir: Path, query_id: str) -> Tuple[bool, str]:
     """Load EXPLAIN plan text for a query. Returns (has_explain, truncated_text)."""
-    search_paths = [
-        benchmark_dir / "explains" / f"{query_id}.json",
-        benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
-        benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
-    ]
-    for path in search_paths:
-        if not path.exists():
-            continue
+    data = _load_explain_json(benchmark_dir, query_id)
+    if data:
         try:
-            data = json.loads(path.read_text())
             text = data.get("plan_text", "")
             if not text:
                 # PG format — render plan tree from plan_json
@@ -474,15 +570,33 @@ def _load_resource_profile(
 
     profile_path = benchmark_dir / "pg_system_profile.json"
     if not profile_path.exists():
+        cfg = _load_json(benchmark_dir / "config.json") or {}
+        dsn = str(cfg.get("benchmark_dsn") or cfg.get("dsn") or "").strip()
+        if dsn:
+            try:
+                from ..pg_tuning import load_or_collect_profile
+                load_or_collect_profile(dsn, benchmark_dir)
+            except Exception as exc:
+                logger.debug(f"PG profile collection skipped: {exc}")
+
+    if not profile_path.exists():
         return None
 
     try:
         data = json.loads(profile_path.read_text())
-        settings = {s["name"]: s["setting"]
-                    for s in data.get("settings", [])}
+        settings = {
+            s["name"]: _format_pg_setting_value(s.get("setting", ""), s.get("unit"))
+            for s in data.get("settings", [])
+            if isinstance(s, dict) and s.get("name")
+        }
+        settings_raw = {
+            s["name"]: str(s.get("setting", ""))
+            for s in data.get("settings", [])
+            if isinstance(s, dict) and s.get("name")
+        }
 
         # Detect storage type heuristic
-        random_cost = float(settings.get("random_page_cost", "4"))
+        random_cost = float(settings_raw.get("random_page_cost", "4"))
         storage = "SSD" if random_cost <= 1.5 else "HDD"
 
         return ResourceProfile(
@@ -496,6 +610,229 @@ def _load_resource_profile(
     except Exception as e:
         logger.debug(f"Resource profile load error: {e}")
         return None
+
+
+def _format_pg_setting_value(setting: Any, unit: Any) -> str:
+    """Render pg_settings value + unit in a readable form."""
+    raw = str(setting)
+    unit_s = str(unit or "")
+    if not unit_s:
+        return raw
+    if unit_s == "kB":
+        try:
+            kb = int(raw)
+            if kb >= 1_048_576:
+                return f"{kb // 1_048_576}GB"
+            if kb >= 1024:
+                return f"{kb // 1024}MB"
+            return f"{kb}kB"
+        except Exception:
+            return f"{raw}{unit_s}"
+    if unit_s == "8kB":
+        try:
+            blocks = int(raw)
+            mb = (blocks * 8) // 1024
+            if mb >= 1024:
+                return f"{mb // 1024}GB"
+            return f"{mb}MB"
+        except Exception:
+            return f"{raw} x 8kB"
+    return f"{raw}{unit_s}"
+
+
+def _load_engine_config_snapshot(
+    benchmark_dir: Path,
+    engine: str,
+    benchmark_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    dsn = str(benchmark_cfg.get("benchmark_dsn") or benchmark_cfg.get("dsn") or "").strip()
+    if engine in ("postgresql", "postgres"):
+        return _load_postgres_config_snapshot(benchmark_dir, dsn)
+    if engine == "snowflake":
+        return _load_snowflake_config_snapshot(benchmark_dir, dsn)
+    return {}
+
+
+def _load_postgres_config_snapshot(benchmark_dir: Path, dsn: str) -> Dict[str, Any]:
+    profile_path = benchmark_dir / "pg_system_profile.json"
+    had_cache = profile_path.exists()
+    if not had_cache and dsn:
+        try:
+            from ..pg_tuning import load_or_collect_profile
+            load_or_collect_profile(dsn, benchmark_dir)
+        except Exception as exc:
+            logger.debug(f"Postgres config snapshot collection failed: {exc}")
+
+    data = _load_json(profile_path)
+    if not data:
+        return {}
+
+    settings_map = {
+        s["name"]: _format_pg_setting_value(s.get("setting", ""), s.get("unit"))
+        for s in data.get("settings", [])
+        if isinstance(s, dict) and s.get("name")
+    }
+    selected = {
+        k: settings_map.get(k, "")
+        for k in (
+            "work_mem",
+            "shared_buffers",
+            "effective_cache_size",
+            "max_parallel_workers_per_gather",
+            "max_connections",
+            "hash_mem_multiplier",
+            "jit",
+            "random_page_cost",
+            "default_statistics_target",
+        )
+        if settings_map.get(k, "")
+    }
+    active = data.get("active_connections")
+    if active is not None:
+        selected["active_connections"] = str(active)
+
+    return {
+        "engine": "postgresql",
+        "source": "cache" if had_cache else "live",
+        "collected_at": data.get("collected_at", ""),
+        "settings": selected,
+    }
+
+
+def _load_snowflake_config_snapshot(benchmark_dir: Path, dsn: str) -> Dict[str, Any]:
+    cache_path = benchmark_dir / "snowflake_system_profile.json"
+    if cache_path.exists():
+        cached = _load_json(cache_path)
+        if isinstance(cached, dict):
+            snapshot = dict(cached)
+            snapshot.setdefault("source", "cache")
+            return snapshot
+
+    if not dsn:
+        return {}
+
+    collected = _collect_snowflake_system_profile(dsn)
+    if not collected:
+        return {}
+    collected["source"] = "live"
+    try:
+        cache_path.write_text(json.dumps(collected, indent=2, default=str))
+    except Exception as exc:
+        logger.debug(f"Failed to cache Snowflake profile: {exc}")
+    return collected
+
+
+def _collect_snowflake_system_profile(dsn: str) -> Dict[str, Any]:
+    try:
+        from ..execution.factory import create_executor_from_dsn
+        executor = create_executor_from_dsn(dsn)
+        executor.connect()
+    except Exception as exc:
+        logger.debug(f"Snowflake connect failed for profile collection: {exc}")
+        return {}
+
+    settings: Dict[str, str] = {}
+    notes: List[str] = []
+    try:
+        ctx_rows = executor.execute(
+            "SELECT CURRENT_WAREHOUSE() AS current_warehouse, "
+            "CURRENT_DATABASE() AS current_database, "
+            "CURRENT_SCHEMA() AS current_schema, "
+            "CURRENT_ROLE() AS current_role"
+        )
+        if ctx_rows:
+            ctx = ctx_rows[0]
+            for key in ("current_warehouse", "current_database", "current_schema", "current_role"):
+                val = ctx.get(key)
+                if val is not None:
+                    settings[key] = str(val)
+
+        wh_name = settings.get("current_warehouse", "")
+        if wh_name:
+            safe_wh = wh_name.replace("'", "''")
+            safe_wh_ident = wh_name.replace('"', '""')
+            wh_rows = executor.execute(f"SHOW WAREHOUSES LIKE '{safe_wh}'")
+            if wh_rows:
+                wh = wh_rows[0]
+                for src, dest in (
+                    ("size", "warehouse_size"),
+                    ("type", "warehouse_type"),
+                    ("state", "warehouse_state"),
+                    ("auto_suspend", "auto_suspend"),
+                    ("auto_resume", "auto_resume"),
+                    ("min_cluster_count", "min_cluster_count"),
+                    ("max_cluster_count", "max_cluster_count"),
+                    ("scaling_policy", "scaling_policy"),
+                    ("enable_query_acceleration", "query_acceleration_enabled"),
+                    ("query_acceleration_max_scale_factor", "query_acceleration_max_scale_factor"),
+                ):
+                    if src in wh and wh[src] is not None:
+                        settings[dest] = str(wh[src])
+            # Warehouse-level parameters are the most reliable source for QAS/QoS.
+            for pname, dest in (
+                ("ENABLE_QUERY_ACCELERATION", "query_acceleration_enabled"),
+                ("QUERY_ACCELERATION_MAX_SCALE_FACTOR", "query_acceleration_max_scale_factor"),
+            ):
+                try:
+                    rows = executor.execute(
+                        f'SHOW PARAMETERS LIKE \'{pname}\' IN WAREHOUSE "{safe_wh_ident}"'
+                    )
+                    if rows:
+                        val = _extract_snowflake_parameter_value(rows[0])
+                        if val is not None:
+                            settings[dest] = str(val)
+                except Exception:
+                    continue
+
+        for pname, dest in (
+            ("STATEMENT_TIMEOUT_IN_SECONDS", "statement_timeout_seconds"),
+            ("USE_CACHED_RESULT", "use_cached_result"),
+        ):
+            try:
+                rows = executor.execute(f"SHOW PARAMETERS LIKE '{pname}' IN SESSION")
+                if rows:
+                    row = rows[0]
+                    val = _extract_snowflake_parameter_value(row)
+                    if val is not None:
+                        settings[dest] = str(val)
+            except Exception:
+                continue
+
+        qas_raw = settings.get("query_acceleration_enabled", "").strip().lower()
+        qas_enabled = qas_raw in {"true", "on", "yes", "1"}
+        if settings.get("query_acceleration_max_scale_factor"):
+            settings["qos_summary"] = (
+                "QAS enabled"
+                if qas_enabled
+                else "QAS disabled"
+            ) + f" (max_scale={settings['query_acceleration_max_scale_factor']})"
+        else:
+            settings["qos_summary"] = "QAS enabled" if qas_enabled else "QAS unknown"
+
+        return {
+            "engine": "snowflake",
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "settings": settings,
+            "notes": notes,
+        }
+    except Exception as exc:
+        logger.debug(f"Snowflake profile collection failed: {exc}")
+        return {}
+    finally:
+        try:
+            executor.close()
+        except Exception:
+            pass
+
+
+def _extract_snowflake_parameter_value(row: Dict[str, Any]) -> Optional[Any]:
+    for key in ("value", "default", "level"):
+        if key in row:
+            return row[key]
+    for key, value in row.items():
+        if "value" in str(key).lower():
+            return value
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -763,43 +1100,34 @@ def _bucket_runtime(runtime_ms: float) -> str:
 
 def load_explain_timing(benchmark_dir: Path, query_id: str, engine: str) -> float:
     """Extract execution time from cached EXPLAIN JSON."""
-    search_paths = [
-        benchmark_dir / "explains" / f"{query_id}.json",
-        benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
-        benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
-    ]
+    data = _load_explain_json(benchmark_dir, query_id)
+    if not data:
+        return -1.0
+    try:
+        # DuckDB format
+        if "execution_time_ms" in data:
+            val = data["execution_time_ms"]
+            if val and val > 0:
+                return float(val)
 
-    for path in search_paths:
-        if not path.exists():
-            continue
-        try:
-            data = json.loads(path.read_text())
-
-            # DuckDB format
-            if "execution_time_ms" in data:
-                val = data["execution_time_ms"]
-                if val and val > 0:
-                    return float(val)
-
-            # PostgreSQL format
-            plan_json = data.get("plan_json")
-            if isinstance(plan_json, list) and plan_json:
-                exec_time = plan_json[0].get("Execution Time")
-                if exec_time is not None:
-                    return float(exec_time)
-
-            # DuckDB plan_json dict
-            if isinstance(plan_json, dict):
-                latency = plan_json.get("latency")
-                if latency and latency > 0:
-                    return float(latency) * 1000
-
-            # Snowflake: executionTime field
-            exec_time = data.get("executionTime")
+        # PostgreSQL format
+        plan_json = data.get("plan_json")
+        if isinstance(plan_json, list) and plan_json:
+            exec_time = plan_json[0].get("Execution Time")
             if exec_time is not None:
                 return float(exec_time)
 
-        except Exception:
-            pass
+        # DuckDB plan_json dict
+        if isinstance(plan_json, dict):
+            latency = plan_json.get("latency")
+            if latency and latency > 0:
+                return float(latency) * 1000
+
+        # Snowflake format
+        exec_time = data.get("executionTime")
+        if exec_time is not None:
+            return float(exec_time)
+    except Exception:
+        pass
 
     return -1.0

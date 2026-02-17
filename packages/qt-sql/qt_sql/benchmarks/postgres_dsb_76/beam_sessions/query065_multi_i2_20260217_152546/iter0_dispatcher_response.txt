@@ -1,0 +1,223 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The cost spine shows two independent Nested Loop scans of store_sales and date_dim for subqueries sb and sc with identical filters, causing redundant work. Late selectivity at store and item filters after large joins suggests early dimension filtering could reduce row amplification. Decorrelation of the revenue threshold condition should avoid recomputation.",
+    "reasoning_trace": [
+      "Cost spine dominated by Nested Loop → Aggregation paths for sb and sc subqueries",
+      "Identical date_dim scans repeated (1215-1215+11) with same ss_sales_price filter",
+      "Late filtering on store.s_state and item.i_manager_id after large joins"
+    ],
+    "cost_spine": [
+      "Nested Loop (sa) → Aggregate (sb) → Materialize → Merge Join",
+      "Nested Loop (sc) → Aggregate (sc) → Nested Loop (main)"
+    ],
+    "hotspots": [
+      {"op": "Nested Loop (sa)", "why": "repeated scan of store_sales+date_dim", "evidence": "rows=36809, time=2842ms"},
+      {"op": "Nested Loop (sc)", "why": "redundant scan with same filters", "evidence": "rows=36809, time=1158ms"},
+      {"op": "Aggregate (sb)", "why": "expensive two-stage aggregation", "evidence": "time=4821ms"}
+    ],
+    "do_not_do": ["or_to_union", "intersect_to_exists"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Consolidate sa/sc subqueries into single MATERIALIZED base_cte: (ss_store_sk, ss_item_sk, revenue) with filters, reuse in sb/sc",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1215 AND 1226", "ss_sales_price/ss_list_price BETWEEN 0.79 AND 0.89"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "redundant_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Single base_cte scan replacing two Nested Loops, Materialized CTE for shared access"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs after pre-filtering date_dim in CTE",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Explicit JOIN syntax, date_dim CTE with Index Scan"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter store/item in CTEs: store_cte (s_store_sk) WHERE s_state IN, item_cte (i_item_sk) WHERE i_manager_id BETWEEN",
+      "node_contract": {
+        "from_must_include": ["store", "item"],
+        "where_must_preserve": ["s_state IN ('KS','OH','SD')", "i_manager_id BETWEEN 10 AND 14"],
+        "output_must_preserve": ["s_store_name", "i_item_desc", "i_current_price", "i_wholesale_cost", "i_brand"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Seq Scan → Index Scan on store/item, earlier row reduction"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Precompute sb.ave threshold in CTE before main query, join via sc.revenue <= 0.1 * sb_threshold.ave",
+      "node_contract": {
+        "where_must_preserve": ["sc.revenue <= 0.1 * sb.ave"],
+        "output_must_preserve": ["s_store_name", "i_item_desc", "sc.revenue"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Threshold CTE materialized once, Merge Join replaces recomputation"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate sa/sc aggregates: single CTE computing revenue (ss_store_sk, ss_item_sk) and AVG(revenue) per store",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1215 AND 1226"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue", "ave"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows identical base scans - single-pass aggregation should eliminate redundant work",
+      "confidence": 0.75,
+      "expected_explain_delta": "One aggregate CTE replacing sb/sc subqueries"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Combine sa/sc scans: single CASE-based aggregation for revenue per (store,item) and store-level AVG",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1215 AND 1226"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue", "ave"]
+      },
+      "gates_checked": ["redundant_scan_elimination:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Identical scan patterns suggest CASE-based consolidation could reduce I/O",
+      "confidence": 0.7,
+      "expected_explain_delta": "Single aggregate replacing two subqueries"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create date_cte MATERIALIZED for d_month_seq filter, reference in both sa/sc subqueries",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1215 AND 1226"],
+        "output_must_preserve": ["d_date_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Single date_dim scan via CTE, hash joins in subqueries"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Chain CTEs: date_filter → store_sales JOIN → pre-aggregation",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.82,
+      "expected_explain_delta": "Reduced store_sales scan after date join"
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Materialize threshold CTE with GROUP BY ss_store_sk, use in main query JOIN",
+      "node_contract": {
+        "where_must_preserve": ["sc.revenue <= 0.1 * sb.ave"],
+        "output_must_preserve": ["s_store_name", "i_item_desc", "sc.revenue"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.87,
+      "expected_explain_delta": "Materialized CTE for sb.ave, Merge Join in main query"
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize base revenue CTE for reuse in sb/sc",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1215 AND 1226"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.83,
+      "expected_explain_delta": "Materialized CTE scan replacing repeated base scans"
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push store.s_state and item.i_manager_id filters into CTE definitions",
+      "node_contract": {
+        "where_must_preserve": ["s_state IN ('KS','OH','SD')", "i_manager_id BETWEEN 10 AND 14"],
+        "output_must_preserve": ["s_store_sk", "i_item_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Earlier Index Scans on store/item"
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales before joining date_dim (ss_store_sk, ss_item_sk, revenue)",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sales_price/ss_list_price BETWEEN 0.79 AND 0.89"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.78,
+      "expected_explain_delta": "Aggregate before date_dim join, reduced rows to join"
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "registry: bitmap-or capable in PostgreSQL"},
+    {"transform_id": "sf_inline_decorrelate", "family": "B", "reason": "engine contraindication: Snowflake-specific"}
+  ]
+}

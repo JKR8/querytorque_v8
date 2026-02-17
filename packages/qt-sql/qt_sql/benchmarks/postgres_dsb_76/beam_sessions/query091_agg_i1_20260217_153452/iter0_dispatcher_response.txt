@@ -1,0 +1,292 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Cost spine dominated by sequential scan on catalog_returns (719K rows) followed by nested loops. Late filtering on customer dimensions causes row amplification. Early dimension isolation and explicit join conversion should reduce fact table scans and enable better join planning.",
+    "reasoning_trace": [
+      "Sequential scan on catalog_returns (719K rows) consumes 95% of plan time",
+      "Nested loops amplify small row counts (300→40→3) with late dimension filters",
+      "OR condition on customer_demographics may block efficient index usage",
+      "Comma joins prevent optimal join ordering estimates"
+    ],
+    "cost_spine": [
+      "Seq Scan on catalog_returns → Hash Join → Nested Loop → Nested Loop → Nested Loop"
+    ],
+    "hotspots": [
+      {
+        "op": "Seq Scan on catalog_returns",
+        "why": "Full table scan without early filtering",
+        "evidence": "rows=719420, time=2141ms (95% of total)"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "Late dimension filtering causes row amplification",
+        "evidence": "300→40→3 row reduction with 2227ms cost"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union for single-column OR conditions",
+      "materialize_simple_exists",
+      "cte_materialization_fence for single-use CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax in FROM clause",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "call_center", "date_dim", "customer", "customer_address", "customer_demographics", "household_demographics"],
+        "where_must_preserve": ["cr_call_center_sk = cc_call_center_sk", "cr_returned_date_sk = d_date_sk", "cr_returning_customer_sk = c_customer_sk", "cd_demo_sk = c_current_cdemo_sk", "hd_demo_sk = c_current_hdemo_sk", "ca_address_sk = c_current_addr_sk"],
+        "output_must_preserve": ["cc_call_center_id", "cc_name", "cc_manager", "cd_marital_status", "cd_education_status", "SUM(cr_net_loss)"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "no_left_join:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Hash joins replace nested loops, reduced row estimates in Gather",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Extract date_dim filter into CTE: WITH date_cte AS (SELECT d_date_sk FROM date_dim WHERE d_year=1998 AND d_moy=2)",
+      "node_contract": {
+        "from_must_include": ["date_cte"],
+        "where_must_preserve": ["cr_returned_date_sk = date_cte.d_date_sk"],
+        "output_must_preserve": ["original SELECT columns and aggregation"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "cte_materialization_fence:WARNING"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "IndexOnlyScan on date_dim → CTE scan, earlier date filter application",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create customer_set CTE with filtered customer keys: WITH customer_set AS (SELECT c_customer_sk FROM customer JOIN customer_address... WHERE conditions)",
+      "node_contract": {
+        "from_must_include": ["customer_set"],
+        "where_must_preserve": ["cr_returning_customer_sk = customer_set.c_customer_sk"],
+        "output_must_preserve": ["GROUP BY columns and aggregation semantics"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "no_aggregation_change:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows late customer dimension filtering. Pre-joining dimensions should reduce catalog_returns scan early.",
+      "confidence": 0.78,
+      "expected_explain_delta": "Reduced rows in catalog_returns scan, earlier hash join",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Staged CTE chain: 1) date_cte, 2) customer_set, 3) JOIN catalog_returns ON date/customer keys",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_cte", "customer_set"],
+        "where_must_preserve": ["cr_call_center_sk = cc_call_center_sk"],
+        "output_must_preserve": ["original aggregation and ordering"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Eliminated nested loops, single hash join between prefetched CTEs",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create CTEs for all dimensions: date_cte, cc_cte, customer_set, then JOIN catalog_returns",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_cte", "cc_cte", "customer_set"],
+        "where_must_preserve": ["cr_returned_date_sk = date_cte.d_date_sk", "cr_call_center_sk = cc_cte.cc_call_center_sk"],
+        "output_must_preserve": ["GROUP BY columns with original semantics"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "no_join_multiplicity_change:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension filtering may compound selectivity. PostgreSQL CTE materialization benefits small dimension sets.",
+      "confidence": 0.75,
+      "expected_explain_delta": "Eliminated all dimension table scans, reduced catalog_returns probe size",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR condition into UNION ALL branches: (M/Unknown) UNION ALL (W/Advanced Degree)",
+      "node_contract": {
+        "from_must_include": ["customer_demographics"],
+        "where_must_preserve": ["hd_buy_potential LIKE '1001-5000%'", "ca_gmt_offset = -7"],
+        "output_must_preserve": ["Exact result set with deterministic ordering"]
+      },
+      "gates_checked": ["same_column_or:FAIL", "bitmap_or_scan:WARNING"],
+      "exploration": true,
+      "exploration_hypothesis": "OR condition spans multiple columns. UNION branches may enable per-branch index optimization.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Appearance of UNION node, branch-specific index scans on customer_demographics",
+      "recommended_patch_ops": ["replace_where_predicate", "wrap_query_with_cte"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_returns: WITH agg_cr AS (SELECT cr_call_center_sk, cr_returning_customer_sk, SUM(cr_net_loss) AS loss... GROUP BY 1,2)",
+      "node_contract": {
+        "from_must_include": ["agg_cr"],
+        "where_must_preserve": ["date_dim filters", "customer dimension filters"],
+        "output_must_preserve": ["Final aggregation matches original sum semantics"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS", "no_join_multiplicity_change:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early aggregation reduces rows before dimension joins. Valid since GROUP BY keys align with join keys.",
+      "confidence": 0.7,
+      "expected_explain_delta": "Aggregate node before joins, reduced rows in nested loops",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize customer_demographics filter: WITH cd_cte AS (SELECT cd_demo_sk FROM customer_demographics WHERE (M/Unknown) OR (W/Advanced Degree))",
+      "node_contract": {
+        "from_must_include": ["cd_cte"],
+        "where_must_preserve": ["cd_demo_sk = c_current_cdemo_sk"],
+        "output_must_preserve": ["cd_marital_status", "cd_education_status in GROUP BY"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Materialized CTE scan replacing index scan, earlier filter application",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize household_demographics: WITH hd_cte AS (SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential LIKE '1001-5000%')",
+      "node_contract": {
+        "from_must_include": ["hd_cte"],
+        "where_must_preserve": ["hd_demo_sk = c_current_hdemo_sk"],
+        "output_must_preserve": ["Original GROUP BY columns"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.82,
+      "expected_explain_delta": "CTE scan replacing index scan, reduced nested loop iterations",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize customer_address: WITH ca_cte AS (SELECT ca_address_sk FROM customer_address WHERE ca_gmt_offset = -7)",
+      "node_contract": {
+        "from_must_include": ["ca_cte"],
+        "where_must_preserve": ["ca_address_sk = c_current_addr_sk"],
+        "output_must_preserve": ["All original SELECT columns"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.83,
+      "expected_explain_delta": "Eliminated sequential scan on customer_address, CTE materialization",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Combine date_cte with explicit joins: WITH date_cte AS (...) THEN INNER JOIN date_cte ON ...",
+      "node_contract": {
+        "from_must_include": ["date_cte"],
+        "where_must_preserve": ["cr_returned_date_sk = date_cte.d_date_sk"],
+        "output_must_preserve": ["Original result set"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "cte_materialization_fence:WARNING"],
+      "exploration": false,
+      "confidence": 0.87,
+      "expected_explain_delta": "Hash join between catalog_returns and materialized date_cte",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "All dimensions in CTEs + explicit star-join: date_cte, cc_cte, customer_set, ca_cte, cd_cte, hd_cte JOIN catalog_returns",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_cte", "cc_cte", "customer_set", "ca_cte", "cd_cte", "hd_cte"],
+        "where_must_preserve": ["Key join conditions between CTEs"],
+        "output_must_preserve": ["Complete result set with original aggregation"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "no_join_multiplicity_change:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL benefits from explicit join syntax with pre-materialized dimensions. Combined CTEs maximize early filtering.",
+      "confidence": 0.77,
+      "expected_explain_delta": "Single large hash join, eliminated all nested loops and dimension scans",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push customer_demographics filter into CTE definition: WITH cd_cte AS (...WHERE (M/Unknown) OR (W/Advanced Degree))",
+      "node_contract": {
+        "from_must_include": ["cd_cte"],
+        "where_must_preserve": ["cd_demo_sk = c_current_cdemo_sk"],
+        "output_must_preserve": ["cd_marital_status", "cd_education_status in output"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "no_aggregation_change:PASS"],
+      "exploration": false,
+      "confidence": 0.84,
+      "expected_explain_delta": "Reduced rows in customer_demographics CTE, faster probe in nested loop",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push household_demographics filter into CTE: WITH hd_cte AS (...WHERE hd_buy_potential LIKE '1001-5000%')",
+      "node_contract": {
+        "from_must_include": ["hd_cte"],
+        "where_must_preserve": ["hd_demo_sk = c_current_hdemo_sk"],
+        "output_must_preserve": ["All original GROUP BY columns"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "confidence": 0.86,
+      "expected_explain_delta": "Smaller household_demographics CTE, reduced index scan cost",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "Regression registry: bitmap-or capable on PostgreSQL unless evidence shows OR blocks index usage"
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine contraindication: Snowflake-specific transform not applicable to PostgreSQL"
+    }
+  ]
+}

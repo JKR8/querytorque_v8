@@ -7,20 +7,20 @@ from qt_sql.patches.beam_router import assign_importance_stars
 from qt_sql.patches.beam_wide_prompts import (
     ProbeSpec,
     build_beam_editor_strike_prompt,
-    build_beam_dispatcher_prompt,
+    build_beam_analyst_prompt,
     build_beam_worker_retry_prompt,
     build_beam_worker_prompt,
-    parse_scout_response,
+    parse_analyst_response,
 )
 from qt_sql.patches.beam_prompt_builder import (
     append_shot_results,
-    build_beam_sniper_prompt,
+    build_beam_compiler_prompt,
 )
 from qt_sql.patches.pathology_classifier import build_intelligence_brief
 
 
 TEMPLATE_DIR = (
-    Path(__file__).resolve().parent.parent / "prompts" / "samples" / "V3"
+    Path(__file__).resolve().parent.parent / "prompts" / "templates" / "V3"
 )
 
 
@@ -36,7 +36,7 @@ def test_assign_importance_stars_uses_80_10_10_workload_split() -> None:
     assert stars["q3"] == 1
 
 
-def test_parse_scout_response_supports_dispatch_wrapper_and_probe_count() -> None:
+def test_parse_analyst_response_supports_dispatch_wrapper_and_probe_count() -> None:
     response = """
     {
       "dispatch": {
@@ -67,7 +67,7 @@ def test_parse_scout_response_supports_dispatch_wrapper_and_probe_count() -> Non
       "dropped": []
     }
     """
-    result = parse_scout_response(response)
+    result = parse_analyst_response(response)
     assert result is not None
     assert result.hypothesis == "Nested loop hotspot"
     assert len(result.probes) == 1
@@ -80,7 +80,7 @@ def test_parse_scout_response_supports_dispatch_wrapper_and_probe_count() -> Non
 
 
 def test_dispatcher_prompt_includes_v3_dynamic_sections() -> None:
-    prompt = build_beam_dispatcher_prompt(
+    prompt = build_beam_analyst_prompt(
         query_id="query_001",
         original_sql="SELECT 1",
         explain_text="SEQ_SCAN t [100ms]",
@@ -105,7 +105,7 @@ def test_dispatcher_prompt_includes_v3_dynamic_sections() -> None:
 
 def test_sniper_prompt_contains_bda_table_and_full_sql_patches() -> None:
     sql_patch = "SELECT 1 AS a\nUNION ALL\nSELECT 2 AS a"
-    prompt = build_beam_sniper_prompt(
+    prompt = build_beam_compiler_prompt(
         query_id="query_001",
         original_sql="SELECT a FROM t",
         explain_text="SEQ_SCAN t [200ms]",
@@ -138,8 +138,8 @@ def test_sniper_prompt_contains_bda_table_and_full_sql_patches() -> None:
     assert "## Worker SQL Patches" in prompt
     assert sql_patch in prompt
     assert "## Schema / Index / Stats Context" in prompt
-    assert "## Dispatcher Hypothesis" in prompt
-    assert "## Dispatcher Reasoning Trace" in prompt
+    assert "## Analyst Hypothesis" in prompt
+    assert "## Analyst Reasoning Trace" in prompt
     assert "## Equivalence Tier" in prompt
 
 
@@ -170,13 +170,14 @@ def test_worker_prompt_contains_transform_recipe_section() -> None:
     assert "recommended_patch_ops" in prompt
     assert "expected_explain_delta: Nested loop removed" in prompt
     assert "equivalence_tier: unordered" in prompt
-    assert "### Dispatcher Reasoning Trace" in prompt
-    assert "### Dispatcher Do-Not-Do" in prompt
+    assert "### Analyst Reasoning Trace" in prompt
+    assert "### Analyst Do-Not-Do" in prompt
     assert "avoid_or_to_union" in prompt
     assert "existing_ctes" in prompt
     assert "### Engine-Specific Knowledge" in prompt
-    assert "replace_join_condition" in prompt
-    assert "replace_select" in prompt
+    assert "## DAG Output Contract (MUST follow)" in prompt
+    assert "\"verification\"" in prompt
+    assert "one changed node" in prompt
 
 
 def test_worker_retry_prompt_includes_structured_gate_failure_feedback() -> None:
@@ -210,25 +211,24 @@ def test_editor_strike_prompt_injects_selected_transform() -> None:
     assert "## Schema / Index / Stats Context" in prompt
 
 
-def test_sniper_template_matches_runtime_evidence_contract() -> None:
-    text = (TEMPLATE_DIR / "beam_sniper_v3.txt").read_text(encoding="utf-8")
-    assert "Worker SQL patch outcomes" in text
-    assert "exactly TWO optimization attempts" in text
-    assert "first character must be `[`" in text
-    assert "Top candidate PatchPlans (full JSON)" not in text
-    assert "replace_join_condition" in text
-    assert "wrap_query_with_cte" in text
+def test_compiler_template_matches_runtime_evidence_contract() -> None:
+    text = (TEMPLATE_DIR / "beam_compiler_v3.txt").read_text(encoding="utf-8")
+    assert "Beam Compiler" in text
+    assert "DAG Output Contract (MUST follow)" in text
+    assert "top-level value may be:" in text
+    assert "changed nodes MUST include full executable SQL in `sql`" in text
+    assert "PatchPlan" not in text
 
 
 def test_v3_templates_avoid_sql_ellipsis_placeholders() -> None:
-    for name in ("beam_dispatcher_v3.txt", "beam_worker_v3.txt", "beam_sniper_v3.txt"):
+    for name in ("beam_analyst_v3.txt", "beam_worker_v3.txt", "beam_compiler_v3.txt"):
         text = (TEMPLATE_DIR / name).read_text(encoding="utf-8")
         assert "SELECT ..." not in text
         assert "..." not in text
 
 
-def test_append_shot_results_for_sniper_enforces_two_plan_array_policy() -> None:
-    base_prompt = "You are the Beam Sniper.\nYour task: produce exactly TWO optimization attempts."
+def test_append_shot_results_for_compiler_allows_one_or_two_plans() -> None:
+    base_prompt = "You are the Beam Compiler.\nYour task: produce one or two optimization attempts."
     patches = [
         SimpleNamespace(
             patch_id="s1",
@@ -241,8 +241,7 @@ def test_append_shot_results_for_sniper_enforces_two_plan_array_policy() -> None
     ]
     shot2 = append_shot_results(base_prompt=base_prompt, patches=patches, explains={})
     assert "Output policy:" in shot2
-    assert "Output JSON array with exactly TWO objects." in shot2
-    assert "output ONE JSON object" not in shot2
+    assert "Output one DAG object, or a JSON array with exactly two DAG objects." in shot2
 
 
 def test_intelligence_brief_labels_portability_candidates() -> None:

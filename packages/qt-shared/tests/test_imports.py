@@ -123,6 +123,12 @@ class TestQtSharedImports:
         from qt_shared.llm.gemini import GeminiClient
         assert GeminiClient is not None
 
+    def test_import_llm_ollama(self):
+        """Test Ollama LLM client import."""
+        from qt_shared.llm import ollama
+        from qt_shared.llm.ollama import OllamaClient
+        assert OllamaClient is not None
+
 
 class TestQtSharedCrossModuleImports:
     """Test cross-module imports work correctly."""

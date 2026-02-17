@@ -1,0 +1,132 @@
+{
+  "dispatch": {
+    "dialect": "duckdb",
+    "importance_stars": 1,
+    "probe_count": 5,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "CTE materialization (539K rows) followed by two CTE_SCANs and a correlated subquery implemented via LEFT_DELIM_JOIN / HASH_JOIN LEFT is efficient for DuckDB (253ms total). However, the HASH_GROUP_BY (124.6ms, 49%) on store_returns after join with date_dim is the dominant cost; early filtering on date_dim is already present (366 rows).",
+    "reasoning_trace": [
+      "Cost spine: HASH_GROUP_BY (124.6ms) → HASH_JOIN INNER on c_customer_sk (24.6ms) → HASH_JOIN LEFT (14.8ms) → TOP_N (5.0ms).",
+      "No nested loops, no repeated scans, no set ops, no comma joins → families B, D, E, F less likely.",
+      "Plan already uses CTE materialization (CTE_SCAN) and hash joins; DuckDB's CTE_INLINING strength makes further CTE transforms low-impact.",
+      "Low importance (★) → lower probe count (5) with focus on A (early filtering) and C (aggregation pushdown) families."
+    ],
+    "cost_spine": ["HASH_GROUP_BY (CTE) → HASH_JOIN INNER (ctr1+store+customer) → LEFT_DELIM_JOIN (correlated subquery) → TOP_N"],
+    "hotspots": [
+      {"op": "HASH_GROUP_BY", "why": "aggregation of 539K rows after join", "evidence": "time=124.6ms, rows=539K, 49% total"}
+    ],
+    "do_not_do": ["or_to_union (no OR in query)", "intersect_to_exists (no INTERSECT)", "materialize_cte (CTE already materialized)"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Push aggregation below the date_dim join: pre-aggregate store_returns by sr_customer_sk, sr_store_sk, sr_returned_date_sk before joining with date_dim, then sum the pre-aggregated fees per customer/store.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["sr_returned_date_sk = d_date_sk", "d_year = 2000"],
+        "output_must_preserve": ["sr_customer_sk as ctr_customer_sk", "sr_store_sk as ctr_store_sk", "SUM(SR_FEE) as ctr_total_return"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "HASH_GROUP_BY moves before the HASH_JOIN INNER with date_dim, reducing join input from 558K rows to distinct (customer, store, date) groups.",
+      "recommended_patch_ops": ["replace_from", "replace_where_predicate"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate the two references to customer_total_return CTE (ctr1, ctr2) into a single CTE that computes both the per-store average and the per-customer/store total in one pass, eliminating the second CTE_SCAN.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["sr_returned_date_sk = d_date_sk", "d_year = 2000"],
+        "output_must_preserve": ["sr_customer_sk as ctr_customer_sk", "sr_store_sk as ctr_store_sk", "SUM(SR_FEE) as ctr_total_return"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows two CTE_SCANs (1.8ms, 1.4ms) referencing the same CTE; DuckDB may not eliminate redundant scans when CTE is referenced twice. Single-pass aggregation could reduce total scan cost.",
+      "confidence": 0.60,
+      "expected_explain_delta": "CTE_SCAN count drops from 2 to 1; HASH_GROUP_BY may show additional aggregation for per-store average.",
+      "recommended_patch_ops": ["replace_body", "insert_cte"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Create a CTE that pre-filters date_dim (d_year=2000) and store (s_state='SD'), then join with store_returns and customer in a staged pipeline to reduce rows before aggregation.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim", "store", "customer"],
+        "where_must_preserve": ["sr_returned_date_sk = d_date_sk", "d_year = 2000", "s_state = 'SD'", "ctr1.ctr_customer_sk = c_customer_sk", "ctr1.ctr_store_sk = s_store_sk"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Plan shows store filtered to 35 rows late; moving store filter earlier may reduce rows before joining with CTE, possibly reducing HASH_JOIN INNER cost.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Rewrite the correlated scalar subquery (SELECT AVG(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk) as a standalone CTE computing per-store averages, then JOIN in main WHERE clause.",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1", "store", "customer"],
+        "where_must_preserve": ["ctr1.ctr_total_return > avg_store_return", "s_state = 'SD'", "ctr1.ctr_customer_sk = c_customer_sk", "ctr1.ctr_store_sk = s_store_sk"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "LEFT_DELIM_JOIN and HASH_JOIN LEFT replaced by a single HASH_JOIN INNER with a pre-aggregated store-average CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Use Snowflake-style shared-scan decorrelation: create a CTE with store_returns+date_dim join, then compute per-store averages and per-customer/store totals in separate CTEs from that shared scan, then join in main query.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["sr_returned_date_sk = d_date_sk", "d_year = 2000"],
+        "output_must_preserve": ["sr_customer_sk as ctr_customer_sk", "sr_store_sk as ctr_store_sk", "SUM(SR_FEE) as ctr_total_return"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows CTE scanned twice; shared-scan decorrelation may reduce total I/O by computing both aggregates from a single materialized scan. DuckDB's CTE_INLINING may still inline, but explicit shared CTE could improve.",
+      "confidence": 0.55,
+      "expected_explain_delta": "CTE_SCAN count remains 2 but base scan of store_returns may be shared; HASH_GROUP_BY may split into two aggregations (per-store avg, per-customer/store total).",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "no OR condition in query"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "no INTERSECT in query"},
+    {"transform_id": "materialize_cte", "family": "E", "reason": "CTE already materialized in plan"},
+    {"transform_id": "self_join_decomposition", "family": "F", "reason": "no self-join pattern in query"}
+  ]
+}

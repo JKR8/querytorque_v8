@@ -1,0 +1,251 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The execution plan shows a dominant bottleneck in sequential scans on store_sales (249s) and web_sales due to late predicate application and comma-join inefficiencies. Key issues include full fact table scans before dimension filters, comma-join cardinality misestimation, and redundant CTE rescans. Transform families A (Early Filtering) and F (Join Topology) should reduce scan amplification through dimension isolation and explicit joins.",
+    "reasoning_trace": [
+      "Cost spine: Seq Scan on store_sales (249s) → Hash Join (253s) → Nested Loop (253s)",
+      "Amplification: 415k rows scanned in store_sales before dimension filters",
+      "Late selectivity: Dimension filters (item/customer_address) applied after fact table scan",
+      "Comma-join weakness: Poor cardinality estimates in FROM clause joins"
+    ],
+    "cost_spine": ["Seq Scan on store_sales → Hash Join → Nested Loop"],
+    "hotspots": [
+      {"op": "Seq Scan on store_sales", "why": "Full table scan without predicate pushdown", "evidence": "rows=415237, time=249309ms"},
+      {"op": "Hash Join", "why": "Amplification from unfiltered fact-dimension join", "evidence": "time=252594ms after store_sales scan"}
+    ],
+    "do_not_do": ["or_to_union (bitmap_or_scan active)", "materialize_cte (unused CTE scans)"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Replace comma joins in ss CTE with explicit INNER JOINs. Isolate date_dim filter via CTE materialization.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "ss_addr_sk=ca_address_sk", "ss_item_sk = i_item_sk", "i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "sum(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "BitmapAnd replacing Seq Scan, reduced loops in Nested Loop",
+      "recommended_patch_ops": ["replace_from", "insert_cte"],
+      "gold_example_id": "date_cte_explicit_join_pg"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter item/customer_address into CTEs before ss CTE join. Preserve i_manager_id and ca_state filters.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_year=1999"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "sum(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS", "no_nested_loops:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows late dimension filters; pre-materialization should reduce fact table scan rows",
+      "confidence": 0.75,
+      "expected_explain_delta": "Reduced rows in store_sales scan via early dimension filtering",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "dimension_cte_isolate_db"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create CTEs for all filtered dimensions (item, customer_address, date_dim) before joining with store_sales",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_list_price between 244 and 258"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "sum(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension selectivity should compound scan reduction per engine gap CROSS_CTE_PREDICATE_BLINDNESS",
+      "confidence": 0.68,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with small dimension CTEs",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "multi_dimension_prefetch_db"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add d_date_sk BETWEEN filter to store_sales using date_dim CTE surrogate keys",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_year=1999"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year"]
+      },
+      "gates_checked": ["predicate_transitivity_failure:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Date surrogate key pushdown may enable index scan despite portability candidate status",
+      "confidence": 0.6,
+      "expected_explain_delta": "Index Scan replacing Seq Scan on store_sales if date_sk range is selective",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "gold_example_id": "sf_sk_pushdown_multi_fact_sf"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize ss CTE once and derive all quarters via CASE aggregation to avoid self-joins",
+      "node_contract": {
+        "from_must_include": ["ss"],
+        "where_must_preserve": ["ss1.d_qoy=1", "ss2.d_qoy=2", "ss3.d_qoy=3"],
+        "output_must_preserve": ["web_q1_q2_increase", "store_q1_q2_increase", "web_q2_q3_increase", "store_q2_q3_increase"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Eliminated 5 CTE Scans and Nested Loops in main query",
+      "recommended_patch_ops": ["replace_body", "insert_cte"],
+      "gold_example_id": "pg_self_join_decomposition_pg"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_item_sk/ss_addr_sk before joining dimensions",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_list_price between 244 and 258"],
+        "output_must_preserve": ["ss_item_sk", "ss_addr_sk", "sum(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Reduces fact table rows before join; 415k → estimated county groups",
+      "confidence": 0.8,
+      "expected_explain_delta": "GroupAggregate before Hash Join in ss CTE",
+      "recommended_patch_ops": ["replace_from", "insert_cte"],
+      "gold_example_id": "aggregate_pushdown_db"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create shared CTE for filtered item/customer_address reused in ss and ws CTEs",
+      "node_contract": {
+        "from_must_include": ["item", "customer_address"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["i_item_sk", "ca_address_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Avoids duplicate dimension scans; plan shows identical item filters in ss/ws",
+      "confidence": 0.7,
+      "expected_explain_delta": "Single dimension scan replacing duplicate Bitmap Heap Scans",
+      "recommended_patch_ops": ["insert_cte"],
+      "gold_example_id": "shared_dimension_multi_channel_db"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Staged reduction: Filter customer_address → join with store_sales → join with item",
+      "node_contract": {
+        "from_must_include": ["customer_address", "store_sales", "item"],
+        "where_must_preserve": ["ss_addr_sk=ca_address_sk", "ss_item_sk = i_item_sk"],
+        "output_must_preserve": ["ca_county", "sum(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Progressive filtering should reduce fact table scan earlier in pipeline",
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced rows in store_sales scan after early customer_address filter",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "prefetch_fact_join_db"
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize pre-join filtered fact tables (store_sales/web_sales) before main query ratios",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales"],
+        "where_must_preserve": ["ss_list_price between 244 and 258", "ws_list_price between 244 and 258"],
+        "output_must_preserve": ["ss1.ca_county", "ws1.web_sales", "ss1.store_sales"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Materialized CTE scans replacing repeated joins in main query",
+      "recommended_patch_ops": ["insert_cte", "replace_block_with_cte_pair"],
+      "gold_example_id": "materialized_dimension_fact_prefilter_pg"
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push d_year=1999 filter into ss/ws CTE definitions (not just main query)",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year=1999"],
+        "output_must_preserve": ["d_qoy", "d_date_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.95,
+      "expected_explain_delta": "Reduced rows in ss/ws CTE aggregates by 97% (all years → 1999)",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "gold_example_id": "early_filter_universal"
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax in ws CTE",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["ws_sold_date_sk = d_date_sk", "ws_bill_addr_sk=ca_address_sk", "ws_item_sk = i_item_sk"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "sum(ws_ext_sales_price)"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Improved join order and bitmap scan usage in ws CTE",
+      "recommended_patch_ops": ["replace_from"],
+      "gold_example_id": "inner_join_conversion_db"
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate ss1/ss2/ss3 into single CTE using CASE for quarterly aggregates",
+      "node_contract": {
+        "from_must_include": ["ss"],
+        "where_must_preserve": ["d_qoy IN (1,2,3)"],
+        "output_must_preserve": ["ca_county", "d_year", "store_q1_q2_increase", "store_q2_q3_increase"]
+      },
+      "gates_checked": ["no_group_by:PASS"],
+      "exploration": false,
+      "confidence": 0.87,
+      "expected_explain_delta": "Eliminated self-joins; single CTE scan with conditional aggregates",
+      "recommended_patch_ops": ["replace_body", "replace_select"],
+      "gold_example_id": "single_pass_aggregation_db"
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "regression registry: bitmap-or capable per engine strength BITMAP_OR_SCAN"},
+    {"transform_id": "decorrelate", "family": "B", "reason": "no correlated subqueries in plan evidence"}
+  ]
+}

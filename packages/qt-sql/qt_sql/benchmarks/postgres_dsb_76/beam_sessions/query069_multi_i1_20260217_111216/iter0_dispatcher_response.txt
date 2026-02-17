@@ -1,0 +1,320 @@
+### Analysis & Hypothesis
+
+**Cost Spine Analysis**  
+The execution plan reveals a dominant bottleneck in the nested loop operations:
+1. **Top-level Nested Loop** (25.6s): Processes 964 rows but consumes 99.9% of query time
+2. **Nested Loop Anti Join**: Executes NOT EXISTS conditions via nested loops against `web_sales` and `catalog_sales`, materializing 310K+ rows
+3. **Date Dimension Scans**: Repeated full scans of `date_dim` (3 instances) with inefficient filtering
+
+**Key Amplification Factors**  
+- ⚠️ **Correlated Subquery Paralysis**: NOT EXISTS conditions re-execute per outer row (1105 loops)
+- ⚠️ **Late Filtering**: `date_dim` filters applied after large fact table joins
+- ⚠️ **Comma Join Weakness**: Implicit joins prevent optimal join reordering
+
+**Hypothesis**  
+PostgreSQL is repeatedly scanning large fact tables (`store_sales`, `web_sales`, `catalog_sales`) for each customer due to correlated NOT EXISTS subqueries. The comma-join syntax blocks join reordering, while late date filtering causes unnecessary row processing. Applying decorrelation transforms (Family B) with early dimension filtering (Family A) and explicit joins (Family F) should eliminate per-row re-execution and reduce input sizes.
+
+---
+
+### Dispatch Plan
+```json
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Nested loop anti-join on NOT EXISTS subqueries dominates runtime (25s) due to per-row re-execution. Correlated subquery paralysis and comma-join syntax prevent efficient set operations. Decorrelation + dimension isolation should convert nested loops to single-pass hash joins.",
+    "reasoning_trace": [
+      "Cost spine: Nested Loop (25.6s) → Nested Loop Anti (materializing 310K rows)",
+      "Amplification: 1105 outer loops for NOT EXISTS subqueries",
+      "Late filtering: date_dim scans occur after fact table joins"
+    ],
+    "cost_spine": [
+      "Nested Loop (25.6s) → Nested Loop Anti (web/catalog sales) → Materialize (310K rows)"
+    ],
+    "hotspots": [
+      {
+        "op": "Nested Loop Anti",
+        "why": "Correlated subquery re-execution",
+        "evidence": "1105 loops, 310K rows materialized, time=25.6s"
+      },
+      {
+        "op": "date_dim scans",
+        "why": "Late filtering after fact joins",
+        "evidence": "3 full scans despite small date range"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union (BITMAP_OR_SCAN strength)",
+      "intersect_to_exists (no INTERSECT in query)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decorrelate store_sales EXISTS by creating CTE store_customers: SELECT DISTINCT ss_customer_sk FROM store_sales JOIN date_dim WHERE d_year=2002 AND d_moy BETWEEN 10-12 AND ss_list_price BETWEEN 80-169",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_year=2002", "d_moy BETWEEN 10 AND 12", "ss_list_price BETWEEN 80 AND 169"],
+        "output_must_preserve": ["c.c_customer_sk IN store_customers"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.95,
+      "expected_explain_delta": "Replace nested loop with hash semi-join to store_customers CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decorrelate web_sales NOT EXISTS via CTE web_customers: SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN date_dim WHERE d_year=2002 AND d_moy BETWEEN 10-12 AND ws_list_price BETWEEN 80-169",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim"],
+        "where_must_preserve": ["ws_sold_date_sk = d_date_sk", "d_year=2002", "d_moy BETWEEN 10 AND 12", "ws_list_price BETWEEN 80 AND 169"],
+        "output_must_preserve": ["c.c_customer_sk NOT IN web_customers"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.95,
+      "expected_explain_delta": "Replace nested loop anti-join with hash anti-join to web_customers CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decorrelate catalog_sales NOT EXISTS via CTE catalog_customers: SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN date_dim WHERE d_year=2002 AND d_moy BETWEEN 10-12 AND cs_list_price BETWEEN 80-169",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["cs_sold_date_sk = d_date_sk", "d_year=2002", "d_moy BETWEEN 10 AND 12", "cs_list_price BETWEEN 80 AND 169"],
+        "output_must_preserve": ["c.c_customer_sk NOT IN catalog_customers"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.95,
+      "expected_explain_delta": "Replace nested loop anti-join with hash anti-join to catalog_customers CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered date_dim as CTE date_range: SELECT d_date_sk FROM date_dim WHERE d_year=2002 AND d_moy BETWEEN 10-12",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year=2002", "d_moy BETWEEN 10 AND 12"],
+        "output_must_preserve": ["All date_dim joins use date_range CTE"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Replace 3 date_dim scans with single CTE scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax: FROM customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN customer_demographics cd ON cd_demo_sk = c.c_current_cdemo_sk",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics"],
+        "where_must_preserve": ["ca_state IN ('CO','NC','TX')", "cd_marital_status IN ('S','M','U')", "cd_education_status IN ('Primary','College')"],
+        "output_must_preserve": ["All join conditions"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Enable hash join planning with accurate cardinality estimates",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter customer_address into CTE filtered_ca: SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('CO','NC','TX')",
+      "node_contract": {
+        "from_must_include": ["customer_address"],
+        "where_must_preserve": ["ca_state IN ('CO','NC','TX')"],
+        "output_must_preserve": ["c.c_current_addr_sk = filtered_ca.ca_address_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduce customer_address scan from 11K to estimated 3 states",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter customer_demographics into CTE filtered_cd: SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status IN ('S','M','U') AND cd_education_status IN ('Primary','College')",
+      "node_contract": {
+        "from_must_include": ["customer_demographics"],
+        "where_must_preserve": ["cd_marital_status IN ('S','M','U')", "cd_education_status IN ('Primary','College')"],
+        "output_must_preserve": ["cd_demo_sk = c.c_current_cdemo_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduce customer_demographics scan using composite filter",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Combine customer + filtered_ca + filtered_cd into CTE base_customers: SELECT c_customer_sk, c_current_cdemo_sk FROM customer JOIN filtered_ca JOIN filtered_cd",
+      "node_contract": {
+        "from_must_include": ["customer", "filtered_ca", "filtered_cd"],
+        "where_must_preserve": ["All join conditions"],
+        "output_must_preserve": ["c_customer_sk", "c_current_cdemo_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Eliminate redundant dimension rescans in main query",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Combine all sales channel checks into single CTE: SELECT ss_customer_sk AS cust_key, 'store' AS channel FROM store_sales JOIN date_range UNION ALL ...",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales", "catalog_sales", "date_range"],
+        "where_must_preserve": ["All date and price filters"],
+        "output_must_preserve": ["EXISTS/NOT EXISTS logic via channel flags"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single CTE scan may outperform 3 separate CTEs when channel data overlaps",
+      "confidence": 0.6,
+      "expected_explain_delta": "Replace 3 CTE scans with single partitioned scan",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Reuse date_range CTE in all sales channel CTEs (p01-p03)",
+      "node_contract": {
+        "from_must_include": ["date_range"],
+        "where_must_preserve": ["d_date_sk joins in all sales CTEs"],
+        "output_must_preserve": ["Date filters remain consistent"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may optimize CTE reuse better than DuckDB despite being non-native",
+      "confidence": 0.65,
+      "expected_explain_delta": "Eliminate redundant date_range materializations",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN to store_sales CTE: WHERE ss_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_range) AND (SELECT MAX(d_date_sk) FROM date_range",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sold_date_sk range constraint"],
+        "output_must_preserve": ["Join to date_range remains valid"]
+      },
+      "gates_checked": ["predicate_transitivity_failure:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Date_sk pushdown may enable partition pruning despite being Snowflake pattern",
+      "confidence": 0.55,
+      "expected_explain_delta": "Index scan instead of full scan on store_sales",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Convert store_sales EXISTS to LEFT JOIN ... WHERE IS NOT NULL",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["All original filters"],
+        "output_must_preserve": ["Same EXISTS semantics"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": true,
+      "confidence": 0.7,
+      "expected_explain_delta": "Convert nested loop to hash semi-join",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate customer counts in base_customers CTE before sales joins",
+      "node_contract": {
+        "from_must_include": ["base_customers"],
+        "where_must_preserve": ["GROUP BY keys remain compatible"],
+        "output_must_preserve": ["Original aggregation columns"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS"],
+      "exploration": true,
+      "confidence": 0.6,
+      "expected_explain_delta": "Move aggregation below sales joins",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate sales channel checks via CASE: MAX(CASE WHEN channel='store' THEN 1 END) AS has_store_sale",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales", "catalog_sales"],
+        "where_must_preserve": ["All date/price filters"],
+        "output_must_preserve": ["Same EXISTS/NOT EXISTS logic"]
+      },
+      "gates_checked": ["redundant_scan_elimination:PASS"],
+      "exploration": true,
+      "confidence": 0.5,
+      "expected_explain_delta": "Single sales scan instead of 3 separate scans",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "Regression registry: BITMAP_OR_SCAN strength in PostgreSQL"
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOINs in query"
+    }
+  ]
+}
+```
+
+### Key Optimization Strategy
+1. **Break Correlated Subqueries** (p01-p03): Convert EXISTS/NOT EXISTS to anti/semi-joins via CTEs
+2. **Isolate Dimensions Early** (p04-p08): Pre-filter date_range, customer_address, and demographics
+3. **Fix Join Topology** (p05): Explicit JOIN syntax unlocks optimizer potential
+4. **Exploration Probes** (p09-p14): Test non-native patterns like:
+   - Single CTE for all sales channels (p09)
+   - Snowflake-style date_sk pushdown (p11)
+   - Conditional aggregation (p14)
+
+Probes are ranked by expected impact, with decorrelation and dimension isolation as highest priority. PostgreSQL's CTE materialization strength is leveraged while respecting its BITMAP_OR_SCAN and SEMI_JOIN_EXISTS capabilities.

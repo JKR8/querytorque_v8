@@ -1,0 +1,201 @@
+### EXPLAIN Analysis
+**Cost Spine**:  
+The top-level `Nested Loop` (25.9s) dominates runtime. Its left child (6.1s) processes base tables + `EXISTS`, while its right child (`Materialize` of 310K rows) is scanned 1,105 times (343M row scans) for `NOT EXISTS` validation.  
+
+**Spine Nodes**:
+- `NESTED_LOOP`: Correlated `NOT EXISTS` forces full materialized scan per outer row (1105x).
+- `SEQ_SCAN`: Unfiltered scans on `customer` (166K rows) and `customer_address` (11K rows).
+- `MATERIALIZE`: `catalog_sales` result (310K rows) reused but amplified 1105x.
+
+**Row Flow**:  
+Base tables → 1691 rows → `EXISTS` (fast) → 1105 rows → `NOT EXISTS` (slow 343M-row scan).  
+
+**Repeated Scans**:  
+`date_dim` scanned 3x (store/web/catalog sales) with identical filters.  
+
+**Bottleneck Hypothesis**:  
+Correlated `NOT EXISTS` forces nested-loop validation of a large materialized `catalog_sales` set (310K rows × 1105 loops). Base tables lack early filtering, and comma joins obscure cardinality estimates.  
+
+**Scan Count**:  
+- `customer`: 1  
+- `customer_address`: 1  
+- `date_dim`: 3  
+
+---
+
+### Hypothesis
+Correlated `NOT EXISTS` subqueries cause nested-loop amplification of large intermediate results. Early filtering and decorrelation via CTE anti-joins will reduce base rows before expensive operations. Comma-join ambiguity prevents accurate cardinality estimation.  
+
+---
+
+### Probes (Ranked by Phase)
+```json
+{
+  "explain_analysis": {
+    "cost_spine": "Nested Loop (25.9s) with inner Materialize (310K rows × 1105 loops)",
+    "bottleneck_hypothesis": "Correlated NOT EXISTS forces nested-loop validation of large materialized set (343M row scans)",
+    "scan_count": {"customer": 1, "customer_address": 1, "date_dim": 3}
+  },
+  "hypothesis": "Correlated NOT EXISTS subqueries cause nested-loop amplification. Early filtering and decorrelation via CTE anti-joins will reduce base rows.",
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "explicit_join",
+      "family": "F",
+      "target": "S0 FROM clause (comma joins)",
+      "node_contract": {
+        "from": "customer c, customer_address ca, customer_demographics",
+        "where": "c.c_current_addr_sk = ca.ca_address_sk AND cd_demo_sk = c.c_current_cdemo_sk",
+        "output": ["JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk", "JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk"]
+      },
+      "gates_checked": ["comma_joins:ACTIVE", "no_good_estimate:ACTIVE"],
+      "phase": 1,
+      "exploration": false,
+      "confidence": 0.95,
+      "recommended_examples": ["pg_explicit_join_materialized"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "date_dim scans across EXISTS/NOT EXISTS",
+      "node_contract": {
+        "from": "date_dim",
+        "where": "d_year=2002 AND d_moy BETWEEN 10 AND 12",
+        "output": ["CTE date_range AS (SELECT d_date_sk FROM date_dim WHERE ...)"]
+      },
+      "gates_checked": ["repeated_scan:ACTIVE", "small_cte:PASS (31 rows)"],
+      "phase": 1,
+      "exploration": false,
+      "confidence": 0.90,
+      "recommended_examples": ["pg_date_cte_explicit_join"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "base_customers_cte",
+      "family": "A",
+      "target": "S0 base tables + filters",
+      "node_contract": {
+        "from": "customer c JOIN customer_address ca JOIN customer_demographics",
+        "where": "ca_state IN ('CO','NC','TX') AND cd_marital_status IN ('S','M','U') AND cd_education_status IN ('Primary','College')",
+        "output": ["CTE filtered_customers AS (SELECT ... WHERE ...)"]
+      },
+      "gates_checked": ["late_filter:ACTIVE", "high_selectivity:PASS (ca_state=3/50)"],
+      "phase": 1,
+      "exploration": false,
+      "confidence": 0.88,
+      "recommended_examples": ["materialized_dimension_fact_prefilter"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "store_customers_cte",
+      "family": "B",
+      "target": "EXISTS subquery (store_sales)",
+      "node_contract": {
+        "from": "store_sales JOIN date_range",
+        "where": "ss_sold_date_sk=d_date_sk AND ss_list_price BETWEEN 80 AND 169",
+        "output": ["CTE store_customers AS (SELECT DISTINCT ss_customer_sk)"]
+      },
+      "gates_checked": ["correlated_subquery:ACTIVE", "not_simple_exists:PASS"],
+      "phase": 2,
+      "exploration": false,
+      "confidence": 0.93,
+      "recommended_examples": ["early_filter_decorrelate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "web_customers_cte",
+      "family": "B",
+      "target": "NOT EXISTS (web_sales)",
+      "node_contract": {
+        "from": "web_sales JOIN date_range",
+        "where": "ws_sold_date_sk=d_date_sk AND ws_list_price BETWEEN 80 AND 169",
+        "output": ["CTE web_customers AS (SELECT DISTINCT ws_bill_customer_sk)"]
+      },
+      "gates_checked": ["correlated_subquery:ACTIVE", "not_simple_exists:PASS"],
+      "phase": 2,
+      "exploration": false,
+      "confidence": 0.93,
+      "recommended_examples": ["inline_decorrelate_materialized"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "catalog_customers_cte",
+      "family": "B",
+      "target": "NOT EXISTS (catalog_sales)",
+      "node_contract": {
+        "from": "catalog_sales JOIN date_range",
+        "where": "cs_sold_date_sk=d_date_sk AND cs_list_price BETWEEN 80 AND 169",
+        "output": ["CTE catalog_customers AS (SELECT DISTINCT cs_ship_customer_sk)"]
+      },
+      "gates_checked": ["correlated_subquery:ACTIVE", "not_simple_exists:PASS"],
+      "phase": 2,
+      "exploration": false,
+      "confidence": 0.93,
+      "recommended_examples": ["inline_decorrelate_materialized"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "replace_subqueries_with_joins",
+      "family": "B",
+      "target": "S0 WHERE clause (EXISTS/NOT EXISTS)",
+      "node_contract": {
+        "from": "filtered_customers c",
+        "where": "EXISTS(store_sales...) AND NOT EXISTS(web_sales...) AND NOT EXISTS(catalog_sales...)",
+        "output": [
+          "JOIN store_customers sc ON c.c_customer_sk=sc.ss_customer_sk",
+          "LEFT JOIN web_customers wc ON c.c_customer_sk=wc.ws_bill_customer_sk",
+          "LEFT JOIN catalog_customers cc ON c.c_customer_sk=cc.cs_ship_customer_sk",
+          "WHERE wc.ws_bill_customer_sk IS NULL AND cc.cs_ship_customer_sk IS NULL"
+        ]
+      },
+      "gates_checked": ["anti_join_safe:PASS", "no_orphan_cte:PASS"],
+      "phase": 3,
+      "exploration": false,
+      "confidence": 0.91,
+      "recommended_examples": ["pg_shared_scan_decorrelate"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "combine_not_exists_cte",
+      "family": "B",
+      "target": "web_customers + catalog_customers CTEs",
+      "node_contract": {
+        "from": "web_customers UNION catalog_customers",
+        "output": ["CTE invalid_customers AS (SELECT ws_bill_customer_sk AS cust_sk FROM web_customers UNION SELECT cs_ship_customer_sk FROM catalog_customers)"]
+      },
+      "gates_checked": ["setop_small:PASS"],
+      "phase": 2,
+      "exploration": true,
+      "confidence": 0.75,
+      "exploration_hypothesis": "Single anti-join on combined invalid customers may reduce JOIN overhead"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "early_aggregation",
+      "family": "C",
+      "reason": "gate failed: GROUP_BY keys not compatible with join keys (demographic columns ≠ customer_sk)"
+    },
+    {
+      "transform_id": "cte_materialize_force",
+      "family": "E",
+      "reason": "gate failed: CTE single-use and not expensive (date_dim scan already fast)"
+    }
+  ]
+}
+```
+
+### Key Insights
+1. **Phase 1 (Row Reduction)**:  
+   - Explicit joins (`p01`) resolve comma-join ambiguity.  
+   - `date_cte` (`p02`) and `base_customers` (`p03`) CTEs apply early filters.  
+2. **Phase 2 (Redundancy Elimination)**:  
+   - Decorrelation CTEs (`p04-p06`) convert `NOT EXISTS` to anti-joins.  
+   - Exploration probe `p08` tests UNION optimization.  
+3. **Phase 3 (Topology Repair)**:  
+   - `p07` replaces subqueries with efficient anti-joins.  
+
+**Regressions Avoided**:  
+- No `EXISTS`→`IN` conversion (preserves semi-join).  
+- No CTEs for single-use scans (`date_dim`).

@@ -7,6 +7,8 @@ Validates that SyntheticValidator correctly:
 - Returns actionable error messages for LLM retry
 """
 
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -71,7 +73,7 @@ class TestSyntheticValidatorPair:
         v = self._make_validator()
         result = v.validate_sql_pair(
             original_sql="SELECT 1 AS x",
-            optimized_sql="SELECT * FROM nonexistent_table_xyz",
+            optimized_sql="SELECT CAST('abc' AS INTEGER) AS x",
         )
         assert result['match'] is False
         assert result['opt_success'] is False
@@ -116,6 +118,36 @@ class TestSyntheticValidatorPair:
         assert result['orig_success'] is True
         assert result['opt_success'] is True
 
+    def test_validate_sql_pair_merges_schema_from_optimized_query(self):
+        """Optimized query may reference extra columns/tables not in original."""
+        v = self._make_validator()
+        original = "SELECT c_customer_id FROM customer LIMIT 5"
+        optimized = """
+            SELECT c.c_customer_id
+            FROM customer c
+            LEFT JOIN customer_demographics cd
+              ON c.c_current_cdemo_sk = cd.cd_demo_sk
+            LIMIT 5
+        """
+        result = v.validate_sql_pair(
+            original_sql=original,
+            optimized_sql=optimized,
+            target_rows=200,
+        )
+        assert result["orig_success"] is True
+        assert result["opt_success"] is True
+        assert "column" not in (result.get("reason", "").lower())
+
+    def test_select_star_without_reference_schema_is_low_confidence(self):
+        """Pure AST mode should fail closed for SELECT * without concrete schema."""
+        v = self._make_validator()
+        result = v.validate_sql_pair(
+            original_sql="SELECT * FROM orders",
+            optimized_sql="SELECT orders_sk FROM orders",
+        )
+        assert result['match'] is False
+        assert "low-confidence schema" in result['reason'].lower()
+
 
 class TestTableInferenceHelpers:
     """Table-resolution helpers should be generic and ambiguity-safe."""
@@ -159,6 +191,10 @@ class TestTableInferenceHelpers:
         assert find_primary_key_column(
             "store_returns",
             ["sr_item_sk", "sr_customer_sk", "sr_store_sk", "sr_reason_sk"],
+        ) is None
+        assert find_primary_key_column(
+            "store_sales",
+            ["ss_item_sk", "ss_sold_date_sk", "ss_ticket_number"],
         ) is None
 
 
@@ -247,6 +283,52 @@ class TestSyntheticGenerationRobustness:
 
         used_fks = {r[0] for r in conn.execute("SELECT DISTINCT customer_id FROM orders").fetchall()}
         assert used_fks.issubset({1, 2, 3})
+
+    def test_composite_fk_generation_keeps_parent_key_pairs(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        conn.execute("CREATE TABLE store_sales (ss_ticket_number INTEGER, ss_item_sk INTEGER)")
+        conn.execute("CREATE TABLE store_returns (sr_ticket_number INTEGER, sr_item_sk INTEGER)")
+
+        sales_schema = {
+            "columns": {
+                "ss_ticket_number": {"type": "INTEGER", "nullable": False},
+                "ss_item_sk": {"type": "INTEGER", "nullable": False},
+            },
+            "key": "ss_item_sk",
+        }
+        returns_schema = {
+            "columns": {
+                "sr_ticket_number": {"type": "INTEGER", "nullable": False},
+                "sr_item_sk": {"type": "INTEGER", "nullable": False},
+            },
+            "key": "sr_item_sk",
+        }
+
+        gen = SyntheticDataGenerator(conn)
+        gen.generate_table_data("store_sales", sales_schema, row_count=500)
+        gen.generate_table_data(
+            "store_returns",
+            returns_schema,
+            row_count=300,
+            foreign_keys={
+                "sr_ticket_number": ("store_sales", "ss_ticket_number"),
+                "sr_item_sk": ("store_sales", "ss_item_sk"),
+            },
+        )
+
+        parent_pairs = {
+            (r[0], r[1])
+            for r in conn.execute("SELECT DISTINCT ss_ticket_number, ss_item_sk FROM store_sales").fetchall()
+        }
+        child_pairs = {
+            (r[0], r[1])
+            for r in conn.execute("SELECT DISTINCT sr_ticket_number, sr_item_sk FROM store_returns").fetchall()
+        }
+
+        assert child_pairs
+        assert child_pairs.issubset(parent_pairs)
 
     def test_sibling_fact_tables_share_fk_anchor_overlap(self):
         from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
@@ -443,6 +525,17 @@ class TestSyntheticGenerationRobustness:
         )
         assert 10 <= q <= 20
 
+    def test_parse_decimal_type_supports_single_and_bare_decimal(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        gen = SyntheticDataGenerator(conn)
+
+        assert gen._parse_decimal_type("DECIMAL(10,2)") == {"precision": 10, "scale": 2}
+        assert gen._parse_decimal_type("DECIMAL(10)") == {"precision": 10, "scale": 0}
+        assert gen._parse_decimal_type("DECIMAL") == {"precision": 18, "scale": 2}
+        assert gen._parse_decimal_type("INTEGER") is None
+
 
 class TestConstraintGraphPropagation:
     """Query-graph propagation should move predicates across join equalities."""
@@ -507,6 +600,24 @@ class TestConstraintGraphPropagation:
         assert set(order) == {"a", "b"}
         assert len(order) == 2
 
+    def test_resolve_ambiguous_columns_does_not_guess_multi_match(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        import sqlglot
+        from sqlglot import exp
+
+        sql = """
+            SELECT c.customer_id, o.customer_id
+            FROM customers c
+            JOIN orders o ON c.customer_id = o.customer_id
+            ORDER BY customer_id
+        """
+        fixed = SyntheticValidator._resolve_ambiguous_columns(sql)
+        parsed = sqlglot.parse_one(fixed)
+        order = parsed.find(exp.Order)
+        cols = list(order.find_all(exp.Column)) if order else []
+        assert cols
+        assert cols[0].table in (None, "")
+
     def test_reverse_propagates_filtered_child_fk_to_parent(self):
         from qt_sql.validation.synthetic_validator import SyntheticValidator, SyntheticDataGenerator
 
@@ -570,6 +681,30 @@ class TestConstraintGraphPropagation:
         assert "store_returns" in filters
         assert filters["store_returns"]["sr_reason_sk"] == ["BETWEEN:43:46"]
 
+    def test_extract_filters_evaluates_constant_arithmetic_expressions(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+            SELECT *
+            FROM date_dim d
+            WHERE d.d_year = 2002 - 1
+              AND d.d_moy BETWEEN 33 * 0.01 AND 53 * 0.01
+        """
+        tables = {
+            "date_dim": {
+                "columns": {
+                    "d_year": {"type": "INTEGER", "nullable": True},
+                    "d_moy": {"type": "INTEGER", "nullable": True},
+                },
+                "alias": "d",
+            }
+        }
+
+        filters = v._extract_filter_values(sql, tables)
+        assert filters["date_dim"]["d_year"] == ["2001"]
+        assert filters["date_dim"]["d_moy"] == ["BETWEEN:0.33:0.53"]
+
     def test_varchar_id_generation_uses_generic_table_prefix(self):
         from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
 
@@ -618,6 +753,73 @@ class TestConstraintGraphPropagation:
         assert "orders" in fk
         assert fk["orders"]["customer_id"] == ("customers", "customer_id")
 
+    def test_detect_fk_from_joins_supports_ticket_number_pairs(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+            SELECT *
+            FROM store_sales ss
+            JOIN store_returns sr
+              ON ss.ss_ticket_number = sr.sr_ticket_number
+             AND ss.ss_item_sk = sr.sr_item_sk
+        """
+        tables = {
+            "store_sales": {
+                "columns": {
+                    "ss_ticket_number": {"type": "INTEGER", "nullable": False},
+                    "ss_item_sk": {"type": "INTEGER", "nullable": False},
+                },
+                "alias": "ss",
+                "key": "ss_item_sk",
+            },
+            "store_returns": {
+                "columns": {
+                    "sr_ticket_number": {"type": "INTEGER", "nullable": False},
+                    "sr_item_sk": {"type": "INTEGER", "nullable": False},
+                },
+                "alias": "sr",
+                "key": "sr_item_sk",
+            },
+        }
+
+        fk = v._detect_fk_from_joins(sql, tables)
+        assert "store_returns" in fk
+        assert fk["store_returns"]["sr_ticket_number"] == ("store_sales", "ss_ticket_number")
+        assert fk["store_returns"]["sr_item_sk"] == ("store_sales", "ss_item_sk")
+
+    def test_detect_fk_from_joins_prefers_parent_pk_direction(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+            SELECT *
+            FROM store_sales ss
+            JOIN item i ON i.i_item_sk = ss.ss_item_sk
+        """
+        tables = {
+            "store_sales": {
+                "columns": {
+                    "ss_item_sk": {"type": "INTEGER", "nullable": False},
+                    "ss_ticket_number": {"type": "INTEGER", "nullable": False},
+                    "ss_sold_date_sk": {"type": "INTEGER", "nullable": False},
+                },
+                "alias": "ss",
+            },
+            "item": {
+                "columns": {
+                    "i_item_sk": {"type": "INTEGER", "nullable": False},
+                    "i_category": {"type": "VARCHAR", "nullable": True},
+                    "i_brand_id": {"type": "INTEGER", "nullable": True},
+                },
+                "alias": "i",
+            },
+        }
+
+        fk = v._detect_fk_from_joins(sql, tables)
+        assert "store_sales" in fk
+        assert fk["store_sales"]["ss_item_sk"] == ("item", "i_item_sk")
+
     def test_detect_foreign_keys_supports_generic_names(self):
         from qt_sql.validation.synthetic_validator import SyntheticValidator
 
@@ -649,6 +851,364 @@ class TestConstraintGraphPropagation:
         fk = v._detect_foreign_keys(sql, tables)
         assert "orders" in fk
         assert fk["orders"]["customer_id"] == ("customers", "customer_id")
+
+    def test_llm_repair_loop_can_fix_zero_row_validation(self, tmp_path):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        def repair_stub(_prompt: str) -> str:
+            return (
+                '{"actions":[{"type":"set_filter_values","table":"customers",'
+                '"column":"state","values":["ZZZ_FIX"]}],"note":"Inject values for LIKE predicate"}'
+            )
+
+        sql = """
+            SELECT c.customer_id
+            FROM customers c
+            WHERE c.state LIKE 'ZZZ%'
+        """
+        sql_file = tmp_path / "repair_case.sql"
+        sql_file.write_text(sql)
+
+        v = SyntheticValidator(
+            reference_db=None,
+            dialect="duckdb",
+            llm_max_retries=1,
+            repair_analyze_fn=repair_stub,
+            repair_mode="hybrid",
+        )
+        result = v.validate(
+            str(sql_file),
+            target_rows=100,
+            min_rows=1,
+            max_rows=1000,
+        )
+
+        assert result["success"] is True
+        assert result["actual_rows"] > 0
+        assert result.get("llm_repair_attempts") == 1
+        assert result.get("llm_repair_history")
+
+    def test_llm_swarm_prompt_contains_repair_log_context(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        prompts = []
+
+        def repair_stub(prompt: str) -> str:
+            prompts.append(prompt)
+            return (
+                '{"actions":[{"type":"set_row_count","table":"orders","row_count":4000}],'
+                '"note":"top up orders"}'
+            )
+
+        v = SyntheticValidator(
+            reference_db=None,
+            dialect="duckdb",
+            llm_max_retries=1,
+            repair_analyze_fn=repair_stub,
+            repair_mode="add_only",
+            llm_swarm_size=2,
+        )
+        tables = {
+            "orders": {"columns": {"order_id": {}, "customer_id": {}}},
+            "customers": {"columns": {"customer_id": {}}},
+        }
+        plan = v._request_llm_repair_plan(
+            sql="SELECT * FROM orders WHERE customer_id = 1",
+            last_error=None,
+            actual_rows=0,
+            min_rows=10,
+            max_rows=1000,
+            tables=tables,
+            fk_relationships={"orders": {"customer_id": ("customers", "customer_id")}},
+            filter_values={"orders": {"customer_id": ["1"]}},
+            table_row_counts={"orders": 2000, "customers": 2000},
+            generation_order=["customers", "orders"],
+            attempt=1,
+            repair_log=[
+                {
+                    "attempt": 1,
+                    "source": "llm",
+                    "rows_before": 0,
+                    "rows_after": 1,
+                    "row_delta": 1,
+                    "regressed": False,
+                    "plan_actions": [{"type": "set_row_count", "table": "orders", "row_count": 2500}],
+                }
+            ],
+        )
+        assert plan is not None
+        assert len(prompts) == 2
+        assert all("REPAIR_LOG=" in p for p in prompts)
+        assert all("SWARM_STRATEGY=" in p for p in prompts)
+
+    def test_llm_swarm_variants_are_phase_scoped(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        cov = v._swarm_variants(1, phase="coverage")
+        adv = v._swarm_variants(1, phase="adversarial")
+
+        assert cov
+        assert adv
+        assert all(str(x.get("strategy_id", "")).startswith("coverage_") for x in cov)
+        assert all(str(x.get("strategy_id", "")).startswith("adversarial_") for x in adv)
+
+    def test_llm_prompt_includes_role_examples(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        prompts = []
+
+        def repair_stub(prompt: str) -> str:
+            prompts.append(prompt)
+            return (
+                '{"actions":[{"type":"set_row_count","table":"orders","row_count":4000}],'
+                '"note":"top up orders"}'
+            )
+
+        v = SyntheticValidator(
+            reference_db=None,
+            dialect="duckdb",
+            llm_max_retries=1,
+            repair_analyze_fn=repair_stub,
+            repair_mode="add_only",
+            llm_swarm_size=1,
+        )
+        tables = {"orders": {"columns": {"order_id": {}, "status": {}}}}
+
+        _ = v._request_llm_repair_plan(
+            sql="SELECT order_id FROM orders WHERE status='A'",
+            last_error=None,
+            actual_rows=2,
+            min_rows=10,
+            max_rows=1000,
+            tables=tables,
+            fk_relationships={},
+            filter_values={"orders": {"status": ["A"]}},
+            table_row_counts={"orders": 2000},
+            generation_order=["orders"],
+            attempt=1,
+            repair_log=[],
+            phase="coverage",
+        )
+        assert prompts
+        assert "ROLE=coverage" in prompts[-1]
+        assert "Coverage: top up selective fact + filter dimension" in prompts[-1]
+
+        _ = v._request_llm_repair_plan(
+            sql="SELECT order_id FROM orders WHERE status='A'",
+            last_error=None,
+            actual_rows=2,
+            min_rows=10,
+            max_rows=1000,
+            tables=tables,
+            fk_relationships={},
+            filter_values={"orders": {"status": ["A"]}},
+            table_row_counts={"orders": 2000},
+            generation_order=["orders"],
+            attempt=2,
+            repair_log=[],
+            phase="adversarial",
+        )
+        assert "ROLE=adversarial" in prompts[-1]
+        assert "Adversarial: add edge-case overlap rows" in prompts[-1]
+
+    def test_llm_swarm_prefers_targeted_plan_over_global_scale(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        def repair_stub(prompt: str) -> str:
+            if "coverage_filter_roots" in prompt:
+                return (
+                    '{"actions":[{"type":"set_row_count","table":"orders","row_count":4500}],'
+                    '"note":"target filter root"}'
+                )
+            if "coverage_filter_plus_bridge" in prompt:
+                return (
+                    '{"actions":[{"type":"scale_row_counts","multiplier":2.2}],'
+                    '"note":"global scale"}'
+                )
+            return (
+                '{"actions":[{"type":"set_row_count","table":"customers","row_count":7000}],'
+                '"note":"target previously regressed table"}'
+            )
+
+        v = SyntheticValidator(
+            reference_db=None,
+            dialect="duckdb",
+            llm_max_retries=1,
+            repair_analyze_fn=repair_stub,
+            repair_mode="add_only",
+            llm_swarm_size=3,
+        )
+        tables = {
+            "orders": {"columns": {"order_id": {}, "customer_id": {}, "status": {}}},
+            "customers": {"columns": {"customer_id": {}, "state": {}}},
+        }
+        plan = v._request_llm_repair_plan(
+            sql="SELECT o.order_id FROM orders o JOIN customers c ON c.customer_id=o.customer_id WHERE o.status='A'",
+            last_error=None,
+            actual_rows=2,
+            min_rows=100,
+            max_rows=1000,
+            tables=tables,
+            fk_relationships={"orders": {"customer_id": ("customers", "customer_id")}},
+            filter_values={"orders": {"status": ["A"]}},
+            table_row_counts={"orders": 2500, "customers": 2500},
+            generation_order=["customers", "orders"],
+            attempt=1,
+            repair_log=[
+                {
+                    "attempt": 1,
+                    "source": "llm",
+                    "rows_before": 20,
+                    "rows_after": 10,
+                    "row_delta": -10,
+                    "regressed": True,
+                    "plan_actions": [{"type": "set_row_count", "table": "customers", "row_count": 5000}],
+                }
+            ],
+        )
+        assert plan is not None
+        assert plan["actions"]
+        assert plan["actions"][0]["type"] == "set_row_count"
+        assert plan["actions"][0]["table"] == "orders"
+        assert plan.get("_swarm", {}).get("chosen_strategy") == "coverage_filter_roots"
+
+    def test_llm_swarm_normalizes_set_row_count_count_alias(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        def repair_stub(_prompt: str) -> str:
+            return (
+                '{"actions":[{"type":"set_row_count","table":"orders","count":4200}],'
+                '"note":"use count alias"}'
+            )
+
+        v = SyntheticValidator(
+            reference_db=None,
+            dialect="duckdb",
+            llm_max_retries=1,
+            repair_analyze_fn=repair_stub,
+            repair_mode="add_only",
+            llm_swarm_size=1,
+        )
+        tables = {"orders": {"columns": {"order_id": {}, "status": {}}}}
+        plan = v._request_llm_repair_plan(
+            sql="SELECT order_id FROM orders WHERE status='A'",
+            last_error=None,
+            actual_rows=0,
+            min_rows=10,
+            max_rows=1000,
+            tables=tables,
+            fk_relationships={},
+            filter_values={"orders": {"status": ["A"]}},
+            table_row_counts={"orders": 2000},
+            generation_order=["orders"],
+            attempt=1,
+            repair_log=[],
+        )
+        assert plan is not None
+        assert plan["actions"][0]["type"] == "set_row_count"
+        assert plan["actions"][0]["table"] == "orders"
+        assert plan["actions"][0]["row_count"] == 4200
+
+    def test_dag_targeted_fallback_topup_limits_scope_and_includes_bridge(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        tables = {
+            "store_returns": {"columns": {}},
+            "date_dim": {"columns": {}},
+            "store": {"columns": {}},
+            "customer": {"columns": {}},
+            "customer_demographics": {"columns": {}},
+        }
+        fk_relationships = {
+            "store_returns": {
+                "sr_returned_date_sk": ("date_dim", "d_date_sk"),
+                "sr_store_sk": ("store", "s_store_sk"),
+                "sr_customer_sk": ("customer", "c_customer_sk"),
+            },
+            "customer": {
+                "c_current_cdemo_sk": ("customer_demographics", "cd_demo_sk"),
+            },
+        }
+        filter_values = {
+            "date_dim": {"d_year": ["2002"]},
+            "store": {"s_state": ["TX"]},
+        }
+        table_row_counts = {
+            "store_returns": 6000,
+            "date_dim": 3000,
+            "store": 2000,
+            "customer": 5000,
+            "customer_demographics": 3000,
+        }
+
+        plan = v._build_fallback_repair_plan(
+            actual_rows=1,
+            min_rows=100,
+            max_rows=1000,
+            tables=tables,
+            table_row_counts=table_row_counts,
+            filter_values=filter_values,
+            fk_relationships=fk_relationships,
+        )
+
+        assert plan is not None
+        actions = [a for a in plan["actions"] if a.get("type") == "set_row_count"]
+        assert 1 <= len(actions) <= 2
+        action_tables = {a["table"] for a in actions}
+        # Must include filter roots and at least one non-root join bridge/fact table.
+        assert action_tables & {"date_dim", "store"}
+        assert any(t not in {"date_dim", "store"} for t in action_tables)
+        assert "scale_row_counts" not in [a.get("type") for a in plan["actions"]]
+
+    def test_dag_targeting_avoids_regressing_table_pair(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        tables = {
+            "store_returns": {"columns": {}},
+            "date_dim": {"columns": {}},
+            "store": {"columns": {}},
+            "customer": {"columns": {}},
+            "customer_demographics": {"columns": {}},
+        }
+        fk_relationships = {
+            "store_returns": {
+                "sr_returned_date_sk": ("date_dim", "d_date_sk"),
+                "sr_store_sk": ("store", "s_store_sk"),
+                "sr_customer_sk": ("customer", "c_customer_sk"),
+            },
+            "customer": {
+                "c_current_cdemo_sk": ("customer_demographics", "cd_demo_sk"),
+            },
+        }
+        filter_values = {
+            "customer": {"c_birth_month": ["2"]},
+            "customer_demographics": {"cd_gender": ["F"]},
+            "store": {"s_state": ["TX"]},
+            "store_returns": {"sr_reason_sk": ["BETWEEN:43:46"]},
+            "date_dim": {"d_year": ["2002"]},
+        }
+        table_row_counts = {
+            "store_returns": 12000,
+            "date_dim": 1000,
+            "store": 1000,
+            "customer": 12000,
+            "customer_demographics": 1000,
+        }
+
+        selected = v._select_targeted_topup_tables(
+            tables=tables,
+            table_row_counts=table_row_counts,
+            filter_values=filter_values,
+            fk_relationships=fk_relationships,
+            max_tables=2,
+            avoid_table_pairs={("customer", "store_returns")},
+            table_penalties={"customer": 2.0, "store_returns": 2.0},
+        )
+        assert len(selected) >= 1
+        assert tuple(sorted(selected[:2])) != ("customer", "store_returns")
 
 
 # ── PatchGateValidator integration tests ────────────────────────────────────
@@ -768,3 +1328,103 @@ class TestDSNHandling:
         # Not supported: unknown schemes
         assert SchemaFromDB.supports_dsn('snowflake://account/db') is False
         assert SchemaFromDB.supports_dsn(None) is False
+
+
+class TestDSB76SyntheticDatasetReadiness:
+    """Dataset-level checks for prebuilt DSB76 synthetic DB artifacts."""
+
+    BENCH_DIR = QT_SQL_ROOT / "qt_sql" / "benchmarks" / "postgres_dsb_76"
+    MANIFEST_PATH = BENCH_DIR / "manifest.json"
+    QUERIES_DIR = BENCH_DIR / "queries"
+    DEFAULT_SYNTH_DB = Path("/mnt/d/qt_synth/postgres_dsb_76_synthetic.duckdb")
+    DEFAULT_SYNTH_REPORT = Path("/mnt/d/qt_synth/postgres_dsb_76_synthetic.report.json")
+
+    @classmethod
+    def _resolve_synth_db(cls) -> Path | None:
+        env_path = os.getenv("QT_DSB76_SYNTH_DB", "").strip()
+        if env_path:
+            p = Path(env_path)
+            if p.exists():
+                return p
+
+        if cls.DEFAULT_SYNTH_DB.exists():
+            return cls.DEFAULT_SYNTH_DB
+
+        report_env = os.getenv("QT_DSB76_SYNTH_REPORT", "").strip()
+        report_path = Path(report_env) if report_env else cls.DEFAULT_SYNTH_REPORT
+        if report_path.exists():
+            try:
+                payload = json.loads(report_path.read_text(encoding="utf-8"))
+                out_db = payload.get("summary", {}).get("out_db", "")
+                if out_db:
+                    p = Path(out_db)
+                    if p.exists():
+                        return p
+            except Exception:
+                pass
+        return None
+
+    @classmethod
+    def _query_ids(cls) -> list[str]:
+        payload = json.loads(cls.MANIFEST_PATH.read_text(encoding="utf-8"))
+        return list(payload["queries"])
+
+    def test_all_queries_return_rows_on_prebuilt_synthetic_db(self):
+        """All 76 benchmark queries must return >0 rows on prebuilt synthetic DB."""
+        from qt_sql.validation.build_dsb76_synthetic_db import (
+            _count_query_rows,
+            _read_first_statement,
+            _to_duckdb_sql,
+        )
+
+        db_path = self._resolve_synth_db()
+        if not db_path:
+            pytest.skip(
+                "No prebuilt synthetic DB found. Set QT_DSB76_SYNTH_DB to a built "
+                "postgres_dsb_76 synthetic DuckDB file."
+            )
+
+        timeout_s = int(os.getenv("QT_DSB76_SYNTH_QUERY_TIMEOUT_S", "20"))
+        conn = duckdb.connect(str(db_path), read_only=True)
+        failures: list[str] = []
+        try:
+            for query_id in self._query_ids():
+                sql_path = self.QUERIES_DIR / f"{query_id}.sql"
+                if not sql_path.exists():
+                    failures.append(f"{query_id}: missing_sql_file")
+                    continue
+
+                sql = _read_first_statement(sql_path)
+                sql_duckdb = _to_duckdb_sql(sql, "postgres")
+
+                try:
+                    row_count = _count_query_rows(conn, sql_duckdb, timeout_s=timeout_s)
+                except Exception as e:
+                    failures.append(f"{query_id}: execution_error={e}")
+                    continue
+
+                if row_count <= 0:
+                    failures.append(f"{query_id}: row_count={row_count}")
+        finally:
+            conn.close()
+
+        assert not failures, (
+            "Synthetic dataset readiness failed; expected every query to return rows.\n"
+            + "\n".join(failures[:30])
+        )
+
+    def test_validator_accepts_original_sql_for_a_real_dsb_query(self):
+        """Guardrail: original SQL should pass validate_sql_pair against itself."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        query_id = "query001_multi_i1"
+        sql = (self.QUERIES_DIR / f"{query_id}.sql").read_text(encoding="utf-8")
+        sql = sql.strip().rstrip(";")
+
+        validator = SyntheticValidator(reference_db=None, dialect="postgres")
+        result = validator.validate_sql_pair(original_sql=sql, optimized_sql=sql)
+
+        assert result["orig_success"] is True, result
+        assert result["opt_success"] is True, result
+        assert result["match"] is True, result
+        assert result["orig_rows"] > 0, result

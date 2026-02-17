@@ -1,0 +1,205 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by correlated subquery re-execution per store_sk in CTE comparison, with nested loop amplification. Late dimension filtering in main query and comma-join syntax prevent optimal planning.",
+    "reasoning_trace": [
+      "Correlated subquery computes AVG(ctr_total_return) per store_sk for each outer row - O(n²) risk",
+      "Comma joins in main query block predicate pushdown and accurate cardinality estimation",
+      "Dimension filters applied after large joins despite high selectivity (e.g., s_state, cd_gender)"
+    ],
+    "cost_spine": [
+      "CTE scan → Correlated subquery execution → Nested Loop → Late filter application"
+    ],
+    "hotspots": [
+      {
+        "op": "Correlated subquery",
+        "why": "Per-row re-execution of aggregate",
+        "evidence": "Subquery scans 7M-row CTE for each ctr_store_sk in outer loop"
+      },
+      {
+        "op": "Comma joins",
+        "why": "Prevents join reordering and predicate pushdown",
+        "evidence": "EXPLAIN shows poor row estimates for multi-table join"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union (bitmap_or_scan strength)",
+      "materialize_simple_exists (semi_join_exists strength)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Replace correlated subquery with MATERIALIZED CTE computing store_sk thresholds. Preserve: WHERE clause logic, GROUP BY keys, and output columns.",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1"],
+        "where_must_preserve": ["ctr1.ctr_total_return > threshold", "ctr1.ctr_reason_sk BETWEEN 17 AND 20"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "no_double_scan:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.92,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join to precomputed thresholds CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "gold_example_id": "pg_correlated_agg"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and pre-filter selective dimensions (store, customer, customer_demographics) into CTEs. Preserve join conditions and output.",
+      "node_contract": {
+        "from_must_include": ["store_f", "customer_f", "cd_f"],
+        "where_must_preserve": ["s_store_sk = ctr1.ctr_store_sk", "ctr1.ctr_customer_sk = c_customer_sk", "c_current_cdemo_sk = cd_demo_sk"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY/LIMIT semantics"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins → explicit joins; dimension scans → Index/Seq Scan on tiny CTEs",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_condition"],
+      "gold_example_id": "pg_comma_join_fix"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Materialize date_dim filter into CTE before store_returns join in CTE definition. Preserve: join condition, return filters, and aggregation logic.",
+      "node_contract": {
+        "from_must_include": ["date_filtered"],
+        "where_must_preserve": ["sr_returned_date_sk = d_date_sk", "d_year=2000", "sr_return_amt/sr_quantity BETWEEN 115 AND 174"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Small date_dim CTE may enable hash join optimization despite portability candidate status",
+      "confidence": 0.65,
+      "expected_explain_delta": "CTE scan → Nested Loop with tiny dimension CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "duckdb_date_cte"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Replace correlated subquery with GROUP BY CTE joined to main query. Preserve: comparison logic and output rows.",
+      "node_contract": {
+        "from_must_include": ["ctr_avg"],
+        "where_must_preserve": ["ctr1.ctr_store_sk = ctr_avg.ctr_store_sk", "ctr1.ctr_total_return > ctr_avg.avg_return"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY/LIMIT"]
+      },
+      "gates_checked": ["aggregation_equiv:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "DuckDB-style decorrelation may bypass planner limitations despite non-native status",
+      "confidence": 0.7,
+      "expected_explain_delta": "Correlated subquery → Hash Join to aggregated CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "gold_example_id": "duckdb_decorrelate"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter store/customer/cd_demo into CTEs before main join. Preserve: join conditions and output columns.",
+      "node_contract": {
+        "from_must_include": ["store_f", "customer_f", "cd_f"],
+        "where_must_preserve": ["s_state IN ('IA','KY','NE')", "c_birth_month=4", "c_birth_year BETWEEN 1987 AND 1993", "cd_marital_status='S'", "cd_education_status='4 yr Degree'", "cd_gender='M'"],
+        "output_must_preserve": ["c_customer_id"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtered dimension CTEs may reduce join input despite predicate blindness gap",
+      "confidence": 0.68,
+      "expected_explain_delta": "Large dimension scans → small CTE scans",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "gold_example_id": "duckdb_early_filter"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage CTE chain: 1) Filter date_dim 2) Join with store_returns 3) Aggregate. Preserve: filters and aggregation logic.",
+      "node_contract": {
+        "from_must_include": ["date_filtered", "sr_with_date"],
+        "where_must_preserve": ["d_year=2000", "sr_return_amt/sr_quantity BETWEEN 115 AND 174"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may optimize join order despite portability status",
+      "confidence": 0.62,
+      "expected_explain_delta": "Single large scan → progressive reduction CTEs",
+      "recommended_patch_ops": ["insert_cte", "replace_body"],
+      "gold_example_id": "duckdb_staged_join"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Combine p01+p02: pre-filter dimensions AND decorrelate subquery. Preserve all original logic.",
+      "node_contract": {
+        "from_must_include": ["store_f", "customer_f", "cd_f", "ctr_thresholds"],
+        "where_must_preserve": ["ctr1.ctr_total_return > ctr_thresholds.avg"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY/LIMIT"]
+      },
+      "gates_checked": ["no_double_scan:PASS", "comma_join_weakness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Synergistic effect of dimension reduction + decorrelation may outperform individual transforms",
+      "confidence": 0.78,
+      "expected_explain_delta": "Nested loop elimination + explicit joins + small dimension CTEs",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "gold_example_id": "pg_hybrid_decorr"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize base store_returns+date_dim join before aggregation. Preserve: filters and aggregation logic.",
+      "node_contract": {
+        "from_must_include": ["base_returns"],
+        "where_must_preserve": ["d_year=2000", "sr_return_amt/sr_quantity BETWEEN 115 AND 174"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "PG materialization may accelerate repeated access to base data pattern",
+      "confidence": 0.6,
+      "expected_explain_delta": "Base scan → Materialized CTE → Aggregation",
+      "recommended_patch_ops": ["insert_cte", "replace_body"],
+      "gold_example_id": "pg_cte_materialize"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "Regression registry: bitmap_or_scan strength in PG"
+    },
+    {
+      "transform_id": "materialize_simple_exists",
+      "family": "E",
+      "reason": "Regression registry: semi_join_exists strength in PG"
+    }
+  ]
+}

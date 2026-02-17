@@ -197,9 +197,9 @@ class Pipeline:
     ):
         """Phase 1: Parse SQL into logical-tree structure with real EXPLAIN costs.
 
-        Reads cached EXPLAIN ANALYZE from benchmark_dir/explains/.
-        If not cached, runs EXPLAIN ANALYZE and caches the result.
-        Falls back to heuristic cost splitting if EXPLAIN fails.
+        Reads cached EXPLAIN from benchmark_dir/explains/.
+        Missing cache collection is controlled by config.explain_policy.
+        Falls back to heuristic cost splitting if EXPLAIN is unavailable.
 
         Returns (logical_tree, costs, explain_result) tuple.
         explain_result is the raw EXPLAIN output dict (or None).
@@ -233,17 +233,42 @@ class Pipeline:
 
         return logical_tree, costs, explain_result
 
-    def _get_explain(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
-        """Get EXPLAIN ANALYZE result — cached first, run if missing or stale.
+    def _get_explain(
+        self,
+        query_id: str,
+        sql: str,
+        *,
+        collect_if_missing: Optional[bool] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get EXPLAIN result from cache, optionally collecting if missing/stale.
 
         Cache location: benchmark_dir/explains/{query_id}.json (flat)
         Falls back to:  explains/sf10/ → explains/sf5/ (backward compat)
 
-        Re-runs EXPLAIN ANALYZE if cached data has no real timing
-        (execution_time_ms is 0 or None) and a DB connection is available.
+        Collection behavior:
+        - collect_if_missing=False: cache-only (never runs EXPLAIN)
+        - collect_if_missing=True: cached first, then run EXPLAIN ANALYZE
+        - collect_if_missing=None: derived from config.explain_policy
+
+        config.explain_policy values that enable collection:
+        explain|collect|refresh|auto|analyze
+
         All cached results include a 'collected_at' ISO timestamp.
         """
         from datetime import datetime
+
+        if collect_if_missing is None:
+            explain_policy = str(
+                getattr(self.config, "explain_policy", "cache")
+                or "cache"
+            ).strip().lower()
+            collect_if_missing = explain_policy in {
+                "explain",
+                "collect",
+                "refresh",
+                "auto",
+                "analyze",
+            }
 
         cache_dir = self.benchmark_dir / "explains"
         flat_path = cache_dir / f"{query_id}.json"
@@ -266,12 +291,25 @@ class Pipeline:
                             f"collected {data.get('collected_at', 'unknown')})"
                         )
                         return data
-                    # Stale cache (no timing) — fall through to re-run
+                    # Stale cache (no timing)
+                    if not collect_if_missing:
+                        logger.info(
+                            f"[{query_id}] Using stale cached EXPLAIN "
+                            f"(collection disabled)"
+                        )
+                        return data
+                    # Fall through to re-run when collection is enabled.
                     logger.info(
                         f"[{query_id}] Cached EXPLAIN has no timing — will re-run if DB available"
                     )
                 except Exception:
                     pass
+
+        if not collect_if_missing:
+            logger.info(
+                f"[{query_id}] EXPLAIN cache miss (collection disabled)"
+            )
+            return None
 
         # Run EXPLAIN ANALYZE and cache to flat path
         logger.info(f"[{query_id}] Running EXPLAIN ANALYZE (will cache)")
@@ -832,7 +870,7 @@ class Pipeline:
         benchmark_lock=None,
         on_phase_change=None,
     ) -> SessionResult:
-        """Run optimization session in specified mode.
+        """Run optimization session in BEAM mode.
 
         Args:
             query_id: Query identifier (e.g., 'query_88')
@@ -840,7 +878,7 @@ class Pipeline:
             max_iterations: Max optimization rounds
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers per iteration
-            mode: Optimization mode (beam)
+            mode: Optimization mode (must be beam)
             orchestrator: Optional Orchestrator for declarative composition
             benchmark_lock: Optional threading.Lock for serializing benchmark
                 phases when running multiple sessions concurrently.
@@ -848,20 +886,12 @@ class Pipeline:
         Returns:
             SessionResult with the best result across all iterations
         """
-        # Session mode routing (beam | reasoning, with legacy aliases tolerated).
         from .sessions.beam_session import BeamSession
         mode_value = mode.value if isinstance(mode, OptimizationMode) else str(mode or "")
-        reasoning_requested = mode_value in ("reasoning", "focused")
-        if reasoning_requested and not bool(
-            getattr(self.config, "enable_reasoning_mode", False)
-        ):
-            logger.info(
-                "Reasoning mode requested but disabled by config; using beam mode"
+        if mode_value and mode_value != OptimizationMode.BEAM.value:
+            raise ValueError(
+                f"Unsupported optimization mode '{mode_value}'. Only 'beam' is supported."
             )
-            mode_value = "beam"
-        if mode_value:
-            self.config.beam_mode = mode_value
-        self.config.tiered_patch_enabled = True
         if not self.config.benchmark_dsn:
             self.config.benchmark_dsn = self.config.db_path_or_dsn
         # max_iterations = snipe_rounds + 1 (1 analyst + N snipes)

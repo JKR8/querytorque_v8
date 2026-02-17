@@ -1,0 +1,244 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows redundant sequential scans on date_dim (3x) and nested loops dominating runtime. Pre-materializing filtered dimensions into CTEs should eliminate redundant scans. Converting comma joins to explicit syntax may improve join planning. EXCEPT operations show high sort costs; NOT EXISTS rewrites could avoid materialization.",
+    "reasoning_trace": [
+      "Cost spine: Nested Loop (5799ms) → Sort (5799ms) → Unique (5799ms) dominates store_sales path",
+      "Seq Scan on date_dim repeated 3x (340ms/147ms/145ms) with identical filters",
+      "EXCEPT operations require full materialization and sorting of distinct sets"
+    ],
+    "cost_spine": [
+      "Seq Scan (date_dim) → Nested Loop → Sort → Unique → SetOp"
+    ],
+    "hotspots": [
+      {"op": "Seq Scan on date_dim", "why": "repeated identical scans", "evidence": "scanned 3x, total time=633ms"},
+      {"op": "Nested Loop", "why": "row amplification", "evidence": "store_sales path=5799ms, catalog_sales=5168ms"},
+      {"op": "Sort", "why": "EXCEPT distinct processing", "evidence": "store_sales sort=5799ms"}
+    ],
+    "do_not_do": [
+      "or_to_union (no OR conditions)",
+      "materialize_cte for EXISTS (no EXISTS subqueries)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create CTE for filtered date_dim: WITH date_cte AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1214 AND 1225). Replace all date_dim references in subqueries with date_cte.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["d_month_seq BETWEEN...", "join conditions"],
+        "output_must_preserve": ["c_last_name", "c_first_name", "d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL CTEs materialize by default. Single scan should replace 3 sequential scans.",
+      "confidence": 0.75,
+      "expected_explain_delta": "Seq Scan on date_dim replaced by CTE scan once. Reduced nested loop iterations.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create CTE for filtered customer: WITH cust_cte AS (SELECT c_customer_sk, c_last_name, c_first_name FROM customer WHERE c_birth_year BETWEEN 1955 AND 1961). Replace all customer references with cust_cte.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["c_birth_year BETWEEN...", "join conditions"],
+        "output_must_preserve": ["c_last_name", "c_first_name", "d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing filtered customer once should eliminate redundant index scans.",
+      "confidence": 0.8,
+      "expected_explain_delta": "Index Scan on customer replaced by single CTE scan. Faster nested loop probes.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs in all subqueries. Example: FROM store_sales INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk INNER JOIN cust_cte ON ss_customer_sk = c_customer_sk",
+      "node_contract": {
+        "from_must_include": ["date_cte", "cust_cte"],
+        "where_must_preserve": ["list_price/wholesale_cost filters"],
+        "output_must_preserve": ["distinct semantics"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Improved join order planning. Potential hash joins instead of nested loops.",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Combine p01-p03: WITH date_cte(...), cust_cte(...). Rewrite all subqueries with explicit JOINs on CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_cte", "cust_cte"],
+        "where_must_preserve": ["all original filters"],
+        "output_must_preserve": ["distinct output columns"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Eliminated all dimension scans. Optimized join paths with materialized CTEs.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "except_to_not_exists",
+      "family": "D",
+      "target": "Rewrite EXCEPT as NOT EXISTS: Store results in CTE, then filter via WHERE NOT EXISTS (catalog) AND NOT EXISTS (web). Preserve (c_customer_sk, d_date) as correlation key.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["all original filters"],
+        "output_must_preserve": ["count(*) accuracy"]
+      },
+      "gates_checked": ["no_double_scans:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Avoids materializing distinct sets. Anti-join may use semi-join optimizations.",
+      "confidence": 0.7,
+      "expected_explain_delta": "Remove Unique/Sort operators. Show Anti Join in plan.",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize entire store_sales path: WITH store AS (SELECT ... FROM store_sales+date_dim+customer). Reuse in main query.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["store_sales filters"],
+        "output_must_preserve": ["distinct c_last_name,c_first_name,d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "CTE scan replaces store_sales path. Reduced nested loop depth.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter all dimensions per channel: WITH store_path AS (SELECT ... FROM store_sales JOIN filtered_date JOIN filtered_customer)",
+      "node_contract": {
+        "from_must_include": ["filtered_date", "filtered_customer"],
+        "where_must_preserve": ["fact table filters"],
+        "output_must_preserve": ["distinct output columns"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension filtering may reduce fact table scans via key propagation.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Earlier fact table filtering. Reduced rows entering joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize only date_dim filter: WITH d AS (SELECT ... FROM date_dim WHERE d_month_seq BETWEEN...)",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq filter"],
+        "output_must_preserve": ["d_date_sk", "d_date"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Single CTE scan replaces three Seq Scans on date_dim.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize date_dim scan only: WITH d AS (SELECT * FROM date_dim WHERE ...)",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq filter"],
+        "output_must_preserve": ["d_date_sk", "d_date"]
+      },
+      "gates_checked": ["unfiltered_cte:FAIL"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Eliminate redundant date_dim scans. Faster nested loop probes.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-join dimensions: WITH dims AS (SELECT d_date_sk, c_customer_sk FROM date_dim, customer WHERE ...)",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer"],
+        "where_must_preserve": ["dimension filters"],
+        "output_must_preserve": ["join keys"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension join result may enable hash join optimizations.",
+      "confidence": 0.7,
+      "expected_explain_delta": "Merge dimension joins into single CTE. Reduced nested loops.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push fact filters earlier: Move ss_list_price/ss_wholesale_cost filters before joins in store_sales subquery.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["list_price/wholesale_cost filters"],
+        "output_must_preserve": ["join conditions"]
+      },
+      "gates_checked": ["predicate_transitivity_failure:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "IndexScan on store_sales shows earlier filter application.",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Convert EXCEPT to NOT EXISTS via keys: WHERE NOT EXISTS (SELECT 1 FROM catalog_sales WHERE cs_bill_customer_sk = c_customer_sk AND ...)",
+      "node_contract": {
+        "from_must_include": ["c_customer_sk"],
+        "where_must_preserve": ["correlation accuracy"],
+        "output_must_preserve": ["count(*) correctness"]
+      },
+      "gates_checked": ["no_double_scans:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Key-based correlation avoids string joins. Anti-join may use index.",
+      "confidence": 0.6,
+      "expected_explain_delta": "Replace SetOp with Anti Join. Remove Unique operators.",
+      "recommended_patch_ops": ["replace_where_predicate", "replace_body"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "no OR conditions in query"},
+    {"transform_id": "aggregate_pushdown", "family": "C", "reason": "no aggregate pushdown opportunities"}
+  ]
+}

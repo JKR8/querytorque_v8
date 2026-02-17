@@ -1,0 +1,187 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 2,
+    "probe_count": 9,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "CTE materialization forces full year+category scan before filtering. Self-join on large CTE output causes expensive hash join. Late d_moy filtering misses partition pruning opportunities.",
+    "reasoning_trace": [
+      "CTE materializes full year data before d_moy filtering",
+      "Self-join on 2.4M+ row CTE causes hash join amplification",
+      "No predicate pushdown into CTE due to materialization fence"
+    ],
+    "cost_spine": ["CTE Materialize → HashAggregate → Nested Loop (dimensions) → Seq Scan (inventory)"],
+    "hotspots": [
+      {"op": "CTE Materialize", "why": "Forces full year scan", "evidence": "133M row inventory scan materialized before d_moy filter"},
+      {"op": "Hash Join", "why": "Self-join on large CTE", "evidence": "CTE output ~2.4M rows joined against itself"}
+    ],
+    "do_not_do": ["or_to_union", "intersect_to_exists", "materialize_cte (indiscriminate)"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push d_moy filter into CTE subquery. Add 'AND d_moy IN (2,3)' to inventory-date_dim join in CTE_Q_S0_inv and CTE_Q_S1_inv",
+      "node_contract": {
+        "from_must_include": ["inventory", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "inv_quantity_on_hand BETWEEN 0 AND 200"],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean"]
+      },
+      "gates_checked": ["no_or_to_union:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Reduced Seq Scan on inventory, earlier Index Scan on date_dim using _dta_index_date_dim_6_661577395__k7_k4_k9_k1",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split CTE inv into inv_m2 and inv_m3. Replace main query with JOIN inv_m2 ON inv_m3 WHERE inv_m2.d_moy=2 AND inv_m3.d_moy=3",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["i_category IN ('Jewelry','Men')", "i_manager_id BETWEEN 81 AND 100"],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "cov"]
+      },
+      "gates_checked": ["not_simple_exists:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL CTE materialization fences block predicate pushdown. Splitting allows per-month partition pruning",
+      "confidence": 0.75,
+      "expected_explain_delta": "Two separate Aggregates with d_moy=2/3 filters, eliminated CTE self-join",
+      "recommended_patch_ops": ["replace_body", "insert_cte"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create CTEs for pre-filtered date_dim (d_year=2002, d_moy IN (2,3)), item (i_category/i_manager_id), warehouse. Join in main CTE",
+      "node_contract": {
+        "from_must_include": ["inventory"],
+        "where_must_preserve": ["inv_quantity_on_hand BETWEEN 0 AND 200"],
+        "output_must_preserve": ["stdev", "mean", "cov calculation"]
+      },
+      "gates_checked": ["no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension CTEs enable hash joins and reduce inventory scan via compound selectivity",
+      "confidence": 0.68,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join, reduced Seq Scan rows on inventory",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize base inventory-dimension join as CTE_base, then derive inv_m2/inv_m3 via separate aggregates on CTE_base",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "inv_quantity_on_hand BETWEEN 0 AND 200"],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "d_moy"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Single Seq Scan on inventory, two Aggregates on materialized CTE_base",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN with ON clauses in CTE subquery",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "i_category IN ('Jewelry','Men')"],
+        "output_must_preserve": ["GROUP BY keys"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Improved join order and row estimates in EXPLAIN",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate inventory by (inv_date_sk, inv_item_sk, inv_warehouse_sk) before dimension joins",
+      "node_contract": {
+        "from_must_include": ["inventory"],
+        "where_must_preserve": ["inv_quantity_on_hand BETWEEN 0 AND 200"],
+        "output_must_preserve": ["stddev_samp(inv_quantity_on_hand)", "avg(inv_quantity_on_hand)"]
+      },
+      "gates_checked": ["agg_below_join_blindness:WATCH"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-aggregation reduces rows before expensive dimension joins",
+      "confidence": 0.7,
+      "expected_explain_delta": "Aggregate before Join, reduced dimension table join costs",
+      "recommended_patch_ops": ["wrap_query_with_cte"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create CTE with filtered inventory (inv_quantity_on_hand) joined to pre-filtered date_dim only, then join item/warehouse",
+      "node_contract": {
+        "from_must_include": ["inventory", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "inv_quantity_on_hand BETWEEN 0 AND 200"],
+        "output_must_preserve": ["inv_item_sk", "inv_warehouse_sk"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:AVOID"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Reduced Seq Scan on inventory, earlier Hash Join with date_dim",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim as CTE_d, convert to explicit JOIN in CTE subquery",
+      "node_contract": {
+        "from_must_include": ["inventory", "CTE_d"],
+        "where_must_preserve": ["d_year=2002"],
+        "output_must_preserve": ["inv_date_sk"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT"],
+      "exploration": false,
+      "confidence": 0.94,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with tiny date_dim CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Compute both stddev_samp and avg in single aggregation pass in CTE",
+      "node_contract": {
+        "from_must_include": ["inventory"],
+        "where_must_preserve": [],
+        "output_must_preserve": ["stddev_samp(inv_quantity_on_hand)", "avg(inv_quantity_on_hand)"]
+      },
+      "gates_checked": ["redundant_scan_elimination:EXPLOIT"],
+      "exploration": false,
+      "confidence": 0.96,
+      "expected_explain_delta": "Single Aggregate node instead of multiple computations",
+      "recommended_patch_ops": ["replace_expr_subtree"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "Regression registry: bitmap_or_scan capable"},
+    {"transform_id": "sf_sk_pushdown_multi_fact", "family": "A", "reason": "Engine contraindication: Snowflake-specific"}
+  ]
+}

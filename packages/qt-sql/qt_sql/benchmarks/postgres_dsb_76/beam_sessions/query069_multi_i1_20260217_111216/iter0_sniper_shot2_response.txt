@@ -1,0 +1,55 @@
+Based on the Battle Damage Assessment and analysis of the query structure, I've developed a compound optimization plan targeting the core bottleneck of correlated subquery execution. The plan combines the winning probe's approach with a novel extension to address the remaining performance hotspots.
+
+### Optimization Plan
+```json
+{
+  "plan_id": "snipe_best",
+  "dialect": "postgres",
+  "importance_stars": 3,
+  "confidence": 0.8,
+  "based_on": ["p12"],
+  "novel_transforms": ["decorrelate_not_exists_anti_join", "shared_date_cte"],
+  "decision_trace": [
+    "p12 showed 34.45x speedup by decorrelating store_sales EXISTS with CTE semi-join",
+    "Original plan shows nested loop anti-joins dominate runtime (25s+) for web_sales/catalog_sales",
+    "Extend CTE decorrelation to NOT EXISTS clauses using anti-join pattern",
+    "Add shared date_range CTE to avoid redundant date_dim scans"
+  ],
+  "strategy": "Build on p12's store_sales decorrelation while adding anti-join CTEs for NOT EXISTS clauses and shared date filtering to eliminate all correlated subquery bottlenecks.",
+  "hypothesis": "The original query suffers from correlated subquery paralysis - each NOT EXISTS re-executes for every customer row. The BDA shows p12's decorrelation of the EXISTS clause delivered 34x speedup, but the NOT EXISTS clauses remain correlated. EXPLAIN shows nested loops with materialization of 310K+ rows for anti-joins. Decorrelating all channel checks should convert nested loops to single-pass hash joins.",
+  "expected_explain_delta": [
+    "Eliminate Nested Loop Anti nodes for web_sales and catalog_sales",
+    "Replace Materialize nodes with hash anti-joins against precomputed CTEs",
+    "Reduce date_dim scans from 3 to 1 via shared date_range CTE"
+  ],
+  "risk_notes": [
+    "DISTINCT in CTEs ensures join multiplicity safety (keys are unique)",
+    "CTE materialization may add overhead but balances against correlation removal",
+    "Date_range CTE may block predicate pushdown but is small (92 rows)",
+    "Semantic equivalence depends on correct customer key mapping across channels"
+  ],
+  "fallback": {
+    "use_probe_only": "p12",
+    "when": "If compound plan shows regression or row count mismatch"
+  },
+  "target_ir": "Main query with 4 CTEs: date_range, store_customers, web_customers, catalog_customers. WHERE clause uses semi-join and anti-joins against CTEs.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "replace_body",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "sql": "WITH date_range AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2002\n    AND d_moy BETWEEN 10 AND 12\n),\nstore_customers AS (\n  SELECT DISTINCT ss_customer_sk\n  FROM store_sales\n  JOIN date_range ON ss_sold_date_sk = date_range.d_date_sk\n  WHERE ss_list_price BETWEEN 80 AND 169\n),\nweb_customers AS (\n  SELECT DISTINCT ws_bill_customer_sk\n  FROM web_sales\n  JOIN date_range ON ws_sold_date_sk = date_range.d_date_sk\n  WHERE ws_list_price BETWEEN 80 AND 169\n),\ncatalog_customers AS (\n  SELECT DISTINCT cs_ship_customer_sk\n  FROM catalog_sales\n  JOIN date_range ON cs_sold_date_sk = date_range.d_date_sk\n  WHERE cs_list_price BETWEEN 80 AND 169\n)\nSELECT \n  cd_gender,\n  cd_marital_status,\n  cd_education_status,\n  COUNT(*) cnt1,\n  cd_purchase_estimate,\n  COUNT(*) cnt2,\n  cd_credit_rating,\n  COUNT(*) cnt3\nFROM\n  customer c,\n  customer_address ca,\n  customer_demographics\nWHERE\n  c.c_current_addr_sk = ca.ca_address_sk\n  AND ca_state IN ('CO','NC','TX')\n  AND cd_demo_sk = c.c_current_cdemo_sk\n  AND cd_marital_status IN ('S', 'M', 'U')\n  AND cd_education_status IN ('Primary', 'College')\n  AND EXISTS (SELECT 1 FROM store_customers WHERE ss_customer_sk = c.c_customer_sk)\n  AND NOT EXISTS (SELECT 1 FROM web_customers WHERE ws_bill_customer_sk = c.c_customer_sk)\n  AND NOT EXISTS (SELECT 1 FROM catalog_customers WHERE cs_ship_customer_sk = c.c_customer_sk)\nGROUP BY \n  cd_gender,\n  cd_marital_status,\n  cd_education_status,\n  cd_purchase_estimate,\n  cd_credit_rating\nORDER BY \n  cd_gender,\n  cd_marital_status,\n  cd_education_status,\n  cd_purchase_estimate,\n  cd_credit_rating\nLIMIT 100;"
+      }
+    }
+  ]
+}
+```
+
+### Key Optimizations
+1. **Full Decorrelation** - Converts all EXISTS/NOT EXISTS subqueries to CTE-based semi-joins and anti-joins
+2. **Shared Date CTE** - Single date_range CTE reused across all sales channels
+3. **DISTINCT Optimization** - Ensures CTE customer keys are unique for safe joins
+4. **Predicate Consolidation** - Moves all date/list_price filters into CTE definitions
+
+The plan preserves the original query semantics while targeting the core performance bottleneck identified in the BDA. The fallback to p12 provides a safety net while maintaining most of the gains from store_sales decorrelation.

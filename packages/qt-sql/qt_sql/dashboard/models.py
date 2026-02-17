@@ -70,6 +70,11 @@ class ForensicQuery:
     has_explain: bool = False
     explain_text: str = ""      # Truncated EXPLAIN plan text for drawer
 
+    # Spill indicators from plan evidence/history
+    spill_detected: bool = False
+    spill_remote: bool = False
+    spill_local: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Engine profile types
@@ -176,6 +181,8 @@ class ForensicSummary:
     resource_profile: Optional[ResourceProfile] = None
     dominant_pathology: str = ""
     estimated_opportunity_ms: float = 0.0
+    config_snapshot: Dict[str, Any] = field(default_factory=dict)
+    spill_summary: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

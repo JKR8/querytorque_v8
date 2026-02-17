@@ -1,0 +1,260 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Plan shows nested loops dominating runtime with repeated dimension rescans and correlated EXISTS execution. Decorrelating subqueries (B) and prefiltering dimensions (A) should reduce nested loop amplification. Materialization (E) and explicit joins (F) may optimize dimension reuse.",
+    "reasoning_trace": [
+      "Cost spine: Gather (32.4s) → Nested Loop (14.9s) → Index Scans on multiple date_dim/item copies",
+      "Amplification: 135k rows in store_sales loop, 59k rows in catalog_sales loop with repeated dimension rescans",
+      "Late selectivity: Dimension filters applied after joins, missing early reduction opportunities"
+    ],
+    "cost_spine": ["Gather → Nested Loop → Index Only Scan (date_dim) → Index Only Scan (store_sales) → Index Scan (item)"],
+    "hotspots": [
+      {"op": "Nested Loop", "why": "Correlated EXISTS re-execution", "evidence": "rows=135401, time=14876ms for store_sales path"},
+      {"op": "Gather", "why": "Parallelization overhead", "evidence": "time=32395ms for initial subquery execution"}
+    ],
+    "do_not_do": ["or_to_union (bitmap-or capable)", "materialize_simple_exists (semi-join optimized)"]
+  },
+  "probe_summary_schema": [
+    "probe_id", "transform_id", "family", "status", "speedup", "expected_explain_delta", "ops_used", "confidence", "exploration", "failure_reason", "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decorate store_sales EXISTS: Create CTE store_sales_cte SELECT DISTINCT ss_customer_sk FROM store_sales JOIN date_dim JOIN item WITH filters. Replace EXISTS with c.c_customer_sk IN (SELECT ss_customer_sk FROM store_sales_cte)",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year=1999", "d_moy BETWEEN 5 AND 8", "i_category IN ('Children','Home','Women')", "ss_sales_price/ss_list_price BETWEEN 0.65 AND 0.75"],
+        "output_must_preserve": ["DISTINCT ss_customer_sk"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "correlated_subquery_parasitism:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Nested Loop replaced by Hash Semi Join against materialized store_sales_cte",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decorate web_sales EXISTS: Create CTE web_sales_cte SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN date_dim JOIN item WITH filters. Replace EXISTS with c.c_customer_sk IN (SELECT ws_bill_customer_sk FROM web_sales_cte)",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year=1999", "d_moy BETWEEN 5 AND 8", "i_category IN ('Children','Home','Women')", "ws_sales_price/ws_list_price BETWEEN 0.65 AND 0.75"],
+        "output_must_preserve": ["DISTINCT ws_bill_customer_sk"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "correlated_subquery_parasitism:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Nested Loop replaced by Hash Semi Join against materialized web_sales_cte",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decorate catalog_sales EXISTS: Create CTE catalog_sales_cte SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN date_dim JOIN item WITH filters. Replace EXISTS with c.c_customer_sk IN (SELECT cs_ship_customer_sk FROM catalog_sales_cte)",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year=1999", "d_moy BETWEEN 5 AND 8", "i_category IN ('Children','Home','Women')", "cs_sales_price/cs_list_price BETWEEN 0.65 AND 0.75"],
+        "output_must_preserve": ["DISTINCT cs_ship_customer_sk"]
+      },
+      "gates_checked": ["not_simple_exists:PASS", "correlated_subquery_parasitism:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Nested Loop replaced by Hash Semi Join against materialized catalog_sales_cte",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Combine web/catalog EXISTS: Create CTE web_catalog_union AS (SELECT ws_bill_customer_sk FROM web_sales_cte UNION SELECT cs_ship_customer_sk FROM catalog_sales_cte). Replace OR condition with c.c_customer_sk IN (SELECT * FROM web_catalog_union)",
+      "node_contract": {
+        "from_must_include": ["web_sales_cte", "catalog_sales_cte"],
+        "where_must_preserve": ["OR logic semantics"],
+        "output_must_preserve": ["UNION of customer keys"]
+      },
+      "gates_checked": ["no_set_ops_materialization:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows separate expensive scans for web/catalog. UNION CTE enables single semi-join instead of OR branching",
+      "confidence": 0.75,
+      "expected_explain_delta": "OR condition replaced by single Hash Semi Join against pre-materialized UNION",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_date_cte AS MATERIALIZED SELECT d_date_sk FROM date_dim WHERE d_year=1999 AND d_moy BETWEEN 5 AND 8. Replace all date_dim scans in sales CTEs with this CTE",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year=1999", "d_moy BETWEEN 5 AND 8"],
+        "output_must_preserve": ["d_date_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows 3 identical date_dim scans. Materialized CTE enables single scan and hash reuse",
+      "confidence": 0.85,
+      "expected_explain_delta": "Multiple date_dim scans replaced by single CTE scan + materialization",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_item_cte AS MATERIALIZED SELECT i_item_sk FROM item WHERE i_category IN ('Children','Home','Women') AND i_manager_id BETWEEN 91 AND 100. Replace all item scans in sales CTEs with this CTE",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_category filter", "i_manager_id range"],
+        "output_must_preserve": ["i_item_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows 3 identical item scans. Materialized CTE enables single scan and hash reuse",
+      "confidence": 0.85,
+      "expected_explain_delta": "Multiple item scans replaced by single CTE scan + materialization",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize sales CTEs: Add MATERIALIZED keyword to store_sales_cte, web_sales_cte, catalog_sales_cte definitions to prevent inlining",
+      "node_contract": {
+        "from_must_include": [],
+        "where_must_preserve": [],
+        "output_must_preserve": ["CTE content identical"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "CTE scans show Materialize node in EXPLAIN",
+      "recommended_patch_ops": ["replace_expr_subtree"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert main FROM clause to explicit joins: customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics"],
+        "where_must_preserve": ["join conditions moved to ON clauses"],
+        "output_must_preserve": ["original join semantics"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Comma joins replaced by explicit JOIN syntax in plan",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Add filtered dimension CTEs to main query: Pre-join customer with filtered customer_demographics CTE (WHERE cd_gender='M' AND cd_marital_status IN (...) AND cd_education_status IN (...))",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_demographics"],
+        "where_must_preserve": ["cd_gender", "cd_marital_status", "cd_education_status filters"],
+        "output_must_preserve": ["all original columns"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "customer_demographics scan shows reduced rows earlier in plan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Consolidate dimension CTEs: Replace individual date/item CTEs in sales CTEs with shared filtered_date_cte and filtered_item_cte",
+      "node_contract": {
+        "from_must_include": ["filtered_date_cte", "filtered_item_cte"],
+        "where_must_preserve": ["original join conditions"],
+        "output_must_preserve": ["same customer keys"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Runtime evidence supports dimension reuse. PostgreSQL CTEs act as optimization fences when materialized",
+      "confidence": 0.78,
+      "expected_explain_delta": "Elimination of redundant dimension scans in sales CTEs",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Force materialization of filtered_date_cte and filtered_item_cte with MATERIALIZED keyword",
+      "node_contract": {
+        "from_must_include": [],
+        "where_must_preserve": [],
+        "output_must_preserve": ["CTE content identical"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL materialization prevents predicate blindness during sales CTE joins",
+      "confidence": 0.7,
+      "expected_explain_delta": "CTE scans show Materialize node in EXPLAIN",
+      "recommended_patch_ops": ["replace_expr_subtree"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Add county filter to customer_address CTE: Create ca_filtered AS SELECT * FROM customer_address WHERE ca_county IN (...). Join with customer in main query",
+      "node_contract": {
+        "from_must_include": ["customer_address"],
+        "where_must_preserve": ["ca_county IN values"],
+        "output_must_preserve": ["all columns"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "customer_address scan shows reduced rows earlier in plan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert customer_address join to INNER JOIN since ca_county filter eliminates NULLs",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address"],
+        "where_must_preserve": ["c.c_current_addr_sk = ca.ca_address_sk"],
+        "output_must_preserve": ["join semantics"]
+      },
+      "gates_checked": ["left_join_filter_order_rigidity:PASS"],
+      "exploration": false,
+      "confidence": 0.95,
+      "expected_explain_delta": "Explicit INNER JOIN in plan output",
+      "recommended_patch_ops": ["replace_join_condition"]
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Push COUNT() into sales CTEs: Modify store_sales_cte to include COUNT() per customer, then reference in main SELECT",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["all original filters"],
+        "output_must_preserve": ["customer key", "aggregate correctness"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Plan shows separate aggregates after joins. Early aggregation may reduce row counts earlier",
+      "confidence": 0.65,
+      "expected_explain_delta": "Aggregate node moves below join in sales CTE path",
+      "recommended_patch_ops": ["replace_select", "replace_body"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "registry: bitmap-or capable on postgres"},
+    {"transform_id": "sf_sk_pushdown_multi_fact", "family": "A", "reason": "engine contraindication: snowflake-specific"}
+  ]
+}

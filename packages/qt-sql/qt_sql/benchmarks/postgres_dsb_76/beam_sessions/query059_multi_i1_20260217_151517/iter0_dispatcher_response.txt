@@ -1,0 +1,250 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The cost spine is dominated by sequential scan on store_sales (241s) and nested loop. Late filtering on date_dim in the main query leads to unnecessary rows processed. Comma joins and lack of early dimension filtering contribute to poor join planning.",
+    "reasoning_trace": [
+      "Seq Scan on store_sales dominates runtime (241166ms) due to lack of early filtering.",
+      "Main query uses comma joins leading to poor cardinality estimates (COMMA_JOIN_WEAKNESS).",
+      "CTE wss joins store_sales without date filters, scanned twice in y/x subqueries."
+    ],
+    "cost_spine": ["Seq Scan on store_sales → Nested Loop → Hash Join → Sort"],
+    "hotspots": [
+      {"op": "Seq Scan on store_sales", "why": "Full table scan without pushdown", "evidence": "rows=7M, time=241s"},
+      {"op": "Hash Join", "why": "Processing large CTE outputs", "evidence": "time=263s"}
+    ],
+    "do_not_do": ["or_to_union", "materialize_simple_exists"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins in main FROM to explicit INNER JOINs with ON clause. Create date_dim CTEs pre-filtered by d_month_seq ranges.",
+      "node_contract": {
+        "from_must_include": ["y", "x"],
+        "where_must_preserve": ["s_store_id1=s_store_id2", "d_week_seq1=d_week_seq2-52"],
+        "output_must_preserve": ["All original columns and ratios"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "EXPLAIN shows explicit JOIN nodes with lower row estimates."
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "target": "Split wss CTE into wss_y and wss_x CTEs with d_month_seq 1187-1198 and 1199-1210 filters.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales"],
+        "where_must_preserve": ["d_month_seq ranges"],
+        "output_must_preserve": ["Original grouping and aggregates"]
+      },
+      "gates_checked": ["no_set_ops:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Two separate CTE Scans with lower row counts in EXPLAIN."
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter date_dim and store into CTEs before joining with store_sales in wss.",
+      "node_contract": {
+        "from_must_include": ["prefiltered_date", "prefiltered_store"],
+        "where_must_preserve": ["s_state filters", "d_month_seq ranges"],
+        "output_must_preserve": ["Original join conditions"]
+      },
+      "gates_checked": ["no_repeated_scans:PASS"],
+      "exploration": true,
+      "confidence": 0.7,
+      "expected_explain_delta": "Seq Scan replaced by Index Scan on filtered CTEs."
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Merge y/x CTEs into single wss with CASE aggregates for both date ranges.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["BETWEEN 57*0.01 AND 77*0.01 ratio"],
+        "output_must_preserve": ["Original sum columns per day"]
+      },
+      "gates_checked": ["no_redundant_scans:PASS"],
+      "exploration": true,
+      "confidence": 0.65,
+      "expected_explain_delta": "Single CTE Scan with multiple aggregates in EXPLAIN."
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push d_month_seq filters into wss CTE definition using pre-filtered date_dim CTE.",
+      "node_contract": {
+        "from_must_include": ["prefiltered_dates"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk"],
+        "output_must_preserve": ["Aggregate columns"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduced rows in wss CTE Scan."
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize wss CTE with MATERIALIZED keyword to prevent re-scan.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["Original WHERE clauses"],
+        "output_must_preserve": ["Grouped aggregates"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.75,
+      "expected_explain_delta": "Materialized CTE in EXPLAIN."
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_store_sk/d_week_seq before joining.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["sales ratio filter"],
+        "output_must_preserve": ["Group keys and aggregates"]
+      },
+      "gates_checked": ["agg_below_join_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.68,
+      "expected_explain_delta": "Aggregate node below JOIN in EXPLAIN."
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs for filtered date_dim and store, then explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["date_cte", "store_cte"],
+        "where_must_preserve": ["s_state", "d_month_seq"],
+        "output_must_preserve": ["Join semantics"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.82,
+      "expected_explain_delta": "Hash Join with small dimension CTEs."
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered date_dim and store CTEs before joining to store_sales.",
+      "node_contract": {
+        "from_must_include": ["materialized_date", "materialized_store"],
+        "where_must_preserve": ["Key joins"],
+        "output_must_preserve": ["Original aggregate logic"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.78,
+      "expected_explain_delta": "Materialized CTEs in FROM clause."
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add d_date_sk BETWEEN filters in store_sales join condition.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk range"],
+        "output_must_preserve": ["Aggregate correctness"]
+      },
+      "gates_checked": ["portability_candidate:PASS"],
+      "exploration": true,
+      "confidence": 0.6,
+      "expected_explain_delta": "Index Scan on ss_sold_date_sk."
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit comma joins to INNER JOIN where applicable.",
+      "node_contract": {
+        "from_must_include": ["explicit JOIN syntax"],
+        "where_must_preserve": ["Original join conditions"],
+        "output_must_preserve": ["Result set"]
+      },
+      "gates_checked": ["left_join_filter_order:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Explicit JOIN nodes in EXPLAIN."
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared store filters into a CTE referenced by y/x subqueries.",
+      "node_contract": {
+        "from_must_include": ["store_cte"],
+        "where_must_preserve": ["s_state"],
+        "output_must_preserve": ["Store attributes"]
+      },
+      "gates_checked": ["no_redundant_scans:PASS"],
+      "exploration": true,
+      "confidence": 0.65,
+      "expected_explain_delta": "CTE Scan on prefiltered store."
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Chain CTEs: filter date_dim → join with store_sales → aggregate.",
+      "node_contract": {
+        "from_must_include": ["filtered_date", "filtered_store_sales"],
+        "where_must_preserve": ["sales ratio"],
+        "output_must_preserve": ["Grouped aggregates"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.72,
+      "expected_explain_delta": "Reduced rows in initial scans."
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Combine y/x aggregations into single CASE statements in wss CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["d_month_seq ranges via CASE"],
+        "output_must_preserve": ["Original aggregates"]
+      },
+      "gates_checked": ["no_redundant_scans:PASS"],
+      "exploration": true,
+      "confidence": 0.6,
+      "expected_explain_delta": "Single CTE with dual aggregates."
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "reason": "No OR conditions in predicates"},
+    {"transform_id": "intersect_to_exists", "reason": "No INTERSECT in query"}
+  ]
+}

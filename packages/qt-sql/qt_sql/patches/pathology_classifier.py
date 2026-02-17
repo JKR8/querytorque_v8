@@ -185,6 +185,7 @@ Output a JSON array. If no pathologies match, output an empty array [].
 def build_intelligence_brief(
     detected_transforms: list,
     classification: Optional[ClassificationResult] = None,
+    runtime_dialect: Optional[str] = None,
 ) -> str:
     """Merge AST detection + LLM classification into analyst-readable brief.
 
@@ -197,6 +198,13 @@ def build_intelligence_brief(
         Empty string if no useful signals.
     """
     lines: List[str] = []
+    runtime_norm: Optional[str] = None
+    if runtime_dialect:
+        try:
+            from ..knowledge.normalization import normalize_dialect
+            runtime_norm = normalize_dialect(runtime_dialect)
+        except Exception:
+            runtime_norm = str(runtime_dialect).strip().lower()
 
     # AST detection results (top 5 with >30% overlap)
     top_ast = [m for m in detected_transforms if m.overlap_ratio >= 0.30][:5]
@@ -209,9 +217,20 @@ def build_intelligence_brief(
             if m.contraindications:
                 contra_names = [c.get("id", "?") for c in m.contraindications[:2]]
                 contra_str = f" [CAUTION: {', '.join(contra_names)}]"
+            support_str = ""
+            if runtime_norm:
+                engines = [str(e) for e in (m.engines or []) if e]
+                if not engines or runtime_norm in engines or "all" in engines:
+                    support_str = " [SUPPORT: native_or_universal]"
+                else:
+                    support_str = (
+                        "[SUPPORT: portability_candidate; engines="
+                        + ",".join(engines)
+                        + "]"
+                    )
             lines.append(
                 f"- **{m.id}**: {m.overlap_ratio:.0%} match "
-                f"({', '.join(m.matched_features[:4])}){gap_str}{contra_str}"
+                f"({', '.join(m.matched_features[:4])}){gap_str}{contra_str} {support_str}".strip()
             )
             if m.missing_features:
                 lines.append(

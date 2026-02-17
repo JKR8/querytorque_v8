@@ -1,10 +1,10 @@
-"""Beam optimization session — single mode: BEAM (probes + sniper).
+"""Beam optimization session — single mode: BEAM (probes + compiler).
 
 BEAM pipeline:
-1. Dispatcher (R1) → 8-16 independent transform probes
+1. Analyst (R1) → 8-16 independent transform probes
 2. Workers (qwen, parallel) → PatchPlan JSON per probe
 3. Validate (structural + equivalence + benchmark)
-4. R1 Sniper shot 1 always; shot 2 only on retryable syntax/error paths
+4. R1 Compiler shot 1 always; shot 2 only on retryable syntax/error paths
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ class PatchIterationResult:
 
 
 class BeamSession(OptimizationSession):
-    """Patch optimization session supporting BEAM and REASONING modes."""
+    """Patch optimization session supporting BEAM mode."""
 
     # Pricing is configurable via QT_LLM_PRICING_OVERRIDES_JSON.
     # Values are USD per 1M tokens.
@@ -284,16 +284,7 @@ class BeamSession(OptimizationSession):
             }
 
     def run(self) -> SessionResult:
-        """Execute optimization loop by configured beam mode."""
-        mode = str(getattr(self.pipeline.config, "beam_mode", "beam") or "beam")
-        if mode in ("reasoning", "focused"):
-            if not bool(getattr(self.pipeline.config, "enable_reasoning_mode", False)):
-                logger.info(
-                    f"[{self.query_id}] Reasoning mode requested but disabled; forcing BEAM"
-                )
-                return self._run_beam()
-            logger.info(f"[{self.query_id}] BEAM MODE: REASONING")
-            return self._run_reasoning()
+        """Execute BEAM optimization loop (single mode)."""
         logger.info(f"[{self.query_id}] BEAM MODE: BEAM")
         return self._run_beam()
 
@@ -301,14 +292,13 @@ class BeamSession(OptimizationSession):
         """Single-call strike path for editor mode.
 
         Strike mode is intentionally lightweight:
-        - no dispatcher phase
+        - no analyst phase
         - no probe fan-out
-        - no sniper rounds
+        - no compiler rounds
         - one worker LLM call scoped to one transform id
         """
         from ..ir import build_script_ir, render_ir_node_map, Dialect
         from ..patches.beam_wide_prompts import build_beam_editor_strike_prompt
-        from ..execution.database_utils import run_explain_analyze
 
         strike_transform = (transform_id or "").strip() or "auto"
         logger.info(
@@ -329,11 +319,17 @@ class BeamSession(OptimizationSession):
         session_dir = self._create_session_dir()
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
+        beam_edit_mode = self._beam_edit_mode()
+        dag_mode = beam_edit_mode == "dag"
+        base_dag = self._build_base_dag(self.original_sql) if dag_mode else None
+        base_dag_prompt = self._render_dag_for_prompt(base_dag) if base_dag else ""
+        beam_provider_override, beam_model_override = self._beam_llm_override()
+        logger.info(f"[{self.query_id}] BEAM edit mode: {beam_edit_mode}")
 
         if self.on_phase_change:
             self.on_phase_change(phase="strike_prepare", iteration=0)
 
-        explain_result = run_explain_analyze(db_path, self.original_sql)
+        explain_result = self._get_original_explain_cached(db_path)
         original_explain = self._render_explain_compact(
             explain_result, self.dialect
         )
@@ -348,17 +344,30 @@ class BeamSession(OptimizationSession):
             dialect=self.dialect,
             schema_context=schema_context,
         )
+        if dag_mode:
+            strike_prompt = (
+                strike_prompt
+                + "\n\n"
+                + self._worker_dag_mode_suffix(base_dag_prompt)
+            )
         self._save_to_disk(session_dir, 0, "strike_prompt", strike_prompt)
 
-        worker_call_fn = self._make_llm_call_fn()
+        beam_provider_override, beam_model_override = self._beam_llm_override()
+        worker_call_fn = self._make_llm_call_fn(
+            provider_spec=beam_provider_override,
+            model_spec=beam_model_override,
+        )
 
         if self.on_phase_change:
             self.on_phase_change(phase="strike_worker", iteration=0)
         strike_response = worker_call_fn(strike_prompt)
         self._save_to_disk(session_dir, 0, "strike_response", strike_response)
 
-        output_sql = self._apply_wide_worker_response(
-            strike_response, script_ir, dialect_enum
+        output_sql = self._apply_worker_response_compat(
+            strike_response,
+            script_ir,
+            dialect_enum,
+            dag_base=base_dag,
         )
         patch = AppliedPatch(
             patch_id="strike_01",
@@ -440,7 +449,7 @@ class BeamSession(OptimizationSession):
         Falls back to plan_text if no JSON plan.
 
         IMPORTANT: This is the ONLY entry point for EXPLAIN into prompts.
-        The compact format is what analysts, workers, and snipers all see.
+        The compact format is what analysts, workers, and compilers all see.
         Raw box-drawing must NEVER leak through.
         """
         if not explain_result:
@@ -471,6 +480,478 @@ class BeamSession(OptimizationSession):
         if plan_text:
             return plan_text
         return "(EXPLAIN unavailable)"
+
+    def _get_original_explain_cached(self, db_path: str) -> Optional[dict]:
+        """Load original-query EXPLAIN from cache only in optimization paths."""
+        get_explain = getattr(self.pipeline, "_get_explain", None)
+        if callable(get_explain):
+            try:
+                return get_explain(
+                    self.query_id,
+                    self.original_sql,
+                    collect_if_missing=False,
+                )
+            except TypeError:
+                # Compatibility for older helper signatures.
+                return get_explain(self.query_id, self.original_sql)
+            except Exception as e:
+                logger.warning(
+                    f"[{self.query_id}] Failed to load cached EXPLAIN: {e}"
+                )
+                return None
+
+        # Test-stub fallback: use direct explain when Pipeline helper is unavailable.
+        from ..execution.database_utils import run_explain_analyze
+        return run_explain_analyze(db_path, self.original_sql)
+
+    def _beam_edit_mode(self) -> str:
+        """Return BEAM edit representation mode."""
+        mode = str(
+            getattr(self.pipeline.config, "beam_edit_mode", "patchplan")
+            or "patchplan"
+        ).strip().lower()
+        return "dag" if mode == "dag" else "patchplan"
+
+    @staticmethod
+    def _extract_json_value(text: str) -> Optional[Any]:
+        """Extract top-level JSON value (object or array) from model output."""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+
+        # Remove fenced wrappers if present.
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines:
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+
+        # Fallback: find first balanced JSON object/array.
+        for open_ch, close_ch in (("{", "}"), ("[", "]")):
+            start = raw.find(open_ch)
+            if start < 0:
+                continue
+            depth = 0
+            in_str = False
+            esc = False
+            for idx in range(start, len(raw)):
+                ch = raw[idx]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start : idx + 1]
+                        try:
+                            return json.loads(candidate)
+                        except Exception:
+                            break
+        return None
+
+    def _extract_dag_candidates(self, response: str) -> List[Dict[str, Any]]:
+        """Parse DAG plan candidates from worker/compiler output."""
+        payload = self._extract_json_value(response)
+        if payload is None:
+            return []
+
+        items: List[Any]
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            plans = payload.get("plans")
+            if isinstance(plans, list):
+                items = plans
+            else:
+                items = [payload]
+        else:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("dag"), dict):
+                candidates.append(item)
+                continue
+            if isinstance(item.get("nodes"), list) or isinstance(item.get("nodes"), dict):
+                # Allow bare DAG object (without enclosing "dag").
+                candidates.append(
+                    {
+                        "plan_id": item.get("plan_id"),
+                        "family": item.get("family"),
+                        "transform": item.get("transform"),
+                        "dag": item,
+                    }
+                )
+        return candidates
+
+    def _extract_dag_outputs(self, sql_text: str) -> List[str]:
+        """Extract projected output column names from a SQL fragment."""
+        try:
+            import sqlglot
+            from sqlglot import exp
+        except Exception:
+            return []
+        try:
+            ast = sqlglot.parse_one(sql_text, dialect=self.dialect)
+            selects = []
+            if hasattr(ast, "selects") and ast.selects:
+                selects = list(ast.selects)
+            elif isinstance(ast, exp.Select):
+                selects = list(ast.expressions)
+            out: List[str] = []
+            for e in selects:
+                alias = getattr(e, "alias_or_name", None) or getattr(e, "output_name", None)
+                if alias:
+                    out.append(str(alias))
+                else:
+                    out.append((e.sql(dialect=self.dialect) or "").strip())
+            return out
+        except Exception:
+            return []
+
+    def _extract_dag_deps(self, sql_text: str, known_nodes: List[str]) -> List[str]:
+        """Extract dependencies on known DAG node ids from table references."""
+        if not known_nodes:
+            return []
+        known = {str(x).lower(): str(x) for x in known_nodes}
+        deps: List[str] = []
+        try:
+            import sqlglot
+            from sqlglot import exp
+            ast = sqlglot.parse_one(sql_text, dialect=self.dialect)
+            for table in ast.find_all(exp.Table):
+                name = str(table.name or "").strip()
+                if not name:
+                    continue
+                key = name.lower()
+                if key in known and known[key] not in deps:
+                    deps.append(known[key])
+        except Exception:
+            return []
+        return deps
+
+    def _build_base_dag(self, sql_text: str) -> Dict[str, Any]:
+        """Build a lightweight DAG from query CTEs + final select."""
+        base = {
+            "order": ["final_select"],
+            "final_node_id": "final_select",
+            "nodes": [
+                {
+                    "node_id": "final_select",
+                    "deps": [],
+                    "grain": [],
+                    "keys": {},
+                    "outputs": self._extract_dag_outputs(sql_text),
+                    "sql": sql_text.strip().rstrip(";"),
+                }
+            ],
+        }
+        try:
+            import sqlglot
+            ast = sqlglot.parse_one(sql_text, dialect=self.dialect)
+        except Exception:
+            return base
+
+        with_expr = ast.args.get("with")
+        if with_expr is None or not getattr(with_expr, "expressions", None):
+            return base
+
+        ctes = list(with_expr.expressions or [])
+        cte_ids: List[str] = []
+        for idx, cte in enumerate(ctes, start=1):
+            name = str(cte.alias_or_name or f"cte_{idx}")
+            if name in cte_ids:
+                name = f"{name}_{idx}"
+            cte_ids.append(name)
+
+        nodes: List[Dict[str, Any]] = []
+        for idx, cte in enumerate(ctes):
+            node_id = cte_ids[idx]
+            cte_sql = (cte.this.sql(dialect=self.dialect) or "").strip().rstrip(";")
+            nodes.append(
+                {
+                    "node_id": node_id,
+                    "deps": self._extract_dag_deps(cte_sql, cte_ids),
+                    "grain": [],
+                    "keys": {},
+                    "outputs": self._extract_dag_outputs(cte_sql),
+                    "sql": cte_sql,
+                }
+            )
+
+        final_ast = ast.copy()
+        final_ast.set("with", None)
+        final_sql = (final_ast.sql(dialect=self.dialect) or sql_text).strip().rstrip(";")
+        nodes.append(
+            {
+                "node_id": "final_select",
+                "deps": self._extract_dag_deps(final_sql, cte_ids),
+                "grain": [],
+                "keys": {},
+                "outputs": self._extract_dag_outputs(final_sql),
+                "sql": final_sql,
+            }
+        )
+        return {
+            "order": cte_ids + ["final_select"],
+            "final_node_id": "final_select",
+            "nodes": nodes,
+        }
+
+    def _render_dag_for_prompt(self, dag: Dict[str, Any]) -> str:
+        """Render compact DAG spec for prompt context."""
+        lines = [
+            "## Base DAG Spec",
+            "Use this as the authoritative node graph for rewrite proposals.",
+            "",
+        ]
+        for node in dag.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("node_id", "")).strip()
+            deps = node.get("deps") or []
+            outs = node.get("outputs") or []
+            lines.append(f"node: {node_id}")
+            lines.append(f"  deps: {deps}")
+            lines.append(f"  outputs: {outs}")
+            lines.append("  sql: OMITTED")
+            lines.append("")
+        lines.append(f"order: {dag.get('order', [])}")
+        lines.append(f"final_node_id: {dag.get('final_node_id', 'final_select')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _worker_dag_mode_suffix(base_dag_spec: str) -> str:
+        """Worker DAG-mode runtime contract (takes precedence over template text)."""
+        return (
+            "## Runtime Override: DAG Mode (Takes Precedence)\n"
+            "Ignore PatchPlan output requirements above.\n"
+            "Output ONE JSON object with a `dag` payload.\n"
+            "Worker constraints:\n"
+            "- exactly ONE changed node\n"
+            "- changed node must include full executable SQL in `sql`\n"
+            "- unchanged nodes should omit `sql`\n"
+            "- first character must be `{` (no prose/markdown)\n\n"
+            "Expected shape:\n"
+            "{\n"
+            "  \"probe_id\": \"pNN\",\n"
+            "  \"transform_id\": \"...\",\n"
+            "  \"family\": \"A|B|C|D|E|F\",\n"
+            "  \"hypothesis\": \"...\",\n"
+            "  \"dag\": {\n"
+            "    \"order\": [\"...\"],\n"
+            "    \"final_node_id\": \"final_select\",\n"
+            "    \"nodes\": [\n"
+            "      {\"node_id\": \"...\", \"deps\": [\"...\"], \"outputs\": [\"...\"], \"changed\": true, \"sql\": \"SELECT ...\"}\n"
+            "    ]\n"
+            "  }\n"
+            "}\n\n"
+            f"{base_dag_spec}"
+        )
+
+    @staticmethod
+    def _worker_lane_suffix(lane: str) -> str:
+        """Lane-specific behavior contract appended to worker prompts."""
+        lane_norm = str(lane or "").strip().lower()
+        if lane_norm == "reasoner":
+            return (
+                "## Runtime Override: Reasoner Lane\n"
+                "You are the high-reasoning lane.\n"
+                "- You may combine families or rewrite shapes when evidence supports it.\n"
+                "- You are not constrained to a single-family tactic.\n"
+                "- Preserve semantics and hard bans.\n"
+            )
+        return (
+            "## Runtime Override: Qwen Lane\n"
+            "You are the wide exploration lane.\n"
+            "- Stay within ONE family strategy: the assigned `family` and `transform_id`.\n"
+            "- Do not combine multiple families in one rewrite.\n"
+            "- Preserve semantics and hard bans.\n"
+        )
+
+    @staticmethod
+    def _compiler_dag_mode_suffix(base_dag_spec: str) -> str:
+        """Compiler DAG-mode runtime contract (takes precedence over template text)."""
+        return (
+            "## Runtime Override: DAG Mode (Takes Precedence)\n"
+            "Ignore PatchPlan output requirements above.\n"
+            "Compiler may output ONE or TWO attempts.\n"
+            "No constraint on number of changed nodes.\n"
+            "Output must be JSON object or JSON array (length 1-2), no prose/markdown.\n"
+            "Each attempt should include `plan_id` and `dag`; include full SQL for changed nodes.\n\n"
+            "Accepted example:\n"
+            "[\n"
+            "  {\"plan_id\": \"snipe_p1\", \"hypothesis\": \"...\", \"dag\": {\"order\": [\"...\"], \"nodes\": [{\"node_id\":\"...\",\"changed\":true,\"sql\":\"SELECT ...\"}]}}\n"
+            "]\n\n"
+            f"{base_dag_spec}"
+        )
+
+    @staticmethod
+    def _append_dag_shot_results(base_prompt: str, patches: List[AppliedPatch]) -> str:
+        """Append shot results with DAG-mode compiler instructions."""
+        lines = [base_prompt, "", "## Shot 1 Results", ""]
+        lines.append("| # | Transform | Speedup | Status | Error |")
+        lines.append("|---|-----------|---------|--------|-------|")
+        for p in patches:
+            speedup = f"{p.speedup:.2f}x" if p.speedup is not None else "-"
+            err = (p.apply_error or "").replace("\n", " ")
+            lines.append(
+                f"| {p.patch_id} | {p.transform} | {speedup} | {p.status} | {err} |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Shot 2 — DAG Mode",
+                "Return one or two DAG attempts as JSON (object or array).",
+                "No changed-node-count constraints.",
+                "Preserve semantics and literals.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _compile_dag_candidate_sql(
+        self,
+        candidate: Dict[str, Any],
+        base_dag: Dict[str, Any],
+        *,
+        strict_single_change: bool,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Compile a DAG candidate into executable SQL."""
+        dag = candidate.get("dag")
+        if not isinstance(dag, dict):
+            return None, "Missing `dag` object"
+
+        base_nodes = {}
+        for node in base_dag.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("node_id", "")).strip()
+            sql = str(node.get("sql", "") or "").strip()
+            if node_id and sql:
+                base_nodes[node_id] = sql.rstrip(";")
+
+        order = dag.get("order")
+        if not isinstance(order, list) or not order:
+            order = list(base_dag.get("order") or [])
+        order = [str(x).strip() for x in order if str(x).strip()]
+        if not order:
+            return None, "DAG order is empty"
+
+        final_node_id = str(
+            dag.get("final_node_id")
+            or base_dag.get("final_node_id")
+            or order[-1]
+        ).strip()
+        if not final_node_id:
+            return None, "Missing final_node_id"
+
+        node_items = dag.get("nodes")
+        if isinstance(node_items, dict):
+            node_items = list(node_items.values())
+        if not isinstance(node_items, list):
+            node_items = []
+
+        changed_count = 0
+        for item in node_items:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("node_id") or item.get("id") or "").strip()
+            if not node_id:
+                continue
+            sql_text = item.get("sql")
+            changed = bool(item.get("changed"))
+            if isinstance(sql_text, str) and sql_text.strip():
+                base_nodes[node_id] = sql_text.strip().rstrip(";")
+                changed = True
+            if changed:
+                changed_count += 1
+
+        if strict_single_change and changed_count != 1:
+            return None, f"Worker DAG must change exactly one node (got {changed_count})"
+
+        for node_id in order:
+            if node_id not in base_nodes:
+                return None, f"Missing SQL for DAG node `{node_id}`"
+        if final_node_id not in base_nodes:
+            return None, f"Missing SQL for final node `{final_node_id}`"
+
+        final_sql = base_nodes[final_node_id].strip().rstrip(";")
+        cte_ids = [nid for nid in order if nid != final_node_id]
+        if not cte_ids:
+            return final_sql + ";", None
+
+        with_parts = [f"{nid} AS ({base_nodes[nid].strip().rstrip(';')})" for nid in cte_ids]
+        if final_sql.lower().startswith("with "):
+            # Final node already carries a complete WITH query.
+            return final_sql + ";", None
+        return f"WITH {', '.join(with_parts)} {final_sql};", None
+
+    def _apply_dag_worker_response(
+        self,
+        response: str,
+        base_dag: Dict[str, Any],
+    ) -> Optional[str]:
+        """Apply worker DAG response and return SQL if valid."""
+        candidates = self._extract_dag_candidates(response)
+        if not candidates:
+            return None
+        sql, _err = self._compile_dag_candidate_sql(
+            candidates[0], base_dag, strict_single_change=True
+        )
+        return sql
+
+    def _apply_dag_compiler_response(
+        self,
+        response: str,
+        base_dag: Dict[str, Any],
+        *,
+        prefix: str,
+    ) -> List[AppliedPatch]:
+        """Apply compiler DAG response (1-2 attempts) into AppliedPatch objects."""
+        candidates = self._extract_dag_candidates(response)
+        if not candidates:
+            return []
+
+        patches: List[AppliedPatch] = []
+        for idx, candidate in enumerate(candidates[:2], start=1):
+            plan_id = str(candidate.get("plan_id") or f"{prefix}_{idx}")
+            family = str(candidate.get("family") or "?")
+            transform = str(candidate.get("transform") or "dag_rewrite")
+            sql, err = self._compile_dag_candidate_sql(
+                candidate, base_dag, strict_single_change=False
+            )
+            patch = AppliedPatch(
+                patch_id=plan_id,
+                family=family,
+                transform=transform,
+                relevance_score=1.0,
+                output_sql=sql,
+                status="applied" if sql else "FAIL",
+                raw_plan=candidate,
+            )
+            if not sql:
+                patch.apply_error = err or "Failed to parse/apply DAG plan"
+            patches.append(patch)
+        return patches
 
     def _apply_patchplan_array(
         self,
@@ -566,8 +1047,16 @@ class BeamSession(OptimizationSession):
 
         return patches
 
-    def _is_sniper_tier0_shape_failure(self, response: str) -> bool:
-        """True when sniper output violates the top-level PatchPlan array contract."""
+    def _is_compiler_tier0_shape_failure(
+        self,
+        response: str,
+        *,
+        dag_mode: bool = False,
+    ) -> bool:
+        """True when compiler output violates expected top-level shape."""
+        if dag_mode:
+            return len(self._extract_dag_candidates(response)) == 0
+
         from ..patches.beam_patch_validator import _extract_json_array
 
         def _is_patchplan_obj(obj: Any) -> bool:
@@ -582,8 +1071,22 @@ class BeamSession(OptimizationSession):
             return True
         return False
 
-    def _build_sniper_tier0_retry_prompt(self, base_prompt: str) -> str:
-        """Append hard shape feedback for one sniper retry."""
+    def _build_compiler_tier0_retry_prompt(
+        self,
+        base_prompt: str,
+        *,
+        dag_mode: bool = False,
+    ) -> str:
+        """Append hard shape feedback for one compiler retry."""
+        if dag_mode:
+            return (
+                base_prompt
+                + "\n\n## RETRY — Output Shape Failure (DAG Mode)\n"
+                + "Your previous output was not parseable as DAG JSON.\n"
+                + "Return JSON object or JSON array (length 1-2) only.\n"
+                + "Each attempt must include a `dag` object with `nodes` and `order`.\n"
+                + "No markdown/prose."
+            )
         return (
             base_prompt
             + "\n\n## RETRY — Tier-0 Output Contract Failure\n"
@@ -598,7 +1101,7 @@ class BeamSession(OptimizationSession):
             + "- never emit payload.sql; use payload.sql_fragment\n"
         )
 
-    def _is_sniper_retry_error_patch(self, patch: AppliedPatch) -> bool:
+    def _is_compiler_retry_error_patch(self, patch: AppliedPatch) -> bool:
         """True when a patch indicates retry-worthy syntax/parse/error failures."""
         status = str(patch.status or "").upper()
         err = str(patch.apply_error or "").lower()
@@ -620,7 +1123,7 @@ class BeamSession(OptimizationSession):
         return any(marker in err for marker in retry_markers)
 
     def _categorize_probe_failure(self, patch: AppliedPatch) -> str:
-        """Classify probe outcome for sniper evidence synthesis."""
+        """Classify probe outcome for compiler evidence synthesis."""
         status = str(patch.status or "").upper()
         err = str(patch.apply_error or "").lower()
 
@@ -794,182 +1297,32 @@ class BeamSession(OptimizationSession):
                 except Exception as e:
                     logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
 
-    # ── REASONING Mode ────────────────────────────────────────────────────
-
-    def _run_reasoning(self) -> SessionResult:
-        """REASONING mode: analyst 2-shot PatchPlan search (no worker swarm)."""
-        from ..ir import build_script_ir, render_ir_node_map, Dialect
-        from ..patches.beam_prompt_builder import (
-            load_gold_examples,
-            build_reasoning_prompt,
-            append_reasoning_shot_results,
-        )
-        from ..execution.database_utils import run_explain_analyze
-
-        db_path = (
-            self.pipeline.config.benchmark_dsn
-            or self.pipeline.config.db_path_or_dsn
-        )
-        dialect_upper = self.dialect.upper()
-        dialect_enum = (
-            Dialect[dialect_upper]
-            if dialect_upper in Dialect.__members__
-            else Dialect.POSTGRES
-        )
-
-        session_dir = self._create_session_dir()
-        script_ir = build_script_ir(self.original_sql, dialect_enum)
-        ir_node_map = render_ir_node_map(script_ir)
-
-        explain_result = run_explain_analyze(db_path, self.original_sql)
-        original_explain = self._render_explain_compact(
-            explain_result, self.dialect
-        )
-
-        total_api_calls = 0
-        gold_examples = load_gold_examples(self.dialect)
-
-        intelligence_brief = ""
-        try:
-            from ..detection import detect_transforms, load_transforms
-            from ..patches.pathology_classifier import build_intelligence_brief
-
-            transforms_catalog = load_transforms()
-            detected = detect_transforms(
-                self.original_sql, transforms_catalog,
-                dialect=self.dialect,
-            )
-            classification = self._load_cached_classification(self.query_id)
-            intelligence_brief = build_intelligence_brief(
-                detected,
-                classification,
-                runtime_dialect=self.dialect,
-            )
-        except Exception as e:
-            logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
-
-        if self.on_phase_change:
-            self.on_phase_change(phase="analyst", iteration=0)
-
-        analyst_call_fn = self._make_llm_call_fn()
-
-        shot1_prompt = build_reasoning_prompt(
-            query_id=self.query_id,
-            original_sql=self.original_sql,
-            explain_text=original_explain,
-            ir_node_map=ir_node_map,
-            all_5_examples=gold_examples,
-            dialect=self.dialect,
-            intelligence_brief=intelligence_brief,
-        )
-        self._save_to_disk(session_dir, 0, "reasoning_shot1_prompt", shot1_prompt)
-        shot1_response = analyst_call_fn(shot1_prompt)
-        total_api_calls += 1
-        self._save_to_disk(session_dir, 0, "reasoning_shot1_response", shot1_response)
-
-        shot1_patches = self._apply_patchplan_array(
-            shot1_response, script_ir, dialect_enum, prefix="r1"
-        )
-
-        if self.on_phase_change:
-            self.on_phase_change(phase="benchmark", iteration=0)
-        self._validate_and_benchmark_patches(shot1_patches, db_path, session_dir, 0)
-
-        shot2_prompt = append_reasoning_shot_results(
-            base_prompt=shot1_prompt,
-            patches=shot1_patches,
-            explains={p.patch_id: p.explain_text or "" for p in shot1_patches},
-        )
-        self._save_to_disk(session_dir, 0, "reasoning_shot2_prompt", shot2_prompt)
-        shot2_response = analyst_call_fn(shot2_prompt)
-        total_api_calls += 1
-        self._save_to_disk(session_dir, 0, "reasoning_shot2_response", shot2_response)
-
-        shot2_patches = self._apply_patchplan_array(
-            shot2_response, script_ir, dialect_enum, prefix="r2"
-        )
-        self._validate_and_benchmark_patches(shot2_patches, db_path, session_dir, 1)
-
-        all_patches = shot1_patches + shot2_patches
-        final_patches = [p for p in all_patches if p.semantic_passed]
-        explains = {p.patch_id: p.explain_text for p in all_patches if p.explain_text}
-
-        best_speedup = 0.0
-        best_sql = self.original_sql
-        best_transforms: List[str] = []
-        best_status = "NEUTRAL"
-
-        candidates = [
-            p for p in final_patches
-            if p.speedup is not None and p.speedup >= 1.0
-        ]
-        if candidates:
-            best_patch = max(candidates, key=lambda p: p.speedup)
-            best_speedup = best_patch.speedup
-            best_sql = best_patch.output_sql or self.original_sql
-            best_transforms = [best_patch.transform]
-            best_status = self._classify_speedup(best_speedup)
-
-        iter_result = PatchIterationResult(
-            iteration=0,
-            prompt=shot1_prompt,
-            response=shot1_response,
-            n_api_calls=total_api_calls,
-            patches=all_patches,
-            explains=explains,
-            best_speedup=best_speedup,
-            best_patch_id=max(candidates, key=lambda p: p.speedup).patch_id if candidates else None,
-            best_sql=best_sql,
-        )
-
-        self._save_to_disk(
-            session_dir,
-            0,
-            "result",
-            json.dumps(self._serialize_iteration(iter_result), indent=2, default=str),
-        )
-
-        return SessionResult(
-            query_id=self.query_id,
-            mode="reasoning",
-            best_speedup=best_speedup,
-            best_sql=best_sql,
-            original_sql=self.original_sql,
-            best_transforms=best_transforms,
-            status=best_status,
-            iterations=[self._serialize_iteration(iter_result)],
-            n_iterations=1,
-            n_api_calls=total_api_calls,
-            **self._session_cost_fields(),
-        )
-
     # ── BEAM Mode ─────────────────────────────────────────────────────────
 
     def _run_beam(self, baseline_ms: Optional[float] = None) -> SessionResult:
-        """BEAM mode: cheap qwen probes + R1 sniper with retry-gated shot2.
+        """BEAM mode: mixed worker lanes + compiler with retry-gated shot2.
 
         Pipeline:
-        1. Dispatcher (R1) → 8-16 independent transform probes
-        2. Workers (qwen, parallel) → execute probes → PatchPlan JSON
+        1. Analyst (R1) → 8-16 independent transform probes
+        2. Workers (reasoner lane + qwen lane, parallel) → execute probes
         3. Validate + benchmark all probes
-        4. R1 Sniper shot1, then shot2 only for retryable syntax/error failures
+        4. R1 Compiler shot1, then shot2 only for retryable syntax/error failures
         """
         from ..ir import build_script_ir, render_ir_node_map, Dialect
         from ..patches.beam_prompt_builder import (
             load_gold_examples,
-            build_beam_sniper_prompt,
+            build_beam_compiler_prompt,
             append_shot_results,
             _load_engine_intelligence,
         )
         from ..patches.beam_wide_prompts import (
-            build_beam_dispatcher_prompt,
+            build_beam_analyst_prompt,
             build_beam_worker_prompt,
             build_beam_worker_retry_prompt,
-            parse_scout_response,
+            parse_analyst_response,
             _load_gold_example_for_family,
             _load_gold_example_by_id,
         )
-        from ..execution.database_utils import run_explain_analyze
 
         target_speedup = self.target_speedup or getattr(
             self.pipeline.config, "target_speedup", 10.0
@@ -996,8 +1349,14 @@ class BeamSession(OptimizationSession):
         session_dir = self._create_session_dir()
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
+        beam_edit_mode = self._beam_edit_mode()
+        dag_mode = beam_edit_mode == "dag"
+        base_dag = self._build_base_dag(self.original_sql) if dag_mode else None
+        base_dag_prompt = self._render_dag_for_prompt(base_dag) if base_dag else ""
+        beam_provider_override, beam_model_override = self._beam_llm_override()
+        logger.info(f"[{self.query_id}] BEAM edit mode: {beam_edit_mode}")
 
-        explain_result = run_explain_analyze(db_path, self.original_sql)
+        explain_result = self._get_original_explain_cached(db_path)
         original_explain = self._render_explain_compact(
             explain_result, self.dialect
         )
@@ -1041,13 +1400,16 @@ class BeamSession(OptimizationSession):
         except Exception as e:
             logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
 
-        # ── Phase 1: Dispatcher → 8-16 probes ─────────────────────────
+        # ── Phase 1: Analyst → 8-16 probes ─────────────────────────
         if self.on_phase_change:
             self.on_phase_change(phase="analyst", iteration=0)
 
-        analyst_call_fn = self._make_llm_call_fn()
+        analyst_call_fn = self._make_llm_call_fn(
+            provider_spec=beam_provider_override,
+            model_spec=beam_model_override,
+        )
 
-        dispatcher_prompt_base = build_beam_dispatcher_prompt(
+        analyst_prompt_base = build_beam_analyst_prompt(
             query_id=self.query_id,
             original_sql=self.original_sql,
             explain_text=original_explain,
@@ -1060,44 +1422,44 @@ class BeamSession(OptimizationSession):
             engine_knowledge=engine_knowledge,
         )
 
-        max_dispatcher_attempts = max(
-            1, int(getattr(self.pipeline.config, "dispatcher_max_attempts", 2) or 1)
+        max_analyst_attempts = max(
+            1, int(getattr(self.pipeline.config, "analyst_max_attempts", 2) or 1)
         )
-        dispatcher_prompt = dispatcher_prompt_base
-        dispatcher_response = ""
+        analyst_prompt = analyst_prompt_base
+        analyst_response = ""
         scout_result = None
-        for attempt in range(1, max_dispatcher_attempts + 1):
+        for attempt in range(1, max_analyst_attempts + 1):
             if attempt > 1:
-                dispatcher_prompt = (
-                    dispatcher_prompt_base
+                analyst_prompt = (
+                    analyst_prompt_base
                     + "\n\n## Retry Requirements\n"
                     + "Your prior response was not parseable. Return ONLY valid JSON "
                     + "with keys: dispatch, probes, dropped. No markdown fences."
                 )
-            dispatcher_response = analyst_call_fn(dispatcher_prompt)
+            analyst_response = analyst_call_fn(analyst_prompt)
             total_api_calls += 1
             prompt_label = (
-                "dispatcher_prompt"
+                "analyst_prompt"
                 if attempt == 1
-                else f"dispatcher_prompt_retry{attempt - 1}"
+                else f"analyst_prompt_retry{attempt - 1}"
             )
             response_label = (
-                "dispatcher_response"
+                "analyst_response"
                 if attempt == 1
-                else f"dispatcher_response_retry{attempt - 1}"
+                else f"analyst_response_retry{attempt - 1}"
             )
-            self._save_to_disk(session_dir, 0, prompt_label, dispatcher_prompt)
-            self._save_to_disk(session_dir, 0, response_label, dispatcher_response)
-            scout_result = parse_scout_response(dispatcher_response)
+            self._save_to_disk(session_dir, 0, prompt_label, analyst_prompt)
+            self._save_to_disk(session_dir, 0, response_label, analyst_response)
+            scout_result = parse_analyst_response(analyst_response)
             if scout_result and scout_result.probes:
                 break
             logger.warning(
-                f"[{self.query_id}] Dispatcher parse failed (attempt "
-                f"{attempt}/{max_dispatcher_attempts})"
+                f"[{self.query_id}] Analyst parse failed (attempt "
+                f"{attempt}/{max_analyst_attempts})"
             )
 
         if not scout_result or not scout_result.probes:
-            logger.warning(f"[{self.query_id}] Dispatcher returned no probes")
+            logger.warning(f"[{self.query_id}] Analyst returned no probes")
             return SessionResult(
                 query_id=self.query_id,
                 mode="beam",
@@ -1117,29 +1479,122 @@ class BeamSession(OptimizationSession):
             ),
         )[:max_probes]
         logger.info(
-            f"[{self.query_id}] Dispatcher: {len(probes)} probes designed"
+            f"[{self.query_id}] Analyst: {len(probes)} probes designed"
         )
 
         # ── Phase 2: Workers (parallel) ────────────────────────────────
         if self.on_phase_change:
             self.on_phase_change(phase="workers", iteration=0)
 
-        worker_call_fn = self._make_llm_call_fn()
+        qwen_provider_override, qwen_model_override = self._beam_qwen_llm_override(
+            beam_provider_override or getattr(self.pipeline, "provider", None),
+            beam_model_override or getattr(self.pipeline, "model", None),
+        )
+        reasoner_provider_override, reasoner_model_override = (
+            self._beam_reasoner_llm_override()
+        )
 
         patches: List[AppliedPatch] = []
+        worker_call_fn_by_patch_id: Dict[str, Callable[[str], str]] = {}
         worker_parallelism = max(
             1,
             int(getattr(self.pipeline.config, "wide_worker_parallelism", 8) or 8),
         )
-        n_workers = min(len(probes), worker_parallelism)
+        reasoner_slots = max(
+            0, int(getattr(self.pipeline.config, "beam_reasoner_workers", 0) or 0)
+        )
+        qwen_slots = max(
+            0,
+            int(
+                getattr(
+                    self.pipeline.config,
+                    "beam_qwen_workers",
+                    worker_parallelism,
+                )
+                or 0
+            ),
+        )
+        if reasoner_slots > 0 and (
+            not reasoner_provider_override or not reasoner_model_override
+        ):
+            raise RuntimeError(
+                f"[{self.query_id}] beam_reasoner_workers={reasoner_slots} "
+                "requires beam_reasoner_provider and beam_reasoner_model"
+            )
+        if qwen_slots > 0 and (
+            not qwen_provider_override or not qwen_model_override
+        ):
+            raise RuntimeError(
+                f"[{self.query_id}] beam_qwen_workers={qwen_slots} "
+                "requires qwen lane provider/model (beam_qwen_* or beam_llm_*)"
+            )
+
+        reasoner_selected: List[Any] = []
+        if reasoner_slots > 0:
+            ranked = sorted(
+                probes,
+                key=self._probe_hardness_score,
+                reverse=True,
+            )
+            reasoner_selected = ranked[: min(reasoner_slots, len(ranked))]
+
+        reasoner_probe_ids = {
+            str(getattr(p, "probe_id", "")) for p in reasoner_selected
+        }
+        remaining_for_qwen = [
+            p for p in probes if str(getattr(p, "probe_id", "")) not in reasoner_probe_ids
+        ]
+        qwen_selected = remaining_for_qwen[: min(qwen_slots, len(remaining_for_qwen))]
+
+        qwen_worker_call_fn: Optional[Callable[[str], str]] = None
+        if qwen_selected:
+            qwen_worker_call_fn = self._make_llm_call_fn(
+                provider_spec=qwen_provider_override,
+                model_spec=qwen_model_override,
+            )
+        reasoner_worker_call_fn: Optional[Callable[[str], str]] = None
+        if reasoner_selected:
+            reasoner_worker_call_fn = self._make_llm_call_fn(
+                provider_spec=reasoner_provider_override,
+                model_spec=reasoner_model_override,
+            )
+
+        lane_assignments: List[Tuple[Any, str, Callable[[str], str], str]] = []
+        for probe in reasoner_selected:
+            lane_assignments.append(
+                (
+                    probe,
+                    "reasoner",
+                    reasoner_worker_call_fn,  # type: ignore[arg-type]
+                    str(reasoner_model_override or ""),
+                )
+            )
+        for probe in qwen_selected:
+            lane_assignments.append(
+                (
+                    probe,
+                    "qwen",
+                    qwen_worker_call_fn,  # type: ignore[arg-type]
+                    str(qwen_model_override or ""),
+                )
+            )
+
+        if not lane_assignments:
+            raise RuntimeError(
+                f"[{self.query_id}] No worker lanes scheduled. "
+                "Set beam_qwen_workers and/or beam_reasoner_workers > 0."
+            )
+
+        n_workers = min(len(lane_assignments), worker_parallelism)
         logger.info(
-            f"[{self.query_id}] Worker parallelism: {n_workers} "
+            f"[{self.query_id}] Worker lanes: reasoner={len(reasoner_selected)}, "
+            f"qwen={len(qwen_selected)}, parallelism={n_workers} "
             f"(cap={worker_parallelism}, probes={len(probes)})"
         )
 
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        with ThreadPoolExecutor(max_workers=max(1, n_workers)) as pool:
             futures = {}
-            for probe in probes:
+            for probe, lane, lane_call_fn, lane_model in lane_assignments:
                 gold_ex = None
                 for ex_id in probe.recommended_examples:
                     gold_ex = _load_gold_example_by_id(ex_id, self.dialect)
@@ -1168,12 +1623,26 @@ class BeamSession(OptimizationSession):
                     engine_knowledge=engine_knowledge,
                     do_not_do=scout_result.do_not_do,
                 )
+                worker_prompt = (
+                    worker_prompt
+                    + "\n\n"
+                    + self._worker_lane_suffix(lane)
+                )
+                if dag_mode:
+                    worker_prompt = (
+                        worker_prompt
+                        + "\n\n"
+                        + self._worker_dag_mode_suffix(base_dag_prompt)
+                    )
 
-                future = pool.submit(worker_call_fn, worker_prompt)
-                futures[future] = (probe, worker_prompt)
+                probe_id = str(getattr(probe, "probe_id", ""))
+                if probe_id:
+                    worker_call_fn_by_patch_id[probe_id] = lane_call_fn
+                future = pool.submit(lane_call_fn, worker_prompt)
+                futures[future] = (probe, worker_prompt, lane, lane_model)
 
             for future in as_completed(futures):
-                probe, w_prompt = futures[future]
+                probe, w_prompt, lane, lane_model = futures[future]
                 total_api_calls += 1
                 try:
                     response = future.result()
@@ -1182,8 +1651,11 @@ class BeamSession(OptimizationSession):
                         f"worker_{probe.probe_id}_response", response,
                     )
 
-                    output_sql = self._apply_wide_worker_response(
-                        response, script_ir, dialect_enum
+                    output_sql = self._apply_worker_response_compat(
+                        response,
+                        script_ir,
+                        dialect_enum,
+                        dag_base=base_dag,
                     )
 
                     patch = AppliedPatch(
@@ -1195,20 +1667,22 @@ class BeamSession(OptimizationSession):
                         status="applied" if output_sql else "FAIL",
                         worker_prompt=w_prompt,
                         worker_response=response,
-                        description=probe.target,
+                        worker_role=f"{lane}:{lane_model}",
+                        description=f"[{lane}:{lane_model}] {probe.target}",
                     )
                     if not output_sql:
-                        patch.apply_error = "Failed to parse/apply PatchPlan"
+                        patch.apply_error = "Failed to parse/apply worker output"
                     patches.append(patch)
 
                     logger.info(
                         f"[{self.query_id}] Worker {probe.probe_id} "
-                        f"({probe.transform_id}): "
+                        f"({lane}/{lane_model}, {probe.transform_id}): "
                         f"{'OK' if output_sql else 'FAIL'}"
                     )
                 except Exception as e:
                     logger.warning(
-                        f"[{self.query_id}] Worker {probe.probe_id} error: {e}"
+                        f"[{self.query_id}] Worker {probe.probe_id} "
+                        f"({lane}/{lane_model}) error: {e}"
                     )
                     patches.append(AppliedPatch(
                         patch_id=probe.probe_id,
@@ -1217,7 +1691,8 @@ class BeamSession(OptimizationSession):
                         relevance_score=probe.confidence,
                         apply_error=str(e),
                         status="ERROR",
-                        description=probe.target,
+                        worker_role=f"{lane}:{lane_model}",
+                        description=f"[{lane}:{lane_model}] {probe.target}",
                     ))
 
         applied = [p for p in patches if p.output_sql]
@@ -1258,15 +1733,18 @@ class BeamSession(OptimizationSession):
             self.on_phase_change(phase="benchmark", iteration=0)
 
         self._validate_and_benchmark_patches(applied, db_path, session_dir, 0)
+        retry_default_fn = qwen_worker_call_fn or reasoner_worker_call_fn
         retry_calls = self._retry_tier1_worker_failures(
             patches=applied,
-            worker_call_fn=worker_call_fn,
+            worker_call_fn=retry_default_fn,  # type: ignore[arg-type]
             build_retry_prompt_fn=build_beam_worker_retry_prompt,
             script_ir=script_ir,
             dialect_enum=dialect_enum,
             db_path=db_path,
             session_dir=session_dir,
             shot=0,
+            dag_base=base_dag,
+            worker_call_fn_by_patch_id=worker_call_fn_by_patch_id,
         )
         total_api_calls += retry_calls
 
@@ -1276,11 +1754,11 @@ class BeamSession(OptimizationSession):
             f"{len(sem_passed)}/{len(applied)} passed"
         )
 
-        # ── Phase 4: R1 Sniper (shot2 only on retryable syntax/error) ─
-        sniper_patches: List[AppliedPatch] = []
+        # ── Phase 4: R1 Compiler (shot2 only on retryable syntax/error) ─
+        compiler_patches: List[AppliedPatch] = []
         winners = [p for p in sem_passed if p.speedup and p.speedup >= 1.05]
         retry_error_candidates = [
-            p for p in patches if self._is_sniper_retry_error_patch(p)
+            p for p in patches if self._is_compiler_retry_error_patch(p)
         ]
         has_retry_errors = bool(retry_error_candidates)
         snipe_rounds = int(getattr(self.pipeline.config, "snipe_rounds", 2) or 0)
@@ -1291,7 +1769,7 @@ class BeamSession(OptimizationSession):
                 self.on_phase_change(phase="snipe", iteration=0)
 
             logger.info(
-                f"[{self.query_id}] Phase 4: R1 sniper "
+                f"[{self.query_id}] Phase 4: R1 compiler "
                 f"(winners={len(winners)}, sem_passed={len(sem_passed)}, "
                 f"retryable_errors={len(retry_error_candidates)})"
             )
@@ -1313,7 +1791,7 @@ class BeamSession(OptimizationSession):
             ]
 
             # Shot 1: BDA + intelligence → 2 PatchPlans
-            sniper_shot1_prompt = build_beam_sniper_prompt(
+            compiler_shot1_prompt = build_beam_compiler_prompt(
                 query_id=self.query_id,
                 original_sql=self.original_sql,
                 explain_text=original_explain,
@@ -1329,113 +1807,153 @@ class BeamSession(OptimizationSession):
                 dispatch_reasoning_trace=scout_result.reasoning_trace,
                 equivalence_tier=scout_result.equivalence_tier,
             )
+            if dag_mode:
+                compiler_shot1_prompt = (
+                    compiler_shot1_prompt
+                    + "\n\n"
+                    + self._compiler_dag_mode_suffix(base_dag_prompt)
+                )
 
             self._save_to_disk(
-                session_dir, 0, "sniper_shot1_prompt", sniper_shot1_prompt
+                session_dir, 0, "compiler_shot1_prompt", compiler_shot1_prompt
             )
-            sniper_shot1_response = analyst_call_fn(sniper_shot1_prompt)
+            compiler_shot1_response = analyst_call_fn(compiler_shot1_prompt)
             total_api_calls += 1
             self._save_to_disk(
-                session_dir, 0, "sniper_shot1_response", sniper_shot1_response
+                session_dir, 0, "compiler_shot1_response", compiler_shot1_response
             )
 
-            shot1_sniper = self._apply_patchplan_array(
-                sniper_shot1_response, script_ir, dialect_enum, prefix="s1"
-            )
-            if not shot1_sniper and self._is_sniper_tier0_shape_failure(sniper_shot1_response):
-                logger.warning(
-                    f"[{self.query_id}] Sniper shot 1 Tier-0 shape failure, retrying once"
+            if dag_mode:
+                shot1_compiler = self._apply_dag_compiler_response(
+                    compiler_shot1_response, base_dag or {}, prefix="s1"
                 )
-                sniper_shot1_retry_prompt = self._build_sniper_tier0_retry_prompt(
-                    sniper_shot1_prompt
+            else:
+                shot1_compiler = self._apply_patchplan_array(
+                    compiler_shot1_response, script_ir, dialect_enum, prefix="s1"
+                )
+            if not shot1_compiler and self._is_compiler_tier0_shape_failure(
+                compiler_shot1_response,
+                dag_mode=dag_mode,
+            ):
+                logger.warning(
+                    f"[{self.query_id}] Compiler shot 1 Tier-0 shape failure, retrying once"
+                )
+                compiler_shot1_retry_prompt = self._build_compiler_tier0_retry_prompt(
+                    compiler_shot1_prompt,
+                    dag_mode=dag_mode,
                 )
                 self._save_to_disk(
-                    session_dir, 0, "sniper_shot1_retry_prompt", sniper_shot1_retry_prompt
+                    session_dir, 0, "compiler_shot1_retry_prompt", compiler_shot1_retry_prompt
                 )
-                sniper_shot1_retry_response = analyst_call_fn(sniper_shot1_retry_prompt)
+                compiler_shot1_retry_response = analyst_call_fn(compiler_shot1_retry_prompt)
                 total_api_calls += 1
                 self._save_to_disk(
-                    session_dir, 0, "sniper_shot1_retry_response", sniper_shot1_retry_response
+                    session_dir, 0, "compiler_shot1_retry_response", compiler_shot1_retry_response
                 )
-                shot1_sniper = self._apply_patchplan_array(
-                    sniper_shot1_retry_response, script_ir, dialect_enum, prefix="s1r"
-                )
+                if dag_mode:
+                    shot1_compiler = self._apply_dag_compiler_response(
+                        compiler_shot1_retry_response, base_dag or {}, prefix="s1r"
+                    )
+                else:
+                    shot1_compiler = self._apply_patchplan_array(
+                        compiler_shot1_retry_response, script_ir, dialect_enum, prefix="s1r"
+                    )
             logger.info(
-                f"[{self.query_id}] Sniper shot 1: {len(shot1_sniper)} patches"
+                f"[{self.query_id}] Compiler shot 1: {len(shot1_compiler)} patches"
             )
 
             self._validate_and_benchmark_patches(
-                shot1_sniper, db_path, session_dir, 1
+                shot1_compiler, db_path, session_dir, 1
             )
-            sniper_patches.extend(shot1_sniper)
+            compiler_patches.extend(shot1_compiler)
 
             # Shot 2 is reserved for retry paths (syntax/parse/error), not for speed-only cases.
             shot1_retry_errors = [
-                p for p in shot1_sniper if self._is_sniper_retry_error_patch(p)
+                p for p in shot1_compiler if self._is_compiler_retry_error_patch(p)
             ]
             should_run_shot2 = snipe_rounds > 1 and (
                 has_retry_errors or bool(shot1_retry_errors)
             )
             if should_run_shot2:
-                sniper_shot2_prompt = append_shot_results(
-                    base_prompt=sniper_shot1_prompt,
-                    patches=shot1_sniper,
-                    explains={
-                        p.patch_id: p.explain_text or ""
-                        for p in shot1_sniper
-                    },
-                )
+                if dag_mode:
+                    compiler_shot2_prompt = self._append_dag_shot_results(
+                        base_prompt=compiler_shot1_prompt,
+                        patches=shot1_compiler,
+                    )
+                else:
+                    compiler_shot2_prompt = append_shot_results(
+                        base_prompt=compiler_shot1_prompt,
+                        patches=shot1_compiler,
+                        explains={
+                            p.patch_id: p.explain_text or ""
+                            for p in shot1_compiler
+                        },
+                    )
 
                 self._save_to_disk(
-                    session_dir, 0, "sniper_shot2_prompt", sniper_shot2_prompt
+                    session_dir, 0, "compiler_shot2_prompt", compiler_shot2_prompt
                 )
-                sniper_shot2_response = analyst_call_fn(sniper_shot2_prompt)
+                compiler_shot2_response = analyst_call_fn(compiler_shot2_prompt)
                 total_api_calls += 1
                 self._save_to_disk(
-                    session_dir, 0, "sniper_shot2_response", sniper_shot2_response
+                    session_dir, 0, "compiler_shot2_response", compiler_shot2_response
                 )
 
-                shot2_sniper = self._apply_patchplan_array(
-                    sniper_shot2_response, script_ir, dialect_enum, prefix="s2"
-                )
-                if not shot2_sniper and self._is_sniper_tier0_shape_failure(sniper_shot2_response):
-                    logger.warning(
-                        f"[{self.query_id}] Sniper shot 2 Tier-0 shape failure, retrying once"
+                if dag_mode:
+                    shot2_compiler = self._apply_dag_compiler_response(
+                        compiler_shot2_response, base_dag or {}, prefix="s2"
                     )
-                    sniper_shot2_retry_prompt = self._build_sniper_tier0_retry_prompt(
-                        sniper_shot2_prompt
+                else:
+                    shot2_compiler = self._apply_patchplan_array(
+                        compiler_shot2_response, script_ir, dialect_enum, prefix="s2"
+                    )
+                if not shot2_compiler and self._is_compiler_tier0_shape_failure(
+                    compiler_shot2_response,
+                    dag_mode=dag_mode,
+                ):
+                    logger.warning(
+                        f"[{self.query_id}] Compiler shot 2 Tier-0 shape failure, retrying once"
+                    )
+                    compiler_shot2_retry_prompt = self._build_compiler_tier0_retry_prompt(
+                        compiler_shot2_prompt,
+                        dag_mode=dag_mode,
                     )
                     self._save_to_disk(
-                        session_dir, 0, "sniper_shot2_retry_prompt", sniper_shot2_retry_prompt
+                        session_dir, 0, "compiler_shot2_retry_prompt", compiler_shot2_retry_prompt
                     )
-                    sniper_shot2_retry_response = analyst_call_fn(sniper_shot2_retry_prompt)
+                    compiler_shot2_retry_response = analyst_call_fn(compiler_shot2_retry_prompt)
                     total_api_calls += 1
                     self._save_to_disk(
-                        session_dir, 0, "sniper_shot2_retry_response", sniper_shot2_retry_response
+                        session_dir, 0, "compiler_shot2_retry_response", compiler_shot2_retry_response
                     )
-                    shot2_sniper = self._apply_patchplan_array(
-                        sniper_shot2_retry_response, script_ir, dialect_enum, prefix="s2r"
-                    )
+                    if dag_mode:
+                        shot2_compiler = self._apply_dag_compiler_response(
+                            compiler_shot2_retry_response, base_dag or {}, prefix="s2r"
+                        )
+                    else:
+                        shot2_compiler = self._apply_patchplan_array(
+                            compiler_shot2_retry_response, script_ir, dialect_enum, prefix="s2r"
+                        )
                 logger.info(
-                    f"[{self.query_id}] Sniper shot 2 (retry path): {len(shot2_sniper)} patches"
+                    f"[{self.query_id}] Compiler shot 2 (retry path): {len(shot2_compiler)} patches"
                 )
 
                 self._validate_and_benchmark_patches(
-                    shot2_sniper, db_path, session_dir, 2
+                    shot2_compiler, db_path, session_dir, 2
                 )
-                sniper_patches.extend(shot2_sniper)
+                compiler_patches.extend(shot2_compiler)
             else:
                 logger.info(
-                    f"[{self.query_id}] Sniper shot 2 skipped "
+                    f"[{self.query_id}] Compiler shot 2 skipped "
                     f"(no retryable syntax/error failures)"
                 )
 
         # ── Collect all results ────────────────────────────────────────
         all_final = list(sem_passed) + [
-            sp for sp in sniper_patches if sp.semantic_passed
+            sp for sp in compiler_patches if sp.semantic_passed
         ]
 
-        all_patches_full = patches + sniper_patches
+        all_patches_full = patches + compiler_patches
         iter_explains: Dict[str, str] = {
             p.patch_id: p.explain_text
             for p in all_patches_full
@@ -1443,14 +1961,14 @@ class BeamSession(OptimizationSession):
         }
         iter_result = PatchIterationResult(
             iteration=0,
-            prompt=dispatcher_prompt,
-            response=dispatcher_response,
+            prompt=analyst_prompt,
+            response=analyst_response,
             n_api_calls=total_api_calls,
             patches=all_patches_full,
             explains=iter_explains,
         )
 
-        # Find best across probes + sniper
+        # Find best across probes + compiler
         best_speedup = 0.0
         best_sql = self.original_sql
         best_transforms: List[str] = []
@@ -1509,6 +2027,8 @@ class BeamSession(OptimizationSession):
         db_path: str,
         session_dir: Path,
         shot: int,
+        dag_base: Optional[Dict[str, Any]] = None,
+        worker_call_fn_by_patch_id: Optional[Dict[str, Callable[[str], str]]] = None,
     ) -> int:
         """Retry workers once with structured gate feedback for Tier-1 failures."""
         max_retry_attempts = max(
@@ -1561,7 +2081,11 @@ class BeamSession(OptimizationSession):
                     f"worker_{patch.patch_id}_retry_prompt",
                     retry_prompt,
                 )
-                future = pool.submit(worker_call_fn, retry_prompt)
+                lane_call_fn = (
+                    (worker_call_fn_by_patch_id or {}).get(patch.patch_id)
+                    or worker_call_fn
+                )
+                future = pool.submit(lane_call_fn, retry_prompt)
                 futures[future] = (patch, retry_prompt)
 
             for future in as_completed(futures):
@@ -1581,13 +2105,16 @@ class BeamSession(OptimizationSession):
                     f"worker_{patch.patch_id}_retry_response",
                     retry_response,
                 )
-                output_sql = self._apply_wide_worker_response(
-                    retry_response, script_ir, dialect_enum
+                output_sql = self._apply_worker_response_compat(
+                    retry_response,
+                    script_ir,
+                    dialect_enum,
+                    dag_base=dag_base,
                 )
                 if not output_sql:
                     patch.status = "FAIL"
                     patch.semantic_passed = False
-                    patch.apply_error = "Retry failed: Failed to parse/apply PatchPlan"
+                    patch.apply_error = "Retry failed: Failed to parse/apply worker output"
                     patch.worker_prompt = retry_prompt
                     patch.worker_response = retry_response
                     continue
@@ -1619,6 +2146,8 @@ class BeamSession(OptimizationSession):
         response: str,
         script_ir,
         dialect_enum,
+        *,
+        dag_base: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Parse a wide worker's PatchPlan JSON and apply to IR → SQL.
 
@@ -1668,7 +2197,14 @@ class BeamSession(OptimizationSession):
                                 break
             return None
 
-        # Try JSON PatchPlan first
+        # DAG mode: parse DAG candidate first.
+        if dag_base is not None:
+            sql = self._apply_dag_worker_response(response, dag_base)
+            if sql and sql.strip():
+                return sql.strip()
+            return None
+
+        # PatchPlan mode: try JSON PatchPlan first
         try:
             plan_data = _extract_json_object(response)
             if plan_data and isinstance(plan_data, dict) and "steps" in plan_data:
@@ -1720,22 +2256,145 @@ class BeamSession(OptimizationSession):
 
         return None
 
+    def _apply_worker_response_compat(
+        self,
+        response: str,
+        script_ir,
+        dialect_enum,
+        dag_base: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Call worker apply path with backwards-compatible signature handling."""
+        try:
+            return self._apply_wide_worker_response(
+                response,
+                script_ir,
+                dialect_enum,
+                dag_base=dag_base,
+            )
+        except TypeError:
+            # Test monkeypatches may still use the legacy 3-arg signature.
+            return self._apply_wide_worker_response(
+                response,
+                script_ir,
+                dialect_enum,
+            )
+
     # ── Internal Methods ────────────────────────────────────────────────────
 
-    def _make_llm_call_fn(self, model_spec: Optional[str] = None) -> callable:
+    def _beam_llm_override(self) -> Tuple[Optional[str], Optional[str]]:
+        """Return BEAM-only provider/model overrides from config/env."""
+        cfg = getattr(self.pipeline, "config", None)
+        provider = ""
+        model = ""
+        if cfg is not None:
+            provider = str(getattr(cfg, "beam_llm_provider", "") or "").strip()
+            model = str(getattr(cfg, "beam_llm_model", "") or "").strip()
+
+        # Env wins over benchmark config when provided.
+        env_provider = str(os.environ.get("QT_BEAM_LLM_PROVIDER", "") or "").strip()
+        env_model = str(os.environ.get("QT_BEAM_LLM_MODEL", "") or "").strip()
+        if env_provider:
+            provider = env_provider
+        if env_model:
+            model = env_model
+
+        return (provider or None, model or None)
+
+    def _beam_qwen_llm_override(
+        self,
+        default_provider: Optional[str],
+        default_model: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Return qwen-lane provider/model overrides from config/env.
+
+        Falls back to BEAM default provider/model because qwen lane is the
+        baseline worker lane in mixed execution.
+        """
+        cfg = getattr(self.pipeline, "config", None)
+        provider = str(default_provider or "").strip()
+        model = str(default_model or "").strip()
+        if cfg is not None:
+            provider_cfg = str(
+                getattr(cfg, "beam_qwen_provider", "") or ""
+            ).strip()
+            model_cfg = str(
+                getattr(cfg, "beam_qwen_model", "") or ""
+            ).strip()
+            if provider_cfg:
+                provider = provider_cfg
+            if model_cfg:
+                model = model_cfg
+
+        env_provider = str(os.environ.get("QT_BEAM_QWEN_PROVIDER", "") or "").strip()
+        env_model = str(os.environ.get("QT_BEAM_QWEN_MODEL", "") or "").strip()
+        if env_provider:
+            provider = env_provider
+        if env_model:
+            model = env_model
+
+        return (provider or None, model or None)
+
+    def _beam_reasoner_llm_override(self) -> Tuple[Optional[str], Optional[str]]:
+        """Return reasoner-lane provider/model overrides from config/env."""
+        cfg = getattr(self.pipeline, "config", None)
+        provider = ""
+        model = ""
+        if cfg is not None:
+            provider = str(
+                getattr(cfg, "beam_reasoner_provider", "") or ""
+            ).strip()
+            model = str(
+                getattr(cfg, "beam_reasoner_model", "") or ""
+            ).strip()
+
+        env_provider = str(
+            os.environ.get("QT_BEAM_REASONER_PROVIDER", "") or ""
+        ).strip()
+        env_model = str(
+            os.environ.get("QT_BEAM_REASONER_MODEL", "") or ""
+        ).strip()
+        if env_provider:
+            provider = env_provider
+        if env_model:
+            model = env_model
+
+        return (provider or None, model or None)
+
+    @staticmethod
+    def _probe_hardness_score(probe: Any) -> Tuple[int, float]:
+        """Heuristic score for assigning hardest probes to reasoner lane."""
+        family = str(getattr(probe, "family", "") or "").upper()
+        transform = str(getattr(probe, "transform_id", "") or "").lower()
+        confidence = float(getattr(probe, "confidence", 0.0) or 0.0)
+        decorrelation_hit = (
+            family == "B"
+            or "decorrelate" in transform
+            or "de-correlate" in transform
+        )
+        return (1 if decorrelation_hit else 0, confidence)
+
+    def _make_llm_call_fn(
+        self,
+        provider_spec: Optional[str] = None,
+        model_spec: Optional[str] = None,
+    ) -> callable:
         """Create an LLM call function for a specific model.
 
         Args:
-            model_spec: Deprecated per-call override. Ignored when provided.
-                The global pipeline model is always used.
+            provider_spec: Optional per-call provider override.
+            model_spec: Optional per-call model override.
 
         Returns:
             Callable that takes prompt string, returns response string.
         """
         from ..generate import CandidateGenerator
 
-        effective_model = str(getattr(self.pipeline, "model", "") or "").strip()
-        effective_provider = str(getattr(self.pipeline, "provider", "") or "").strip()
+        effective_provider = str(
+            provider_spec or getattr(self.pipeline, "provider", "") or ""
+        ).strip()
+        effective_model = str(
+            model_spec or getattr(self.pipeline, "model", "") or ""
+        ).strip()
 
         if not effective_provider:
             raise RuntimeError(
@@ -1746,11 +2405,6 @@ class BeamSession(OptimizationSession):
             raise RuntimeError(
                 f"[{self.query_id}] Missing global LLM model. "
                 "Set QT_LLM_MODEL explicitly."
-            )
-        if model_spec and str(model_spec).strip() and str(model_spec).strip() != effective_model:
-            logger.info(
-                f"[{self.query_id}] Ignoring per-phase model override "
-                f"({model_spec}); using global model {effective_model}"
             )
 
         logger.info(
@@ -2093,6 +2747,15 @@ class BeamSession(OptimizationSession):
             "target_speedup": self.target_speedup,
             "llm_provider": self.pipeline.provider or "?",
             "llm_model": self.pipeline.model or "?",
+            "beam_llm_provider": getattr(self.pipeline.config, "beam_llm_provider", "") or "",
+            "beam_llm_model": getattr(self.pipeline.config, "beam_llm_model", "") or "",
+            "beam_qwen_workers": int(getattr(self.pipeline.config, "beam_qwen_workers", 8) or 0),
+            "beam_reasoner_workers": int(getattr(self.pipeline.config, "beam_reasoner_workers", 0) or 0),
+            "beam_qwen_provider": getattr(self.pipeline.config, "beam_qwen_provider", "") or "",
+            "beam_qwen_model": getattr(self.pipeline.config, "beam_qwen_model", "") or "",
+            "beam_reasoner_provider": getattr(self.pipeline.config, "beam_reasoner_provider", "") or "",
+            "beam_reasoner_model": getattr(self.pipeline.config, "beam_reasoner_model", "") or "",
+            "beam_edit_mode": getattr(self.pipeline.config, "beam_edit_mode", "patchplan"),
             "provider": self.pipeline.provider or "?",
             "semantic_validation_enabled": self.pipeline.config.semantic_validation_enabled,
             "semantic_sample_pct": self.pipeline.config.semantic_sample_pct,

@@ -3,6 +3,8 @@
 import logging
 import time
 
+from .rate_limit import llm_call_guard
+
 logger = logging.getLogger(__name__)
 
 # System prompt for optimization calls
@@ -59,32 +61,43 @@ class GroqClient:
 
         logger.debug("Sending request to Groq API (prompt=%d chars)", len(prompt))
         start_time = time.time()
+        with llm_call_guard():
+            client = Groq(api_key=self.api_key)
 
-        client = Groq(api_key=self.api_key)
+            request_params = {
+                "messages": [
+                    {"role": "system", "content": OPTIMIZATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "temperature": self.temperature,
+            }
 
-        request_params = {
-            "messages": [
-                {"role": "system", "content": OPTIMIZATION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-        }
+            # Add reasoning_effort for models that support it
+            if self.reasoning_effort and "deepseek" in self.model.lower():
+                request_params["reasoning_format"] = "parsed"
+                request_params["reasoning_effort"] = self.reasoning_effort
 
-        # Add reasoning_effort for models that support it
-        if self.reasoning_effort and "deepseek" in self.model.lower():
-            request_params["reasoning_format"] = "parsed"
-            request_params["reasoning_effort"] = self.reasoning_effort
+            # Enable JSON mode on supported models
+            if "reasoning_format" not in request_params:
+                request_params["response_format"] = {"type": "json_object"}
 
-        # Enable JSON mode on supported models
-        if "reasoning_format" not in request_params:
-            request_params["response_format"] = {"type": "json_object"}
-
-        chat_completion = client.chat.completions.create(**request_params)
+            chat_completion = client.chat.completions.create(**request_params)
 
         duration = time.time() - start_time
         response_text = chat_completion.choices[0].message.content
+        self.last_usage = {}
+        usage = getattr(chat_completion, "usage", None)
+        if usage:
+            self.last_usage = {
+                "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+            }
+            explicit_cost = getattr(usage, "cost", None)
+            if isinstance(explicit_cost, (int, float)):
+                self.last_usage["cost_usd"] = float(explicit_cost)
         logger.info(
             "Groq API response: model=%s, duration=%.2fs, response=%d chars",
             self.model, duration, len(response_text)

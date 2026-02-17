@@ -1,5 +1,6 @@
 """Tests for fleet orchestrator: _emit, wait_for_triage_approval, pause_event, triage logic."""
 
+import json
 import threading
 import time
 
@@ -73,6 +74,45 @@ class TestEmit:
         ev = bus.get_event(timeout=1.0)
         assert ev is not None
         assert ev.data["query_id"] == "q2"
+
+
+class TestRuntimeConfig:
+    def test_apply_runtime_config_overrides_db_and_policy(self, tmp_path):
+        from types import SimpleNamespace
+
+        cfg_path = tmp_path / ".fleet_runtime_config.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "source_mode": "local",
+                    "db_dsn": "postgresql://runtime-db",
+                    "explain_policy": "explain",
+                }
+            )
+        )
+
+        bus = EventBus()
+        pipeline = SimpleNamespace(
+            config=SimpleNamespace(
+                engine="duckdb",
+                db_path_or_dsn=":memory:",
+                benchmark_dsn=":memory:",
+            )
+        )
+        orch = FleetOrchestrator(
+            pipeline=pipeline,
+            benchmark_dir=tmp_path,
+            event_bus=bus,
+        )
+
+        orch._apply_runtime_config()
+
+        assert pipeline.config.db_path_or_dsn == "postgresql://runtime-db"
+        assert pipeline.config.benchmark_dsn == "postgresql://runtime-db"
+        assert getattr(pipeline.config, "explain_policy") == "explain"
+        ev = bus.get_event(timeout=1.0)
+        assert ev is not None
+        assert ev.type == EventType.EVENT_LOG
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +267,166 @@ class TestTriage:
         queries = {"q1": "SELECT * FROM big_table"}
         results = orch.triage(surveys, queries)
         assert results[0].sql == "SELECT * FROM big_table"
+
+
+class TestTriageHistory:
+    def test_triage_uses_prior_history_for_priority_and_seed(self, tmp_path):
+        from types import SimpleNamespace
+
+        prior_sql = "SELECT * FROM optimized_history"
+        session_dir = tmp_path / "beam_sessions" / "query_7_20260216_010203"
+        session_dir.mkdir(parents=True)
+        (session_dir / "iter0_result.txt").write_text(
+            json.dumps({"best_speedup": 1.8, "best_sql": prior_sql})
+        )
+
+        orch = FleetOrchestrator(
+            pipeline=SimpleNamespace(config=SimpleNamespace(engine="duckdb")),
+            benchmark_dir=tmp_path,
+        )
+        surveys = {"q7": SurveyResult(query_id="q7", runtime_ms=15000)}
+        queries = {"q7": "SELECT * FROM original_query"}
+
+        results = orch.triage(surveys, queries)
+        assert len(results) == 1
+        tri = results[0]
+        assert tri.seed_sql == prior_sql
+        assert tri.prior_best_sql == prior_sql
+        assert tri.prior_source == "beam_sessions"
+        # Base HIGH priority is 5.0 (tractability=0/bonus=0), history 1.8x => 9.0.
+        assert tri.priority_score == pytest.approx(9.0, rel=1e-6)
+
+    def test_triage_disables_history_when_runtime_config_says_off(self, tmp_path):
+        from types import SimpleNamespace
+
+        session_dir = tmp_path / "beam_sessions" / "query_8_20260216_010203"
+        session_dir.mkdir(parents=True)
+        (session_dir / "iter0_result.txt").write_text(
+            json.dumps({"best_speedup": 2.2, "best_sql": "SELECT * FROM prior"})
+        )
+        (tmp_path / ".fleet_runtime_config.json").write_text(
+            json.dumps({"use_blackboard_history": False})
+        )
+
+        orch = FleetOrchestrator(
+            pipeline=SimpleNamespace(config=SimpleNamespace(engine="duckdb")),
+            benchmark_dir=tmp_path,
+        )
+        surveys = {"query_8": SurveyResult(query_id="query_8", runtime_ms=15000)}
+        queries = {"query_8": "SELECT * FROM original_query"}
+
+        results = orch.triage(surveys, queries)
+        assert len(results) == 1
+        tri = results[0]
+        assert tri.seed_sql == "SELECT * FROM original_query"
+        assert tri.prior_best_sql == ""
+        assert tri.prior_best_speedup is None
+        assert tri.priority_score == pytest.approx(5.0, rel=1e-6)
+
+
+class TestExecuteHistory:
+    def test_execute_uses_original_sql_when_history_disabled(self, tmp_path):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        pipeline = MagicMock()
+        pipeline.config = SimpleNamespace(
+            engine="duckdb",
+            db_path_or_dsn=":memory:",
+            benchmark_dsn=":memory:",
+        )
+        pipeline.run_optimization_session.return_value = SimpleNamespace(
+            status="WIN",
+            best_speedup=1.2,
+        )
+        (tmp_path / ".fleet_runtime_config.json").write_text(
+            json.dumps({"use_blackboard_history": False})
+        )
+
+        orch = FleetOrchestrator(
+            pipeline=pipeline,
+            benchmark_dir=tmp_path,
+            concurrency=1,
+        )
+        triaged = [
+            TriageResult(
+                query_id="query_9",
+                sql="SELECT * FROM original_query",
+                bucket="HIGH",
+                priority_score=10.0,
+                max_iterations=1,
+                survey=SurveyResult(query_id="query_9", runtime_ms=11000),
+                seed_sql="SELECT * FROM prior_query",
+                prior_best_speedup=2.0,
+                prior_best_sql="SELECT * FROM prior_query",
+                prior_source="beam_sessions",
+            )
+        ]
+
+        out = tmp_path / "out"
+        out.mkdir()
+        results = orch.execute(
+            triaged=triaged,
+            completed_ids=set(),
+            out=out,
+            checkpoint_path=tmp_path / "checkpoint.json",
+        )
+
+        assert results[0]["status"] == "WIN"
+        assert pipeline.run_optimization_session.call_args.kwargs["sql"] == "SELECT * FROM original_query"
+
+    def test_execute_seeds_from_history_artifact_when_enabled(self, tmp_path):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        prior_sql = "SELECT * FROM optimized_seed"
+        session_dir = tmp_path / "beam_sessions" / "query_10_20260216_010203"
+        session_dir.mkdir(parents=True)
+        (session_dir / "iter0_result.txt").write_text(
+            json.dumps({"best_speedup": 1.6, "best_sql": prior_sql})
+        )
+        (tmp_path / ".fleet_runtime_config.json").write_text(
+            json.dumps({"use_blackboard_history": True})
+        )
+
+        pipeline = MagicMock()
+        pipeline.config = SimpleNamespace(
+            engine="duckdb",
+            db_path_or_dsn=":memory:",
+            benchmark_dsn=":memory:",
+        )
+        pipeline.run_optimization_session.return_value = SimpleNamespace(
+            status="WIN",
+            best_speedup=1.4,
+        )
+
+        orch = FleetOrchestrator(
+            pipeline=pipeline,
+            benchmark_dir=tmp_path,
+            concurrency=1,
+        )
+        triaged = [
+            TriageResult(
+                query_id="q10",
+                sql="SELECT * FROM original_query",
+                bucket="HIGH",
+                priority_score=10.0,
+                max_iterations=1,
+                survey=SurveyResult(query_id="q10", runtime_ms=11000),
+            )
+        ]
+
+        out = tmp_path / "out"
+        out.mkdir()
+        results = orch.execute(
+            triaged=triaged,
+            completed_ids=set(),
+            out=out,
+            checkpoint_path=tmp_path / "checkpoint.json",
+        )
+
+        assert results[0]["status"] == "WIN"
+        assert pipeline.run_optimization_session.call_args.kwargs["sql"] == prior_sql
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING
 if TYPE_CHECKING:
     from ..pipeline import Pipeline
     from .dashboard import FleetDashboard
+from .event_bus import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,7 @@ RUNTIME_THRESHOLDS = [
 RUNTIME_WEIGHTS = {"SKIP": 0, "LOW": 1, "MEDIUM": 3, "HIGH": 5}
 
 MAX_ITERS_BASE = {"SKIP": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+PRIOR_HISTORY_SPEEDUP_BONUS_CAP = 2.0
 
 
 # ── Data Classes ───────────────────────────────────────────────────────────
@@ -59,6 +62,23 @@ class TriageResult:
     priority_score: float
     max_iterations: int
     survey: SurveyResult
+    seed_sql: str = ""
+    prior_best_speedup: Optional[float] = None
+    prior_best_sql: str = ""
+    prior_source: str = ""
+    prior_reference: str = ""
+
+
+@dataclass
+class PriorOptimization:
+    """Best known historical optimization artifact for a query."""
+
+    query_id: str
+    best_speedup: float
+    best_sql: str
+    source: str
+    reference: str
+    updated_at: float
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────────
@@ -85,11 +105,275 @@ class FleetOrchestrator:
         self.triage_gate = triage_gate
         self.pause_event = pause_event
         self.benchmark_lock = threading.Lock()
+        self._prior_history_cache: Optional[Dict[str, PriorOptimization]] = None
 
-    def _emit(self, event_type, **data) -> None:
+    def _emit(self, event_type: EventType | str, **data) -> None:
         """Emit event to EventBus if attached."""
         if self.event_bus:
-            self.event_bus.emit(event_type, **data)
+            normalized = event_type
+            if isinstance(event_type, str):
+                try:
+                    normalized = EventType(event_type)
+                except ValueError:
+                    logger.warning("Fleet: unknown event type %r", event_type)
+            self.event_bus.emit(normalized, **data)
+
+    def _runtime_config_path(self) -> Path:
+        return self.benchmark_dir / ".fleet_runtime_config.json"
+
+    @staticmethod
+    def _canonical_query_id(query_id: str) -> str:
+        qid = str(query_id or "").strip().lower()
+        if not qid:
+            return ""
+        if qid.startswith("query_") or qid.startswith("query"):
+            return qid
+        if re.match(r"^q\d", qid):
+            return f"query_{qid[1:]}"
+        return qid
+
+    @staticmethod
+    def _compact_query_id(query_id: str) -> str:
+        qid = str(query_id or "").strip().lower()
+        if qid.startswith("query_"):
+            return f"q{qid[len('query_'):]}"
+        return qid
+
+    @staticmethod
+    def _parse_bool_flag(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _load_runtime_config(self) -> Dict[str, Any]:
+        path = self._runtime_config_path()
+        if not path.exists():
+            return {}
+        try:
+            cfg = json.loads(path.read_text())
+            return cfg if isinstance(cfg, dict) else {}
+        except Exception as e:
+            logger.warning("Fleet: failed to read runtime config: %s", e)
+            return {}
+
+    def _use_blackboard_history(self, cfg: Optional[Dict[str, Any]] = None) -> bool:
+        active_cfg = cfg if cfg is not None else self._load_runtime_config()
+        return self._parse_bool_flag(
+            active_cfg.get("use_blackboard_history"),
+            default=True,
+        )
+
+    @staticmethod
+    def _session_query_id_from_dirname(dirname: str) -> str:
+        # Expected patterns include query_88_YYYYMMDD_HHMMSS and q88_YYYYMMDD_HHMMSS.
+        return re.sub(r"_\d{8}_\d{6}$", "", dirname)
+
+    @staticmethod
+    def _safe_read_json(path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _relative_ref(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.benchmark_dir))
+        except Exception:
+            return str(path)
+
+    def _read_sql_file(self, path: Path) -> str:
+        try:
+            return path.read_text().strip()
+        except Exception:
+            return ""
+
+    def _worker_sql_path(self, query_dir: Path, worker_id: Any) -> Optional[Path]:
+        try:
+            wid = int(worker_id)
+        except Exception:
+            return None
+        candidates = [
+            query_dir / f"worker_{wid}_sql.sql",
+            query_dir / f"worker_{wid:02d}_sql.sql",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _record_prior_candidate(
+        self,
+        history: Dict[str, PriorOptimization],
+        query_id: str,
+        speedup: Any,
+        sql: str,
+        source: str,
+        reference: str,
+        updated_at: float,
+    ) -> None:
+        if not query_id:
+            return
+        qid = self._canonical_query_id(query_id)
+        if not qid:
+            return
+        try:
+            score = float(speedup)
+        except Exception:
+            return
+        if score <= 0:
+            return
+        normalized_sql = (sql or "").strip()
+        if not normalized_sql:
+            return
+
+        candidate = PriorOptimization(
+            query_id=qid,
+            best_speedup=score,
+            best_sql=normalized_sql,
+            source=source,
+            reference=reference,
+            updated_at=updated_at,
+        )
+        current = history.get(qid)
+        if current is None:
+            history[qid] = candidate
+            return
+        if candidate.best_speedup > current.best_speedup:
+            history[qid] = candidate
+            return
+        if (
+            abs(candidate.best_speedup - current.best_speedup) < 1e-9
+            and candidate.updated_at > current.updated_at
+        ):
+            history[qid] = candidate
+
+    def _load_prior_optimizations(self) -> Dict[str, PriorOptimization]:
+        if self._prior_history_cache is not None:
+            return self._prior_history_cache
+
+        history: Dict[str, PriorOptimization] = {}
+
+        # Beam session history (iter0_result.txt has best_speedup + best_sql).
+        beam_root = self.benchmark_dir / "beam_sessions"
+        if beam_root.exists():
+            for result_path in beam_root.glob("*/iter0_result.txt"):
+                payload = self._safe_read_json(result_path)
+                if not payload:
+                    continue
+                session_query_id = self._session_query_id_from_dirname(result_path.parent.name)
+                speedup = payload.get("best_speedup")
+                best_sql = str(payload.get("best_sql", "") or "")
+                self._record_prior_candidate(
+                    history=history,
+                    query_id=session_query_id,
+                    speedup=speedup,
+                    sql=best_sql,
+                    source="beam_sessions",
+                    reference=self._relative_ref(result_path),
+                    updated_at=result_path.stat().st_mtime,
+                )
+
+        # Swarm/blackboard history.
+        for batch_dir in self.benchmark_dir.glob("swarm_batch_*"):
+            if not batch_dir.is_dir():
+                continue
+            for query_dir in batch_dir.glob("query_*"):
+                if not query_dir.is_dir():
+                    continue
+                query_id = query_dir.name
+
+                # Prefer benchmark summaries for speedup, map worker -> SQL file.
+                for bench_path in query_dir.glob("benchmark_iter*.json"):
+                    payload = self._safe_read_json(bench_path)
+                    if not payload:
+                        continue
+                    speedup = payload.get("best_speedup")
+                    worker_id = payload.get("best_worker_id")
+                    sql_path = self._worker_sql_path(query_dir, worker_id)
+                    if not sql_path:
+                        for fallback_name in ("final_worker_sql.sql", "snipe_worker_sql.sql"):
+                            candidate = query_dir / fallback_name
+                            if candidate.exists():
+                                sql_path = candidate
+                                break
+                    if not sql_path:
+                        continue
+                    sql_text = self._read_sql_file(sql_path)
+                    self._record_prior_candidate(
+                        history=history,
+                        query_id=query_id,
+                        speedup=speedup,
+                        sql=sql_text,
+                        source=f"swarm_batch:{batch_dir.name}",
+                        reference=self._relative_ref(sql_path),
+                        updated_at=bench_path.stat().st_mtime,
+                    )
+
+                # Blackboard metadata fallback for runs missing benchmark_iter artifacts.
+                bb_raw = batch_dir / "blackboard" / "raw" / query_id
+                if bb_raw.exists():
+                    for worker_json in bb_raw.glob("worker_*.json"):
+                        payload = self._safe_read_json(worker_json)
+                        if not payload:
+                            continue
+                        speedup = payload.get("speedup")
+                        sql_path = self._worker_sql_path(
+                            query_dir,
+                            payload.get("worker_id"),
+                        )
+                        if not sql_path:
+                            continue
+                        sql_text = self._read_sql_file(sql_path)
+                        self._record_prior_candidate(
+                            history=history,
+                            query_id=query_id,
+                            speedup=speedup,
+                            sql=sql_text,
+                            source=f"blackboard:{batch_dir.name}",
+                            reference=self._relative_ref(worker_json),
+                            updated_at=worker_json.stat().st_mtime,
+                        )
+
+        self._prior_history_cache = history
+        logger.info("Fleet: loaded %d prior optimization records", len(history))
+        return history
+
+    def _apply_runtime_config(self) -> None:
+        cfg = self._load_runtime_config()
+        if not cfg:
+            return
+
+        db_dsn = str(cfg.get("db_dsn", "") or "").strip()
+        explain_policy = str(cfg.get("explain_policy", "") or "").strip()
+        source_mode = str(cfg.get("source_mode", "local") or "local").strip()
+
+        if db_dsn:
+            self.pipeline.config.db_path_or_dsn = db_dsn
+            self.pipeline.config.benchmark_dsn = db_dsn
+        if explain_policy:
+            setattr(self.pipeline.config, "explain_policy", explain_policy)
+
+        logger.info(
+            "Fleet: runtime config applied (mode=%s, db=%s, explain_policy=%s)",
+            source_mode,
+            "set" if db_dsn else "default",
+            explain_policy or "default",
+        )
+        self._emit(
+            EventType.EVENT_LOG,
+            scope="fleet",
+            target="Config",
+            msg=(
+                "Runtime config applied for execution: "
+                f"mode={source_mode}, "
+                f"db={'set' if db_dsn else 'default'}, "
+                f"policy={explain_policy or 'default'}"
+            ),
+            level="system",
+        )
 
     def wait_for_triage_approval(self, timeout: float = 3600) -> bool:
         """Block until the triage gate is set (browser clicks Approve). Returns True if approved."""
@@ -212,7 +496,12 @@ class FleetOrchestrator:
         if not sql:
             return None
         try:
-            return self.pipeline._get_explain(query_id, sql)
+            # Survey/triage is the pre-flight stage allowed to collect missing EXPLAINs.
+            return self.pipeline._get_explain(
+                query_id,
+                sql,
+                collect_if_missing=True,
+            )
         except Exception as e:
             logger.warning(f"[{query_id}] EXPLAIN collection failed: {e}")
             return None
@@ -248,20 +537,37 @@ class FleetOrchestrator:
         queries: Dict[str, str],
     ) -> List[TriageResult]:
         """Score and sort queries by optimization potential."""
+        cfg = self._load_runtime_config()
+        use_history = self._use_blackboard_history(cfg)
+        history = self._load_prior_optimizations() if use_history else {}
+
         results: List[TriageResult] = []
 
         for qid, sv in surveys.items():
             bucket = self._bucket_runtime(sv.runtime_ms)
-            priority = self._compute_priority(sv, bucket)
+            base_sql = queries.get(qid, "")
+            prior = history.get(self._canonical_query_id(qid))
+            prior_speedup = prior.best_speedup if prior else None
+            prior_sql = prior.best_sql if prior else ""
+            priority = self._compute_priority(
+                sv,
+                bucket,
+                prior_best_speedup=prior_speedup,
+            )
             max_iters = self._compute_max_iterations(bucket, sv.tractability)
 
             results.append(TriageResult(
                 query_id=qid,
-                sql=queries.get(qid, ""),
+                sql=base_sql,
                 bucket=bucket,
                 priority_score=priority,
                 max_iterations=max_iters,
                 survey=sv,
+                seed_sql=prior_sql or base_sql,
+                prior_best_speedup=prior_speedup,
+                prior_best_sql=prior_sql,
+                prior_source=prior.source if prior else "",
+                prior_reference=prior.reference if prior else "",
             ))
 
         # Sort descending by priority (HIGH first)
@@ -278,9 +584,20 @@ class FleetOrchestrator:
         return "HIGH"
 
     @staticmethod
-    def _compute_priority(sv: SurveyResult, bucket: str) -> float:
+    def _compute_priority(
+        sv: SurveyResult,
+        bucket: str,
+        prior_best_speedup: Optional[float] = None,
+    ) -> float:
         weight = RUNTIME_WEIGHTS[bucket]
-        return weight * (1.0 + sv.tractability + sv.structural_bonus)
+        base_priority = weight * (1.0 + sv.tractability + sv.structural_bonus)
+        if prior_best_speedup is None or prior_best_speedup <= 1.0:
+            return base_priority
+        bonus = min(
+            max(prior_best_speedup - 1.0, 0.0),
+            PRIOR_HISTORY_SPEEDUP_BONUS_CAP,
+        )
+        return base_priority * (1.0 + bonus)
 
     @staticmethod
     def _compute_max_iterations(bucket: str, tractability: int) -> int:
@@ -302,6 +619,21 @@ class FleetOrchestrator:
     ) -> List[Dict]:
         """Parallel LLM + serial benchmark execution."""
         from ..schemas import OptimizationMode
+
+        self._apply_runtime_config()
+        runtime_cfg = self._load_runtime_config()
+        use_history = self._use_blackboard_history(runtime_cfg)
+        history = self._load_prior_optimizations() if use_history else {}
+        self._emit(
+            EventType.EVENT_LOG,
+            scope="fleet",
+            target="Triage",
+            msg=(
+                "Prior optimization seeding "
+                f"{'enabled' if use_history else 'disabled'}."
+            ),
+            level="system",
+        )
 
         # Filter out SKIP and already completed queries
         work_items = [
@@ -329,6 +661,39 @@ class FleetOrchestrator:
 
         def _run_one(triage_item: TriageResult) -> tuple:
             qid = triage_item.query_id
+            seed_sql = triage_item.sql
+            seed_source = "original"
+            seed_speedup = None
+            seed_ref = ""
+
+            if use_history:
+                if triage_item.prior_best_sql:
+                    seed_sql = triage_item.prior_best_sql
+                    seed_source = triage_item.prior_source or "history"
+                    seed_speedup = triage_item.prior_best_speedup
+                    seed_ref = triage_item.prior_reference
+                else:
+                    prior = history.get(self._canonical_query_id(qid))
+                    if prior and prior.best_sql:
+                        seed_sql = prior.best_sql
+                        seed_source = prior.source
+                        seed_speedup = prior.best_speedup
+                        seed_ref = prior.reference
+
+            if seed_source != "original":
+                speed_txt = (
+                    f", prior={seed_speedup:.2f}x"
+                    if isinstance(seed_speedup, (int, float))
+                    else ""
+                )
+                ref_txt = f", ref={seed_ref}" if seed_ref else ""
+                self._emit(
+                    EventType.EVENT_LOG,
+                    scope="fleet",
+                    target=qid,
+                    msg=f"Seed SQL: {seed_source}{speed_txt}{ref_txt}",
+                    level="system",
+                )
 
             # Update dashboard
             if self.dashboard:
@@ -350,6 +715,13 @@ class FleetOrchestrator:
                     iteration=iteration + 1,
                     max_iterations=triage_item.max_iterations,
                 )
+                self._emit(
+                    EventType.EVENT_LOG,
+                    scope="fleet",
+                    target=qid,
+                    msg=f"Phase: {phase} (iter {iteration + 1}/{triage_item.max_iterations})",
+                    level="system",
+                )
 
             # Check pause gate before starting
             if self.pause_event:
@@ -357,7 +729,7 @@ class FleetOrchestrator:
 
             result = self.pipeline.run_optimization_session(
                 query_id=qid,
-                sql=triage_item.sql,
+                sql=seed_sql or triage_item.sql,
                 max_iterations=triage_item.max_iterations,
                 target_speedup=10.0,  # intentional: fleet always aims for 10x
                 mode=OptimizationMode.BEAM,
@@ -403,6 +775,14 @@ class FleetOrchestrator:
                         speedup=speedup,
                         completed=len(results), total=len(work_items),
                     )
+                    speed_txt = f" {speedup:.2f}x" if isinstance(speedup, (int, float)) else ""
+                    self._emit(
+                        EventType.EVENT_LOG,
+                        scope="fleet",
+                        target=qid,
+                        msg=f"Completed: {status_str}{speed_txt}",
+                        level=str(status_str).lower(),
+                    )
 
                     logger.info(
                         f"Fleet [{len(results)}/{len(work_items)}] "
@@ -426,6 +806,13 @@ class FleetOrchestrator:
                         query_id=qid, status="ERROR",
                         error=str(e)[:100],
                         completed=len(results), total=len(work_items),
+                    )
+                    self._emit(
+                        EventType.EVENT_LOG,
+                        scope="fleet",
+                        target=qid,
+                        msg=f"Error: {e}",
+                        level="error",
                     )
                     logger.error(f"Fleet {qid}: ERROR {e}")
 

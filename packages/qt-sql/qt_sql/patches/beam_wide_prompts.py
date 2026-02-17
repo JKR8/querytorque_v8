@@ -1,11 +1,11 @@
-"""Beam prompt builders — reasoning dispatcher + worker probes for BEAM mode.
+"""Beam prompt builders — analyst + worker probes for BEAM mode.
 
-Pipeline: R1 dispatcher (8-16 probes) → workers → (sniper handled by beam_prompt_builder).
+Pipeline: analyst (8-16 probes) → workers → compiler stage (beam_prompt_builder).
 
 Functions:
-    build_beam_dispatcher_prompt() — R1 analyst: hypothesis + 8-16 probes
-    build_beam_worker_prompt()     — qwen worker: one transform, PatchPlan out
-    parse_scout_response()         — parse dispatcher JSON response
+    build_beam_analyst_prompt()    — analyst: hypothesis + 8-16 probes
+    build_beam_worker_prompt()     — worker: one transform, DAG candidate out
+    parse_analyst_response()       — parse analyst JSON response
 """
 
 from __future__ import annotations
@@ -23,19 +23,18 @@ logger = logging.getLogger(__name__)
 
 EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
 PROMPT_TEMPLATES_DIR = (
-    Path(__file__).resolve().parent.parent / "prompts" / "samples" / "V3"
+    Path(__file__).resolve().parent.parent / "prompts" / "templates" / "V3"
 )
-IR_SCHEMA_REFERENCE = """## IR Patch Contract Reference
+IR_SCHEMA_REFERENCE = """## IR Node Map Reference
 - `S0` = top-level SELECT statement for this query mission.
-- Use `target: {"by_node_id": "S0"}` for all coarse-grained edits.
-- Use `by_anchor_hash` only for exact expression/predicate subtree edits.
 - Anchor hashes are parser-generated and formatting-stable; copy verbatim.
-- If anchor is ambiguous, prefer safe coarse ops (`replace_where_predicate`) or no-op."""
+- Use node ids/anchor hashes only as structural locators for downstream edits.
+- If a locator is ambiguous, prefer safer coarse targeting and preserve semantics."""
 
 
 @lru_cache(maxsize=8)
 def _load_prompt_template(filename: str) -> str:
-    """Load a prompt template from prompts/samples/V3."""
+    """Load a prompt template from prompts/templates/V3."""
     path = PROMPT_TEMPLATES_DIR / filename
     if not path.exists():
         logger.warning("Prompt template missing: %s", path)
@@ -258,9 +257,9 @@ def _format_gold_patch_hint(gold_patch_plan: Dict[str, Any]) -> List[str]:
     return lines
 
 
-# ── Beam Dispatcher Prompt (R1) ───────────────────────────────────────────────
+# ── Beam Analyst Prompt ───────────────────────────────────────────────────────
 
-def build_beam_dispatcher_prompt(
+def build_beam_analyst_prompt(
     query_id: str,
     original_sql: str,
     explain_text: str,
@@ -273,8 +272,8 @@ def build_beam_dispatcher_prompt(
     schema_context: str = "",
     engine_knowledge: str = "",
 ) -> str:
-    """Build dispatcher prompt from beam_dispatcher_v3 template + dynamic tail."""
-    template = _load_prompt_template("beam_dispatcher_v3.txt")
+    """Build analyst prompt from beam_analyst_v3 template + dynamic tail."""
+    template = _load_prompt_template("beam_analyst_v3.txt")
     stars = max(1, min(3, int(importance_stars or 1)))
     star_label = "*" * stars
 
@@ -294,8 +293,6 @@ def build_beam_dispatcher_prompt(
         ),
         f"## Original SQL\n```sql\n{original_sql}\n```",
         f"## Execution Plan\n```\n{explain_text}\n```",
-        IR_SCHEMA_REFERENCE,
-        f"## IR Structure + Anchor Hashes\n```\n{ir_node_map}\n```",
         _build_transform_catalog_section(dialect),
     ]
     if schema_context:
@@ -315,7 +312,7 @@ def build_beam_dispatcher_prompt(
     return "\n\n".join(
         [
             "## Role",
-            "You are the Beam Dispatcher. Return JSON with dispatch+hypothesis+probes+dropped.",
+            "You are the Beam Analyst. Return JSON with dispatch+hypothesis+probes+dropped.",
             "## Cache Boundary",
             "Everything below is query-specific input.",
         ]
@@ -323,9 +320,8 @@ def build_beam_dispatcher_prompt(
     )
 
 
-# Keep old names as aliases for backwards compatibility
-build_wide_analyst_prompt = build_beam_dispatcher_prompt
-build_wide_scout_prompt = build_beam_dispatcher_prompt
+build_wide_analyst_prompt = build_beam_analyst_prompt
+build_wide_scout_prompt = build_beam_analyst_prompt
 
 
 # ── Beam Worker Prompt (qwen) ─────────────────────────────────────────────────
@@ -346,7 +342,7 @@ def build_beam_worker_prompt(
     """Build worker prompt from beam_worker_v3 template + dynamic tail."""
     template = _load_prompt_template("beam_worker_v3.txt")
     lines = [
-        f"## Shared Dispatcher Hypothesis\n{hypothesis or '(none)'}",
+        f"## Shared Analyst Hypothesis\n{hypothesis or '(none)'}",
         (
             "## Runtime Dialect Contract\n"
             f"- target_dialect: {dialect}\n"
@@ -390,7 +386,7 @@ def build_beam_worker_prompt(
     else:
         lines.append("not provided")
     lines.append("")
-    lines.append("### Dispatcher Do-Not-Do")
+    lines.append("### Analyst Do-Not-Do")
     if do_not_do:
         for item in do_not_do[:8]:
             lines.append(f"- {item}")
@@ -422,7 +418,7 @@ def build_beam_worker_prompt(
         ]
     )
     if reasoning_trace:
-        lines.append("### Dispatcher Reasoning Trace")
+        lines.append("### Analyst Reasoning Trace")
         for item in reasoning_trace[:4]:
             lines.append(f"- {item}")
         lines.append("")
@@ -467,9 +463,9 @@ def build_beam_editor_strike_prompt(
     dialect: str = "postgres",
     schema_context: str = "",
 ) -> str:
-    """Build dedicated single-call Strike prompt for editor mode.
+    """Build dedicated single-call strike prompt for editor mode.
 
-    This path intentionally avoids dispatcher/scout overhead and injects one
+    This path intentionally avoids analyst overhead and injects one
     explicit transform target for the worker model.
     """
     template = _load_prompt_template("beam_strike_worker_v1.txt")
@@ -618,10 +614,10 @@ def _build_transform_catalog_section(dialect: str) -> str:
     return "\n".join(lines)
 
 
-# ── Parse Dispatcher Response ────────────────────────────────────────────────
+# ── Parse Reasoner Response ──────────────────────────────────────────────────
 
-def parse_scout_response(response: str) -> Optional[ScoutResult]:
-    """Parse the dispatcher's JSON response into a ScoutResult.
+def parse_analyst_response(response: str) -> Optional[ScoutResult]:
+    """Parse the analyst JSON response into a ScoutResult.
 
     Args:
         response: Raw LLM response text.
@@ -641,13 +637,13 @@ def parse_scout_response(response: str) -> Optional[ScoutResult]:
         if json_match:
             json_text = json_match.group(0).strip()
         else:
-            logger.warning("No JSON found in dispatcher response")
+            logger.warning("No JSON found in analyst response")
             return None
 
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse dispatcher JSON: {e}")
+        logger.warning(f"Failed to parse analyst JSON: {e}")
         return None
 
     dispatch = data.get("dispatch") if isinstance(data.get("dispatch"), dict) else {}

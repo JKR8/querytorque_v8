@@ -1,0 +1,272 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Cost spine dominated by repeated date_dim scans and nested loops across all three CTEs. Late filtering on date_dim causes full table scans. Decorrelating subqueries and pre-filtering dimensions should reduce row amplification.",
+    "reasoning_trace": [
+      "Nested loops dominate all three CTEs (ss/cs/ws) with high row amplification (e.g., 30→1811→54335)",
+      "Seq scans on date_dim occur despite selective d_month_seq filter due to late predicate application",
+      "Identical date_dim subquery executed 9 times across CTEs",
+      "Comma joins prevent optimal join ordering"
+    ],
+    "cost_spine": [
+      "Nested Loop (store_sales CTE) → Nested Loop (catalog_sales CTE) → Nested Loop (web_sales CTE)"
+    ],
+    "hotspots": [
+      {"op": "Seq Scan on date_dim", "why": "Late filter application", "evidence": "3 scans, 73049 rows each, total time ~1.4s"},
+      {"op": "Nested Loop", "why": "Row amplification", "evidence": "30→1811→54335 amplification in store_sales CTE"},
+      {"op": "Correlated subquery", "why": "Re-execution cost", "evidence": "d_month_seq subquery executed 9 times"}
+    ],
+    "do_not_do": [
+      "or_to_union (bitmap-or capable per PG guardrails)",
+      "materialize_cte (single-use CTEs block pushdown)",
+      "intersect_to_exists (no INTERSECT in query)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Replace correlated date_dim subquery with materialized CTE. Anchor: WHERE [554a3fe2201f4929] in ss_items",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_month_seq = (SELECT d_month_seq FROM date_dim WHERE d_date = '2001-06-06')"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "ss_item_rev"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Seq Scan → Index Scan on date_dim; subquery replaced by CTE join",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma join to explicit INNER JOIN in ss_items. Anchor: FROM clause",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_date IN (SELECT d_date FROM date_range_cte)"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "ss_item_rev"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Nested Loop → Hash Join; better cardinality estimates",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter item/customer into CTEs for all sales channels. Anchor: top-level WITH clause",
+      "node_contract": {
+        "from_must_include": ["item", "customer"],
+        "where_must_preserve": ["i_manager_id BETWEEN 42 AND 71", "c_birth_year BETWEEN 1985 AND 1991"],
+        "output_must_preserve": ["i_item_id", "c_birth_year"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Index Scan → Index Only Scan; reduced rows in nested loops",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Reuse date_range CTE across all sales channels. Anchor: top-level WITH clause",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq = (SELECT d_month_seq FROM date_dim WHERE d_date = '2001-06-06')"],
+        "output_must_preserve": ["d_date"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Runtime engine knowledge doesn't contraindicate CTE reuse; plan shows 9 identical subquery executions",
+      "confidence": 0.75,
+      "expected_explain_delta": "Eliminate 6 redundant date_dim subqueries",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales before joining dimensions. Anchor: FROM store_sales in ss_items",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_list_price BETWEEN 168 AND 197"],
+        "output_must_preserve": ["ss_item_sk", "c_customer_sk", "SUM(ss_ext_sales_price)"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "High row amplification (30→1811) suggests early aggregation could reduce join workload",
+      "confidence": 0.7,
+      "expected_explain_delta": "Nested Loop → HashAggregate earlier in plan",
+      "recommended_patch_ops": ["replace_body", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered item CTE for reuse. Anchor: top-level WITH clause",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_manager_id BETWEEN 42 AND 71"],
+        "output_must_preserve": ["i_item_id", "i_item_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Index Scan → CTE scan; avoid repeated filtering",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push ss_list_price filter into store_sales scan. Anchor: WHERE [554a3fe2201f4929]",
+      "node_contract": {
+        "where_must_preserve": ["ss_list_price BETWEEN 168 AND 197"],
+        "output_must_preserve": ["ss_item_sk", "ss_sold_date_sk", "ss_ext_sales_price"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Index Only Scan with index condition",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Decorrelate d_month_seq subquery in cs_items. Anchor: WHERE [1486ed692fcdf986]",
+      "node_contract": {
+        "where_must_preserve": ["d_date IN (SELECT d_date FROM date_range_cte)"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "cs_item_rev"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.87,
+      "expected_explain_delta": "SubPlan → CTE join; eliminate re-execution",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Materialize date_range as CTE. Anchor: top-level WITH clause",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_date = '2001-06-06'"],
+        "output_must_preserve": ["d_month_seq"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.83,
+      "expected_explain_delta": "Eliminate redundant d_month_seq subqueries",
+      "recommended_patch_ops": ["insert_cte", "replace_expr_subtree"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma join to INNER JOIN in ws_items. Anchor: FROM clause",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim"],
+        "where_must_preserve": ["ws_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "ws_item_rev"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.86,
+      "expected_explain_delta": "Nested Loop → Merge Join; better join ordering",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Pre-join filtered date_dim with store_sales. Anchor: FROM in ss_items",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_date IN (SELECT d_date FROM date_range_cte)"],
+        "output_must_preserve": ["ss_item_sk", "c_customer_sk", "ss_ext_sales_price"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.82,
+      "expected_explain_delta": "Seq Scan → Index Scan with reduced rows",
+      "recommended_patch_ops": ["replace_from", "wrap_query_with_cte"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate customer filters into single CTE. Anchor: top-level WITH clause",
+      "node_contract": {
+        "from_must_include": ["customer"],
+        "where_must_preserve": ["c_birth_year BETWEEN 1985 AND 1991"],
+        "output_must_preserve": ["c_customer_sk", "c_birth_year"]
+      },
+      "gates_checked": ["redundant_scan_elimination:PASS"],
+      "exploration": false,
+      "confidence": 0.84,
+      "expected_explain_delta": "Eliminate redundant customer scans",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Pre-filter date_dim and join with catalog_sales. Anchor: FROM in cs_items",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["cs_sold_date_sk = d_date_sk", "d_date IN (SELECT d_date FROM date_range_cte)"],
+        "output_must_preserve": ["cs_item_sk", "c_customer_sk", "cs_ext_sales_price"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:ABSENT"],
+      "exploration": false,
+      "confidence": 0.81,
+      "expected_explain_delta": "Reduce nested loop input rows",
+      "recommended_patch_ops": ["replace_from", "wrap_query_with_cte"]
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate sales channel scans (exploration). Anchor: top-level WITH clause",
+      "node_contract": {
+        "output_must_preserve": ["item_id", "birth_year", "ss_item_rev", "cs_item_rev", "ws_item_rev"]
+      },
+      "gates_checked": ["redundant_scan_elimination:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Identical aggregation patterns across channels; single-pass could reduce I/O despite PG guardrails",
+      "confidence": 0.65,
+      "expected_explain_delta": "Three CTEs → single CTE with CASE-based aggregation",
+      "recommended_patch_ops": ["replace_block_with_cte_pair"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "Guardrail: PostgreSQL bitmap-or capable"},
+    {"transform_id": "sf_sk_pushdown_multi_fact", "family": "A", "reason": "Engine contraindication: Snowflake-only transform"},
+    {"transform_id": "rollup_to_union_windowing", "family": "D", "reason": "No ROLLUP in query"}
+  ]
+}

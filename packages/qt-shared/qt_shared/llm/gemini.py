@@ -4,6 +4,8 @@ import logging
 import time
 from typing import Optional
 
+from .rate_limit import llm_call_guard
+
 logger = logging.getLogger(__name__)
 
 # System prompt for optimization calls
@@ -45,23 +47,39 @@ class GeminiAPIClient:
         logger.debug("Sending request to Gemini API (prompt=%d chars)", len(prompt))
         start_time = time.time()
 
-        genai.configure(api_key=self.api_key)
+        with llm_call_guard():
+            genai.configure(api_key=self.api_key)
 
-        generation_config = genai.types.GenerationConfig(
-            max_output_tokens=8192,
-            temperature=0.1,
-        )
+            generation_config = genai.types.GenerationConfig(
+                max_output_tokens=8192,
+                temperature=0.1,
+            )
 
-        model = genai.GenerativeModel(
-            self.model,
-            generation_config=generation_config,
-            system_instruction=OPTIMIZATION_SYSTEM_PROMPT,
-        )
+            model = genai.GenerativeModel(
+                self.model,
+                generation_config=generation_config,
+                system_instruction=OPTIMIZATION_SYSTEM_PROMPT,
+            )
 
-        response = model.generate_content(prompt)
+            response = model.generate_content(prompt)
 
         duration = time.time() - start_time
         response_text = response.text
+        self.last_usage = {}
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
+            completion_tokens = int(
+                getattr(usage, "candidates_token_count", 0) or 0
+            )
+            total_tokens = int(getattr(usage, "total_token_count", 0) or 0)
+            if total_tokens <= 0:
+                total_tokens = prompt_tokens + completion_tokens
+            self.last_usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
         logger.info(
             "Gemini API response: model=%s, duration=%.2fs, response=%d chars",
             self.model, duration, len(response_text)
@@ -105,14 +123,14 @@ class GeminiCLIClient:
 
         try:
             full_input = "SYSTEM: " + OPTIMIZATION_SYSTEM_PROMPT + "\n\n" + prompt
-
-            result = subprocess.run(
-                cmd,
-                input=full_input,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-            )
+            with llm_call_guard():
+                result = subprocess.run(
+                    cmd,
+                    input=full_input,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                )
 
             if result.returncode != 0:
                 error_msg = result.stderr or result.stdout or "Unknown error"

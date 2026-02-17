@@ -88,6 +88,8 @@ def prepare(
         os.environ["QT_ALLOW_INTELLIGENCE_BOOTSTRAP"] = "1"
 
     pipeline = Pipeline(bench_dir)
+    # Prepare is a pre-flight mode; allow EXPLAIN collection for missing cache entries.
+    pipeline.config.explain_policy = "explain"
 
     # Load scenario card if specified
     scenario_card = None

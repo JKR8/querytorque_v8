@@ -1,0 +1,284 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by sequential scans on returns tables (172k-509k rows) and repeated full scans of item table. Nested loops on large fact tables and expensive self-join of CTE materialization. Early filtering and CTE optimizations should reduce input sizes.",
+    "reasoning_trace": [
+      "Sequential scans on store_returns (172k rows), catalog_returns (157k rows), web_returns (50k rows) consume >15s",
+      "Item table scanned 3x (86k rows each) despite identical filter (i_category='Home')",
+      "CTE self-join (731x690 rows) uses comma join syntax blocking optimization",
+      "No date filters in UNION branches despite outer query needing only 1998-1999"
+    ],
+    "cost_spine": [
+      "Seq Scan store_returns → Hash Join → Nested Loop → Append",
+      "Seq Scan catalog_returns → Hash Join → Nested Loop → Append",
+      "CTE Scan curr_yr → Nested Loop → Sort"
+    ],
+    "hotspots": [
+      {"op": "Seq Scan store_returns", "why": "large unindexed scan", "evidence": "rows=172653, time=6092ms"},
+      {"op": "Seq Scan item", "why": "repeated full scans", "evidence": "3x scans, 735ms each"},
+      {"op": "Nested Loop self-join", "why": "CTE materialization cost", "evidence": "time=18011ms for 50 rows"}
+    ],
+    "do_not_do": [
+      "or_to_union (bitmap_or_scan strength)",
+      "intersect_to_exists (no INTERSECT in query)",
+      "inline_decorrelate_materialized (no correlated subqueries)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create filtered_item CTE with i_item_sk for i_category='Home', reference in all 3 UNION branches",
+      "node_contract": {
+        "from_must_include": ["item i"],
+        "where_must_preserve": ["i_category='Home'"],
+        "output_must_preserve": ["all original SELECT columns"]
+      },
+      "gates_checked": ["no_double_scan:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may not push CTE filters into UNION branches. Pre-materialized item keys should eliminate 3 full scans.",
+      "confidence": 0.75,
+      "expected_explain_delta": "Replace 3x Seq Scan item with CTE scans, reduce rows from 86k to filtered set",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push cr_reason_sk filter into catalog_returns CTE before join",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr"],
+        "where_must_preserve": ["cr_reason_sk IN (7,25,26,52,69)"],
+        "output_must_preserve": ["cs_quantity - COALESCE(cr_return_quantity,0)"]
+      },
+      "gates_checked": ["not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Reduce catalog_returns scan from 157k rows to filtered subset",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push sr_reason_sk filter into store_returns CTE before join",
+      "node_contract": {
+        "from_must_include": ["store_returns sr"],
+        "where_must_preserve": ["sr_reason_sk IN (7,25,26,52,69)"],
+        "output_must_preserve": ["ss_quantity - COALESCE(sr_return_quantity,0)"]
+      },
+      "gates_checked": ["not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Reduce store_returns scan from 172k rows to filtered subset",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push wr_reason_sk filter into web_returns CTE before join",
+      "node_contract": {
+        "from_must_include": ["web_returns wr"],
+        "where_must_preserve": ["wr_reason_sk IN (7,25,26,52,69)"],
+        "output_must_preserve": ["ws_quantity - COALESCE(wr_return_quantity,0)"]
+      },
+      "gates_checked": ["not_simple_exists:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Reduce web_returns scan from 50k rows to filtered subset",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Create date_range CTE with d_date_sk for d_year IN (1998,1999), join in UNION branches",
+      "node_contract": {
+        "from_must_include": ["date_dim d"],
+        "where_must_preserve": ["d_date_sk = {sales}.{sold_date_sk}"],
+        "output_must_preserve": ["d_year"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may not propagate CTE predicates to UNION branches. Pre-filtered dates should reduce fact scans.",
+      "confidence": 0.7,
+      "expected_explain_delta": "Replace date_dim scans with CTE, reduce joined rows via early filter",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert store_returns LEFT JOIN to INNER JOIN since sr_reason_sk filter nulls",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns"],
+        "where_must_preserve": ["ss_ticket_number=sr_ticket_number", "ss_item_sk=sr_item_sk"],
+        "output_must_preserve": ["ss_quantity - COALESCE(sr_return_quantity,0)"]
+      },
+      "gates_checked": ["null_elimination:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Change join type to Hash Join in store branch",
+      "recommended_patch_ops": ["replace_join_condition"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert catalog_returns LEFT JOIN to INNER JOIN since cr_reason_sk filter nulls",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": ["cs_order_number=cr_order_number", "cs_item_sk=cr_item_sk"],
+        "output_must_preserve": ["cs_quantity - COALESCE(cr_return_quantity,0)"]
+      },
+      "gates_checked": ["null_elimination:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Change join type to Hash Join in catalog branch",
+      "recommended_patch_ops": ["replace_join_condition"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert web_returns LEFT JOIN to INNER JOIN since wr_reason_sk filter nulls",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns"],
+        "where_must_preserve": ["ws_order_number=wr_order_number", "ws_item_sk=wr_item_sk"],
+        "output_must_preserve": ["ws_quantity - COALESCE(wr_return_quantity,0)"]
+      },
+      "gates_checked": ["null_elimination:PASS"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Change join type to Hash Join in web branch",
+      "recommended_patch_ops": ["replace_join_condition"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert final comma join to explicit INNER JOIN syntax",
+      "node_contract": {
+        "from_must_include": ["all_sales curr_yr", "all_sales prev_yr"],
+        "where_must_preserve": ["curr_yr.i_brand_id=prev_yr.i_brand_id", "curr_yr.i_class_id=prev_yr.i_class_id", "curr_yr.i_category_id=prev_yr.i_category_id", "curr_yr.i_manufact_id=prev_yr.i_manufact_id"],
+        "output_must_preserve": ["prev_yr_cnt", "curr_yr_cnt", "sales_cnt_diff"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.95,
+      "expected_explain_delta": "Enable better join planning for CTE self-join",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize curr_year and prev_year aggregates separately before join",
+      "node_contract": {
+        "from_must_include": ["all_sales"],
+        "where_must_preserve": ["d_year=1999", "d_year=1998"],
+        "output_must_preserve": ["sales_cnt", "sales_amt"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Split CTE into curr_yr_data and prev_yr_data materializations",
+      "recommended_patch_ops": ["insert_cte", "replace_block_with_cte_pair"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Push aggregation into each UNION branch before main aggregation",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "store_sales", "web_sales"],
+        "where_must_preserve": ["i_category='Home'", "{sales_price}/{list_price} BETWEEN 0.34 AND 0.54"],
+        "output_must_preserve": ["SUM(sales_cnt)", "SUM(sales_amt)"]
+      },
+      "gates_checked": ["aggregate_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-aggregating per channel may reduce rows before UNION",
+      "confidence": 0.65,
+      "expected_explain_delta": "Move Aggregates below UNION in plan",
+      "recommended_patch_ops": ["replace_body"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Combine item+date filters into single prefetch CTE for all branches",
+      "node_contract": {
+        "from_must_include": ["item i", "date_dim d"],
+        "where_must_preserve": ["i_category='Home'", "d_year IN (1998,1999)"],
+        "output_must_preserve": ["i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "d_year"]
+      },
+      "gates_checked": ["small_dimension:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension CTE may enable better join ordering",
+      "confidence": 0.6,
+      "expected_explain_delta": "Single dimension CTE scan instead of per-branch scans",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize pre-joined fact+dimension sets for each channel",
+      "node_contract": {
+        "from_must_include": ["{sales}", "item i", "date_dim d"],
+        "where_must_preserve": ["{sales}.{item_sk}=i.i_item_sk", "d_date_sk={sales}.{sold_date_sk}"],
+        "output_must_preserve": ["sales_cnt", "sales_amt"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-joined CTEs may reduce nested loop costs",
+      "confidence": 0.55,
+      "expected_explain_delta": "Replace Nested Loops with CTE scans in UNION branches",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push ratio filters into sales table scans",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": [
+          "cs_sales_price/cs_list_price BETWEEN 0.34 AND 0.54",
+          "ss_sales_price/ss_list_price BETWEEN 0.34 AND 0.54",
+          "ws_sales_price/ws_list_price BETWEEN 0.34 AND 0.54"
+        ],
+        "output_must_preserve": ["cs_quantity", "ss_quantity", "ws_quantity"]
+      },
+      "gates_checked": ["no_index_regression:PASS"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Apply ratio filters during table scans",
+      "recommended_patch_ops": ["replace_where_predicate"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "regression registry: bitmap-or capable"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "no INTERSECT in query"},
+    {"transform_id": "inline_decorrelate_materialized", "family": "B", "reason": "no correlated subqueries"}
+  ]
+}

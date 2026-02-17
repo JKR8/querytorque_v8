@@ -1,0 +1,238 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by Hash Join between catalog_sales (2.4M rows) and catalog_returns (2.1M rows) taking 183s. Nested loops amplify dimension scans. Late filtering on date_dim d1 causes full scan. Transform families A and F should reduce fact table rows via early dimension filtering and explicit join syntax.",
+    "reasoning_trace": [
+      "Merge Join (186s) between item scan and large Aggregate from Hash Join",
+      "Hash Join (183s) between seq-scanned catalog_sales and catalog_returns dominates runtime",
+      "Nested loops show index scans on dimensions but late d1 filter misses partition elimination",
+      "Comma joins in cross_sales CTE prevent optimal join reordering"
+    ],
+    "cost_spine": ["Hash Join → Merge Join → Nested Loop → Aggregate"],
+    "hotspots": [
+      {"op": "Hash Join", "why": "large fact tables with late filtering", "evidence": "rows=365923, time=183186ms"},
+      {"op": "Nested Loop", "why": "dimension scan amplification", "evidence": "rows=30779, time=206059ms"}
+    ],
+    "do_not_do": ["or_to_union (BITMAP_OR_SCAN strength)", "exists_to_materialized_cte (SEMI_JOIN_EXISTS strength)"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Add d1.d_year IN (1998,1999) to cross_sales CTE WHERE clause to enable early partition pruning",
+      "node_contract": {
+        "from_must_include": ["date_dim d1"],
+        "where_must_preserve": ["ss_sold_date_sk = d1.d_date_sk", "original GROUP BY d1.d_year"],
+        "output_must_preserve": ["d1.d_year as syear"]
+      },
+      "gates_checked": ["no_or_to_union:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "IndexScan on d1 with d_year condition, reduced rows in downstream joins",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "gold_example_id": "TPC-DS Q64"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_cd1 CTE with cd1.cd_marital_status/cd_education_status filters before cross_sales join",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1"],
+        "where_must_preserve": ["cd1.cd_demo_sk = ss_cdemo_sk", "cd1.cd_marital_status in ('M','U')", "cd1.cd_education_status in ('Unknown','Advanced Degree','College')"],
+        "output_must_preserve": ["all original cd1 columns used"]
+      },
+      "gates_checked": ["not_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension scan but may enable better join ordering with explicit CTE",
+      "confidence": 0.65,
+      "expected_explain_delta": "CTE scan replaces index scan, possible hash join elimination",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_cd2 CTE with cd2 filters before cross_sales join",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd2"],
+        "where_must_preserve": ["c_current_cdemo_sk = cd2.cd_demo_sk", "cd2.cd_marital_status in ('M','U')", "cd2.cd_education_status in ('Unknown','Advanced Degree','College')"],
+        "output_must_preserve": ["all original cd2 columns used"]
+      },
+      "gates_checked": ["not_unfiltered_cte:PASS"],
+      "exploration": true,
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced dimension scan before nested loop",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert cross_sales comma joins to explicit INNER JOIN..ON syntax",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "date_dim d1", "customer"],
+        "where_must_preserve": ["ss_store_sk = s_store_sk", "ss_sold_date_sk = d1.d_date_sk", "ss_customer_sk = c_customer_sk"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Improved join order with explicit syntax, better hash join selection",
+      "recommended_patch_ops": ["replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Isolate store_sales with ss_wholesale_cost filter in CTE before cross_sales joins",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 35 AND 55", "all original join conditions"],
+        "output_must_preserve": ["ss_item_sk", "ss_ticket_number", "ss_wholesale_cost"]
+      },
+      "gates_checked": ["no_double_scan:PASS"],
+      "exploration": true,
+      "confidence": 0.7,
+      "expected_explain_delta": "SeqScan on store_sales with early filter, reduced rows in HashJoin",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_promotion CTE with p_channel_* filters before cross_sales join",
+      "node_contract": {
+        "from_must_include": ["promotion"],
+        "where_must_preserve": ["ss_promo_sk = p_promo_sk", "p_channel_email='N'", "p_channel_tv='Y'", "p_channel_radio='N'"],
+        "output_must_preserve": ["all promotion columns used"]
+      },
+      "gates_checked": ["not_unfiltered_cte:PASS"],
+      "exploration": true,
+      "confidence": 0.68,
+      "expected_explain_delta": "BitmapScan on promotion replaced by CTE scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_item CTE with i_current_price filter before cross_sales join",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["ss_item_sk = i_item_sk", "i_current_price BETWEEN 26 AND 36"],
+        "output_must_preserve": ["i_product_name", "i_item_sk"]
+      },
+      "gates_checked": ["not_unfiltered_cte:PASS"],
+      "exploration": true,
+      "confidence": 0.75,
+      "expected_explain_delta": "IndexScan on item with price range, reduced rows",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create filtered_ad2 CTE with ad2.ca_state filter before cross_sales join",
+      "node_contract": {
+        "from_must_include": ["customer_address ad2"],
+        "where_must_preserve": ["c_current_addr_sk = ad2.ca_address_sk", "ad2.ca_state IN ('IA','IL','TX')"],
+        "output_must_preserve": ["ad2.ca_street_number", "ad2.ca_street_name", "ad2.ca_city", "ad2.ca_zip"]
+      },
+      "gates_checked": ["not_unfiltered_cte:PASS"],
+      "exploration": true,
+      "confidence": 0.72,
+      "expected_explain_delta": "Reduced ad2 scan before nested loop",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Isolate catalog_sales with cs_wholesale_cost filter in CTE before cs_ui join",
+      "node_contract": {
+        "from_must_include": ["catalog_sales"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["cs_item_sk", "cs_order_number", "cs_ext_list_price"]
+      },
+      "gates_checked": ["no_double_scan:PASS"],
+      "exploration": true,
+      "confidence": 0.6,
+      "expected_explain_delta": "SeqScan on catalog_sales with early filter",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create CTEs for all selective dimensions (d1, cd1, cd2, promotion, item, ad2) then join with facts",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales"],
+        "where_must_preserve": ["all original join conditions and filters"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension filtering may reduce fact table scans below optimizer threshold",
+      "confidence": 0.55,
+      "expected_explain_delta": "Multiple CTE scans replacing dimension tables, reduced fact rows",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Create CTEs for d2 and d3 even without filters to control join order",
+      "node_contract": {
+        "from_must_include": ["date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["c_first_sales_date_sk = d2.d_date_sk", "c_first_shipto_date_sk = d3.d_date_sk"],
+        "output_must_preserve": ["d2.d_year as fsyear", "d3.d_year as s2year"]
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "confidence": 0.5,
+      "expected_explain_delta": "Materialized CTE scans for d2/d3, possible join order improvement",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage 1: Filter dimensions. Stage 2: Join dimensions with store_sales. Stage 3: Join with remaining tables",
+      "node_contract": {
+        "from_must_include": ["store_sales", "filtered dimensions"],
+        "where_must_preserve": ["all original join conditions"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["max_2_chains:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Progressive reduction may overcome comma join limitations in complex star schema",
+      "confidence": 0.45,
+      "expected_explain_delta": "CTE chain with progressively smaller rowcounts, reduced nested loops",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR conditions in query"},
+    {"transform_id": "decorrelate", "family": "B", "reason": "No correlated subqueries detected"},
+    {"transform_id": "aggregate_pushdown", "family": "C", "reason": "No aggregation below join opportunity in cs_ui"}
+  ]
+}

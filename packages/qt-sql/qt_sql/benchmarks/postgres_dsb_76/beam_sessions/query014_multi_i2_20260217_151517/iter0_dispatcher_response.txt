@@ -1,0 +1,204 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 2,
+    "probe_count": 10,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Query performance suffers from repeated large scans of sales tables, expensive INTERSECT operations requiring full materialization/sorting, and comma-join inefficiencies. PostgreSQL's CTE materialization fences and comma-join weakness amplify costs. Early filtering, decorrelation, and join topology transforms should reduce row amplification.",
+    "reasoning_trace": [
+      "INTERSECT operations materialize large intermediate results from store/catalog/web sales",
+      "Comma joins in CTEs prevent optimal join ordering and predicate pushdown",
+      "Repeated date_dim/item scans with identical filters across channels",
+      "Late filtering on item after large fact table joins in cross_items CTE"
+    ],
+    "cost_spine": ["Scan store_sales → Scan catalog_sales → Scan web_sales → SetOp INTERSECT → Aggregate avg_sales → Scan store_sales (2x)"],
+    "hotspots": [
+      {"op": "SetOp INTERSECT", "why": "Full materialization/sorting of three large resultsets", "evidence": "N/A (no plan)"},
+      {"op": "Comma joins", "why": "Prevents join reordering and accurate cardinality estimation", "evidence": "N/A (no plan)"},
+      {"op": "Repeated dimension scans", "why": "Same date_dim/item filters scanned 6+ times", "evidence": "N/A (no plan)"}
+    ],
+    "do_not_do": ["or_to_union", "exists_to_in"]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs in cross_items subqueries. Pre-filter date_dim into CTE for d_year range.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_year BETWEEN 1999 AND 2001", "i_category IN ('Electronics','Shoes','Sports')", "i_manager_id BETWEEN 42 AND 51"],
+        "output_must_preserve": ["ss_item_sk", "brand_id", "class_id", "category_id"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Comma joins → explicit JOINs; date_dim scans → Index Scan using date_dim indexes",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Materialize filtered date_dim and item into CTEs before cross_items. Use in all fact table joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_year BETWEEN 1999 AND 2001", "i_category IN ('Electronics','Shoes','Sports')", "i_manager_id BETWEEN 42 AND 51"],
+        "output_must_preserve": ["ss_item_sk", "brand_id", "class_id", "category_id"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Large item/date_dim scans → small CTE scans; fact table joins become hash joins with tiny dimensions",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push item filters into cross_items subqueries. Remove redundant outer WHERE clause.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item"],
+        "where_must_preserve": ["i_category IN ('Electronics','Shoes','Sports')", "i_manager_id BETWEEN 42 AND 51"],
+        "output_must_preserve": ["ss_item_sk", "brand_id", "class_id", "category_id"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:PASS"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Late item filter → early filter; reduced rows before INTERSECT operations",
+      "recommended_patch_ops": ["replace_where_predicate", "delete_expr_subtree"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "target": "Replace INTERSECT with correlated EXISTS. Pre-materialize date_dim filtered keys.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item"],
+        "where_must_preserve": ["d_year BETWEEN 1999 AND 2001", "wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["ss_item_sk"]
+      },
+      "gates_checked": ["no_set_ops:FAIL"],
+      "exploration": true,
+      "exploration_hypothesis": "INTERSECT materialization dominates cost. EXISTS with precomputed keys may enable semi-join optimizations.",
+      "confidence": 0.75,
+      "expected_explain_delta": "SetOp INTERSECT → Nested Loop Semi Join; materialization/sorting eliminated",
+      "recommended_patch_ops": ["replace_body", "insert_cte"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create single CTE for shared item/date_dim filters. Reuse in store/catalog/web sales channels.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_year BETWEEN 1999 AND 2001", "i_category IN ('Electronics','Shoes','Sports')"],
+        "output_must_preserve": ["ss_item_sk", "brand_id", "class_id", "category_id"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:PASS"],
+      "exploration": true,
+      "confidence": 0.78,
+      "expected_explain_delta": "6+ dimension scans → 2 CTE scans; fact table scans reduced via early joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales in main query before joining with item/cross_items.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item"],
+        "where_must_preserve": ["ss_item_sk IN (cross_items)", "d_week_seq = ..."],
+        "output_must_preserve": ["i_brand_id", "i_class_id", "i_category_id", "SUM(ss_quantity*ss_list_price)"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:PASS"],
+      "exploration": false,
+      "confidence": 0.82,
+      "expected_explain_delta": "Large join → GroupAggregate before join; rows reduced 100-1000x before final join",
+      "recommended_patch_ops": ["replace_from", "wrap_query_with_cte_pair"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize base store_sales+item join for both years. Derive yearly aggregates separately.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_week_seq = ...", "ss_item_sk IN (cross_items)"],
+        "output_must_preserve": ["i_brand_id", "i_class_id", "i_category_id", "year", "SUM(ss_quantity*ss_list_price)"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.87,
+      "expected_explain_delta": "Two store_sales scans → one materialized scan; aggregates computed from CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_block_with_cte_pair"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert main query comma join to explicit INNER JOIN between this_year/last_year CTEs.",
+      "node_contract": {
+        "from_must_include": ["this_year", "last_year"],
+        "where_must_preserve": ["this_year.i_brand_id=last_year.i_brand_id", "this_year.i_class_id=last_year.i_class_id", "this_year.i_category_id=last_year.i_category_id"],
+        "output_must_preserve": ["ty_channel", "ty_brand", "ty_class", "ty_category", "ty_sales", "ty_number_sales", "ly_channel", "ly_brand", "ly_class", "ly_category", "ly_sales", "ly_number_sales"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS"],
+      "exploration": false,
+      "confidence": 0.90,
+      "expected_explain_delta": "Comma join → explicit JOIN; better join order optimization",
+      "recommended_patch_ops": ["replace_from", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize cross_items results before reuse in main query. Prevent redundant computation.",
+      "node_contract": {
+        "from_must_include": ["item", "x"],
+        "where_must_preserve": ["i_brand_id=brand_id", "i_class_id=class_id", "i_category_id=category_id"],
+        "output_must_preserve": ["ss_item_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:PASS"],
+      "exploration": false,
+      "confidence": 0.80,
+      "expected_explain_delta": "cross_items subplan → CTE scan; single materialization for multiple references",
+      "recommended_patch_ops": ["insert_cte"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate avg_sales UNION ALL branches into single scan with conditional aggregation.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_year BETWEEN 1999 AND 2001", "wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["AVG(quantity*list_price)"]
+      },
+      "gates_checked": ["redundant_scan_elimination:PASS"],
+      "exploration": true,
+      "confidence": 0.70,
+      "expected_explain_delta": "Three fact table scans → one scan; UNION ALL eliminated",
+      "recommended_patch_ops": ["replace_body"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "Regression registry: PostgreSQL bitmap-or capable"},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "Superseded by multi_intersect_exists_cte"},
+    {"transform_id": "decorrelate", "family": "B", "reason": "Less comprehensive than early_filter_decorrelate"}
+  ]
+}

@@ -1,0 +1,393 @@
+## Role
+
+You are a **Beam Worker** for SQL optimization on the target runtime dialect.
+
+You must apply **ONE specific transform** to the query and output a **PatchPlan JSON** that updates the query’s IR.
+
+One worker = one probe = one transform.
+
+---
+
+## Prompt Map (cache friendly)
+
+### Phase A — Cached Instructions (static)
+A1. Patch operations
+A2. Semantic guards (must preserve)
+A3. Anchor-hash rules (robustness requirements)
+A4. Verification checklist
+A5. PatchPlan output schema
+
+### Phase B — Probe-Specific Input (dynamic; after cache boundary)
+B1. Shared dispatcher hypothesis (short)
+B2. Probe assignment (transform + target + node contract + gates_checked)
+B3. Original SQL
+B4. Optional execution plan snippet
+B5. IR node map (S0 + anchor hashes)
+B6. Engine-specific knowledge profile (strengths, gaps, contraindications)
+
+---
+
+## Patch Operations (core + advanced)
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the full WHERE boolean expression | expr_sql |
+| replace_body | Replace entire query body | sql_fragment |
+| replace_expr_subtree | Replace a specific expression/predicate | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression/predicate | (target only, no payload) |
+| replace_join_condition | Replace a specific JOIN condition expression | expr_sql (+ by_anchor_hash) |
+| replace_select | Replace SELECT projection list | sql_fragment |
+| replace_block_with_cte_pair | Replace block using CTE-integrated SQL fragment | sql_fragment |
+| wrap_query_with_cte | Add wrapper CTE to statement | cte_name, cte_query_sql |
+
+All step targets MUST use: `{"by_node_id": "S0"}`.
+Use `by_anchor_hash` only when replacing/deleting a specific predicate/expression.
+
+Target examples:
+- Statement-level edit:
+  `{"by_node_id": "S0"}`
+- Predicate-subtree edit:
+  `{"by_node_id": "S0", "by_anchor_hash": "ab12cd34ef56ab78"}`
+
+---
+
+## Semantic Guards (MUST preserve)
+
+- Preserve ALL WHERE/HAVING/ON conditions exactly, unless the assigned transform explicitly replaces a correlated subquery with an equivalent join/anti-join.
+- Do NOT change any literal values (numbers, strings, dates, arithmetic forms).
+- Preserve SELECT columns, aliases, ORDER BY, LIMIT exactly.
+- Do NOT add new filters.
+- Do NOT leave orphaned CTEs or duplicate base scans after replacement.
+- Follow dispatcher `node_contract` precisely.
+
+If `node_contract` or `gates_checked` is missing or ambiguous:
+- Output a minimal safe failure PatchPlan with `steps: []` and hypothesis explaining what is missing.
+
+If a RETRY section is present with a gate-failure object:
+- Fix the specific gate issue first (do not redesign the transform intent).
+- Preserve all semantic guards while correcting only what failed.
+
+---
+
+## Anchor-hash rules (robustness)
+
+- `by_anchor_hash` values are produced by an external parser and are **whitespace/formatting independent**.
+- You MUST copy anchor hashes verbatim; never invent hashes.
+- If you cannot confidently identify the exact target anchor, do not use `replace_expr_subtree`.
+  Prefer `replace_where_predicate`, or output a safe no-op plan.
+
+---
+
+## Verification Checklist (self-check)
+
+- [ ] Patch steps produce a valid executable query
+- [ ] No missing tables/aliases
+- [ ] No duplicated source scans (orphan risk)
+- [ ] EXISTS / NOT EXISTS semantics preserved if rewritten
+- [ ] No same-column OR to UNION split unless EXPLAIN evidence shows OR blocks index usage and UNION branches become index scans
+- [ ] New CTEs are selective (meaningful WHERE) unless transform requires otherwise
+
+---
+
+## PatchPlan Output Schema (MUST follow)
+
+Tier-0 output contract:
+- first character must be `{` (no leading whitespace/newlines)
+- top-level value must be one JSON object
+- no markdown fences, no prose, no commentary
+
+Output JSON shape:
+{
+  "probe_id": "p01",
+  "transform_id": "decorrelate_not_exists_to_cte",
+  "family": "B",
+  "dialect": "<target_dialect>",
+  "hypothesis": "1 sentence: why this transform should reduce the plan hotspot",
+  "reasoning_trace": [
+    "Target correlated NOT EXISTS on customer_demographics",
+    "Replace per-row re-execution with one anti-join-ready CTE"
+  ],
+  "target_ir": "Short structural description of the post-patch query shape",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_customers",
+        "cte_query_sql": "SELECT c_customer_sk FROM customer WHERE c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Worked example (fully valid output):
+{
+  "probe_id": "p07",
+  "transform_id": "decorrelate_exists_to_semijoin_cte",
+  "family": "B",
+  "dialect": "postgres",
+  "hypothesis": "Replace correlated EXISTS with a precomputed distinct keyset so the planner uses one set-based join instead of per-row subquery execution.",
+  "reasoning_trace": [
+    "The EXISTS subquery depends only on customer key.",
+    "A DISTINCT keyset CTE preserves EXISTS semantics and removes repeated inner work."
+  ],
+  "target_ir": "CTE keyset plus semijoin in FROM; original non-EXISTS filters preserved in WHERE.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "store_buyers",
+        "cte_query_sql": "SELECT DISTINCT ss_customer_sk AS customer_sk FROM store_sales WHERE ss_list_price BETWEEN 80 AND 169"
+      }
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "from_sql": "customer c JOIN store_buyers sb ON sb.customer_sk = c.c_customer_sk"
+      }
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "expr_sql": "c.c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Rules:
+- Steps must be minimal and sufficient.
+- Every SQL fragment in payload MUST be complete and executable (no ellipsis).
+- Prefer `insert_cte` + `replace_from` + `replace_where_predicate` over `replace_body` unless necessary.
+- Never emit `payload.sql`; use `payload.sql_fragment` for replace_body/replace_select/replace_block_with_cte_pair.
+
+---
+
+## Cache Boundary
+Everything below is probe-specific input.
+
+## Shared Dispatcher Hypothesis
+The cost spine is dominated by sequential scans on store_sales (245s) and CTE materialization (258s) due to full-table scans without date range filtering. Transform families A (early filtering) and E (materialization) should push date filters into CTEs and reduce fact table scans.
+## Runtime Dialect Contract
+- target_dialect: postgres
+- runtime_dialect_is_source_of_truth: true
+- if static examples conflict, follow runtime dialect behavior
+## Probe Assignment
+- transform_id: date_cte_explicit_join
+- family: F
+- target: Convert comma join to explicit INNER JOIN in wss CTE. Add filtered date_dim CTE for d_month_seq 1183-1206.
+- phase: ?
+- exploration: no
+- dialect: postgres
+- recommended_patch_ops: `replace_from`, `insert_cte`
+- expected_explain_delta: Hash join instead of nested loop; better cardinality estimates
+- equivalence_tier: unordered
+
+### Gates Checked
+comma_join_weakness:PASS
+
+### Node Contract
+
+```json
+{
+  "from_must_include": [
+    "store_sales",
+    "date_dim"
+  ],
+  "where_must_preserve": [
+    "d_date_sk = ss_sold_date_sk",
+    "price ratio filter"
+  ],
+  "output_must_preserve": [
+    "d_week_seq",
+    "ss_store_sk",
+    "all aggregates"
+  ]
+}
+```
+
+### Original SQL
+
+```sql
+with wss as
+ (select d_week_seq,
+        ss_store_sk,
+        sum(case when (d_day_name='Sunday') then ss_sales_price else null end) sun_sales,
+        sum(case when (d_day_name='Monday') then ss_sales_price else null end) mon_sales,
+        sum(case when (d_day_name='Tuesday') then ss_sales_price else  null end) tue_sales,
+        sum(case when (d_day_name='Wednesday') then ss_sales_price else null end) wed_sales,
+        sum(case when (d_day_name='Thursday') then ss_sales_price else null end) thu_sales,
+        sum(case when (d_day_name='Friday') then ss_sales_price else null end) fri_sales,
+        sum(case when (d_day_name='Saturday') then ss_sales_price else null end) sat_sales
+ from store_sales,date_dim
+ where d_date_sk = ss_sold_date_sk
+ and ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 85 * 0.01
+ group by d_week_seq,ss_store_sk
+ )
+  select  s_store_name1,s_store_id1,d_week_seq1
+       ,sun_sales1/sun_sales2,mon_sales1/mon_sales2
+       ,tue_sales1/tue_sales2,wed_sales1/wed_sales2,thu_sales1/thu_sales2
+       ,fri_sales1/fri_sales2,sat_sales1/sat_sales2
+ from
+ (select s_store_name s_store_name1,wss.d_week_seq d_week_seq1
+        ,s_store_id s_store_id1,sun_sales sun_sales1
+        ,mon_sales mon_sales1,tue_sales tue_sales1
+        ,wed_sales wed_sales1,thu_sales thu_sales1
+        ,fri_sales fri_sales1,sat_sales sat_sales1
+  from wss,store,date_dim d
+  where d.d_week_seq = wss.d_week_seq and
+        ss_store_sk = s_store_sk and
+        d_month_seq between 1183 and 1183 + 11
+        and s_state in ('AR','GA','IN'
+                    ,'KS','KY','OH','SD','VA')
+        ) y,
+ (select s_store_name s_store_name2,wss.d_week_seq d_week_seq2
+        ,s_store_id s_store_id2,sun_sales sun_sales2
+        ,mon_sales mon_sales2,tue_sales tue_sales2
+        ,wed_sales wed_sales2,thu_sales thu_sales2
+        ,fri_sales fri_sales2,sat_sales sat_sales2
+  from wss,store,date_dim d
+  where d.d_week_seq = wss.d_week_seq and
+        ss_store_sk = s_store_sk and
+        d_month_seq between 1183+ 12 and 1183 + 23
+        and s_state in ('AR','GA','IN'
+                    ,'KS','KY','OH','SD','VA')) x
+ where s_store_id1=s_store_id2
+   and d_week_seq1=d_week_seq2-52
+ order by s_store_name1,s_store_id1,d_week_seq1
+limit 100;
+```
+
+### Current IR Node Map
+
+```
+S0 [SELECT]
+  CTE: wss  (via CTE_Q_S0_wss)
+    FROM: store_sales, date_dim
+    WHERE [57528f4c700e359a]: d_date_sk = ss_sold_date_sk AND ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 85 * 0.01
+    GROUP BY: d_week_seq, ss_store_sk
+  MAIN QUERY (via Q_S0)
+    FROM: (subquery) y, (subquery) x
+    WHERE [0b824afb49a292d0]: s_store_id1 = s_store_id2 AND d_week_seq1 = d_week_seq2 - 52
+    ORDER BY: s_store_name1, s_store_id1, d_week_seq1
+
+Patch operations (core+advanced): insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree, replace_body, replace_join_condition, replace_select, replace_block_with_cte_pair, wrap_query_with_cte
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+### Dispatcher Reasoning Trace
+- Sequential scan on store_sales processes 4M rows in 245s
+- CTE wss materialization takes 258s without date range filtering
+- Late date_dim filtering occurs after aggregation in main query
+- Comma joins prevent predicate pushdown optimization
+
+### Schema / Index / Stats Context
+- source: postgres
+- referenced_tables: 3
+
+| Table | Rows(est) | PK | Indexes |
+|-------|-----------|----|---------|
+| date_dim | 73049 | d_date_sk | date_dim_pkey, _dta_index_date_dim_6_661577395__k7_k4_k9_k1, _dta_index_date_dim_6_661577395__k7_k9_k1, _dta_index_date_dim_6_661577395__k1_k7_k9, _dta_index_date_dim_6_661577395__k7_k11_k1, _dta_index_date_dim_6_661577395__k9_k7_k1 |
+| store | 102 | s_store_sk | store_pkey, _dta_index_store_6_885578193__k1_2_6, _dta_index_store_6_885578193__k25_k1 |
+| store_sales | 28806628 | ss_item_sk, ss_ticket_number | store_sales_pkey, _dta_index_store_sales_6_1333579789__k1_k23_k14_k6_k8_k5_k7_3_4, _dta_index_store_sales_6_1333579789__k1_k5_k8_k3_11_13_14_20, _dta_index_store_sales_6_1333579789__k1_k3_k10_k4_k8_9_16_23, _dta_index_store_sales_6_1333579789__k4_1_3_10_11_14, _dta_index_store_sales_6_1333579789__k1_k3_k10_k4_k8_23 |
+
+### Engine-Specific Knowledge
+## Dialect Profile (POSTGRES)
+
+**Combined Intelligence Baseline**: Combined intelligence baseline from 53 validated DSB queries at SF5-SF10, plus regression registry outcomes. PostgreSQL has bitmap index scans, JIT compilation, and aggressive CTE materialization. Techniques that work on DuckDB often regress here.
+
+### Optimizer Strengths (don't fight these)
+- `BITMAP_OR_SCAN`: Avoid splitting OR conditions into UNION ALL by default. Only consider OR→UNION when EXPLAIN shows OR blocks index usage and UNION branches become index scans. 0.21x and 0.26x reg…
+- `SEMI_JOIN_EXISTS`: NEVER convert EXISTS to IN/NOT IN or materialized CTEs. 0.50x, 0.75x observed. Note: NOT EXISTS anti-join decorrelation can still be valid when replacing large correlated anti patterns.
+- `INNER_JOIN_REORDERING`: Don't restructure INNER JOIN orders. Focus on LEFT JOIN blocking or comma-join confusion.
+- `INDEX_ONLY_SCAN`: Small dimension lookups (<10K rows) may not need CTEs.
+
+### Known Gaps (exploit these)
+- `COMMA_JOIN_WEAKNESS` [HIGH] detect: FROM t1, t2, t3 WHERE t1.key = t2.key (comma joins, no explicit JOIN). Poor row estimates in EXPLAIN. | action: Convert comma-joins to explicit JOIN...ON syntax. Best when combined with date_cte_isolate.
+- `CORRELATED_SUBQUERY_PARALYSIS` [HIGH] detect: Nested loop in EXPLAIN, inner re-executes aggregate per outer row. SQL: WHERE col > (SELECT AGG FROM ... WHERE outer.key = inner.key). Hash… | action: Convert correlated WHERE to explicit CTE with GROUP BY + JOIN.
+- `NON_EQUI_JOIN_INPUT_BLINDNESS` [HIGH] detect: Expensive non-equi join (BETWEEN, <, >) with large inputs on both sides. Neither side filtered. | action: Reduce fact table input size via filtered CTE before the non-equi join.
+- `CTE_MATERIALIZATION_FENCE` [MEDIUM] detect: Large CTE + small post-filter. Multi-referenced CTE that blocks predicate pushdown. | action: Materialize STRATEGICALLY: only when CTE is expensive and reused. Avoid fencing single-use cases.
+- `CROSS_CTE_PREDICATE_BLINDNESS` [MEDIUM] detect: Sequential scan on dimension table without index condition. Late filter after large scan/join. | action: Pre-filter into CTE definition. But be more cautious than on DuckDB.
+
+### Transform Recipe
+- `transform_id`: `date_cte_explicit_join`
+- `family`: `F`
+- `principle`: Dimension Isolation + Explicit Joins: materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma-separated joins to explicit JOIN syntax. On PostgreSQL, the combination enables better hash join planning with a tiny probe table.
+- `expected_features`: `AGG_SUM`, `BETWEEN`, `CASE_EXPR`, `DATE_DIM`, `GROUP_BY`
+
+### Gold Pattern Reference
+- `plan_id`: `gold_postgres_pg_explicit_join_materialized`
+- `step_ops`: insert_cte -> insert_cte+replace_from -> insert_cte+replace_from -> insert_cte+replace_from -> replace_from -> delete_expr_subtree
+- `ctes`: `date_subquery_cte`
+- Reuse pattern shape, not literal table/column names.
+
+
+## RETRY — Gate failure feedback (attempt 2/2)
+Your previous patch failed validation. Return a corrected PatchPlan JSON only.
+First character must be `{` and output must contain no markdown/prose.
+
+### Failure Object
+```json
+{
+  "probe_id": "p03",
+  "transform_id": "date_cte_explicit_join",
+  "gate": "tier1_structural",
+  "status": "FAIL",
+  "error": "Tier-1: LITERAL MISMATCH: Original literals missing from rewrite \u2014 strings: ['AR', 'GA', 'IN', 'KS', 'KY'], numbers: ['11.0', '12.0']. The rewrite changed filter values instead of preserving them."
+}
+```
+
+### Failed SQL (from attempt 1)
+```sql
+WITH wss AS (SELECT d_week_seq, ss_store_sk, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales, date_dim WHERE d_date_sk = ss_sold_date_sk AND ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 85 * 0.01 GROUP BY d_week_seq, ss_store_sk), filtered_date_dim AS (SELECT d_date_sk, d_week_seq FROM date_dim WHERE d_month_seq BETWEEN 1183 AND 1183 + 23) SELECT s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / sun_sales2, mon_sales1 / mon_sales2, tue_sales1 / tue_sales2, wed_sales1 / wed_sales2, thu_sales1 / thu_sales2, fri_sales1 / fri_sales2, sat_sales1 / sat_sales2 FROM store_sales AS ss JOIN filtered_date_dim AS dd ON dd.d_date_sk = ss.ss_sold_date_sk WHERE s_store_id1 = s_store_id2 AND d_week_seq1 = d_week_seq2 - 52 ORDER BY s_store_name1, s_store_id1, d_week_seq1 LIMIT 100;
+```
+
+### Previous Worker Output (attempt 1)
+```
+{
+  "probe_id": "p01",
+  "transform_id": "date_cte_explicit_join",
+  "family": "F",
+  "dialect": "postgres",
+  "hypothesis": "Isolate date_dim filtering into a CTE and convert comma joins to explicit JOINs to enable better cardinality estimation and hash join planning.",
+  "reasoning_trace": [
+    "The wss CTE currently performs a comma join between store_sales and date_dim without early date filtering.",
+    "This causes full table scans on store_sales (28M rows) and inefficient materialization of wss.",
+    "Adding a filtered date_dim CTE for d_month_seq 1183-1206 will reduce rows before aggregation.",
+    "Converting the comma join in wss to an explicit INNER JOIN improves PostgreSQL's join planning."
+  ],
+  "target_ir": "CTE-filtered date_dim joined explicitly in wss; comma joins replaced with INNER JOINs in main query subqueries.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_date_dim",
+        "cte_query_sql": "SELECT d_date_sk, d_week_seq FROM date_dim WHERE d_month_seq BETWEEN 1183 AND 1183 + 23"
+      }
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "from_sql": "store_sales ss JOIN filtered_date_dim dd ON dd.d_date_sk = ss.ss_sold_date_sk"
+      }
+    }
+  ]
+}
+```
+
+Fix only what caused the gate failure while preserving transform intent and semantics.
+Output ONLY valid PatchPlan JSON.
+Never emit payload.sql; use payload.sql_fragment where SQL fragments are required.

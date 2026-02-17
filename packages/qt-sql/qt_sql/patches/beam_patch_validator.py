@@ -519,13 +519,18 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
     Returns:
         Parsed list of dicts, or None on failure.
     """
+    def _is_patchplan_array(value: Any) -> bool:
+        if not isinstance(value, list):
+            return False
+        return all(isinstance(item, dict) for item in value)
+
     # Strip markdown code fences if present
     text = text.strip()
 
     # Try direct parse first (fast path)
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, list):
+        if _is_patchplan_array(parsed):
             return parsed
     except json.JSONDecodeError:
         pass
@@ -535,21 +540,19 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
     if fenced:
         try:
             parsed = json.loads(fenced.group(1))
-            if isinstance(parsed, list):
+            if _is_patchplan_array(parsed):
                 return parsed
         except json.JSONDecodeError:
             pass
 
-    # Find the first '[' and its matching ']' using bracket counting
-    start = text.find('[')
-    if start == -1:
-        return None
-
-    depth = 0
+    # Scan all bracketed arrays and return the first list[dict] candidate.
+    # This avoids false captures like based_on: ["p12"] from an object response.
     in_string = False
     escape = False
-    for i in range(start, len(text)):
-        c = text[i]
+    array_start: Optional[int] = None
+    depth = 0
+
+    for i, c in enumerate(text):
         if escape:
             escape = False
             continue
@@ -561,19 +564,26 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
             continue
         if in_string:
             continue
+
         if c == '[':
-            depth += 1
-        elif c == ']':
-            depth -= 1
             if depth == 0:
-                candidate = text[start:i + 1]
+                array_start = i
+            depth += 1
+            continue
+
+        if c == ']':
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and array_start is not None:
+                candidate = text[array_start:i + 1]
                 try:
                     parsed = json.loads(candidate)
-                    if isinstance(parsed, list):
+                    if _is_patchplan_array(parsed):
                         return parsed
                 except json.JSONDecodeError:
                     pass
-                break
+                array_start = None
 
     return None
 

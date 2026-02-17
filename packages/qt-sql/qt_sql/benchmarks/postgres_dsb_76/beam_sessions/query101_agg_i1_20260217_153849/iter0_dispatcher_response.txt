@@ -1,0 +1,275 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 14,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by nested loops joining large fact tables (store_sales/store_returns/web_sales) with dimensions. Late filtering on date ranges and inefficient comma-join syntax prevent predicate pushdown and join reordering. Early dimension filtering via CTEs and explicit joins should reduce row amplification.",
+    "reasoning_trace": [
+      "Nested loops consume 99.9% of execution time (205s) with high row amplification",
+      "d1 filter applied early (122 rows) but d2 range condition applied late in nested loop",
+      "Comma-join syntax blocks PostgreSQL's join reordering (COMMA_JOIN_WEAKNESS gap)",
+      "Multiple selective dimensions (item, hd, ca) filtered after large joins"
+    ],
+    "cost_spine": [
+      "Nested Loop → Nested Loop → Gather → Nested Loop → Nested Loop → Hash Join"
+    ],
+    "hotspots": [
+      {"op": "Nested Loop", "why": "Row amplification from fact-dimension joins", "evidence": "time=205203.511ms, rows=0"},
+      {"op": "Hash Join", "why": "Late filtering on date_dim and item", "evidence": "rows=117487, time=34155.251ms"}
+    ],
+    "do_not_do": [
+      "or_to_union (no OR conditions)",
+      "decorrelate (no correlated subqueries)",
+      "materialize_cte (no repeated scans)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs for selective dimensions (d1, item, hd, ca) with filters, then rewrite FROM clause with explicit INNER JOINs",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "web_sales", "d1_cte", "d2_cte", "item_cte", "customer", "ca_cte", "hd_cte"],
+        "where_must_preserve": ["ss_ticket_number = sr_ticket_number", "ss_customer_sk = ws_bill_customer_sk", "ss_sales_price/ss_list_price BETWEEN 0.35 AND 0.55"],
+        "output_must_preserve": ["c_customer_sk", "c_first_name", "c_last_name", "count(*)"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "cte_materialization_fence:CAUTION"],
+      "exploration": false,
+      "confidence": 0.92,
+      "expected_explain_delta": "Bitmap scans on fact tables, reduced rows in Hash Join",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize d1 (d_year=1998) and d2 as CTEs, convert date joins to explicit INNER JOINs",
+      "node_contract": {
+        "from_must_include": ["d1_cte", "d2_cte"],
+        "where_must_preserve": ["sr_returned_date_sk = d1_cte.d_date_sk", "ws_sold_date_sk = d2_cte.d_date_sk", "d2_cte.d_date BETWEEN d1_cte.d_date AND (d1_cte.d_date + interval '90 day')"],
+        "output_must_preserve": ["All original columns"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT"],
+      "exploration": false,
+      "confidence": 0.88,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join between d1_cte and fact tables",
+      "recommended_patch_ops": ["insert_cte", "replace_join_condition"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter item table (category IN) into CTE before joining with store_sales",
+      "node_contract": {
+        "from_must_include": ["item_cte"],
+        "where_must_preserve": ["i_item_sk = ss_item_sk"],
+        "output_must_preserve": ["ss_item_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate may work since item filter is selective (12k rows) and PostgreSQL handles small CTEs well",
+      "confidence": 0.75,
+      "expected_explain_delta": "Reduced rows in Hash Join (item_cte vs item scan)",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Create d1_cte (d_year=1998) and d2_range CTE (joined with d1_cte for BETWEEN condition)",
+      "node_contract": {
+        "from_must_include": ["d1_cte", "d2_range"],
+        "where_must_preserve": ["sr_returned_date_sk = d1_cte.d_date_sk", "ws_sold_date_sk = d2_range.d_date_sk"],
+        "output_must_preserve": ["d1.d_date_sk", "d2.d_date_sk"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:EXPLOIT"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-materializing date range may bypass PostgreSQL's non-equi join blindness",
+      "confidence": 0.68,
+      "expected_explain_delta": "Elimination of d2 range condition in final nested loop",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create hd_cte (income_band_sk/buy_potential) and ca_cte (state) CTEs shared across store/web channels",
+      "node_contract": {
+        "from_must_include": ["hd_cte", "ca_cte"],
+        "where_must_preserve": ["c_current_hdemo_sk = hd_cte.hd_demo_sk", "c_current_addr_sk = ca_cte.ca_address_sk"],
+        "output_must_preserve": ["c_customer_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "confidence": 0.7,
+      "expected_explain_delta": "Faster dimension scans via CTE materialization",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_customer_sk before joining with customer",
+      "node_contract": {
+        "from_must_include": ["ss_agg"],
+        "where_must_preserve": ["ss_agg.ss_customer_sk = c_customer_sk"],
+        "output_must_preserve": ["c_customer_sk", "count(*)"]
+      },
+      "gates_checked": ["aggregate_below_join_blindness:CAUTION"],
+      "exploration": true,
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced rows in customer join (Nested Loop → Index Scan)",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage reduction: CTE1 = store_returns JOIN d1_cte, CTE2 = CTE1 JOIN store_sales",
+      "node_contract": {
+        "from_must_include": ["cte2"],
+        "where_must_preserve": ["ss_ticket_number = sr_ticket_number"],
+        "output_must_preserve": ["ss_customer_sk", "ss_item_sk"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": true,
+      "confidence": 0.72,
+      "expected_explain_delta": "Elimination of separate date_dim scans in nested loops",
+      "recommended_patch_ops": ["insert_cte", "replace_block_with_cte_pair"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered store_sales (price ratio condition) before dimension joins",
+      "node_contract": {
+        "from_must_include": ["ss_filtered"],
+        "where_must_preserve": ["ss_filtered.ss_item_sk = i_item_sk"],
+        "output_must_preserve": ["ss_item_sk", "ss_customer_sk"]
+      },
+      "gates_checked": ["non_equi_join_input_blindness:EXPLOIT"],
+      "exploration": false,
+      "confidence": 0.85,
+      "expected_explain_delta": "Reduced rows in Hash Join (ss_filtered vs store_sales)",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push d1.d_date_sk filter into store_returns CTE definition",
+      "node_contract": {
+        "from_must_include": ["sr_filtered"],
+        "where_must_preserve": ["sr_filtered.sr_item_sk = ss_item_sk"],
+        "output_must_preserve": ["sr_ticket_number"]
+      },
+      "gates_checked": ["predicate_transitivity_failure:EXPLOIT"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate may work since date_dim filter is selective (122 rows)",
+      "confidence": 0.6,
+      "expected_explain_delta": "Earlier index scan on store_returns using sr_returned_date_sk",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize customer+address+hd join into CTE before fact joins",
+      "node_contract": {
+        "from_must_include": ["cust_cte"],
+        "where_must_preserve": ["ss_customer_sk = cust_cte.c_customer_sk"],
+        "output_must_preserve": ["c_customer_sk", "c_first_name", "c_last_name"]
+      },
+      "gates_checked": ["cte_materialization_fence:CAUTION"],
+      "exploration": false,
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduced loops in customer Nested Loop",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert all comma-joins to explicit INNER JOIN syntax",
+      "node_contract": {
+        "from_must_include": ["store_sales INNER JOIN store_returns", "INNER JOIN web_sales"],
+        "where_must_preserve": ["ss_ticket_number = sr_ticket_number", "ss_customer_sk = ws_bill_customer_sk"],
+        "output_must_preserve": ["All join semantics"]
+      },
+      "gates_checked": ["comma_join_weakness:EXPLOIT"],
+      "exploration": false,
+      "confidence": 0.9,
+      "expected_explain_delta": "Better join order in EXPLAIN",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate fact scans into single CTE with CASE-based channel aggregation",
+      "node_contract": {
+        "from_must_include": ["unified_sales"],
+        "where_must_preserve": ["unified_sales.customer_sk = c_customer_sk"],
+        "output_must_preserve": ["count(*)"]
+      },
+      "gates_checked": ["redundant_scan_elimination:EXPLOIT"],
+      "exploration": true,
+      "confidence": 0.55,
+      "expected_explain_delta": "Fewer table scans in cost spine",
+      "recommended_patch_ops": ["insert_cte", "replace_body"]
+    },
+    {
+      "probe_id": "p13",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Materialize d1 and d2 as CTEs with surrogate keys only",
+      "node_contract": {
+        "from_must_include": ["d1_keys", "d2_keys"],
+        "where_must_preserve": ["sr_returned_date_sk = d1_keys.d_date_sk", "ws_sold_date_sk = d2_keys.d_date_sk"],
+        "output_must_preserve": ["d_date_sk"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:CAUTION"],
+      "exploration": true,
+      "confidence": 0.78,
+      "expected_explain_delta": "Tiny hash tables for date joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p14",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Pre-filter household_demographics and push into CTE before customer join",
+      "node_contract": {
+        "from_must_include": ["hd_filtered"],
+        "where_must_preserve": ["c_current_hdemo_sk = hd_filtered.hd_demo_sk"],
+        "output_must_preserve": ["hd_demo_sk"]
+      },
+      "gates_checked": ["correlated_subquery_paralysis:ABSENT"],
+      "exploration": false,
+      "confidence": 0.87,
+      "expected_explain_delta": "Faster Nested Loop via small hd CTE",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "reason": "No OR conditions in query"},
+    {"transform_id": "decorrelate", "reason": "No correlated subqueries"},
+    {"transform_id": "intersect_to_exists", "reason": "No INTERSECT operations"}
+  ]
+}

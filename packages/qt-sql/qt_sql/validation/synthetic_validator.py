@@ -8,10 +8,10 @@ Ported from research/synthetic_validator/validator.py.
 """
 
 import argparse
+from collections import deque
 import hashlib
 import logging
-import os
-import tempfile
+import time
 
 import sqlglot
 from sqlglot import exp
@@ -19,7 +19,8 @@ import duckdb
 import random
 import string
 from datetime import datetime, timedelta
-from typing import Dict, List, Set, Tuple, Any, Optional
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Any, Optional, Callable
 import json
 import re
 import math
@@ -314,6 +315,10 @@ def find_primary_key_column(table_name: str, column_names: List[str]) -> Optiona
     # Weak-signal fallback only if this table has exactly one key-like column.
     if best_score <= 0 and len(key_candidates) > 1:
         return None
+    # Multi-key fact-like tables (e.g., *_sales, *_returns) often have no
+    # single PK in query-projected columns; avoid forcing one on weak signal.
+    if len(key_candidates) > 1 and best_score < 8:
+        return None
     return lower_to_original[chosen]
 
 
@@ -449,9 +454,16 @@ class SchemaExtractor:
             return 'INTEGER'
         
         # Numeric columns - be careful not to match date-related columns
-        if any(num_col in col_lower for num_col in ['qty', 'quantity', 'number']):
+        if any(num_col in col_lower for num_col in ['qty', 'quantity', 'number', 'count', 'seq', 'year', 'month', 'day', 'week']):
             return 'INTEGER'
-        elif any(num_col in col_lower for num_col in ['amt', 'amount', 'price', 'cost', 'fee', 'tax', 'discount', 'profit', 'loss']):
+        elif any(
+            num_col in col_lower
+            for num_col in [
+                'amt', 'amount', 'price', 'cost', 'fee', 'tax', 'discount', 'profit', 'loss',
+                'cash', 'credit', 'charge', 'sales', 'revenue', 'total', 'net', 'gross',
+                'wholesale', 'list', 'coupon', 'return', 'ratio', 'rate', 'margin'
+            ]
+        ):
             return 'DECIMAL(18,2)'
         # 'sales' and 'revenue' should be numeric, but 'sales_date' should be date (handled above)
         elif col_lower.endswith('sales') or col_lower.endswith('revenue'):
@@ -483,6 +495,45 @@ class SyntheticDataGenerator:
         self.foreign_key_values = {}  # Store FK values for referential integrity
         self.filter_matched_values = {}  # Store PK values that match common filters
         self.fk_anchor_values = {}  # Stable FK subsets to improve multi-fact overlap
+        # Tracked per-table join-key columns used for composite FK correlation.
+        self.table_column_values: Dict[str, Dict[str, List[Any]]] = {}
+        self.table_primary_keys: Dict[str, str] = {}
+        self.fk_anchor_row_indexes: Dict[str, List[int]] = {}
+
+    @staticmethod
+    def _is_join_key_col(col_name: str) -> bool:
+        col_lower = col_name.lower()
+        if col_lower.endswith('_sk') or col_lower.endswith('_id') or col_lower == 'id':
+            return True
+        if col_lower.endswith('_order_number') or col_lower.endswith('_ticket_number'):
+            return True
+        return col_lower in {'order_number', 'ticket_number'}
+
+    def _row_year_from_date_fk(
+        self,
+        foreign_keys: Dict[str, Tuple[str, str]],
+        row_context: Optional[Dict[str, Any]],
+    ) -> Optional[int]:
+        if not row_context:
+            return None
+        for _child_col, (parent_table, _parent_col) in foreign_keys.items():
+            parent_lower = str(parent_table).lower()
+            is_date_parent = (
+                parent_lower == "date_dim"
+                or (parent_lower.endswith("_dim") and "date" in parent_lower)
+            )
+            if not is_date_parent:
+                continue
+            parent_idx = row_context.get(f"__parent_row_idx__:{parent_table}")
+            if parent_idx is None:
+                continue
+            years = self.table_column_values.get(parent_table, {}).get("d_year")
+            if years and 0 <= int(parent_idx) < len(years):
+                try:
+                    return int(years[int(parent_idx)])
+                except (TypeError, ValueError):
+                    return None
+        return None
         
     def generate_table_data(self, table_name: str, schema: Dict, row_count: int = 1000, 
                            foreign_keys: Dict = None):
@@ -503,23 +554,36 @@ class SyntheticDataGenerator:
         # values on non-PK key-like columns.
         pk_col = find_primary_key_column(table_name, col_names)
         
-        # Generate rows
-        rows = []
-        for i in range(row_count):
-            row = []
-            for col_name in col_names:
-                col_info = columns[col_name]
-                value = self._generate_value(
-                    col_name,
-                    col_info['type'],
-                    i,
-                    row_count,
-                    foreign_keys,
-                    table_name,
-                    primary_key_col=pk_col,
-                )
-                row.append(value)
-            rows.append(tuple(row))
+        # Generate rows with table-local deterministic RNG so changing row count
+        # of one table doesn't perturb data generation in other tables.
+        seed_input = f"{table_name}|{row_count}"
+        seed = int(hashlib.sha256(seed_input.encode("utf-8")).hexdigest()[:16], 16)
+        prior_rng = self.random
+        self.random = random.Random(seed)
+        try:
+            rows = []
+            fk_cols = [c for c in col_names if c.lower() in foreign_keys]
+            non_fk_cols = [c for c in col_names if c.lower() not in foreign_keys]
+            generation_cols = fk_cols + non_fk_cols
+            for i in range(row_count):
+                row_ctx: Dict[str, Any] = {}
+                row_values: Dict[str, Any] = {}
+                for col_name in generation_cols:
+                    col_info = columns[col_name]
+                    value = self._generate_value(
+                        col_name,
+                        col_info['type'],
+                        i,
+                        row_count,
+                        foreign_keys,
+                        table_name,
+                        primary_key_col=pk_col,
+                        row_context=row_ctx,
+                    )
+                    row_values[col_name] = value
+                rows.append(tuple(row_values[c] for c in col_names))
+        finally:
+            self.random = prior_rng
         
         # Bulk insert using VALUES clause (790x faster than executemany on DuckDB)
         batch_size = 500
@@ -540,6 +604,16 @@ class SyntheticDataGenerator:
                         vals.append(str(v))
                 values_parts.append('(' + ', '.join(vals) + ')')
             self.conn.execute(f"INSERT INTO {table_name} ({col_list}) VALUES {', '.join(values_parts)}")
+
+        # Track join-key columns so children can reuse coherent parent row combos.
+        tracked_cols: Dict[str, List[Any]] = {}
+        for col_idx, col_name in enumerate(col_names):
+            is_pk = bool(pk_col and col_name.lower() == pk_col.lower())
+            if not is_pk and not self._is_join_key_col(col_name):
+                continue
+            tracked_cols[col_name.lower()] = [row[col_idx] for row in rows]
+        if tracked_cols:
+            self.table_column_values[table_name] = tracked_cols
         
         # Store PK values for this table so other tables can reference them as FKs.
         if pk_col:
@@ -548,24 +622,40 @@ class SyntheticDataGenerator:
             col_idx = col_names.index(pk_col)
             for row in rows:
                 self.foreign_key_values[table_name].append(row[col_idx])
+            self.table_primary_keys[table_name] = pk_col.lower()
             
             # For dimension tables, also track which PK values match common filter conditions
             self._track_filter_matched_values(table_name, pk_col, col_names, rows)
     
     def _parse_decimal_type(self, col_type: str) -> Dict:
         """Parse DECIMAL(precision, scale) to extract precision and scale."""
-        if 'DECIMAL' in col_type.upper():
-            match = re.search(r'DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', col_type.upper())
-            if match:
-                return {
-                    'precision': int(match.group(1)),
-                    'scale': int(match.group(2))
-                }
-        return None
+        upper = (col_type or "").upper()
+        if "DECIMAL" not in upper:
+            return None
+
+        # DECIMAL(p, s)
+        match_full = re.search(r"DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", upper)
+        if match_full:
+            return {
+                "precision": int(match_full.group(1)),
+                "scale": int(match_full.group(2)),
+            }
+
+        # DECIMAL(p)
+        match_single = re.search(r"DECIMAL\s*\(\s*(\d+)\s*\)", upper)
+        if match_single:
+            return {
+                "precision": int(match_single.group(1)),
+                "scale": 0,
+            }
+
+        # Bare DECIMAL default for synthetic generation.
+        return {"precision": 18, "scale": 2}
     
     def _generate_value(self, col_name: str, col_type: str, row_idx: int, total_rows: int,
                        foreign_keys: Dict = None, table_name: str = None,
-                       primary_key_col: Optional[str] = None):
+                       primary_key_col: Optional[str] = None,
+                       row_context: Optional[Dict[str, Any]] = None):
         """Generate a single synthetic value."""
         col_name_lower = col_name.lower()
         pk_lower = primary_key_col.lower() if primary_key_col else None
@@ -662,15 +752,73 @@ class SyntheticDataGenerator:
         fk_target = foreign_keys.get(col_name_lower)
         if fk_target:
             target_table, target_col = fk_target
+            target_col_lower = str(target_col).lower()
+            parent_row_key = f"__parent_row_idx__:{target_table}"
+            target_lower = target_table.lower()
+            is_temporal_dim = (
+                target_lower in {'date_dim', 'time_dim'}
+                or ('date' in target_lower and target_lower.endswith('_dim'))
+                or ('time' in target_lower and target_lower.endswith('_dim'))
+            )
+
+            # Composite-key correlation: for multiple child columns pointing to
+            # one parent table, pin all to the same parent row in this output row.
+            parent_tracked_cols = self.table_column_values.get(target_table, {})
+            tracked_target_vals = parent_tracked_cols.get(target_col_lower)
+            if tracked_target_vals:
+                if is_temporal_dim:
+                    return self.random.choice(tracked_target_vals)
+
+                parent_idx = row_context.get(parent_row_key) if row_context else None
+                if parent_idx is None:
+                    same_parent_fk_count = sum(
+                        1 for _child_col, (parent_t, _parent_c) in foreign_keys.items()
+                        if parent_t == target_table
+                    )
+                    # For composite joins (e.g., order_number + item_sk), cover
+                    # the full parent domain to maximize matching combinations.
+                    if same_parent_fk_count > 1:
+                        matched_parent_pks = self.filter_matched_values.get(target_table, [])
+                        pk_col_lower = self.table_primary_keys.get(target_table)
+                        pk_vals = parent_tracked_cols.get(pk_col_lower) if pk_col_lower else None
+                        if matched_parent_pks and pk_vals:
+                            matched_set = set(matched_parent_pks)
+                            allowed = [i for i, v in enumerate(pk_vals) if v in matched_set]
+                            if allowed:
+                                parent_idx = allowed[row_idx % len(allowed)]
+                            else:
+                                parent_idx = row_idx % len(tracked_target_vals)
+                        else:
+                            parent_idx = row_idx % len(tracked_target_vals)
+                    else:
+                        anchors = self.fk_anchor_row_indexes.get(target_table)
+                        if not anchors:
+                            anchors = []
+                            # Prefer parent rows whose PK satisfies known filters.
+                            matched_parent_pks = self.filter_matched_values.get(target_table, [])
+                            pk_col_lower = self.table_primary_keys.get(target_table)
+                            pk_vals = parent_tracked_cols.get(pk_col_lower) if pk_col_lower else None
+                            if matched_parent_pks and pk_vals:
+                                matched_set = set(matched_parent_pks)
+                                allowed = [i for i, v in enumerate(pk_vals) if v in matched_set]
+                                if allowed:
+                                    anchor_size = min(64, len(allowed))
+                                    anchors = allowed[:anchor_size]
+
+                            if not anchors:
+                                n_vals = len(tracked_target_vals)
+                                anchor_size = max(8, min(64, n_vals))
+                                anchors = list(range(anchor_size))
+                            self.fk_anchor_row_indexes[target_table] = anchors
+                        parent_idx = anchors[row_idx % len(anchors)]
+                    if row_context is not None:
+                        row_context[parent_row_key] = parent_idx
+                if 0 <= parent_idx < len(tracked_target_vals):
+                    return tracked_target_vals[parent_idx]
+
             # Prefer filter-matched values if available
             if target_table in self.filter_matched_values and self.filter_matched_values[target_table]:
                 candidates = self.filter_matched_values[target_table]
-                target_lower = target_table.lower()
-                is_temporal_dim = (
-                    target_lower in {'date_dim', 'time_dim'}
-                    or ('date' in target_lower and target_lower.endswith('_dim'))
-                    or ('time' in target_lower and target_lower.endswith('_dim'))
-                )
                 if is_temporal_dim:
                     return self.random.choice(candidates)
 
@@ -758,7 +906,10 @@ class SyntheticDataGenerator:
                 scale = decimal_info['scale']
                 max_val = 10 ** (precision - scale) - 1
                 
-                if 'qty' in col_name_lower or 'quantity' in col_name_lower:
+                if 'return_amount' in col_name_lower or 'return_amt' in col_name_lower:
+                    val = self.random.uniform(0, min(200, max_val))
+                    return round(val, scale)
+                elif 'qty' in col_name_lower or 'quantity' in col_name_lower:
                     return self.random.randint(1, min(100, max_val))
                 elif 'amt' in col_name_lower or 'amount' in col_name_lower or 'sales' in col_name_lower:
                     val = self.random.uniform(10, min(10000, max_val))
@@ -770,13 +921,22 @@ class SyntheticDataGenerator:
                     val = self.random.uniform(0, min(100, max_val))
                     return round(val, scale)
                 elif col_name_lower.endswith('_sk') or col_name_lower.endswith('_id'):
-                    key_domain = max(50, min(1000, max(10, total_rows // 4)))
+                    # Non-PK key-like attributes use a moderate domain so
+                    # grouped dimensions overlap across years/channels.
+                    key_domain = max(20, min(200, max(10, total_rows // 20)))
                     return self.random.randint(1, min(key_domain, max_val))
                 else:
                     return self.random.randint(1, max(10, max_val // 10))
             
             # Regular INTEGER/BIGINT
-            if 'qty' in col_name_lower or 'quantity' in col_name_lower:
+            if 'return_quantity' in col_name_lower:
+                return self.random.randint(0, 20)
+            elif 'qty' in col_name_lower or 'quantity' in col_name_lower:
+                sales_year = self._row_year_from_date_fk(foreign_keys, row_context)
+                if sales_year == 2001:
+                    return self.random.randint(30, 100)
+                if sales_year == 2002:
+                    return self.random.randint(1, 60)
                 return self.random.randint(1, 100)
             elif 'amt' in col_name_lower or 'amount' in col_name_lower or 'sales' in col_name_lower:
                 return round(self.random.uniform(10.0, 10000.0), 2)
@@ -785,7 +945,7 @@ class SyntheticDataGenerator:
             elif 'fee' in col_name_lower or 'tax' in col_name_lower:
                 return round(self.random.uniform(0.0, 100.0), 2)
             elif col_name_lower.endswith('_sk') or col_name_lower.endswith('_id'):
-                key_domain = max(50, min(1000, max(10, total_rows // 4)))
+                key_domain = max(20, min(200, max(10, total_rows // 20)))
                 return self.random.randint(1, key_domain)
             else:
                 return self.random.randint(1, 100000)
@@ -900,7 +1060,13 @@ class SchemaFromDB:
 
     def _pg_connect(self):
         """Connect to PostgreSQL via psycopg2."""
-        import psycopg2
+        try:
+            import psycopg2
+        except ImportError as e:
+            raise ImportError(
+                "psycopg2 is required for PostgreSQL schema extraction. "
+                "Install psycopg2 or psycopg2-binary."
+            ) from e
         return psycopg2.connect(self.db_path)
 
     def _load_all_tables(self):
@@ -1002,16 +1168,1089 @@ class SchemaFromDB:
 
 class SyntheticValidator:
     """Main orchestrator for synthetic data validation."""
-    
-    def __init__(self, reference_db: str = None, dialect: str = 'duckdb'):
+
+    _REPAIR_ACTION_TYPES = {
+        "set_filter_values",
+        "remove_filter",
+        "add_fk",
+        "set_row_count",
+        "scale_row_counts",
+        "set_generation_order",
+        "set_min_rows",
+        "set_max_rows",
+    }
+    _COVERAGE_SWARM_STRATEGIES: Tuple[Tuple[str, str], ...] = (
+        ("coverage_filter_roots", "Coverage role: prioritize FILTER tables first; top up only the most selective root table."),
+        ("coverage_filter_plus_bridge", "Coverage role: top up one FILTER table and one direct FK bridge/fact neighbor."),
+        ("coverage_single_table_conservative", "Coverage role: one conservative top-up to minimize runtime and churn."),
+    )
+    _ADVERSARIAL_SWARM_STRATEGIES: Tuple[Tuple[str, str], ...] = (
+        ("adversarial_edge_case", "Adversarial role: add rows likely to expose semantic drift while staying targeted and add-only."),
+        ("adversarial_stuck_recovery", "Adversarial role: if prior attempts stalled, switch to a different targeted table pair."),
+    )
+
+    def __init__(
+        self,
+        reference_db: str = None,
+        dialect: str = 'duckdb',
+        llm_provider: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        llm_max_retries: int = 1,
+        repair_analyze_fn: Optional[Callable[[str], str]] = None,
+        repair_mode: str = "add_only",
+        llm_swarm_size: int = 1,
+        llm_swarm_temperature_min: float = 0.0,
+        llm_swarm_temperature_max: float = 0.5,
+        llm_swarm_max_history: int = 6,
+        progress_to_console: bool = True,
+        coverage_time_budget_s: int = 60,
+        adversarial_time_budget_s: int = 60,
+        adversarial_log_path: str = "packages/qt-sql/qt_sql/validation/adversarial_efforts.jsonl",
+    ):
         self.conn = duckdb.connect(':memory:')
         self.reference_db = reference_db
         self.dialect = dialect.lower()
+        self.llm_provider = llm_provider
+        self.llm_model = llm_model
+        self.llm_max_retries = max(0, int(llm_max_retries))
+        self._repair_analyze_fn = repair_analyze_fn
+        mode = str(repair_mode or "add_only").strip().lower()
+        self.repair_mode = mode if mode in {"add_only", "hybrid"} else "add_only"
+        self.llm_swarm_size = max(1, int(llm_swarm_size))
+        self.llm_swarm_temperature_min = float(llm_swarm_temperature_min)
+        self.llm_swarm_temperature_max = float(llm_swarm_temperature_max)
+        if self.llm_swarm_temperature_min > self.llm_swarm_temperature_max:
+            self.llm_swarm_temperature_min, self.llm_swarm_temperature_max = (
+                self.llm_swarm_temperature_max,
+                self.llm_swarm_temperature_min,
+            )
+        self.llm_swarm_max_history = max(1, int(llm_swarm_max_history))
+        self.progress_to_console = bool(progress_to_console)
+        self.coverage_time_budget_s = max(0, int(coverage_time_budget_s))
+        self.adversarial_time_budget_s = max(0, int(adversarial_time_budget_s))
+        self.adversarial_log_path = str(adversarial_log_path)
+        self._repair_llm_client = None
+        self._repair_llm_initialized = False
         # Only create SchemaFromDB for supported DSN schemes
         if reference_db and SchemaFromDB.supports_dsn(reference_db):
             self.schema_extractor = SchemaFromDB(reference_db)
         else:
             self.schema_extractor = None
+
+    def _emit_progress(self, message: str) -> None:
+        if not self.progress_to_console:
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[synthetic {ts}] {message}", flush=True)
+
+    def _append_adversarial_effort(
+        self,
+        payload: Dict[str, Any],
+        log_path: Optional[str] = None,
+    ) -> None:
+        path = Path(log_path or self.adversarial_log_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(payload, default=str)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            logger.debug("Failed to append adversarial effort log %s: %s", path, e)
+
+    def _get_repair_llm_client(self):
+        """Lazy-init optional repair LLM client."""
+        if self._repair_analyze_fn is not None:
+            return None
+        if self._repair_llm_initialized:
+            return self._repair_llm_client
+
+        self._repair_llm_initialized = True
+        try:
+            from qt_shared.llm import create_llm_client
+        except Exception as e:
+            logger.debug("Repair LLM unavailable (import): %s", e)
+            self._repair_llm_client = None
+            return None
+
+        try:
+            self._repair_llm_client = create_llm_client(
+                provider=self.llm_provider,
+                model=self.llm_model,
+            )
+        except Exception as e:
+            logger.debug("Repair LLM unavailable (factory): %s", e)
+            self._repair_llm_client = None
+
+        return self._repair_llm_client
+
+    def _analyze_repair_prompt(self, prompt: str, temperature: Optional[float] = None) -> Optional[str]:
+        if self._repair_analyze_fn is not None:
+            try:
+                return self._repair_analyze_fn(prompt)
+            except Exception as e:
+                logger.debug("Repair analyze_fn failed: %s", e)
+                return None
+
+        client = self._get_repair_llm_client()
+        if client is None:
+            return None
+
+        orig_temp = None
+        can_override_temp = (
+            temperature is not None
+            and hasattr(client, "temperature")
+        )
+        if can_override_temp:
+            try:
+                orig_temp = float(getattr(client, "temperature"))
+                setattr(client, "temperature", float(temperature))
+            except Exception:
+                can_override_temp = False
+
+        try:
+            return client.analyze(prompt)
+        except Exception as e:
+            logger.debug("Repair LLM call failed: %s", e)
+            return None
+        finally:
+            if can_override_temp and orig_temp is not None:
+                try:
+                    setattr(client, "temperature", orig_temp)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
+        """Best-effort JSON object extraction from model output."""
+        if not raw_text:
+            return None
+
+        text = raw_text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+        # Try to decode the first valid JSON object embedded in free-form text.
+        decoder = json.JSONDecoder()
+        for i, ch in enumerate(text):
+            if ch != "{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(text[i:])
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                return obj
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                return None
+        return None
+
+    def _build_fallback_repair_plan(
+        self,
+        actual_rows: int,
+        min_rows: int,
+        max_rows: int,
+        tables: Dict[str, Dict],
+        table_row_counts: Dict[str, int],
+        filter_values: Dict[str, Dict[str, list]],
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        avoid_table_pairs: Optional[Set[Tuple[str, ...]]] = None,
+        table_penalties: Optional[Dict[str, float]] = None,
+        attempt: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """Deterministic fallback when LLM output is missing or no-op."""
+        if min_rows <= 0 or actual_rows >= min_rows:
+            return None
+
+        targeted_tables = self._select_targeted_topup_tables(
+            tables=tables,
+            table_row_counts=table_row_counts,
+            filter_values=filter_values,
+            fk_relationships=fk_relationships,
+            max_tables=2,
+            avoid_table_pairs=avoid_table_pairs,
+            table_penalties=table_penalties,
+        )
+
+        actions: List[Dict[str, Any]] = []
+        if targeted_tables:
+            deficit_ratio = float(min_rows) / float(max(1, actual_rows))
+            if deficit_ratio >= 20:
+                base_multiplier = 2.8
+            elif deficit_ratio >= 10:
+                base_multiplier = 2.4
+            elif deficit_ratio >= 5:
+                base_multiplier = 2.1
+            elif deficit_ratio >= 2:
+                base_multiplier = 1.8
+            else:
+                base_multiplier = 1.5
+
+            for idx, table_name in enumerate(targeted_tables):
+                current = int(table_row_counts.get(table_name, 1000))
+                has_fk = bool(fk_relationships.get(table_name))
+                if min_rows >= 100:
+                    floor = 12000 if has_fk else 6000
+                    cap = 60000 if has_fk else 25000
+                else:
+                    floor = 8000 if has_fk else 4000
+                    cap = 40000 if has_fk else 20000
+                attempt_boost = max(0.0, min(1.0, (attempt - 1) * 0.25))
+                mult = base_multiplier + (0.2 if idx == 0 else 0.0) + attempt_boost
+                cap = min(200000, int(cap * (1.0 + attempt_boost)))
+                target = min(200000, max(floor, min(cap, int(current * mult))))
+                if target > current:
+                    actions.append({
+                        "type": "set_row_count",
+                        "table": table_name,
+                        "row_count": target,
+                    })
+
+        if not actions:
+            base = max(1, int(actual_rows))
+            needed_ratio = float(min_rows) / float(base)
+            multiplier = max(1.3, min(3.0, needed_ratio * 1.15))
+            actions = [
+                {
+                    "type": "scale_row_counts",
+                    "multiplier": round(multiplier, 2),
+                }
+            ]
+
+        if max_rows < min_rows:
+            actions.append({"type": "set_max_rows", "value": int(min_rows)})
+
+        return {
+            "actions": actions,
+            "note": (
+                "Fallback repair: DAG-targeted table top-up (filter roots and "
+                "their close FK neighbors) to improve hit rate with bounded cost."
+            ),
+        }
+
+    def _select_targeted_topup_tables(
+        self,
+        tables: Dict[str, Dict],
+        table_row_counts: Dict[str, int],
+        filter_values: Dict[str, Dict[str, list]],
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        max_tables: int = 2,
+        avoid_table_pairs: Optional[Set[Tuple[str, ...]]] = None,
+        table_penalties: Optional[Dict[str, float]] = None,
+    ) -> List[str]:
+        """Rank tables for selective top-up using a join-DAG walk from filters."""
+        if not tables or max_tables <= 0:
+            return []
+        avoid_table_pairs = avoid_table_pairs or set()
+        table_penalties = table_penalties or {}
+
+        table_names = [t for t in tables.keys()]
+        table_set = set(table_names)
+        adjacency: Dict[str, Set[str]] = {t: set() for t in table_names}
+        incoming: Dict[str, int] = {t: 0 for t in table_names}
+        outgoing: Dict[str, int] = {t: 0 for t in table_names}
+
+        for child_table, child_fks in fk_relationships.items():
+            if child_table not in table_set:
+                continue
+            for _child_col, (parent_table, _parent_col) in child_fks.items():
+                if parent_table not in table_set or parent_table == child_table:
+                    continue
+                adjacency[child_table].add(parent_table)
+                adjacency[parent_table].add(child_table)
+                outgoing[child_table] += 1
+                incoming[parent_table] += 1
+
+        roots = [t for t in table_names if t in filter_values]
+        depth_map: Dict[str, int] = {}
+        if roots:
+            q = deque((root, 0) for root in roots)
+            while q:
+                node, depth = q.popleft()
+                old_depth = depth_map.get(node)
+                if old_depth is not None and old_depth <= depth:
+                    continue
+                depth_map[node] = depth
+                if depth >= 2:
+                    continue
+                for nbr in adjacency.get(node, ()):
+                    q.append((nbr, depth + 1))
+
+        if depth_map:
+            candidates = [t for t in table_names if t in depth_map]
+        else:
+            candidates = list(table_names)
+
+        filter_strength: Dict[str, float] = {}
+        for table_name, col_map in filter_values.items():
+            score = 0.0
+            if not isinstance(col_map, dict):
+                continue
+            for _col, vals in col_map.items():
+                if not isinstance(vals, list):
+                    vals = [vals]
+                if any(isinstance(v, str) and v.startswith("BETWEEN:") for v in vals):
+                    score += 3.0
+                n = len([v for v in vals if v is not None])
+                if n <= 1:
+                    score += 2.5
+                elif n <= 3:
+                    score += 2.0
+                else:
+                    score += 1.0
+            filter_strength[table_name] = score
+
+        scored: List[Tuple[float, int, str]] = []
+        for table_name in candidates:
+            score = 0.0
+            depth = depth_map.get(table_name, 3)
+            if roots:
+                if table_name in roots:
+                    score += 120.0
+                elif depth == 1:
+                    score += 80.0
+                elif depth == 2:
+                    score += 40.0
+            score += outgoing.get(table_name, 0) * 12.0
+            score += incoming.get(table_name, 0) * 8.0
+            score += len(adjacency.get(table_name, ())) * 4.0
+            score += filter_strength.get(table_name, 0.0) * 18.0
+            current_rows = int(table_row_counts.get(table_name, 1000))
+            if current_rows < 5000:
+                score += 8.0
+            elif current_rows > 80000:
+                score -= 10.0
+            score -= float(table_penalties.get(table_name, 0.0)) * 22.0
+            # Tie-breakers: lower current rows first, then lexical stability.
+            scored.append((score, -current_rows, table_name))
+
+        scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+        ranked = [t for _s, _neg_rows, t in scored]
+        if not ranked:
+            return []
+
+        first = ranked[0]
+        selected = [first]
+
+        if max_tables >= 2:
+            second = None
+            for cand in ranked[1:]:
+                pair = tuple(sorted((first, cand)))
+                if pair in avoid_table_pairs:
+                    continue
+                second = cand
+                break
+            if second is None and len(ranked) > 1:
+                second = ranked[1]
+            if second and second != first:
+                selected.append(second)
+
+        if roots and len(selected) >= 2 and all(t in roots for t in selected):
+            non_roots = [t for t in ranked if t not in roots]
+            for cand in non_roots:
+                pair = tuple(sorted((selected[0], cand)))
+                if pair in avoid_table_pairs:
+                    continue
+                selected[-1] = cand
+                break
+
+        # Preserve order while removing duplicates.
+        selected = list(dict.fromkeys(selected))
+        return selected
+
+    def _build_table_depth_map(
+        self,
+        tables: Dict[str, Dict],
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        filter_values: Dict[str, Dict[str, list]],
+    ) -> Dict[str, int]:
+        table_names = set(tables.keys())
+        roots = [t for t in filter_values.keys() if t in table_names]
+        if not roots:
+            return {}
+
+        adjacency: Dict[str, Set[str]] = {t: set() for t in table_names}
+        for child_table, child_fks in fk_relationships.items():
+            if child_table not in table_names:
+                continue
+            for _col, (parent_table, _parent_col) in child_fks.items():
+                if parent_table not in table_names or parent_table == child_table:
+                    continue
+                adjacency[child_table].add(parent_table)
+                adjacency[parent_table].add(child_table)
+
+        depth_map: Dict[str, int] = {}
+        queue = deque((root, 0) for root in roots)
+        while queue:
+            table_name, depth = queue.popleft()
+            prev = depth_map.get(table_name)
+            if prev is not None and prev <= depth:
+                continue
+            depth_map[table_name] = depth
+            if depth >= 3:
+                continue
+            for neighbor in adjacency.get(table_name, ()):
+                queue.append((neighbor, depth + 1))
+        return depth_map
+
+    @staticmethod
+    def _action_signature(action: Dict[str, Any]) -> str:
+        action_type = str(action.get("type", "")).strip()
+        if action_type == "set_row_count":
+            table = str(action.get("table", ""))
+            return f"set_row_count:{table}"
+        if action_type == "scale_row_counts":
+            return "scale_row_counts"
+        if action_type == "set_max_rows":
+            return "set_max_rows"
+        if action_type == "set_filter_values":
+            table = str(action.get("table", ""))
+            column = str(action.get("column", ""))
+            return f"set_filter_values:{table}.{column}"
+        return action_type or "unknown"
+
+    def _compact_repair_log(self, repair_log: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        if not repair_log:
+            return []
+
+        compact: List[Dict[str, Any]] = []
+        for entry in repair_log[-self.llm_swarm_max_history:]:
+            if not isinstance(entry, dict):
+                continue
+            actions = entry.get("plan_actions")
+            signatures: List[str] = []
+            if isinstance(actions, list):
+                signatures = [
+                    self._action_signature(a)
+                    for a in actions
+                    if isinstance(a, dict)
+                ][:4]
+            if not signatures:
+                fallback_actions = entry.get("actions")
+                if isinstance(fallback_actions, list):
+                    signatures = [str(x)[:80] for x in fallback_actions[:4]]
+            compact.append({
+                "attempt": int(entry.get("attempt", 0)),
+                "source": str(entry.get("source", "")),
+                "rows_before": int(entry.get("rows_before", 0) or 0),
+                "rows_after": int(entry.get("rows_after", 0) or 0),
+                "row_delta": int(entry.get("row_delta", 0) or 0),
+                "regressed": bool(entry.get("regressed", False)),
+                "actions": signatures,
+            })
+        return compact
+
+    def _failed_action_signatures(self, repair_log: Optional[List[Dict[str, Any]]]) -> Set[Tuple[str, ...]]:
+        failed: Set[Tuple[str, ...]] = set()
+        if not repair_log:
+            return failed
+        for entry in repair_log:
+            if not isinstance(entry, dict):
+                continue
+            row_delta = entry.get("row_delta")
+            if row_delta is None:
+                continue
+            try:
+                delta = int(row_delta)
+            except (TypeError, ValueError):
+                continue
+            if delta > 0:
+                continue
+            actions = entry.get("plan_actions")
+            if not isinstance(actions, list):
+                continue
+            sigs = sorted({
+                self._action_signature(a)
+                for a in actions
+                if isinstance(a, dict)
+            })
+            if sigs:
+                failed.add(tuple(sigs))
+        return failed
+
+    def _score_repair_plan(
+        self,
+        actions: List[Dict[str, Any]],
+        tables: Dict[str, Dict],
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        filter_values: Dict[str, Dict[str, list]],
+        table_row_counts: Dict[str, int],
+        repair_log: Optional[List[Dict[str, Any]]],
+        phase: str = "coverage",
+    ) -> float:
+        if not actions:
+            return -120.0
+
+        roots = set(t for t in filter_values.keys() if t in tables)
+        depth_map = self._build_table_depth_map(tables, fk_relationships, filter_values)
+        failed_signatures = self._failed_action_signatures(repair_log)
+
+        regressed_tables: Set[str] = set()
+        for entry in repair_log or []:
+            if not isinstance(entry, dict) or not entry.get("regressed"):
+                continue
+            for action in entry.get("plan_actions") or []:
+                if isinstance(action, dict) and str(action.get("type", "")) == "set_row_count":
+                    table_name = str(action.get("table", ""))
+                    if table_name:
+                        regressed_tables.add(table_name)
+
+        phase_name = str(phase or "coverage").strip().lower()
+        is_adversarial = phase_name.startswith("adversarial")
+        score = 0.0
+        targeted_tables: Set[str] = set()
+        candidate_sigs: List[str] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                score -= 40.0
+                continue
+            action_type = str(action.get("type", "")).strip()
+            candidate_sigs.append(self._action_signature(action))
+            if action_type == "set_row_count":
+                table = str(action.get("table", ""))
+                if table not in tables:
+                    score -= 80.0
+                    continue
+                targeted_tables.add(table)
+                try:
+                    target_rows = int(action.get("row_count"))
+                except (TypeError, ValueError):
+                    score -= 60.0
+                    continue
+                current_rows = int(table_row_counts.get(table, 1000))
+                ratio = float(target_rows) / float(max(1, current_rows))
+                if target_rows <= current_rows:
+                    score -= 15.0
+                else:
+                    score += 12.0
+                if 1.25 <= ratio <= 3.2:
+                    score += 12.0
+                elif ratio <= 5.0:
+                    score += 4.0
+                else:
+                    score -= 10.0
+                depth = depth_map.get(table, 4)
+                if table in roots:
+                    score += 25.0
+                elif depth == 1:
+                    score += 16.0
+                elif depth == 2:
+                    score += 8.0
+                if table in regressed_tables:
+                    score -= 8.0
+                if is_adversarial and ratio >= 2.0:
+                    score += 4.0
+            elif action_type == "scale_row_counts":
+                score -= 55.0 if is_adversarial else 45.0
+            elif action_type == "set_max_rows":
+                score -= 2.0 if is_adversarial else 1.0
+            else:
+                score -= 35.0
+
+        if len(actions) > 3:
+            score -= 25.0
+        if len(targeted_tables) > 2:
+            score -= 20.0
+        if not targeted_tables:
+            score -= 20.0
+
+        sig_tuple = tuple(sorted(set(s for s in candidate_sigs if s)))
+        if sig_tuple and sig_tuple in failed_signatures:
+            score -= 22.0
+        if is_adversarial and sig_tuple and sig_tuple not in failed_signatures:
+            score += 3.0
+        return score
+
+    @staticmethod
+    def _normalize_repair_action(action: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize common model field aliases to canonical action schema."""
+        if not isinstance(action, dict):
+            return {}
+
+        normalized = dict(action)
+        action_type = str(normalized.get("type", "")).strip()
+
+        if action_type == "set_row_count":
+            if "row_count" not in normalized:
+                for alias in ("count", "rows", "n", "value"):
+                    if alias in normalized:
+                        normalized["row_count"] = normalized.get(alias)
+                        break
+        elif action_type == "scale_row_counts":
+            if "multiplier" not in normalized:
+                for alias in ("scale", "factor", "multiple", "value"):
+                    if alias in normalized:
+                        normalized["multiplier"] = normalized.get(alias)
+                        break
+        elif action_type in {"set_min_rows", "set_max_rows"}:
+            if "value" not in normalized:
+                for alias in ("rows", "count", "row_count"):
+                    if alias in normalized:
+                        normalized["value"] = normalized.get(alias)
+                        break
+
+        return normalized
+
+    def _normalize_repair_actions(self, actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            normalized.append(self._normalize_repair_action(action))
+        return normalized
+
+    def _build_compact_repair_context(
+        self,
+        tables: Dict[str, Dict],
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        filter_values: Dict[str, Dict[str, list]],
+        table_row_counts: Dict[str, int],
+        generation_order: List[str],
+    ) -> Dict[str, Any]:
+        include_tables: List[str] = []
+        seen: Set[str] = set()
+
+        def _push(table_name: str) -> None:
+            if table_name in tables and table_name not in seen:
+                include_tables.append(table_name)
+                seen.add(table_name)
+
+        for t_name in filter_values.keys():
+            _push(t_name)
+        for t_name in self._select_targeted_topup_tables(
+            tables=tables,
+            table_row_counts=table_row_counts,
+            filter_values=filter_values,
+            fk_relationships=fk_relationships,
+            max_tables=4,
+        ):
+            _push(t_name)
+        for t_name in generation_order:
+            _push(t_name)
+            if len(include_tables) >= 12:
+                break
+        if not include_tables:
+            include_tables = list(tables.keys())[:12]
+        include_tables = include_tables[:12]
+        include_set = set(include_tables)
+
+        table_columns = {
+            t: list((tables.get(t, {}) or {}).get("columns", {}).keys())[:8]
+            for t in include_tables
+        }
+        row_counts = {t: int(table_row_counts.get(t, 1000)) for t in include_tables}
+        compact_filters: Dict[str, Dict[str, List[Any]]] = {}
+        for t in include_tables:
+            col_map = filter_values.get(t, {})
+            if not isinstance(col_map, dict):
+                continue
+            compact_filters[t] = {
+                str(col): (vals if isinstance(vals, list) else [vals])[:4]
+                for col, vals in list(col_map.items())[:4]
+            }
+
+        compact_fks: Dict[str, Dict[str, Tuple[str, str]]] = {}
+        for child_table, child_fks in fk_relationships.items():
+            if child_table not in include_set:
+                continue
+            entries = {}
+            for child_col, (parent_table, parent_col) in child_fks.items():
+                if parent_table in include_set:
+                    entries[child_col] = (parent_table, parent_col)
+            if entries:
+                compact_fks[child_table] = entries
+
+        return {
+            "tables": table_columns,
+            "filters": compact_filters,
+            "fks": compact_fks,
+            "row_counts": row_counts,
+            "gen_order": [t for t in generation_order if t in include_set][:12],
+        }
+
+    def _swarm_variants(self, attempt: int, phase: str = "coverage") -> List[Dict[str, Any]]:
+        count = max(1, self.llm_swarm_size)
+        min_t = float(self.llm_swarm_temperature_min)
+        max_t = float(self.llm_swarm_temperature_max)
+        span = max_t - min_t
+        variants: List[Dict[str, Any]] = []
+        phase_name = str(phase or "coverage").strip().lower()
+        strategies = (
+            self._ADVERSARIAL_SWARM_STRATEGIES
+            if phase_name.startswith("adversarial")
+            else self._COVERAGE_SWARM_STRATEGIES
+        )
+        n_profiles = max(1, len(strategies))
+        for idx in range(count):
+            profile_idx = (attempt - 1 + idx) % n_profiles
+            strategy_id, strategy_focus = strategies[profile_idx]
+            if count <= 1:
+                temp = min_t
+            else:
+                temp = min_t + span * (idx / float(count - 1))
+            variants.append({
+                "index": idx,
+                "strategy_id": strategy_id,
+                "strategy_focus": strategy_focus,
+                "temperature": round(temp, 3),
+            })
+        return variants
+
+    def _build_repair_prompt(
+        self,
+        *,
+        sql: str,
+        last_error: Optional[str],
+        actual_rows: int,
+        min_rows: int,
+        max_rows: int,
+        attempt: int,
+        variant: Dict[str, Any],
+        phase: str,
+        compact_context: Dict[str, Any],
+        repair_log_context: List[Dict[str, Any]],
+    ) -> str:
+        allowed_types = (
+            "set_row_count|scale_row_counts|set_max_rows"
+            if self.repair_mode == "add_only"
+            else "set_filter_values|remove_filter|add_fk|set_row_count|scale_row_counts|set_generation_order|set_min_rows|set_max_rows"
+        )
+        add_only_rule = (
+            "- ADD-ONLY: only set_row_count/scale_row_counts/set_max_rows.\n"
+            if self.repair_mode == "add_only"
+            else ""
+        )
+        strategy_id = str(variant.get("strategy_id", "default"))
+        phase_name = str(phase or "coverage").strip().lower()
+        is_adversarial = phase_name.startswith("adversarial") or strategy_id.startswith("adversarial")
+        role_line = (
+            "ROLE=adversarial: add rows likely to expose semantic differences "
+            "(boundary values, rare join-key combos, skewed aggregates) while staying valid.\n"
+            if is_adversarial
+            else "ROLE=coverage: add rows to maximize query hit-rate through selective predicates and key joins.\n"
+        )
+        example_line = (
+            "EXAMPLE={\"actions\":[{\"type\":\"set_row_count\",\"table\":\"store_returns\",\"row_count\":26000},"
+            "{\"type\":\"set_row_count\",\"table\":\"web_returns\",\"row_count\":24000}],"
+            "\"note\":\"Adversarial: add edge-case overlap rows to create rows present in one result and absent in the other.\"}\n"
+            if is_adversarial
+            else "EXAMPLE={\"actions\":[{\"type\":\"set_row_count\",\"table\":\"store_returns\",\"row_count\":22000},"
+            "{\"type\":\"set_row_count\",\"table\":\"date_dim\",\"row_count\":8000}],"
+            "\"note\":\"Coverage: top up selective fact + filter dimension to raise final row count (e.g., 2 -> 100).\"}\n"
+        )
+        sql_compact = re.sub(r"\s+", " ", sql).strip()
+        if len(sql_compact) > 2200:
+            sql_compact = sql_compact[:2200] + " ..."
+        compact_json = json.dumps(compact_context, separators=(",", ":"))
+        repair_log_json = json.dumps(repair_log_context, separators=(",", ":"))
+        return (
+            "You are a SQL synthetic-data repair planner.\n"
+            "Output ONLY JSON object with keys: actions (array), note (string).\n"
+            "No markdown. No extra text.\n"
+            f"Allowed action types: {allowed_types}\n"
+            "Rules:\n"
+            "- Use 1-3 actions max.\n"
+            "- Do not invent tables/columns.\n"
+            "- Prefer targeted set_row_count on FILTER tables and one-hop FK neighbors.\n"
+            "- Change at most 2 tables via set_row_count.\n"
+            "- For set_row_count use ~1.5x-2.5x from current; keep between 2000 and 60000.\n"
+            "- Avoid global scale_row_counts unless no targeted option exists.\n"
+            f"{role_line}"
+            f"{example_line}"
+            f"{add_only_rule}"
+            f"ATTEMPT={attempt}\n"
+            f"SWARM_STRATEGY={strategy_id}\n"
+            f"SWARM_FOCUS={variant.get('strategy_focus','')}\n"
+            f"ROW_STATUS=actual:{actual_rows},min:{min_rows},max:{max_rows}\n"
+            f"LAST_ERROR={last_error or ''}\n"
+            f"REPAIR_LOG={repair_log_json}\n"
+            f"CONTEXT={compact_json}\n"
+            f"SQL={sql_compact}\n"
+        )
+
+    def _request_llm_repair_plan(
+        self,
+        sql: str,
+        last_error: Optional[str],
+        actual_rows: int,
+        min_rows: int,
+        max_rows: int,
+        tables: Dict[str, Dict],
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        filter_values: Dict[str, Dict[str, list]],
+        table_row_counts: Dict[str, int],
+        generation_order: List[str],
+        attempt: int,
+        repair_log: Optional[List[Dict[str, Any]]] = None,
+        phase: str = "coverage",
+    ) -> Optional[Dict[str, Any]]:
+        """Ask repair LLM for a bounded action list; optionally via a diverse swarm."""
+        compact_context = self._build_compact_repair_context(
+            tables=tables,
+            fk_relationships=fk_relationships,
+            filter_values=filter_values,
+            table_row_counts=table_row_counts,
+            generation_order=generation_order,
+        )
+        repair_log_context = self._compact_repair_log(repair_log)
+        variants = self._swarm_variants(attempt, phase=phase)
+
+        candidates: List[Dict[str, Any]] = []
+        for variant in variants:
+            prompt = self._build_repair_prompt(
+                sql=sql,
+                last_error=last_error,
+                actual_rows=actual_rows,
+                min_rows=min_rows,
+                max_rows=max_rows,
+                attempt=attempt,
+                variant=variant,
+                phase=phase,
+                compact_context=compact_context,
+                repair_log_context=repair_log_context,
+            )
+            raw = self._analyze_repair_prompt(prompt, temperature=variant.get("temperature"))
+            if raw is None:
+                continue
+            plan = self._extract_json_object(raw)
+            if not plan:
+                continue
+            actions = plan.get("actions")
+            if not isinstance(actions, list):
+                continue
+            normalized_actions = self._normalize_repair_actions(actions)
+            filtered_actions = self._filter_actions_for_mode(normalized_actions)
+            score = self._score_repair_plan(
+                actions=filtered_actions,
+                tables=tables,
+                fk_relationships=fk_relationships,
+                filter_values=filter_values,
+                table_row_counts=table_row_counts,
+                repair_log=repair_log,
+                phase=phase,
+            )
+            candidates.append({
+                "variant": variant,
+                "score": score,
+                "plan": plan,
+                "actions": filtered_actions,
+                "action_signatures": [self._action_signature(a) for a in filtered_actions if isinstance(a, dict)],
+            })
+
+        if not candidates:
+            return None
+
+        # Prefer higher score; tie-breaker prefers fewer/global actions.
+        candidates.sort(
+            key=lambda c: (
+                float(c["score"]),
+                -sum(1 for a in c["actions"] if str(a.get("type", "")) == "set_row_count"),
+                -len(c["actions"]),
+            ),
+            reverse=True,
+        )
+        chosen = candidates[0]
+        plan = dict(chosen["plan"])
+        plan["actions"] = list(chosen["actions"])
+        plan["_swarm"] = {
+            "requested_candidates": len(variants),
+            "received_candidates": len(candidates),
+            "chosen_strategy": chosen["variant"].get("strategy_id"),
+            "chosen_score": round(float(chosen["score"]), 2),
+            "candidates": [
+                {
+                    "strategy": c["variant"].get("strategy_id"),
+                    "temperature": c["variant"].get("temperature"),
+                    "score": round(float(c["score"]), 2),
+                    "actions": c["action_signatures"][:4],
+                }
+                for c in candidates[: min(8, len(candidates))]
+            ],
+        }
+        return plan
+
+    def _filter_actions_for_mode(self, actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self.repair_mode != "add_only":
+            return actions
+        allowed = {"set_row_count", "scale_row_counts", "set_max_rows"}
+        filtered: List[Dict[str, Any]] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("type", "")).strip()
+            if action_type in allowed:
+                filtered.append(action)
+        return filtered
+
+    def _apply_llm_repair_actions(
+        self,
+        actions: List[Dict[str, Any]],
+        tables: Dict[str, Dict],
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        filter_values: Dict[str, Dict[str, list]],
+        table_row_counts: Dict[str, int],
+        generation_order: List[str],
+        min_rows: int,
+        max_rows: int,
+    ) -> Tuple[bool, List[str], int, int, List[str]]:
+        """Apply safe deterministic mutations from a repair plan."""
+        changed = False
+        notes: List[str] = []
+        current_order = list(generation_order)
+
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("type", "")).strip()
+            if action_type not in self._REPAIR_ACTION_TYPES:
+                continue
+
+            if action_type == "set_filter_values":
+                table = action.get("table")
+                col = action.get("column")
+                vals = action.get("values", [])
+                if table not in tables:
+                    continue
+                real_col = self._resolve_column_name(table, str(col), tables) if col else None
+                if not real_col:
+                    continue
+                if not isinstance(vals, list):
+                    vals = [vals]
+                clean_vals = [v for v in vals if v is not None]
+                if not clean_vals:
+                    continue
+                filter_values.setdefault(table, {})[real_col] = clean_vals
+                changed = True
+                notes.append(f"set_filter_values({table}.{real_col})")
+                continue
+
+            if action_type == "remove_filter":
+                table = action.get("table")
+                col = action.get("column")
+                if table not in filter_values:
+                    continue
+                real_col = self._resolve_column_name(table, str(col), tables) if col else None
+                if not real_col or real_col not in filter_values.get(table, {}):
+                    continue
+                del filter_values[table][real_col]
+                changed = True
+                notes.append(f"remove_filter({table}.{real_col})")
+                continue
+
+            if action_type == "add_fk":
+                child_table = action.get("child_table")
+                child_col = action.get("child_column")
+                parent_table = action.get("parent_table")
+                parent_col = action.get("parent_column")
+                if child_table not in tables or parent_table not in tables:
+                    continue
+                real_child_col = self._resolve_column_name(child_table, str(child_col), tables) if child_col else None
+                real_parent_col = self._resolve_column_name(parent_table, str(parent_col), tables) if parent_col else None
+                if not real_child_col or not real_parent_col:
+                    continue
+                fk_relationships.setdefault(child_table, {})[real_child_col.lower()] = (parent_table, real_parent_col)
+                changed = True
+                notes.append(f"add_fk({child_table}.{real_child_col}->{parent_table}.{real_parent_col})")
+                continue
+
+            if action_type == "set_row_count":
+                table = action.get("table")
+                row_count = action.get("row_count")
+                if table not in tables:
+                    continue
+                try:
+                    n = int(row_count)
+                except (TypeError, ValueError):
+                    continue
+                n = max(10, min(200000, n))
+                table_row_counts[table] = n
+                changed = True
+                notes.append(f"set_row_count({table}={n})")
+                continue
+
+            if action_type == "scale_row_counts":
+                try:
+                    mult = float(action.get("multiplier"))
+                except (TypeError, ValueError):
+                    continue
+                mult = max(0.5, min(10.0, mult))
+                for table_name in table_row_counts:
+                    table_row_counts[table_name] = max(
+                        10, min(200000, int(table_row_counts[table_name] * mult))
+                    )
+                changed = True
+                notes.append(f"scale_row_counts(x{mult:.2f})")
+                continue
+
+            if action_type == "set_generation_order":
+                order = action.get("order")
+                if not isinstance(order, list):
+                    continue
+                normalized = [str(t) for t in order if str(t) in tables]
+                if len(normalized) != len(tables):
+                    continue
+                if set(normalized) != set(tables.keys()):
+                    continue
+                current_order = normalized
+                changed = True
+                notes.append("set_generation_order")
+                continue
+
+            if action_type == "set_min_rows":
+                try:
+                    min_rows = max(0, int(action.get("value")))
+                except (TypeError, ValueError):
+                    continue
+                if max_rows < min_rows:
+                    max_rows = min_rows
+                changed = True
+                notes.append(f"set_min_rows({min_rows})")
+                continue
+
+            if action_type == "set_max_rows":
+                try:
+                    max_rows = max(0, int(action.get("value")))
+                except (TypeError, ValueError):
+                    continue
+                if max_rows < min_rows:
+                    min_rows = max_rows
+                changed = True
+                notes.append(f"set_max_rows({max_rows})")
+                continue
+
+        return changed, notes, min_rows, max_rows, current_order
+
+    def _requires_reference_schema_for_star(self, sql: str) -> bool:
+        """Return True when SELECT * cannot be validated safely in pure AST mode."""
+        if self.schema_extractor is not None:
+            return False
+        try:
+            parsed = sqlglot.parse_one(sql)
+        except Exception:
+            return False
+        if not any(True for _ in parsed.find_all(exp.Star)):
+            return False
+        try:
+            tables = SchemaExtractor(sql).extract_tables()
+        except Exception:
+            return False
+        return any(not info.get('columns') for info in tables.values())
 
     def validate(self, sql_file: str, target_rows: int = 1000, min_rows: int = None, max_rows: int = None) -> Dict[str, Any]:
         """Run full validation pipeline."""
@@ -1039,6 +2278,16 @@ class SyntheticValidator:
 
         logger.debug("Input SQL file: %s", sql_file)
         logger.debug("Target output rows: %d (range: %d-%d)", target_rows, min_rows, max_rows)
+        coverage_started_at = time.monotonic()
+        coverage_deadline = (
+            coverage_started_at + float(self.coverage_time_budget_s)
+            if self.coverage_time_budget_s > 0
+            else None
+        )
+        self._emit_progress(
+            f"start file={sql_file} target={target_rows} range={min_rows}-{max_rows} "
+            f"retries={self.llm_max_retries} coverage_budget_s={self.coverage_time_budget_s}"
+        )
 
         # 1b. Transpile to DuckDB if source dialect differs
         if self.dialect != 'duckdb':
@@ -1154,65 +2403,348 @@ class SyntheticValidator:
                     except Exception as e:
                         logger.debug("  %s: dedup failed: %s", table_name, e)
 
-        _populate_synthetic_data(1)
+        def _run_with_current_context() -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+            _populate_synthetic_data(1)
 
-        # 7. Run query
-        logger.debug("Running query...")
-        exec_sql = sql
-        best_success = None
-        last_error = None
+            logger.debug("Running query...")
+            exec_sql = sql
+            best_success = None
+            last_error = None
 
-        # Adaptive retries: if query executes but yields 0 rows, repopulate with
-        # more synthetic data to increase predicate/join hit probability.
-        for attempt_idx, multiplier in enumerate([1, 3]):
-            if attempt_idx > 0 and min_rows > 0 and best_success and best_success.get('actual_rows', 0) == 0:
-                logger.debug("Repopulating synthetic data with row multiplier x%d", multiplier)
-                _populate_synthetic_data(multiplier)
+            # Adaptive retries: if query executes but remains below threshold,
+            # repopulate with more synthetic data to increase hit probability.
+            for attempt_idx, multiplier in enumerate([1, 3, 10]):
+                if attempt_idx > 0 and min_rows > 0 and best_success and best_success.get('actual_rows', 0) < min_rows:
+                    logger.debug("Repopulating synthetic data with row multiplier x%d", multiplier)
+                    _populate_synthetic_data(multiplier)
 
-            for _ in range(4):
-                try:
-                    result = self.conn.execute(exec_sql).fetchall()
-                    actual_rows = len(result)
-                    in_range = min_rows <= actual_rows <= max_rows
-                    logger.debug("Query returned %d rows (target range: %d-%d)", actual_rows, min_rows, max_rows)
+                for _ in range(4):
+                    try:
+                        result = self.conn.execute(exec_sql).fetchall()
+                        actual_rows = len(result)
+                        in_range = min_rows <= actual_rows <= max_rows
+                        logger.debug("Query returned %d rows (target range: %d-%d)", actual_rows, min_rows, max_rows)
 
-                    columns = [desc[0] for desc in self.conn.description] if self.conn.description else []
-                    payload = {
-                        'success': True,
-                        'target_rows': target_rows,
-                        'min_rows': min_rows,
-                        'max_rows': max_rows,
-                        'actual_rows': actual_rows,
-                        'in_range': in_range,
-                        'columns': columns,
-                        'sample_results': result[:10] if result else [],
-                        'tables_created': list(tables.keys())
-                    }
+                        columns = [desc[0] for desc in self.conn.description] if self.conn.description else []
+                        payload = {
+                            'success': True,
+                            'target_rows': target_rows,
+                            'min_rows': min_rows,
+                            'max_rows': max_rows,
+                            'actual_rows': actual_rows,
+                            'in_range': in_range,
+                            'columns': columns,
+                            'sample_results': result[:10] if result else [],
+                            'tables_created': list(tables.keys())
+                        }
 
-                    if in_range or min_rows == 0 or actual_rows > 0:
-                        return payload
+                        if in_range or min_rows == 0:
+                            return payload, None
 
-                    # Success with 0 rows, not in range: try larger synth set.
-                    best_success = payload
-                    break
-                except Exception as e:
-                    last_error = str(e)
-                    if "Ambiguous reference to column name" in last_error:
-                        fixed_sql = self._resolve_ambiguous_from_error(exec_sql, last_error)
-                        if fixed_sql != exec_sql:
-                            exec_sql = fixed_sql
+                        # Success but not in range: try a larger synth set.
+                        best_success = payload
+                        break
+                    except Exception as e:
+                        last_error = str(e)
+                        if "Ambiguous reference to column name" in last_error:
+                            fixed_sql = self._resolve_ambiguous_from_error(exec_sql, last_error)
+                            if fixed_sql != exec_sql:
+                                exec_sql = fixed_sql
+                                continue
+                        break
+
+            if best_success:
+                return best_success, last_error
+            return None, last_error
+
+        llm_repairs = []
+        current_attempt = 0
+        best_payload: Optional[Dict[str, Any]] = None
+        avoid_table_pairs: Set[Tuple[str, ...]] = set()
+        table_penalties: Dict[str, float] = {}
+
+        def _capture_best_payload(candidate: Optional[Dict[str, Any]]) -> None:
+            nonlocal best_payload
+            if candidate is None:
+                return
+            if not candidate.get('success', False):
+                return
+            rows = int(candidate.get('actual_rows', 0))
+            if best_payload is None or rows > int(best_payload.get('actual_rows', 0)):
+                best_payload = dict(candidate)
+
+        def _prefer_best_payload(current_payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            if best_payload is None:
+                return current_payload
+            if current_payload is None:
+                chosen = dict(best_payload)
+            else:
+                cur_rows = int(current_payload.get('actual_rows', 0))
+                best_rows = int(best_payload.get('actual_rows', 0))
+                chosen = dict(best_payload) if best_rows > cur_rows else current_payload
+            if chosen is not None:
+                chosen['in_range'] = min_rows <= int(chosen.get('actual_rows', 0)) <= max_rows
+            return chosen
+
+        def _attach_coverage_meta(payload_obj: Optional[Dict[str, Any]], *, timeout: bool) -> Optional[Dict[str, Any]]:
+            if payload_obj is None:
+                return None
+            payload_obj['coverage_timeout'] = bool(timeout)
+            payload_obj['coverage_elapsed_s'] = round(max(0.0, time.monotonic() - coverage_started_at), 3)
+            return payload_obj
+
+        while True:
+            payload, last_error = _run_with_current_context()
+            _capture_best_payload(payload)
+            actual_rows_now = payload.get('actual_rows', 0) if payload else 0
+            elapsed_s = max(0.0, time.monotonic() - coverage_started_at)
+            remaining_s = (
+                max(0.0, coverage_deadline - time.monotonic())
+                if coverage_deadline is not None
+                else None
+            )
+            self._emit_progress(
+                f"round={current_attempt} rows={actual_rows_now} in_range={payload.get('in_range', False) if payload else False} "
+                f"error={'none' if not last_error else str(last_error)[:120]} "
+                f"elapsed_s={elapsed_s:.1f}"
+                + (f" remaining_s={remaining_s:.1f}" if remaining_s is not None else "")
+            )
+
+            # Close out previous repair attempt with observed row count after re-run.
+            if llm_repairs and llm_repairs[-1].get('rows_after') is None:
+                llm_repairs[-1]['rows_after'] = actual_rows_now
+                llm_repairs[-1]['in_range_after'] = payload.get('in_range', False) if payload else None
+                before = llm_repairs[-1].get('rows_before')
+                after = llm_repairs[-1].get('rows_after')
+                if isinstance(before, int) and isinstance(after, int):
+                    llm_repairs[-1]['row_delta'] = after - before
+                    llm_repairs[-1]['regressed'] = after < before
+                    set_row_tables = []
+                    for action in llm_repairs[-1].get('plan_actions', []) or []:
+                        if not isinstance(action, dict):
                             continue
-                    break
+                        if str(action.get('type', '')) != 'set_row_count':
+                            continue
+                        table_name = str(action.get('table', ''))
+                        if table_name:
+                            set_row_tables.append(table_name)
+                    if not set_row_tables:
+                        for note in llm_repairs[-1].get('actions', []) or []:
+                            match = re.match(r"set_row_count\(([^=]+)=", str(note))
+                            if match:
+                                set_row_tables.append(match.group(1))
+                    unique_tables = sorted(set(set_row_tables))
+                    if len(unique_tables) >= 2 and after <= before:
+                        avoid_table_pairs.add(tuple(unique_tables))
+                    for tbl in unique_tables:
+                        if after < before:
+                            table_penalties[tbl] = float(table_penalties.get(tbl, 0.0)) + 2.0
+                        elif after == before:
+                            table_penalties[tbl] = float(table_penalties.get(tbl, 0.0)) + 1.0
+                        else:
+                            table_penalties[tbl] = max(
+                                0.0,
+                                float(table_penalties.get(tbl, 0.0)) - 1.0,
+                            )
+                    self._emit_progress(
+                        f"attempt={llm_repairs[-1].get('attempt')} delta={llm_repairs[-1].get('row_delta')} "
+                        f"rows={before}->{after}"
+                    )
 
-        if best_success:
-            return best_success
+            needs_repair = (payload is None) or (not payload.get('in_range', True))
 
-        logger.debug("Query failed: %s", last_error)
-        return {
-            'success': False,
-            'error': last_error or 'Unknown query execution error',
-            'tables_created': list(tables.keys())
-        }
+            if not needs_repair:
+                if payload is not None:
+                    payload['llm_repair_attempts'] = current_attempt
+                    payload['llm_repair_history'] = llm_repairs
+                    return _attach_coverage_meta(payload, timeout=False)
+                break
+
+            if coverage_deadline is not None and time.monotonic() >= coverage_deadline:
+                self._emit_progress(
+                    f"coverage_timeout reached after {elapsed_s:.1f}s; returning best observed payload"
+                )
+                chosen_payload = _prefer_best_payload(payload)
+                if chosen_payload is not None:
+                    chosen_payload['llm_repair_attempts'] = current_attempt
+                    chosen_payload['llm_repair_history'] = llm_repairs
+                    return _attach_coverage_meta(chosen_payload, timeout=True)
+                return {
+                    'success': False,
+                    'error': last_error or 'Coverage timeout before any successful execution',
+                    'tables_created': list(tables.keys()),
+                    'llm_repair_attempts': current_attempt,
+                    'llm_repair_history': llm_repairs,
+                    'coverage_timeout': True,
+                    'coverage_elapsed_s': round(elapsed_s, 3),
+                }
+
+            if current_attempt >= self.llm_max_retries:
+                chosen_payload = _prefer_best_payload(payload)
+                if chosen_payload is not None:
+                    chosen_payload['llm_repair_attempts'] = current_attempt
+                    chosen_payload['llm_repair_history'] = llm_repairs
+                    return _attach_coverage_meta(chosen_payload, timeout=False)
+                logger.debug("Query failed: %s", last_error)
+                return {
+                    'success': False,
+                    'error': last_error or 'Unknown query execution error',
+                    'tables_created': list(tables.keys()),
+                    'llm_repair_attempts': current_attempt,
+                    'llm_repair_history': llm_repairs,
+                    'coverage_timeout': False,
+                    'coverage_elapsed_s': round(max(0.0, time.monotonic() - coverage_started_at), 3),
+                }
+
+            plan = self._request_llm_repair_plan(
+                sql=sql,
+                last_error=last_error,
+                actual_rows=actual_rows_now,
+                min_rows=min_rows,
+                max_rows=max_rows,
+                tables=tables,
+                fk_relationships=fk_relationships,
+                filter_values=filter_values,
+                table_row_counts=table_row_counts,
+                generation_order=generation_order,
+                attempt=current_attempt + 1,
+                repair_log=llm_repairs,
+                phase="coverage",
+            )
+            plan_source = "llm"
+            if not plan:
+                plan = self._build_fallback_repair_plan(
+                    actual_rows=actual_rows_now,
+                    min_rows=min_rows,
+                    max_rows=max_rows,
+                    tables=tables,
+                    table_row_counts=table_row_counts,
+                    filter_values=filter_values,
+                    fk_relationships=fk_relationships,
+                    avoid_table_pairs=avoid_table_pairs,
+                    table_penalties=table_penalties,
+                    attempt=current_attempt + 1,
+                )
+                if plan:
+                    plan_source = "fallback"
+                else:
+                    plan_source = "none"
+            if not plan:
+                chosen_payload = _prefer_best_payload(payload)
+                if chosen_payload is not None:
+                    chosen_payload['llm_repair_attempts'] = current_attempt
+                    chosen_payload['llm_repair_history'] = llm_repairs
+                    return _attach_coverage_meta(chosen_payload, timeout=False)
+                logger.debug("Query failed without repair plan: %s", last_error)
+                return {
+                    'success': False,
+                    'error': last_error or 'Unknown query execution error',
+                    'tables_created': list(tables.keys()),
+                    'llm_repair_attempts': current_attempt,
+                    'llm_repair_history': llm_repairs,
+                    'coverage_timeout': False,
+                    'coverage_elapsed_s': round(max(0.0, time.monotonic() - coverage_started_at), 3),
+                }
+
+            # Guardrail: when we already have some rows, avoid LLM plans that
+            # only top up dimension-like tables (common low-leverage regression).
+            if plan_source == "llm" and actual_rows_now > 0:
+                llm_actions = self._filter_actions_for_mode(plan.get('actions', []))
+                targeted_tables = [
+                    str(a.get("table", ""))
+                    for a in llm_actions
+                    if isinstance(a, dict) and str(a.get("type", "")) == "set_row_count"
+                ]
+                if targeted_tables and not any(bool(fk_relationships.get(t)) for t in targeted_tables):
+                    fallback_plan = self._build_fallback_repair_plan(
+                        actual_rows=actual_rows_now,
+                        min_rows=min_rows,
+                        max_rows=max_rows,
+                        tables=tables,
+                        table_row_counts=table_row_counts,
+                        filter_values=filter_values,
+                        fk_relationships=fk_relationships,
+                        avoid_table_pairs=avoid_table_pairs,
+                        table_penalties=table_penalties,
+                        attempt=current_attempt + 1,
+                    )
+                    if fallback_plan:
+                        plan = fallback_plan
+                        plan_source = "fallback"
+
+            plan_actions = self._filter_actions_for_mode(plan.get('actions', []))
+            self._emit_progress(
+                f"plan source={plan_source} actions={json.dumps(plan_actions)[:220]}"
+            )
+            changed, notes, min_rows, max_rows, generation_order = self._apply_llm_repair_actions(
+                actions=plan_actions,
+                tables=tables,
+                fk_relationships=fk_relationships,
+                filter_values=filter_values,
+                table_row_counts=table_row_counts,
+                generation_order=generation_order,
+                min_rows=min_rows,
+                max_rows=max_rows,
+            )
+            if not changed:
+                fallback_plan = self._build_fallback_repair_plan(
+                    actual_rows=actual_rows_now,
+                    min_rows=min_rows,
+                    max_rows=max_rows,
+                    tables=tables,
+                    table_row_counts=table_row_counts,
+                    filter_values=filter_values,
+                    fk_relationships=fk_relationships,
+                    avoid_table_pairs=avoid_table_pairs,
+                    table_penalties=table_penalties,
+                    attempt=current_attempt + 1,
+                )
+                if plan_source == "llm" and fallback_plan:
+                    plan = fallback_plan
+                    plan_source = "fallback"
+                    plan_actions = self._filter_actions_for_mode(plan.get('actions', []))
+                    changed, notes, min_rows, max_rows, generation_order = self._apply_llm_repair_actions(
+                        actions=plan_actions,
+                        tables=tables,
+                        fk_relationships=fk_relationships,
+                        filter_values=filter_values,
+                        table_row_counts=table_row_counts,
+                        generation_order=generation_order,
+                        min_rows=min_rows,
+                        max_rows=max_rows,
+                    )
+            if not changed:
+                chosen_payload = _prefer_best_payload(payload)
+                if chosen_payload is not None:
+                    chosen_payload['llm_repair_attempts'] = current_attempt
+                    chosen_payload['llm_repair_history'] = llm_repairs
+                    return _attach_coverage_meta(chosen_payload, timeout=False)
+                logger.debug("Repair plan made no changes")
+                return {
+                    'success': False,
+                    'error': last_error or 'Unknown query execution error',
+                    'tables_created': list(tables.keys()),
+                    'llm_repair_attempts': current_attempt,
+                    'llm_repair_history': llm_repairs,
+                    'coverage_timeout': False,
+                    'coverage_elapsed_s': round(max(0.0, time.monotonic() - coverage_started_at), 3),
+                }
+
+            if "set_generation_order" not in notes:
+                generation_order = self._get_table_generation_order(tables, fk_relationships)
+            current_attempt += 1
+            llm_repairs.append({
+                'attempt': current_attempt,
+                'source': plan_source,
+                'note': plan.get('note', ''),
+                'actions': notes,
+                'plan_actions': [a for a in plan_actions if isinstance(a, dict)],
+                'rows_before': actual_rows_now,
+                'rows_after': None,
+                'in_range_after': None,
+                'last_error': last_error,
+                'swarm': plan.get('_swarm'),
+            })
     
     def validate_sql_pair(
         self,
@@ -1243,145 +2775,410 @@ class SyntheticValidator:
                 row_count_match: bool — row counts equal
                 reason: str — human-readable explanation
         """
-        # Fresh connection per validation to avoid state leakage
+        # Fresh connection per validation to avoid state leakage.
         self.conn = duckdb.connect(':memory:')
 
-        # 1. Validate original query — this sets up synthetic tables
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.sql', delete=False
-        ) as f:
-            f.write(original_sql)
-            orig_file = f.name
+        # 1) Transpile both queries to DuckDB if needed.
+        orig_exec = original_sql
+        opt_exec = optimized_sql
+        if self.dialect != 'duckdb':
+            try:
+                orig_exec = '\n'.join(sqlglot.transpile(original_sql, read=self.dialect, write='duckdb'))
+                opt_exec = '\n'.join(sqlglot.transpile(optimized_sql, read=self.dialect, write='duckdb'))
+            except Exception as e:
+                return {
+                    'match': False,
+                    'orig_success': False,
+                    'opt_success': False,
+                    'orig_rows': 0,
+                    'opt_rows': 0,
+                    'orig_error': f'Transpile failed: {e}',
+                    'opt_error': f'Transpile failed: {e}',
+                    'row_count_match': False,
+                    'reason': f'Transpile failed: {e}',
+                }
 
-        try:
-            orig_result = self.validate(orig_file, target_rows=target_rows)
-        finally:
-            os.unlink(orig_file)
+        orig_exec = self._resolve_ambiguous_columns(orig_exec)
+        opt_exec = self._resolve_ambiguous_columns(opt_exec)
 
-        if not orig_result['success']:
+        # Pure AST mode cannot safely validate SELECT * without concrete schema.
+        if self._requires_reference_schema_for_star(orig_exec) or self._requires_reference_schema_for_star(opt_exec):
+            msg = "Low-confidence schema: SELECT * requires reference DB schema in synthetic mode"
             return {
                 'match': False,
                 'orig_success': False,
                 'opt_success': False,
                 'orig_rows': 0,
                 'opt_rows': 0,
-                'orig_error': orig_result.get('error', 'Unknown error'),
-                'opt_error': None,
+                'orig_error': msg,
+                'opt_error': msg,
                 'row_count_match': False,
-                'reason': f"Original query failed: {orig_result.get('error', 'unknown')}",
+                'reason': msg,
             }
 
-        # 2. Transpile optimized SQL if non-DuckDB dialect
-        exec_sql = optimized_sql
-        if self.dialect != 'duckdb':
-            try:
-                transpiled = sqlglot.transpile(
-                    exec_sql, read=self.dialect, write='duckdb'
+        # 2) Extract schema from BOTH queries and merge.
+        try:
+            orig_tables = SchemaExtractor(orig_exec).extract_tables()
+            opt_tables = SchemaExtractor(opt_exec).extract_tables()
+        except Exception as e:
+            return {
+                'match': False,
+                'orig_success': False,
+                'opt_success': False,
+                'orig_rows': 0,
+                'opt_rows': 0,
+                'orig_error': f'Schema extraction failed: {e}',
+                'opt_error': f'Schema extraction failed: {e}',
+                'row_count_match': False,
+                'reason': f'Schema extraction failed: {e}',
+            }
+
+        merged_tables: Dict[str, Dict[str, Any]] = {}
+        for source in (orig_tables, opt_tables):
+            for table_name, table_info in source.items():
+                if table_name not in merged_tables:
+                    merged_tables[table_name] = {
+                        'columns': dict(table_info.get('columns', {})),
+                        'alias': table_info.get('alias'),
+                        'key': table_info.get('key', f'{table_name}_sk'),
+                    }
+                    continue
+                if not merged_tables[table_name].get('alias') and table_info.get('alias'):
+                    merged_tables[table_name]['alias'] = table_info.get('alias')
+                for col_name, col_info in table_info.get('columns', {}).items():
+                    merged_tables[table_name]['columns'].setdefault(col_name, dict(col_info))
+
+        # 3) Apply authoritative reference schema when available.
+        if self.schema_extractor:
+            for table_name in list(merged_tables.keys()):
+                ref_schema = self.schema_extractor.get_table_schema(table_name)
+                if ref_schema:
+                    merged_tables[table_name]['columns'] = dict(ref_schema)
+
+        # 4) Detect FK relationships from both query shapes.
+        fk_relationships = self._detect_fk_from_joins(orig_exec, merged_tables)
+        fk_sources = [
+            self._detect_fk_from_joins(opt_exec, merged_tables),
+            self._detect_foreign_keys(orig_exec, merged_tables),
+            self._detect_foreign_keys(opt_exec, merged_tables),
+        ]
+        for fk_map in fk_sources:
+            for table_name, fks in fk_map.items():
+                dst = fk_relationships.setdefault(table_name, {})
+                for col, target in fks.items():
+                    dst.setdefault(col, target)
+
+        # 5) Merge filter literals from both queries and propagate over join graph.
+        filter_values: Dict[str, Dict[str, list]] = {}
+        for extracted in (
+            self._extract_filter_values(orig_exec, merged_tables),
+            self._extract_filter_values(opt_exec, merged_tables),
+        ):
+            for table_name, col_map in extracted.items():
+                dst_cols = filter_values.setdefault(table_name, {})
+                for col_name, vals in col_map.items():
+                    dst_vals = dst_cols.setdefault(col_name, [])
+                    self._append_unique(dst_vals, list(vals))
+
+        join_graph = self._build_join_column_graph(orig_exec, merged_tables)
+        opt_graph = self._build_join_column_graph(opt_exec, merged_tables)
+        for node, neighbors in opt_graph.items():
+            join_graph.setdefault(node, set()).update(neighbors)
+        filter_values = self._propagate_filter_values_across_joins(filter_values, join_graph, merged_tables)
+
+        # 6) Estimate rows and keep mutable generation state for coverage/adversarial phases.
+        orig_counts = self._estimate_row_counts(orig_exec, merged_tables, target_rows)
+        opt_counts = self._estimate_row_counts(opt_exec, merged_tables, target_rows)
+        table_row_counts = {
+            table_name: max(int(orig_counts.get(table_name, 1000)), int(opt_counts.get(table_name, 1000)))
+            for table_name in merged_tables
+        }
+        generation_order = self._get_table_generation_order(merged_tables, fk_relationships)
+
+        def _populate_pair_data() -> None:
+            self._create_schema(merged_tables)
+            self._create_indexes(merged_tables, orig_exec)
+            self._create_indexes(merged_tables, opt_exec)
+
+            generator = SyntheticDataGenerator(self.conn, all_schemas=merged_tables)
+            generator.filter_literal_values = filter_values
+
+            for table_name in generation_order:
+                schema = merged_tables[table_name]
+                row_count = max(10, min(200000, int(table_row_counts.get(table_name, 1000))))
+                table_fks = fk_relationships.get(table_name, {})
+                generator.generate_table_data(
+                    table_name=table_name,
+                    schema=schema,
+                    row_count=row_count,
+                    foreign_keys=table_fks,
                 )
-                exec_sql = '\n'.join(transpiled)
+                self._update_filter_matched_pks(generator, merged_tables, [table_name], filter_values)
+                self._reverse_propagate_parent_key_matches(
+                    generator,
+                    table_name,
+                    merged_tables,
+                    fk_relationships,
+                    filter_values,
+                )
+
+        def _execute_pair_once() -> Dict[str, Any]:
+            try:
+                orig_rows_local = self.conn.execute(orig_exec).fetchall()
             except Exception as e:
                 return {
-                    'match': False,
-                    'orig_success': True,
-                    'opt_success': False,
-                    'orig_rows': orig_result['actual_rows'],
-                    'opt_rows': 0,
-                    'orig_error': None,
-                    'opt_error': f'Transpile failed: {e}',
-                    'row_count_match': False,
-                    'reason': f"Optimized query transpile failed: {e}",
+                    "orig_success": False,
+                    "opt_success": False,
+                    "orig_rows": [],
+                    "opt_rows": [],
+                    "orig_error": str(e),
+                    "opt_error": None,
+                    "reason": f"Original query failed: {e}",
                 }
 
-        # Resolve ambiguous ORDER BY columns
-        exec_sql = self._resolve_ambiguous_columns(exec_sql)
+            try:
+                opt_rows_local = self.conn.execute(opt_exec).fetchall()
+            except Exception as e:
+                return {
+                    "orig_success": True,
+                    "opt_success": False,
+                    "orig_rows": orig_rows_local,
+                    "opt_rows": [],
+                    "orig_error": None,
+                    "opt_error": str(e),
+                    "reason": f"Optimized query failed: {e}",
+                }
 
-        # 3. Execute optimized query on same synthetic data
-        try:
-            opt_rows = self.conn.execute(exec_sql).fetchall()
-        except Exception as e:
+            return {
+                "orig_success": True,
+                "opt_success": True,
+                "orig_rows": orig_rows_local,
+                "opt_rows": opt_rows_local,
+                "orig_error": None,
+                "opt_error": None,
+                "reason": "executed",
+            }
+
+        def _compare_rows(orig_rows_local: List[Any], opt_rows_local: List[Any]) -> Tuple[bool, bool, str]:
+            orig_count_local = len(orig_rows_local)
+            opt_count_local = len(opt_rows_local)
+            if orig_count_local != opt_count_local:
+                return False, False, f"Row count mismatch: original {orig_count_local} vs optimized {opt_count_local}"
+
+            def _result_hash(rows):
+                sorted_rows = sorted(str(r) for r in rows)
+                return hashlib.md5('\n'.join(sorted_rows).encode()).hexdigest()
+
+            if _result_hash(orig_rows_local) == _result_hash(opt_rows_local):
+                return True, True, "Results match (synthetic data)"
+
+            sorted_orig = sorted(str(r) for r in orig_rows_local)
+            sorted_opt = sorted(str(r) for r in opt_rows_local)
+            first_diff = None
+            for i, (a, b) in enumerate(zip(sorted_orig, sorted_opt)):
+                if a != b:
+                    first_diff = f"Row {i}: orig={a[:80]} vs opt={b[:80]}"
+                    break
+            return False, True, f"Value mismatch: {first_diff or 'unknown difference'}"
+
+        # Coverage phase: initial synthesis/execution.
+        _populate_pair_data()
+        exec_result = _execute_pair_once()
+        if not exec_result.get("orig_success", False):
+            return {
+                'match': False,
+                'orig_success': False,
+                'opt_success': False,
+                'orig_rows': 0,
+                'opt_rows': 0,
+                'orig_error': exec_result.get("orig_error"),
+                'opt_error': exec_result.get("opt_error"),
+                'row_count_match': False,
+                'reason': exec_result.get("reason", "Original query failed"),
+            }
+        if not exec_result.get("opt_success", False):
             return {
                 'match': False,
                 'orig_success': True,
                 'opt_success': False,
-                'orig_rows': orig_result['actual_rows'],
+                'orig_rows': len(exec_result.get("orig_rows", [])),
                 'opt_rows': 0,
-                'orig_error': None,
-                'opt_error': str(e)[:500],
+                'orig_error': exec_result.get("orig_error"),
+                'opt_error': exec_result.get("opt_error"),
                 'row_count_match': False,
-                'reason': f"Optimized query failed: {str(e)[:200]}",
+                'reason': exec_result.get("reason", "Optimized query failed"),
             }
 
-        # 4. Compare results
-        orig_rows = orig_result['sample_results']
-        orig_count = orig_result['actual_rows']
-        opt_count = len(opt_rows)
-
-        if orig_count != opt_count:
-            return {
-                'match': False,
-                'orig_success': True,
-                'opt_success': True,
-                'orig_rows': orig_count,
-                'opt_rows': opt_count,
-                'orig_error': None,
-                'opt_error': None,
-                'row_count_match': False,
-                'reason': f"Row count mismatch: original {orig_count} vs optimized {opt_count}",
-            }
-
-        # Hash comparison (order-independent)
-        def _result_hash(rows):
-            sorted_rows = sorted(str(r) for r in rows)
-            content = '\n'.join(sorted_rows)
-            return hashlib.md5(content.encode()).hexdigest()
-
-        # For original, we only have sample_results (first 10)
-        # Re-execute original to get full results for comparison
-        try:
-            full_orig = self.conn.execute(
-                self._resolve_ambiguous_columns(
-                    '\n'.join(sqlglot.transpile(original_sql, read=self.dialect, write='duckdb'))
-                ) if self.dialect != 'duckdb' else original_sql
-            ).fetchall()
-        except Exception:
-            full_orig = orig_rows  # fallback to sample
-
-        orig_hash = _result_hash(full_orig)
-        opt_hash = _result_hash(opt_rows)
-
-        if orig_hash == opt_hash:
-            return {
-                'match': True,
-                'orig_success': True,
-                'opt_success': True,
-                'orig_rows': orig_count,
-                'opt_rows': opt_count,
-                'orig_error': None,
-                'opt_error': None,
-                'row_count_match': True,
-                'reason': 'Results match (synthetic data)',
-            }
-
-        # Find first differing row for diagnostics
-        sorted_orig = sorted(str(r) for r in full_orig)
-        sorted_opt = sorted(str(r) for r in opt_rows)
-        first_diff = None
-        for i, (a, b) in enumerate(zip(sorted_orig, sorted_opt)):
-            if a != b:
-                first_diff = f"Row {i}: orig={a[:80]} vs opt={b[:80]}"
-                break
-
-        return {
-            'match': False,
+        orig_rows = exec_result["orig_rows"]
+        opt_rows = exec_result["opt_rows"]
+        match, row_count_match, reason = _compare_rows(orig_rows, opt_rows)
+        base_result: Dict[str, Any] = {
+            'match': match,
             'orig_success': True,
             'opt_success': True,
-            'orig_rows': orig_count,
-            'opt_rows': opt_count,
+            'orig_rows': len(orig_rows),
+            'opt_rows': len(opt_rows),
             'orig_error': None,
             'opt_error': None,
-            'row_count_match': True,
-            'reason': f"Value mismatch: {first_diff or 'unknown difference'}",
+            'row_count_match': row_count_match,
+            'reason': reason,
+            'adversarial_attempts': 0,
+            'adversarial_timeout': False,
+            'adversarial_elapsed_s': 0.0,
+            'adversarial_history': [],
         }
+        if not match:
+            return base_result
+
+        # Adversarial phase: add-only attempts to find divergence.
+        adversarial_started_at = time.monotonic()
+        adversarial_deadline = (
+            adversarial_started_at + float(self.adversarial_time_budget_s)
+            if self.adversarial_time_budget_s > 0
+            else None
+        )
+        repair_log: List[Dict[str, Any]] = []
+        attempt = 0
+        prior_row_signal = max(len(orig_rows), len(opt_rows))
+        pair_sql = f"-- ORIGINAL\n{orig_exec}\n-- OPTIMIZED\n{opt_exec}"
+        self._emit_progress(
+            f"adversarial start budget_s={self.adversarial_time_budget_s} retries={self.llm_max_retries}"
+        )
+
+        while (
+            self.llm_max_retries > 0
+            and attempt < self.llm_max_retries
+            and (adversarial_deadline is None or time.monotonic() < adversarial_deadline)
+        ):
+            plan = self._request_llm_repair_plan(
+                sql=pair_sql,
+                last_error=None,
+                actual_rows=prior_row_signal,
+                min_rows=1,
+                max_rows=max(1000, prior_row_signal * 20),
+                tables=merged_tables,
+                fk_relationships=fk_relationships,
+                filter_values=filter_values,
+                table_row_counts=table_row_counts,
+                generation_order=generation_order,
+                attempt=attempt + 1,
+                repair_log=repair_log,
+                phase="adversarial",
+            )
+            if not plan:
+                break
+
+            plan_actions = self._filter_actions_for_mode(plan.get("actions", []))
+            changed, notes, _min_unused, _max_unused, generation_order = self._apply_llm_repair_actions(
+                actions=plan_actions,
+                tables=merged_tables,
+                fk_relationships=fk_relationships,
+                filter_values=filter_values,
+                table_row_counts=table_row_counts,
+                generation_order=generation_order,
+                min_rows=0,
+                max_rows=10**9,
+            )
+            attempt += 1
+            if not changed:
+                break
+
+            _populate_pair_data()
+            exec_result = _execute_pair_once()
+            if not exec_result.get("orig_success", False) or not exec_result.get("opt_success", False):
+                mismatch_reason = exec_result.get("reason", "Adversarial execution failed")
+                effort = {
+                    "ts": datetime.now().isoformat(),
+                    "attempt": attempt,
+                    "phase": "adversarial",
+                    "plan_note": plan.get("note", ""),
+                    "actions": notes,
+                    "match": False,
+                    "row_count_match": False,
+                    "orig_rows": len(exec_result.get("orig_rows", [])),
+                    "opt_rows": len(exec_result.get("opt_rows", [])),
+                    "reason": mismatch_reason,
+                }
+                self._append_adversarial_effort(effort)
+                repair_log.append({
+                    "attempt": attempt,
+                    "source": "llm",
+                    "rows_before": prior_row_signal,
+                    "rows_after": max(len(exec_result.get("orig_rows", [])), len(exec_result.get("opt_rows", []))),
+                    "row_delta": 0,
+                    "regressed": False,
+                    "plan_actions": [a for a in plan_actions if isinstance(a, dict)],
+                })
+                return {
+                    'match': False,
+                    'orig_success': bool(exec_result.get("orig_success", False)),
+                    'opt_success': bool(exec_result.get("opt_success", False)),
+                    'orig_rows': len(exec_result.get("orig_rows", [])),
+                    'opt_rows': len(exec_result.get("opt_rows", [])),
+                    'orig_error': exec_result.get("orig_error"),
+                    'opt_error': exec_result.get("opt_error"),
+                    'row_count_match': False,
+                    'reason': f"Adversarial execution failure: {mismatch_reason}",
+                    'adversarial_attempts': attempt,
+                    'adversarial_timeout': False,
+                    'adversarial_elapsed_s': round(max(0.0, time.monotonic() - adversarial_started_at), 3),
+                    'adversarial_history': repair_log,
+                }
+
+            orig_rows = exec_result["orig_rows"]
+            opt_rows = exec_result["opt_rows"]
+            match, row_count_match, reason = _compare_rows(orig_rows, opt_rows)
+            after_signal = max(len(orig_rows), len(opt_rows))
+            effort = {
+                "ts": datetime.now().isoformat(),
+                "attempt": attempt,
+                "phase": "adversarial",
+                "plan_note": plan.get("note", ""),
+                "actions": notes,
+                "match": bool(match),
+                "row_count_match": bool(row_count_match),
+                "orig_rows": len(orig_rows),
+                "opt_rows": len(opt_rows),
+                "reason": reason,
+            }
+            self._append_adversarial_effort(effort)
+            repair_log.append({
+                "attempt": attempt,
+                "source": "llm",
+                "rows_before": prior_row_signal,
+                "rows_after": after_signal,
+                "row_delta": after_signal - prior_row_signal,
+                "regressed": after_signal < prior_row_signal,
+                "plan_actions": [a for a in plan_actions if isinstance(a, dict)],
+            })
+            prior_row_signal = after_signal
+            self._emit_progress(
+                f"adversarial attempt={attempt} match={match} rows={len(orig_rows)}:{len(opt_rows)} reason={reason[:120]}"
+            )
+            if not match:
+                return {
+                    'match': False,
+                    'orig_success': True,
+                    'opt_success': True,
+                    'orig_rows': len(orig_rows),
+                    'opt_rows': len(opt_rows),
+                    'orig_error': None,
+                    'opt_error': None,
+                    'row_count_match': row_count_match,
+                    'reason': f'Adversarial mismatch found: {reason}',
+                    'adversarial_attempts': attempt,
+                    'adversarial_timeout': False,
+                    'adversarial_elapsed_s': round(max(0.0, time.monotonic() - adversarial_started_at), 3),
+                    'adversarial_history': repair_log,
+                }
+
+        base_result['adversarial_attempts'] = attempt
+        base_result['adversarial_timeout'] = bool(
+            adversarial_deadline is not None and time.monotonic() >= adversarial_deadline
+        )
+        base_result['adversarial_elapsed_s'] = round(max(0.0, time.monotonic() - adversarial_started_at), 3)
+        base_result['adversarial_history'] = repair_log
+        return base_result
 
     @staticmethod
     def _build_alias_map(parsed: exp.Expression) -> Tuple[Dict[str, str], Set[str]]:
@@ -1670,7 +3467,14 @@ class SyntheticValidator:
 
         def _is_key_col(col_name: str) -> bool:
             col_lower = col_name.lower()
-            return col_lower.endswith('_sk') or col_lower.endswith('_id') or col_lower == 'id'
+            return (
+                col_lower.endswith('_sk')
+                or col_lower.endswith('_id')
+                or col_lower == 'id'
+                or col_lower.endswith('_order_number')
+                or col_lower.endswith('_ticket_number')
+                or col_lower in {'order_number', 'ticket_number'}
+            )
         
         for join in parsed.find_all(exp.Join):
             for eq in join.find_all(exp.EQ):
@@ -1729,7 +3533,14 @@ class SyntheticValidator:
 
         def _is_key_col(col_name: str) -> bool:
             col_lower = col_name.lower()
-            return col_lower.endswith('_sk') or col_lower.endswith('_id') or col_lower == 'id'
+            return (
+                col_lower.endswith('_sk')
+                or col_lower.endswith('_id')
+                or col_lower == 'id'
+                or col_lower.endswith('_order_number')
+                or col_lower.endswith('_ticket_number')
+                or col_lower in {'order_number', 'ticket_number'}
+            )
 
         # Build alias map
         alias_map = {}
@@ -1772,6 +3583,19 @@ class SyntheticValidator:
             if left_table not in tables or right_table not in tables:
                 continue
             if not (_is_key_col(left_col) or _is_key_col(right_col)):
+                continue
+
+            left_pk = find_primary_key_column(left_table, list(tables[left_table]['columns'].keys()))
+            right_pk = find_primary_key_column(right_table, list(tables[right_table]['columns'].keys()))
+            left_is_pk = bool(left_pk and left_col.lower() == left_pk.lower())
+            right_is_pk = bool(right_pk and right_col.lower() == right_pk.lower())
+
+            # Strong signal: FK usually points to a parent PK.
+            if left_is_pk and not right_is_pk:
+                fk_relationships.setdefault(right_table, {})[right_col.lower()] = (left_table, left_col)
+                continue
+            if right_is_pk and not left_is_pk:
+                fk_relationships.setdefault(left_table, {})[left_col.lower()] = (right_table, right_col)
                 continue
 
             # Determine FK direction using key-column count heuristic.
@@ -1890,14 +3714,62 @@ class SyntheticValidator:
                     return guessed_table, real_col
             return None
 
+        def _format_const_number(v: float) -> str:
+            if abs(v - round(v)) < 1e-9:
+                return str(int(round(v)))
+            text = f"{v:.12f}".rstrip('0').rstrip('.')
+            return text if text else "0"
+
+        def _extract_const_value(node: Optional[exp.Expression]) -> Optional[str]:
+            if node is None:
+                return None
+            if isinstance(node, exp.Literal):
+                return str(node.this)
+            if isinstance(node, exp.Paren):
+                return _extract_const_value(node.this)
+            if isinstance(node, exp.Neg):
+                inner = _extract_const_value(node.this)
+                if inner is None:
+                    return None
+                try:
+                    return _format_const_number(-float(inner))
+                except (TypeError, ValueError):
+                    return None
+            if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+                left = _extract_const_value(node.left)
+                right = _extract_const_value(node.right)
+                if left is None or right is None:
+                    return None
+                try:
+                    l = float(left)
+                    r = float(right)
+                    if isinstance(node, exp.Add):
+                        out = l + r
+                    elif isinstance(node, exp.Sub):
+                        out = l - r
+                    elif isinstance(node, exp.Mul):
+                        out = l * r
+                    else:
+                        if r == 0:
+                            return None
+                        out = l / r
+                    return _format_const_number(out)
+                except (TypeError, ValueError):
+                    return None
+            if isinstance(node, exp.Cast):
+                return _extract_const_value(node.this)
+            return None
+
         for where in parsed.find_all(exp.Where):
             # Equality filters: col = literal
             for eq in where.find_all(exp.EQ):
-                if isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Literal):
+                if isinstance(eq.left, exp.Column):
                     resolved = _resolve_filter_column(eq.left)
                     if resolved:
+                        val = _extract_const_value(eq.right)
+                        if val is None:
+                            continue
                         table, col = resolved
-                        val = eq.right.this
                         if table not in filter_values:
                             filter_values[table] = {}
                         if col not in filter_values[table]:
@@ -1924,25 +3796,28 @@ class SyntheticValidator:
                     resolved = _resolve_filter_column(between.this)
                     if resolved:
                         table, col = resolved
-                        low = between.args.get('low')
-                        high = between.args.get('high')
-                        if isinstance(low, exp.Literal) and isinstance(high, exp.Literal):
+                        low = _extract_const_value(between.args.get('low'))
+                        high = _extract_const_value(between.args.get('high'))
+                        if low is not None and high is not None:
                             if table not in filter_values:
                                 filter_values[table] = {}
-                            filter_values[table][col] = [f"BETWEEN:{low.this}:{high.this}"]
+                            filter_values[table][col] = [f"BETWEEN:{low}:{high}"]
 
             # GT/GTE/LT: col > literal
             for cmp_cls, op in [(exp.GT, '>'), (exp.GTE, '>='), (exp.LT, '<'), (exp.LTE, '<=')]:
                 for cmp in where.find_all(cmp_cls):
-                    if isinstance(cmp.left, exp.Column) and isinstance(cmp.right, exp.Literal):
+                    if isinstance(cmp.left, exp.Column):
                         resolved = _resolve_filter_column(cmp.left)
                         if resolved:
+                            val = _extract_const_value(cmp.right)
+                            if val is None:
+                                continue
                             table, col = resolved
                             if table not in filter_values:
                                 filter_values[table] = {}
                             if col not in filter_values[table]:
                                 filter_values[table][col] = []
-                            filter_values[table][col].append(f"{op}:{cmp.right.this}")
+                            filter_values[table][col].append(f"{op}:{val}")
 
         return filter_values
 
@@ -1966,7 +3841,13 @@ class SyntheticValidator:
 
             for col_name in table_cols:
                 col_lower = col_name.lower()
-                if not (col_lower.endswith('_sk') or col_lower.endswith('_id')):
+                if not (
+                    col_lower.endswith('_sk')
+                    or col_lower.endswith('_id')
+                    or col_lower.endswith('_order_number')
+                    or col_lower.endswith('_ticket_number')
+                    or col_lower in {'order_number', 'ticket_number'}
+                ):
                     continue
 
                 # Skip likely PK column in current table.
@@ -2075,28 +3956,33 @@ class SyntheticValidator:
         if order is None:
             return sql
 
-        # Build a map: unqualified_col_name -> table qualifier
-        # from GROUP BY and SELECT expressions
-        qualified_map = {}  # col_name -> table_name
+        # Build a map: unqualified_col_name -> set(table qualifiers)
+        # from GROUP BY and SELECT expressions.
+        qualified_map: Dict[str, Set[str]] = {}
 
         # Check GROUP BY for qualified columns
         group = parsed.find(exp.Group)
         if group:
             for col in group.find_all(exp.Column):
                 if col.table and col.name:
-                    qualified_map[col.name] = col.table
+                    qualified_map.setdefault(col.name, set()).add(col.table)
 
         # Check SELECT for qualified columns (if not in GROUP BY)
         for sel_expr in outer_select.expressions:
             for col in sel_expr.find_all(exp.Column):
-                if col.table and col.name and col.name not in qualified_map:
-                    qualified_map[col.name] = col.table
+                if col.table and col.name:
+                    qualified_map.setdefault(col.name, set()).add(col.table)
 
         # Now fix unqualified ORDER BY columns
         modified = False
         for col in order.find_all(exp.Column):
-            if not col.table and col.name in qualified_map:
-                col.set('table', exp.to_identifier(qualified_map[col.name]))
+            if col.table or col.name not in qualified_map:
+                continue
+            candidates = qualified_map[col.name]
+            # Only safe when the candidate table is unique.
+            if len(candidates) == 1:
+                table_name = next(iter(candidates))
+                col.set('table', exp.to_identifier(table_name))
                 modified = True
 
         if modified:

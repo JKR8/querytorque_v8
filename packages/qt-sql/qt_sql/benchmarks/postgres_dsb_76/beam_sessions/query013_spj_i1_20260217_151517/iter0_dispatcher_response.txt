@@ -1,0 +1,252 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Cost spine dominated by Nested Loop joining 168k store_sales rows amplified by late OR condition filtering. Transform families A (early filtering) and D (OR→UNION) should reduce fact table scans and enable index usage.",
+    "reasoning_trace": [
+      "Top hotspot: Nested Loop (168k rows, 42.5s) joining date_dim→store_sales",
+      "Sequential scans on household_demographics/store despite small sizes suggest comma-join weakness",
+      "OR conditions on ss_sales_price/ss_net_profit prevent efficient index usage",
+      "No bitmap scans in plan despite selective dimension filters"
+    ],
+    "cost_spine": [
+      "Nested Loop (168k rows) → Hash Join (18k rows) → Nested Loop (3k rows) → Aggregate"
+    ],
+    "hotspots": [
+      {"op": "Nested Loop", "why": "168k row amplification from date_dim→store_sales", "evidence": "rows=168134, time=42543.93ms"},
+      {"op": "Hash Join", "why": "Late OR condition processing", "evidence": "rows=18795, time=42611.738ms"}
+    ],
+    "do_not_do": [
+      "or_to_union for same-column OR (registry ban)",
+      "EXISTS→IN conversion (dialect strength)",
+      "Join reordering (dialect strength)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "status",
+    "speedup",
+    "expected_explain_delta",
+    "ops_used",
+    "confidence",
+    "exploration",
+    "failure_reason",
+    "target"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Replace comma join with explicit INNER JOIN after isolating date_dim filter. Create CTE: date_filtered AS (SELECT d_date_sk FROM date_dim WHERE d_year=2001). Rewrite FROM clause with JOIN date_filtered ON ss_sold_date_sk = d_date_sk.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year=2001"],
+        "output_must_preserve": ["min(ss_quantity)", "min(ss_ext_sales_price)", "min(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "no_self_join:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "IndexOnlyScan on date_dim replaced by CTE scan, explicit JOIN in plan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs for all dimensions: hd_cte (hd_demo_sk WHERE hd_dep_count IN (1,3)), cd_cte (cd_demo_sk WHERE marital/education conditions), ca_cte (ca_address_sk WHERE country/state conditions). Rewrite FROM with explicit JOINs on CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics", "customer_demographics", "customer_address"],
+        "where_must_preserve": ["ss_hdemo_sk=hd_demo_sk", "ss_cdemo_sk=cd_demo_sk", "ss_addr_sk=ca_address_sk"],
+        "output_must_preserve": "All min() aggregates"
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.8,
+      "expected_explain_delta": "Seq scans replaced by CTE scans, explicit JOIN topology",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split first OR condition (hd/cd filters) into 3 UNION ALL branches. Preserve second OR condition within each branch. Maintain top-level aggregation.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics", "customer_demographics"],
+        "where_must_preserve": ["ss_sales_price BETWEEN ranges"],
+        "output_must_preserve": "Original min() semantics via outer aggregation"
+      },
+      "gates_checked": ["same_column_or:FAIL", "bitmap_or_scan:EXPLAIN_ABSENT"],
+      "exploration": true,
+      "exploration_hypothesis": "EXPLAIN shows no bitmap scans - UNION branches may enable index usage on ss_sales_price",
+      "confidence": 0.65,
+      "expected_explain_delta": "Appearance of 3 UNION branches, reduced Nested Loop rows",
+      "recommended_patch_ops": ["replace_body"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split second OR condition (ca_address filters) into 3 UNION ALL branches. Preserve first OR condition within each branch. Maintain top-level aggregation.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_address"],
+        "where_must_preserve": ["ss_net_profit BETWEEN ranges"],
+        "output_must_preserve": "Original min() semantics via outer aggregation"
+      },
+      "gates_checked": ["same_column_or:FAIL", "bitmap_or_scan:EXPLAIN_ABSENT"],
+      "exploration": true,
+      "exploration_hypothesis": "UNION branches may enable index usage on ss_net_profit where OR condition blocks it",
+      "confidence": 0.6,
+      "expected_explain_delta": "3 UNION branches for address conditions, reduced Hash Join rows",
+      "recommended_patch_ops": ["replace_body"]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create hd_cte: SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count IN (1,3). Replace table reference with CTE and add explicit JOIN.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "household_demographics"],
+        "where_must_preserve": ["ss_hdemo_sk=hd_demo_sk"],
+        "output_must_preserve": "All min() aggregates"
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "small_dimension:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate - pre-filtering may reduce fact table joins despite dialect differences",
+      "confidence": 0.7,
+      "expected_explain_delta": "Seq scan on household_demographics replaced by CTE scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create cd_cte: SELECT cd_demo_sk FROM customer_demographics WHERE (marital+edu conditions). Replace table reference with CTE and add explicit JOIN.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_demographics"],
+        "where_must_preserve": ["ss_cdemo_sk=cd_demo_sk"],
+        "output_must_preserve": "All min() aggregates"
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "small_dimension:PARTIAL"],
+      "exploration": true,
+      "exploration_hypothesis": "Selective filters (3 combinations) may benefit from materialization despite 1.9M rows",
+      "confidence": 0.6,
+      "expected_explain_delta": "Potential index scan on cd_cte vs full scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert all comma joins to explicit INNER JOIN syntax with ON conditions. Preserve original join order.",
+      "node_contract": {
+        "from_must_include": "All original tables",
+        "where_must_preserve": "All join conditions moved to ON clauses",
+        "output_must_preserve": "Identical result set"
+      },
+      "gates_checked": ["comma_join_weakness:PASS", "left_join_absence:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.9,
+      "expected_explain_delta": "Explicit JOIN operators in plan, improved cardinality estimates",
+      "recommended_patch_ops": ["replace_from"]
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Isolate store_sales join with pre-filtered dimensions: FROM (store_sales JOIN date_filtered ON ...) JOIN hd_cte ON ...",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year=2001"],
+        "output_must_preserve": "All min() aggregates"
+      },
+      "gates_checked": ["cross_cte_predicate_blindness:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate - staged reduction might overcome dialect's CTE fencing",
+      "confidence": 0.55,
+      "expected_explain_delta": "Reduced rows in store_sales scan via early dimension joins",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create combined_dim_cte: SELECT ss_item_sk FROM store_sales JOIN all filtered dimensions. Use as base for main query.",
+      "node_contract": {
+        "from_must_include": "All dimension tables",
+        "where_must_preserve": "All dimension filters",
+        "output_must_preserve": "ss_item_sk for outer join"
+      },
+      "gates_checked": ["cte_materialization_fence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate - combined dimension reduction may shrink fact table early",
+      "confidence": 0.5,
+      "expected_explain_delta": "Store_sales scan replaced by CTE scan",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split both OR conditions into 9 UNION ALL branches (3x3 combinations). Maintain top-level aggregation.",
+      "node_contract": {
+        "from_must_include": "All tables",
+        "where_must_preserve": "Branch-specific filters",
+        "output_must_preserve": "min() via outer aggregation"
+      },
+      "gates_checked": ["same_column_or:FAIL", "bitmap_or_scan:EXPLAIN_ABSENT"],
+      "exploration": true,
+      "exploration_hypothesis": "Maximal OR decomposition - may enable compound index usage per branch",
+      "confidence": 0.45,
+      "expected_explain_delta": "9 UNION branches, significantly reduced per-branch rows",
+      "recommended_patch_ops": ["replace_body"]
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create fact_prefilter CTE: SELECT * FROM store_sales WHERE EXISTS (SELECT 1 FROM filtered dimensions). Use as main fact source.",
+      "node_contract": {
+        "from_must_include": "store_sales",
+        "where_must_preserve": "All dimension join conditions",
+        "output_must_preserve": "All ss_* columns"
+      },
+      "gates_checked": ["non_equi_join_absence:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Native transform - EXISTS may force early filtering despite OR conditions",
+      "confidence": 0.6,
+      "expected_explain_delta": "Semi-join in CTE definition, reduced fact rows in main query",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Create ca_cte: SELECT ca_address_sk FROM customer_address WHERE country/state conditions. Replace table reference with CTE and explicit JOIN.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_address"],
+        "where_must_preserve": ["ss_addr_sk=ca_address_sk"],
+        "output_must_preserve": "All min() aggregates"
+      },
+      "gates_checked": ["cte_materialization_fence:PASS", "small_dimension:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "State filters highly selective - CTE may enable hash join optimization",
+      "confidence": 0.75,
+      "expected_explain_delta": "Seq scan on customer_address replaced by CTE scan with index",
+      "recommended_patch_ops": ["insert_cte", "replace_from"]
+    }
+  ],
+  "dropped": [
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "No INTERSECT in query"},
+    {"transform_id": "aggregate_pushdown", "family": "C", "reason": "Global aggregates cannot be pushed down"},
+    {"transform_id": "pg_self_join_decomposition", "family": "E", "reason": "No self-join pattern"}
+  ]
+}

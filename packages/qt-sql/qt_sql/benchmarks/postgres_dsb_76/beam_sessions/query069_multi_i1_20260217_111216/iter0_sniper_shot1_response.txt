@@ -1,0 +1,57 @@
+### Optimization Plan Analysis
+
+The BDA reveals **p12** as the only successful probe (34.45x speedup) by decorrelating the `EXISTS` clause for `store_sales` into a CTE semi-join. However, the NOT EXISTS clauses for `web_sales` and `catalog_sales` remain correlated and dominate runtime (25s in the original plan). The remaining bottleneck is the nested-loop anti-join execution of these NOT EXISTS clauses.
+
+### Proposed PatchPlan
+
+```json
+{
+  "plan_id": "snipe_best",
+  "dialect": "postgres",
+  "importance_stars": 3,
+  "confidence": 0.85,
+  "based_on": ["p12"],
+  "novel_transforms": ["decorrelate_not_exists_web_catalog"],
+  "decision_trace": [
+    "p12 proved decorrelation of EXISTS via CTE is safe and effective (34x speedup)",
+    "Original plan shows NOT EXISTS anti-joins dominate runtime (25s nested loops)",
+    "Extend p12's CTE approach to NOT EXISTS clauses for web_sales/catalog_sales",
+    "Add date_range CTE to avoid redundant date_dim scans (neutral in p04/p10)"
+  ],
+  "strategy": "Combine p12's winning store_sales decorrelation with novel anti-join decorrelation for web/catalog sales using shared date_range CTE.",
+  "hypothesis": "The 25s nested-loop anti-joins for NOT EXISTS clauses can be converted to hash anti-joins against precomputed CTEs. The date_range CTE reduces redundant date_dim processing. This targets the remaining bottleneck while preserving p12's gains.",
+  "expected_explain_delta": [
+    "Replace Nested Loop Anti (310K rows) with Hash Anti Join against CTEs",
+    "Reduce date_dim scans from 3 to 1 via date_range CTE materialization",
+    "Eliminate per-row re-execution of web_sales/catalog_sales subqueries"
+  ],
+  "risk_notes": [
+    "CTE materialization may increase memory usage for large intermediate sets",
+    "DISTINCT in sales CTEs must preserve original NOT EXISTS semantics",
+    "Join conditions must exactly match original keys (ws_bill/cs_ship customer_sk)"
+  ],
+  "fallback": {
+    "use_probe_only": "p12",
+    "when": "If equivalence fails or anti-join decorrelation regresses"
+  },
+  "target_ir": "Main query with date_range + sales CTEs, explicit JOINs, and converted anti-joins",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "replace_body",
+      "payload": {
+        "sql": "WITH date_range AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_year = 2002 AND d_moy BETWEEN 10 AND 12\n),\nstore_customers AS (\n  SELECT DISTINCT ss_customer_sk\n  FROM store_sales, date_range\n  WHERE ss_sold_date_sk = date_range.d_date_sk\n    AND ss_list_price BETWEEN 80 AND 169\n),\nweb_customers AS (\n  SELECT DISTINCT ws_bill_customer_sk\n  FROM web_sales, date_range\n  WHERE ws_sold_date_sk = date_range.d_date_sk\n    AND ws_list_price BETWEEN 80 AND 169\n),\ncatalog_customers AS (\n  SELECT DISTINCT cs_ship_customer_sk\n  FROM catalog_sales, date_range\n  WHERE cs_sold_date_sk = date_range.d_date_sk\n    AND cs_list_price BETWEEN 80 AND 169\n)\nSELECT \n  cd_gender,\n  cd_marital_status,\n  cd_education_status,\n  COUNT(*) AS cnt1,\n  cd_purchase_estimate,\n  COUNT(*) AS cnt2,\n  cd_credit_rating,\n  COUNT(*) AS cnt3\nFROM customer c\nJOIN customer_address ca \n  ON c.c_current_addr_sk = ca.ca_address_sk\nJOIN customer_demographics cd \n  ON cd.cd_demo_sk = c.c_current_cdemo_sk\nWHERE ca.ca_state IN ('CO','NC','TX')\n  AND cd.cd_marital_status IN ('S','M','U')\n  AND cd.cd_education_status IN ('Primary','College')\n  AND EXISTS (SELECT 1 FROM store_customers sc WHERE sc.ss_customer_sk = c.c_customer_sk)\n  AND NOT EXISTS (SELECT 1 FROM web_customers wc WHERE wc.ws_bill_customer_sk = c.c_customer_sk)\n  AND NOT EXISTS (SELECT 1 FROM catalog_customers cc WHERE cc.cs_ship_customer_sk = c.c_customer_sk)\nGROUP BY cd_gender, cd_marital_status, cd_education_status, \n         cd_purchase_estimate, cd_credit_rating\nORDER BY cd_gender, cd_marital_status, cd_education_status, \n         cd_purchase_estimate, cd_credit_rating\nLIMIT 100;"
+      }
+    }
+  ]
+}
+```
+
+### Key Improvements
+1. **Anti-join Decorrelation**: Converts expensive nested-loop NOT EXISTS into hash anti-joins against precomputed CTEs
+2. **Date Dimension Consolidation**: Single `date_range` CTE replaces 3 redundant date_dim scans
+3. **Explicit JOIN Syntax**: Resolves comma-join weakness noted in engine profile
+4. **Semantic Preservation**: Maintains original logic with DISTINCT keys and identical filters
+
+### Fallback Strategy
+Revert to p12 (store_sales decorrelation only) if compound plan shows regression. This preserves 34x speedup for the most impactful transformation.

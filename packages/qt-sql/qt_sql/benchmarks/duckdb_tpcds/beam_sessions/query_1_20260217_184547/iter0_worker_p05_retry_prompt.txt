@@ -1,0 +1,474 @@
+## Role
+
+You are a **Beam Worker** for SQL optimization on the target runtime dialect.
+
+You must apply **ONE specific transform** to the query and output a **PatchPlan JSON** that updates the query’s IR.
+
+One worker = one probe = one transform.
+
+---
+
+## Prompt Map (cache friendly)
+
+### Phase A — Cached Instructions (static)
+A1. Patch operations
+A2. Semantic guards (must preserve)
+A3. Anchor-hash rules (robustness requirements)
+A4. Verification checklist
+A5. PatchPlan output schema
+
+### Phase B — Probe-Specific Input (dynamic; after cache boundary)
+B1. Shared dispatcher hypothesis (short)
+B2. Probe assignment (transform + target + node contract + gates_checked)
+B3. Dispatcher do_not_do list
+B4. Original SQL
+B5. Optional execution plan snippet
+B6. IR node map (S0 + anchor hashes)
+B7. Schema excerpt (tables, columns, nullability, keys, indexes)
+B8. Existing CTE names in current query
+B9. Engine-specific knowledge profile (strengths, gaps, contraindications)
+
+---
+
+## Patch Operations (core + advanced)
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the full WHERE boolean expression | expr_sql |
+| replace_body | Replace entire query body | sql_fragment |
+| replace_expr_subtree | Replace a specific expression/predicate | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression/predicate | (target only, no payload) |
+| replace_join_condition | Replace a specific JOIN condition expression | expr_sql (+ by_anchor_hash) |
+| replace_select | Replace SELECT projection list | sql_fragment |
+| replace_block_with_cte_pair | Replace block using CTE-integrated SQL fragment | sql_fragment |
+| wrap_query_with_cte | Add wrapper CTE to statement | cte_name, cte_query_sql |
+
+All step targets MUST use: `{"by_node_id": "S0"}`.
+Use `by_anchor_hash` only when replacing/deleting a specific predicate/expression.
+
+Target examples:
+- Statement-level edit:
+  `{"by_node_id": "S0"}`
+- Predicate-subtree edit:
+  `{"by_node_id": "S0", "by_anchor_hash": "ab12cd34ef56ab78"}`
+
+---
+
+## Semantic Guards (MUST preserve)
+
+- Preserve ALL WHERE/HAVING/ON conditions exactly, unless the assigned transform explicitly replaces a correlated subquery with an equivalent join/anti-join.
+- Do NOT change any literal values (numbers, strings, dates, arithmetic forms).
+- Preserve SELECT columns, aliases, ORDER BY, LIMIT exactly.
+- Do NOT add new filters.
+- Do NOT leave orphaned CTEs or duplicate base scans after replacement.
+- Follow dispatcher `node_contract` precisely.
+- If dispatcher `do_not_do` conflicts with your assigned transform shape, return a safe no-op plan with `steps: []` and explain the conflict.
+- Keep alias consistency across steps: every alias referenced in WHERE/ON/SELECT must be defined in FROM or a CTE.
+- When using `replace_where_predicate`, copy preserved predicates verbatim from original SQL for clauses you are not transforming.
+- `replace_body` is allowed only when the transform fundamentally changes query shape. If changes are localized to CTE/FROM/WHERE, use targeted ops.
+- For EXISTS/NOT EXISTS rewrites, preserve NULL semantics on join keys (prove NOT NULL from predicates/schema or keep EXISTS form).
+
+If `node_contract` or `gates_checked` is missing or ambiguous:
+- Output a minimal safe failure PatchPlan with `steps: []` and hypothesis explaining what is missing.
+
+If a RETRY section is present with a gate-failure object:
+- Fix the specific gate issue first (do not redesign the transform intent).
+- Preserve all semantic guards while correcting only what failed.
+Expected RETRY object shape:
+`{"gate":"tier_name","status":"FAIL","error":"reason","probe_id":"pNN","transform_id":"id"}`
+
+---
+
+## Anchor-hash rules (robustness)
+
+- `by_anchor_hash` values are produced by an external parser and are **whitespace/formatting independent**.
+- You MUST copy anchor hashes verbatim; never invent hashes.
+- If transform targets a nested subquery/predicate inside WHERE or SELECT, prefer `replace_expr_subtree` with anchor hash to minimize blast radius.
+- If you cannot confidently identify the exact target anchor, do not use `replace_expr_subtree`.
+  Prefer `replace_where_predicate`, or output a safe no-op plan.
+
+---
+
+## Verification Checklist (self-check)
+
+- [ ] Patch steps produce a valid executable query
+- [ ] No missing tables/aliases
+- [ ] No duplicated source scans (orphan risk)
+- [ ] EXISTS / NOT EXISTS semantics preserved if rewritten
+- [ ] No same-column OR to UNION split unless EXPLAIN evidence shows OR blocks index usage and UNION branches become index scans
+- [ ] New CTEs are selective (meaningful WHERE) unless transform requires otherwise
+
+---
+
+## PatchPlan Output Schema (MUST follow)
+
+Tier-0 output contract:
+- first character must be `{` (no leading whitespace/newlines)
+- top-level value must be one JSON object
+- no markdown fences, no prose, no commentary
+
+Output JSON shape:
+{
+  "probe_id": "p01",
+  "transform_id": "decorrelate_not_exists_to_cte",
+  "family": "B",
+  "dialect": "<target_dialect>",
+  "hypothesis": "1 sentence: why this transform should reduce the plan hotspot",
+  "reasoning_trace": [
+    "Target correlated NOT EXISTS on customer_demographics",
+    "Replace per-row re-execution with one anti-join-ready CTE"
+  ],
+  "target_ir": "Short structural description of the post-patch query shape",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "filtered_customers",
+        "cte_query_sql": "SELECT c_customer_sk FROM customer WHERE c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Worked example (fully valid output):
+{
+  "probe_id": "p07",
+  "transform_id": "decorrelate_exists_to_semijoin_cte",
+  "family": "B",
+  "dialect": "postgres",
+  "hypothesis": "Replace correlated EXISTS with a precomputed distinct keyset so the planner uses one set-based join instead of per-row subquery execution.",
+  "reasoning_trace": [
+    "The EXISTS subquery depends only on customer key.",
+    "A DISTINCT keyset CTE preserves EXISTS semantics and removes repeated inner work."
+  ],
+  "target_ir": "CTE keyset plus semijoin in FROM; original non-EXISTS filters preserved in WHERE.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "cte_name": "store_buyers",
+        "cte_query_sql": "SELECT DISTINCT ss_customer_sk AS customer_sk FROM store_sales WHERE ss_list_price BETWEEN 80 AND 169"
+      }
+    },
+    {
+      "step_id": "s2",
+      "op": "replace_from",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "from_sql": "customer c JOIN store_buyers sb ON sb.customer_sk = c.c_customer_sk"
+      }
+    },
+    {
+      "step_id": "s3",
+      "op": "replace_where_predicate",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "expr_sql": "c.c_current_addr_sk IS NOT NULL"
+      }
+    }
+  ]
+}
+
+Rules:
+- Steps must be minimal and sufficient.
+- Every SQL fragment in payload MUST be complete and executable (no ellipsis).
+- Prefer `insert_cte` + `replace_from` + `replace_where_predicate` over `replace_body` unless necessary.
+- Never emit `payload.sql`; use `payload.sql_fragment` for replace_body/replace_select/replace_block_with_cte_pair.
+
+---
+
+## Cache Boundary
+Everything below is probe-specific input.
+
+## Shared Dispatcher Hypothesis
+CTE materialization (539K rows) followed by two CTE_SCANs and a correlated subquery implemented via LEFT_DELIM_JOIN / HASH_JOIN LEFT is efficient for DuckDB (253ms total). However, the HASH_GROUP_BY (124.6ms, 49%) on store_returns after join with date_dim is the dominant cost; early filtering on date_dim is already present (366 rows).
+## Runtime Dialect Contract
+- target_dialect: duckdb
+- runtime_dialect_is_source_of_truth: true
+- if static examples conflict, follow runtime dialect behavior
+## Probe Assignment
+- transform_id: sf_shared_scan_decorrelate
+- family: B
+- target: Use Snowflake-style shared-scan decorrelation: create a CTE with store_returns+date_dim join, then compute per-store averages and per-customer/store totals in separate CTEs from that shared scan, then join in main query.
+- phase: ?
+- exploration: yes
+- dialect: duckdb
+- recommended_patch_ops: `insert_cte`, `replace_from`, `replace_where_predicate`
+- expected_explain_delta: CTE_SCAN count remains 2 but base scan of store_returns may be shared; HASH_GROUP_BY may split into two aggregations (per-store avg, per-customer/store total).
+- equivalence_tier: unordered
+- exploration_hypothesis: Plan shows CTE scanned twice; shared-scan decorrelation may reduce total I/O by computing both aggregates from a single materialized scan. DuckDB's CTE_INLINING may still inline, but explicit shared CTE could improve.
+- existing_ctes: `customer_total_return`
+
+### Gates Checked
+no_or_to_union:PASS; not_simple_exists:PASS
+
+### Dispatcher Do-Not-Do
+- or_to_union (no OR in query)
+- intersect_to_exists (no INTERSECT)
+- materialize_cte (CTE already materialized)
+
+### Node Contract
+
+```json
+{
+  "from_must_include": [
+    "store_returns",
+    "date_dim"
+  ],
+  "where_must_preserve": [
+    "sr_returned_date_sk = d_date_sk",
+    "d_year = 2000"
+  ],
+  "output_must_preserve": [
+    "sr_customer_sk as ctr_customer_sk",
+    "sr_store_sk as ctr_store_sk",
+    "SUM(SR_FEE) as ctr_total_return"
+  ]
+}
+```
+
+### Original SQL
+
+```sql
+-- start query 1 in stream 0 using template query1.tpl
+with customer_total_return as
+(select sr_customer_sk as ctr_customer_sk
+,sr_store_sk as ctr_store_sk
+,sum(SR_FEE) as ctr_total_return
+from store_returns
+,date_dim
+where sr_returned_date_sk = d_date_sk
+and d_year =2000
+group by sr_customer_sk
+,sr_store_sk)
+ select c_customer_id
+from customer_total_return ctr1
+,store
+,customer
+where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+from customer_total_return ctr2
+where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+and s_store_sk = ctr1.ctr_store_sk
+and s_state = 'SD'
+and ctr1.ctr_customer_sk = c_customer_sk
+order by c_customer_id
+ LIMIT 100;
+
+-- end query 1 in stream 0 using template query1.tpl
+
+```
+
+### Current IR Node Map
+
+```
+S0 [SELECT]
+  CTE: customer_total_return  (via CTE_Q_S0_customer_total_return)
+    FROM: store_returns, date_dim
+    WHERE [eb0f6bc97f7168d4]: sr_returned_date_sk = d_date_sk AND d_year = 2000
+    GROUP BY: sr_customer_sk, sr_store_sk
+  MAIN QUERY (via Q_S0)
+    FROM: customer_total_return ctr1, store, customer
+    WHERE [e5b7485395ff5a80]: ctr1.ctr_total_return > (SELECT AVG(ctr_total_return) * 1.2 FROM customer_total_return AS ctr2 WH...
+    ORDER BY: c_customer_id
+S1 [OTHER_DDL]
+
+Patch operations (core+advanced): insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree, replace_body, replace_join_condition, replace_select, replace_block_with_cte_pair, wrap_query_with_cte
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+### Dispatcher Reasoning Trace
+- Cost spine: HASH_GROUP_BY (124.6ms) → HASH_JOIN INNER on c_customer_sk (24.6ms) → HASH_JOIN LEFT (14.8ms) → TOP_N (5.0ms).
+- No nested loops, no repeated scans, no set ops, no comma joins → families B, D, E, F less likely.
+- Plan already uses CTE materialization (CTE_SCAN) and hash joins; DuckDB's CTE_INLINING strength makes further CTE transforms low-impact.
+- Low importance (★) → lower probe count (5) with focus on A (early filtering) and C (aggregation pushdown) families.
+
+### Schema / Index / Stats Context
+- source: duckdb
+- referenced_tables: 4
+
+| Table | Rows(est) | PK | Indexes |
+|-------|-----------|----|---------|
+| customer | 500000 | - | - |
+| date_dim | 73049 | - | - |
+| store | 102 | - | - |
+| store_returns | 2877532 | - | - |
+
+### Column Signatures
+| Table | Column | Type | Nullable | Key Hint |
+|-------|--------|------|----------|----------|
+| customer | c_customer_sk | INTEGER | YES | - |
+| customer | c_customer_id | VARCHAR | YES | - |
+| customer | c_current_cdemo_sk | INTEGER | YES | - |
+| customer | c_current_hdemo_sk | INTEGER | YES | - |
+| customer | c_current_addr_sk | INTEGER | YES | - |
+| customer | c_first_shipto_date_sk | INTEGER | YES | - |
+| customer | c_first_sales_date_sk | INTEGER | YES | - |
+| customer | c_salutation | VARCHAR | YES | - |
+| customer | c_first_name | VARCHAR | YES | - |
+| customer | c_last_name | VARCHAR | YES | - |
+| customer | c_preferred_cust_flag | VARCHAR | YES | - |
+| customer | c_birth_day | INTEGER | YES | - |
+| customer | c_birth_month | INTEGER | YES | - |
+| customer | c_birth_year | INTEGER | YES | - |
+| customer | c_birth_country | VARCHAR | YES | - |
+| customer | c_login | VARCHAR | YES | - |
+| customer | c_email_address | VARCHAR | YES | - |
+| customer | c_last_review_date_sk | INTEGER | YES | - |
+| date_dim | d_date_sk | INTEGER | YES | - |
+| date_dim | d_date_id | VARCHAR | YES | - |
+| date_dim | d_date | DATE | YES | - |
+| date_dim | d_month_seq | INTEGER | YES | - |
+| date_dim | d_week_seq | INTEGER | YES | - |
+| date_dim | d_quarter_seq | INTEGER | YES | - |
+| date_dim | d_year | INTEGER | YES | - |
+| date_dim | d_dow | INTEGER | YES | - |
+| date_dim | d_moy | INTEGER | YES | - |
+| date_dim | d_dom | INTEGER | YES | - |
+| date_dim | d_qoy | INTEGER | YES | - |
+| date_dim | d_fy_year | INTEGER | YES | - |
+| date_dim | d_fy_quarter_seq | INTEGER | YES | - |
+| date_dim | d_fy_week_seq | INTEGER | YES | - |
+| date_dim | d_day_name | VARCHAR | YES | - |
+| date_dim | d_quarter_name | VARCHAR | YES | - |
+| date_dim | d_holiday | VARCHAR | YES | - |
+| date_dim | d_weekend | VARCHAR | YES | - |
+| date_dim | d_following_holiday | VARCHAR | YES | - |
+| date_dim | d_first_dom | INTEGER | YES | - |
+| date_dim | d_last_dom | INTEGER | YES | - |
+| date_dim | d_same_day_ly | INTEGER | YES | - |
+| date_dim | d_same_day_lq | INTEGER | YES | - |
+| date_dim | d_current_day | VARCHAR | YES | - |
+| store | s_store_sk | INTEGER | YES | - |
+| store | s_store_id | VARCHAR | YES | - |
+| store | s_rec_start_date | DATE | YES | - |
+| store | s_rec_end_date | DATE | YES | - |
+| store | s_closed_date_sk | INTEGER | YES | - |
+| store | s_store_name | VARCHAR | YES | - |
+| store | s_number_employees | INTEGER | YES | - |
+| store | s_floor_space | INTEGER | YES | - |
+| store | s_hours | VARCHAR | YES | - |
+| store | s_manager | VARCHAR | YES | - |
+| store | s_market_id | INTEGER | YES | - |
+| store | s_geography_class | VARCHAR | YES | - |
+| store | s_market_desc | VARCHAR | YES | - |
+| store | s_market_manager | VARCHAR | YES | - |
+| store | s_division_id | INTEGER | YES | - |
+| store | s_division_name | VARCHAR | YES | - |
+| store | s_company_id | INTEGER | YES | - |
+| store | s_company_name | VARCHAR | YES | - |
+| store | s_street_number | VARCHAR | YES | - |
+| store | s_street_name | VARCHAR | YES | - |
+| store | s_street_type | VARCHAR | YES | - |
+| store | s_suite_number | VARCHAR | YES | - |
+| store | s_city | VARCHAR | YES | - |
+| store | s_county | VARCHAR | YES | - |
+| store_returns | sr_returned_date_sk | INTEGER | YES | - |
+| store_returns | sr_return_time_sk | INTEGER | YES | - |
+| store_returns | sr_item_sk | INTEGER | YES | - |
+| store_returns | sr_customer_sk | INTEGER | YES | - |
+| store_returns | sr_cdemo_sk | INTEGER | YES | - |
+| store_returns | sr_hdemo_sk | INTEGER | YES | - |
+| store_returns | sr_addr_sk | INTEGER | YES | - |
+| store_returns | sr_store_sk | INTEGER | YES | - |
+| store_returns | sr_reason_sk | INTEGER | YES | - |
+| store_returns | sr_ticket_number | INTEGER | YES | - |
+| store_returns | sr_return_quantity | INTEGER | YES | - |
+| store_returns | sr_return_amt | DECIMAL(7,2) | YES | - |
+| store_returns | sr_return_tax | DECIMAL(7,2) | YES | - |
+| store_returns | sr_return_amt_inc_tax | DECIMAL(7,2) | YES | - |
+| store_returns | sr_fee | DECIMAL(7,2) | YES | - |
+| store_returns | sr_return_ship_cost | DECIMAL(7,2) | YES | - |
+| store_returns | sr_refunded_cash | DECIMAL(7,2) | YES | - |
+| store_returns | sr_reversed_charge | DECIMAL(7,2) | YES | - |
+| store_returns | sr_store_credit | DECIMAL(7,2) | YES | - |
+| store_returns | sr_net_loss | DECIMAL(7,2) | YES | - |
+
+### Engine-Specific Knowledge
+## Dialect Profile (DUCKDB)
+
+**Combined Intelligence Baseline**: Field intelligence from 88 TPC-DS queries at SF1-SF10. Use it to guide analysis but apply your own judgment — every query is different.
+
+### Optimizer Strengths (don't fight these)
+- `INTRA_SCAN_PREDICATE_PUSHDOWN`: If EXPLAIN shows the filter inside the scan node, do not create a CTE to push it.
+- `SAME_COLUMN_OR`: Never split same-column ORs into UNION ALL. 0.59x and 0.23x observed.
+- `HASH_JOIN_SELECTION`: Focus on reducing join inputs, not reordering joins.
+- `CTE_INLINING`: Single-ref CTEs are free — use for clarity. CTE-based strategies are low-cost on DuckDB.
+
+### Known Gaps (exploit these)
+- `CROSS_CTE_PREDICATE_BLINDNESS` [HIGH] detect: Row counts flat through CTE chain, sharp drop at late filter. 2+ stage CTE chain + late predicate with columns available earlier. | action: Move selective predicates INTO the CTE definition. Pre-filter dimensions/facts before materialization.
+- `REDUNDANT_SCAN_ELIMINATION` [HIGH] detect: N separate SEQ_SCAN nodes on same table, identical joins, different bucket filters. | action: Consolidate N subqueries into 1 scan with CASE WHEN / FILTER() inside aggregates.
+- `LEFT_JOIN_FILTER_ORDER_RIGIDITY` [HIGH] detect: LEFT JOIN + WHERE on right-table column (proves right non-null). | action: Convert LEFT→INNER when WHERE proves right non-null, or pre-filter dimension into CTE.
+- `AGGREGATE_BELOW_JOIN_BLINDNESS` [HIGH] detect: GROUP BY input rows >> distinct keys, aggregate node sits after join. | action: Pre-aggregate fact table by join key BEFORE dimension join.
+- `CROSS_COLUMN_OR_DECOMPOSITION` [MEDIUM] detect: Single scan, OR across DIFFERENT columns, 70%+ rows discarded. CRITICAL: same column in all OR arms → STOP. | action: Split cross-column ORs into UNION ALL branches with targeted single-column filters.
+
+### Transform Recipe
+- `transform_id`: `sf_shared_scan_decorrelate`
+- `family`: `B`
+- `principle`: Shared-scan variant: inner and outer scan same fact table with same filters, decompose into shared CTE + threshold CTE
+- `expected_features`: `CORRELATED_SUB`, `SCALAR_AGG_SUB_CTE`, `AGG_AVG`, `CTE`
+
+### Gold Pattern Reference
+- `plan_id`: `gold_duckdb_composite_decorrelate_union`
+- `step_ops`: insert_cte -> insert_cte -> insert_cte -> insert_cte -> insert_cte -> replace_from -> delete_expr_subtree
+- `ctes`: `filtered_dates`, `store_customers`, `web_customers`, `catalog_customers`, `web_or_catalog_customers`
+- Reuse pattern shape, not literal table/column names.
+
+
+## RETRY — Gate failure feedback (attempt 2/2)
+Your previous patch failed validation. Return a corrected PatchPlan JSON only.
+First character must be `{` and output must contain no markdown/prose.
+
+### Failure Object
+```json
+{
+  "probe_id": "p05",
+  "transform_id": "sf_shared_scan_decorrelate",
+  "gate": "tier1_structural",
+  "status": "FAIL",
+  "error": "Tier-1: LITERAL MISMATCH: Original literals missing from rewrite \u2014 numbers: ['1.2']. The rewrite changed filter values instead of preserving them."
+}
+```
+
+### Failed SQL (from attempt 1)
+```sql
+/* start query 1 in stream 0 using template query1.tpl */ WITH customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk) SELECT c_customer_id FROM customer_total AS ctr1 JOIN store_avg AS sa ON ctr1.ctr_store_sk = sa.ctr_store_sk JOIN store AS s ON s.s_store_sk = ctr1.ctr_store_sk JOIN customer AS c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE s.s_state = 'SD' AND ctr1.ctr_total_return > sa.avg_threshold ORDER BY c_customer_id LIMIT 100;
+
+/* end query 1 in stream 0 using template query1.tpl */;
+```
+
+### Previous Worker Output (attempt 1)
+```
+{
+  "probe_id": "p_sf_shared_scan",
+  "transform_id": "sf_shared_scan_decorrelate",
+  "family": "B",
+  "dialect": "duckdb",
+  "hypothesis": "Create a shared CTE for the base join of store_returns and date_dim, then compute per-store averages and per-customer/store totals in separate CTEs, allowing DuckDB to scan the fact table once and share the results, potentially reducing the cost of HASH_GROUP_BY by splitting aggregations.",
+  "reasoning_trace": [
+    "The original query has a CTE customer_total_return that is scanned twice with a correlated subquery for per-store average.",
+    "By materializing the base join in a CTE (base_returns), we can compute both customer totals and store averages from a single scan.",
+    "Decorrelating the subquery into a join with a precomputed store average CTE eliminates per-row re-execution and enables set-based joins."
+  ],
+  "target_ir": "WITH clause with three CTEs: base_returns (shared scan), customer_total (per-customer/store aggregates), store_avg (per-store average threshold); main query joins customer_total with store_avg, store, and customer using explicit joins, preserving original filters and output columns.",
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "replace_body",
+      "target": {"by_node_id": "S0"},
+      "payload": {
+        "sql_fragment": "WITH base_returns AS ( SELECT sr_customer_sk, sr_store_sk, SR_FEE FROM store_returns JOIN date_dim ON sr_returned_date_sk = d_date_sk WHERE d_year = 2000 ), customer_total AS ( SELECT sr_customer_sk as ctr_customer_sk, sr_store_sk as ctr_store_sk, SUM(SR_FEE) as ctr_total_return FROM base_returns GROUP BY sr_customer_sk, sr_store_sk ), store_avg AS ( SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 as avg_threshold FROM customer_total GROUP BY ctr_store_sk ) SELECT c_customer_id FROM customer_total ctr1 JOIN store_avg sa ON ctr1.ctr_store_sk = sa.ctr_store_sk JOIN store s ON s.s_store_sk = ctr1.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE s.s_state = 'SD' AND ctr1.ctr_total_return > sa.avg_threshold ORDER BY c_customer_id LIMIT 100"
+      }
+    }
+  ]
+}
+```
+
+Fix only what caused the gate failure while preserving transform intent and semantics.
+Output ONLY valid PatchPlan JSON.
+Never emit payload.sql; use payload.sql_fragment where SQL fragments are required.

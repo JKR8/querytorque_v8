@@ -8,7 +8,6 @@ import pytest
 
 from qt_sql.pipeline import Pipeline
 from qt_sql.patches.beam_wide_prompts import build_beam_worker_retry_prompt
-from qt_sql.schemas import OptimizationMode
 from qt_sql.sessions.beam_session import AppliedPatch, BeamSession
 
 
@@ -203,6 +202,18 @@ def test_run_optimization_session_falls_back_to_db_path_when_benchmark_dsn_missi
     assert result == "db-primary"
 
 
+def test_run_optimization_session_rejects_non_beam_mode(
+    tmp_path: Path,
+) -> None:
+    pipeline = _make_pipeline(tmp_path)
+    with pytest.raises(ValueError, match="Only 'beam' is supported"):
+        pipeline.run_optimization_session(
+            "q1",
+            "SELECT 1",
+            mode="reasoning",
+        )
+
+
 def test_worker_retry_revalidates_tier1_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -252,53 +263,29 @@ def test_worker_retry_revalidates_tier1_failure(
     assert patch.status == "WIN"
 
 
-def test_run_forces_beam_when_reasoning_not_enabled(
+def test_run_always_routes_to_beam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = _make_session()
-    session.pipeline.config.beam_mode = "reasoning"
-    session.pipeline.config.enable_reasoning_mode = False
-
-    monkeypatch.setattr(session, "_run_reasoning", lambda: "reasoning")
     monkeypatch.setattr(session, "_run_beam", lambda: "beam")
-
     assert session.run() == "beam"
 
 
-def test_run_optimization_session_reasoning_argument_falls_back_to_beam_when_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class StubBeamSession:
-        def __init__(self, pipeline, **kwargs):
-            self.pipeline = pipeline
+def test_probe_hardness_prefers_decorrelation_family() -> None:
+    p_a = SimpleNamespace(family="A", transform_id="early_filter", confidence=0.99)
+    p_b = SimpleNamespace(family="B", transform_id="decorrelate", confidence=0.70)
 
-        def run(self):
-            return self.pipeline.config.beam_mode
+    score_a = BeamSession._probe_hardness_score(p_a)
+    score_b = BeamSession._probe_hardness_score(p_b)
 
-    monkeypatch.setattr("qt_sql.sessions.beam_session.BeamSession", StubBeamSession)
-    pipeline = _make_pipeline(tmp_path)
-
-    result = pipeline.run_optimization_session(
-        "q1",
-        "SELECT 1",
-        mode=OptimizationMode.REASONING,
-    )
-
-    assert result == "beam"
+    assert score_b > score_a
 
 
-def test_run_routes_to_reasoning_mode_when_explicitly_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    session = _make_session()
-    session.pipeline.config.beam_mode = "reasoning"
-    session.pipeline.config.enable_reasoning_mode = True
-
-    monkeypatch.setattr(session, "_run_reasoning", lambda: "reasoning")
-    monkeypatch.setattr(session, "_run_beam", lambda: "beam")
-
-    assert session.run() == "reasoning"
+def test_worker_lane_suffix_contracts_are_distinct() -> None:
+    qwen_text = BeamSession._worker_lane_suffix("qwen")
+    reasoner_text = BeamSession._worker_lane_suffix("reasoner")
+    assert "Stay within ONE family strategy" in qwen_text
+    assert "may combine families" in reasoner_text
 
 
 def test_editor_strike_uses_single_worker_call(
@@ -323,7 +310,7 @@ def test_editor_strike_uses_single_worker_call(
         },
     )
 
-    def fake_make_llm_call_fn(_model_spec=None):
+    def fake_make_llm_call_fn(provider_spec=None, model_spec=None):
         def _call(prompt: str) -> str:
             calls["llm"] += 1
             calls["prompt"] = prompt
@@ -356,7 +343,7 @@ def test_editor_strike_uses_single_worker_call(
     assert result.best_transforms == ["decorrelate"]
 
 
-def test_sniper_retry_error_patch_detection() -> None:
+def test_compiler_retry_error_patch_detection() -> None:
     session = _make_session()
 
     tier1_fail = AppliedPatch(
@@ -395,10 +382,10 @@ def test_sniper_retry_error_patch_detection() -> None:
         apply_error=None,
     )
 
-    assert session._is_sniper_retry_error_patch(tier1_fail) is True
-    assert session._is_sniper_retry_error_patch(parse_fail) is True
-    assert session._is_sniper_retry_error_patch(hard_error) is True
-    assert session._is_sniper_retry_error_patch(slow_but_valid) is False
+    assert session._is_compiler_retry_error_patch(tier1_fail) is True
+    assert session._is_compiler_retry_error_patch(parse_fail) is True
+    assert session._is_compiler_retry_error_patch(hard_error) is True
+    assert session._is_compiler_retry_error_patch(slow_but_valid) is False
 
 
 def test_make_llm_call_fn_requires_global_model() -> None:
@@ -410,6 +397,44 @@ def test_make_llm_call_fn_requires_global_model() -> None:
         session._make_llm_call_fn()
 
 
+def test_make_llm_call_fn_accepts_beam_override_model_and_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import qt_sql.generate as generate_mod
+
+    session = _make_session()
+    session.pipeline.provider = "openrouter"
+    session.pipeline.model = "deepseek/deepseek-v3.2"
+    session.pipeline.config.beam_llm_provider = "openrouter"
+    session.pipeline.config.beam_llm_model = "qwen/qwen3-coder"
+
+    captured = {}
+
+    class StubGenerator:
+        def __init__(self, provider=None, model=None, analyze_fn=None):
+            captured["provider"] = provider
+            captured["model"] = model
+            captured["analyze_fn"] = analyze_fn
+            self._llm_client = SimpleNamespace(last_usage={})
+
+    monkeypatch.setattr(generate_mod, "CandidateGenerator", StubGenerator)
+    monkeypatch.setattr(
+        session,
+        "_call_llm_with_timeout",
+        lambda _generator, _prompt: "{}",
+    )
+
+    provider_override, model_override = session._beam_llm_override()
+    call_fn = session._make_llm_call_fn(
+        provider_spec=provider_override,
+        model_spec=model_override,
+    )
+    call_fn("SELECT 1")
+
+    assert captured["provider"] == "openrouter"
+    assert captured["model"] == "qwen/qwen3-coder"
+
+
 def test_pipeline_require_llm_config_requires_provider_and_model(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path)
     pipeline.provider = ""
@@ -417,3 +442,196 @@ def test_pipeline_require_llm_config_requires_provider_and_model(tmp_path: Path)
 
     with pytest.raises(RuntimeError, match="QT_LLM_PROVIDER"):
         pipeline._require_llm_config(context="test")
+
+
+def test_apply_dag_worker_response_requires_single_changed_node() -> None:
+    session = _make_session()
+    base_dag = {
+        "order": ["n1", "final_select"],
+        "final_node_id": "final_select",
+        "nodes": [
+            {"node_id": "n1", "sql": "SELECT 1 AS a"},
+            {"node_id": "final_select", "sql": "SELECT a FROM n1"},
+        ],
+    }
+
+    valid = json.dumps(
+        {
+            "probe_id": "p01",
+            "dag": {
+                "order": ["n1", "final_select"],
+                "nodes": [
+                    {"node_id": "n1", "changed": True, "sql": "SELECT 2 AS a"},
+                    {"node_id": "final_select", "changed": False},
+                ],
+            },
+        }
+    )
+    invalid = json.dumps(
+        {
+            "probe_id": "p01",
+            "dag": {
+                "order": ["n1", "final_select"],
+                "nodes": [
+                    {"node_id": "n1", "changed": True, "sql": "SELECT 2 AS a"},
+                    {"node_id": "final_select", "changed": True, "sql": "SELECT a FROM n1"},
+                ],
+            },
+        }
+    )
+
+    assert session._apply_dag_worker_response(valid, base_dag) is not None
+    assert session._apply_dag_worker_response(invalid, base_dag) is None
+
+
+def test_compiler_dag_shape_accepts_single_object_or_array() -> None:
+    session = _make_session()
+
+    as_object = json.dumps(
+        {
+            "plan_id": "s1",
+            "dag": {"order": ["final_select"], "nodes": [{"node_id": "final_select", "changed": True, "sql": "SELECT 1"}]},
+        }
+    )
+    as_array = json.dumps(
+        [
+            {
+                "plan_id": "s1",
+                "dag": {"order": ["final_select"], "nodes": [{"node_id": "final_select", "changed": True, "sql": "SELECT 1"}]},
+            }
+        ]
+    )
+
+    assert session._is_compiler_tier0_shape_failure(as_object, dag_mode=True) is False
+    assert session._is_compiler_tier0_shape_failure(as_array, dag_mode=True) is False
+
+
+def test_apply_dag_compiler_response_accepts_single_plan_object() -> None:
+    session = _make_session()
+    base_dag = {
+        "order": ["final_select"],
+        "final_node_id": "final_select",
+        "nodes": [{"node_id": "final_select", "sql": "SELECT 1"}],
+    }
+    response = json.dumps(
+        {
+            "plan_id": "snipe_p1",
+            "family": "B",
+            "transform": "dag_rewrite",
+            "dag": {
+                "order": ["final_select"],
+                "nodes": [
+                    {
+                        "node_id": "final_select",
+                        "changed": True,
+                        "sql": "SELECT 3 AS x",
+                    }
+                ],
+            },
+        }
+    )
+
+    patches = session._apply_dag_compiler_response(response, base_dag, prefix="s1")
+    assert len(patches) == 1
+    assert patches[0].patch_id == "snipe_p1"
+    assert patches[0].status == "applied"
+    assert "SELECT 3 AS x" in (patches[0].output_sql or "")
+
+
+def test_run_beam_dag_mode_executes_without_api_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    session.pipeline.provider = "openrouter"
+    session.pipeline.model = "qwen/qwen3-coder"
+    session.pipeline.benchmark_dir = tmp_path
+    session.pipeline.config.beam_edit_mode = "dag"
+    session.pipeline.config.wide_max_probes = 1
+    session.pipeline.config.wide_worker_parallelism = 1
+    session.pipeline.config.snipe_rounds = 0
+    session.pipeline.config.dispatcher_max_attempts = 1
+    session.pipeline.config.semantic_validation_enabled = False
+    session.pipeline.config.target_speedup = 2.0
+
+    monkeypatch.setattr(session, "_create_session_dir", lambda: tmp_path)
+    monkeypatch.setattr(session, "_save_to_disk", lambda *args, **kwargs: None)
+    monkeypatch.setattr(session, "_build_schema_context", lambda _db: "")
+    monkeypatch.setattr(
+        session,
+        "_get_original_explain_cached",
+        lambda _db: {"execution_time_ms": 100.0, "plan_text": "SEQ_SCAN t [100ms]"},
+    )
+    monkeypatch.setattr(
+        session,
+        "_render_explain_compact",
+        lambda _exp, _dialect: "SEQ_SCAN t [100ms]",
+    )
+    monkeypatch.setattr(
+        session,
+        "_validate_and_benchmark_patches",
+        lambda patches, *_args, **_kwargs: [
+            (
+                setattr(p, "semantic_passed", True),
+                setattr(p, "status", "WIN"),
+                setattr(p, "speedup", 1.2),
+                setattr(p, "output_sql", p.output_sql or "SELECT 2"),
+            )
+            for p in patches
+        ],
+    )
+
+    dispatcher_response = json.dumps(
+        {
+            "dispatch": {
+                "hypothesis": "test",
+                "probe_count": 1,
+                "equivalence_tier": "exact",
+                "reasoning_trace": [],
+                "do_not_do": [],
+            },
+            "probes": [
+                {
+                    "probe_id": "p01",
+                    "transform_id": "decorrelate",
+                    "family": "B",
+                    "target": "rewrite final node",
+                    "confidence": 0.9,
+                    "recommended_patch_ops": ["replace_body"],
+                }
+            ],
+            "dropped": [],
+        }
+    )
+    worker_response = json.dumps(
+        {
+            "probe_id": "p01",
+            "transform_id": "decorrelate",
+            "family": "B",
+            "dag": {
+                "order": ["final_select"],
+                "nodes": [
+                    {
+                        "node_id": "final_select",
+                        "changed": True,
+                        "sql": "SELECT 2",
+                    }
+                ],
+            },
+        }
+    )
+    responses = [dispatcher_response, worker_response]
+
+    def fake_make_llm_call_fn(provider_spec=None, model_spec=None):
+        def _call(_prompt: str) -> str:
+            assert responses, "Unexpected extra LLM call in test"
+            return responses.pop(0)
+
+        return _call
+
+    monkeypatch.setattr(session, "_make_llm_call_fn", fake_make_llm_call_fn)
+
+    result = session._run_beam()
+    assert result.status in {"WIN", "IMPROVED"}
+    assert result.best_sql.strip().upper().startswith("SELECT 2")
+    assert result.n_api_calls == 2
