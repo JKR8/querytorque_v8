@@ -163,6 +163,7 @@ def _infer_type_from_col_name(col_name: str) -> str:
             "charge",
             "discount",
             "tax",
+            "fee",
             "total",
             "net",
             "gross",
@@ -259,6 +260,11 @@ def _guess_table_for_unqualified_column(
     if len(owners) == 1:
         return owners[0]
     if len(owners) > 1:
+        return None
+
+    # Avoid over-aggressive guessing on long generic prefixes
+    # (for example `item_sk` in subquery aliases should not be forced to `item`).
+    if len(prefix) > 3:
         return None
 
     candidates = [
@@ -409,6 +415,58 @@ def _promote_types_from_filters(
                 table_cols[col_name]["type"] = "DATE"
             elif inferred == "TIMESTAMP":
                 table_cols[col_name]["type"] = "TIMESTAMP"
+
+
+def _promote_types_from_expressions(
+    sql: str,
+    tables: Dict[str, Dict[str, Any]],
+) -> None:
+    """Promote column types from arithmetic/aggregate AST usage."""
+    try:
+        ast = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:
+        return
+
+    alias_map: Dict[str, str] = {}
+    for table_expr in ast.find_all(sqlglot.exp.Table):
+        name = (table_expr.name or "").strip()
+        alias = (table_expr.alias_or_name or "").strip()
+        if name in tables:
+            alias_map[name] = name
+            if alias:
+                alias_map[alias] = name
+
+    numeric_cols: Set[Tuple[str, str]] = set()
+
+    def _mark(col: sqlglot.exp.Column, *, aggregate_context: bool = False) -> None:
+        table_name, raw_col = _normalize_ast_column_ref(col, alias_map, tables)
+        if table_name not in tables:
+            return
+        resolved = _resolve_col_case(tables, table_name, raw_col)
+        if not resolved:
+            return
+        if aggregate_context:
+            guessed = _infer_type_from_col_name(resolved).upper()
+            if guessed.startswith("VARCHAR"):
+                return
+        numeric_cols.add((table_name, resolved))
+
+    for node in ast.find_all(sqlglot.exp.Add, sqlglot.exp.Sub, sqlglot.exp.Mul, sqlglot.exp.Div):
+        for col in node.find_all(sqlglot.exp.Column):
+            _mark(col, aggregate_context=False)
+
+    for node in ast.find_all(sqlglot.exp.Avg, sqlglot.exp.Sum, sqlglot.exp.StddevSamp):
+        for col in node.find_all(sqlglot.exp.Column):
+            _mark(col, aggregate_context=True)
+
+    for table_name, col_name in numeric_cols:
+        cinfo = tables.get(table_name, {}).get("columns", {}).get(col_name)
+        if not cinfo:
+            continue
+        ctype = str(cinfo.get("type", "VARCHAR")).upper()
+        if ctype.startswith("DECIMAL") or ctype in ("INTEGER", "BIGINT"):
+            continue
+        cinfo["type"] = "DECIMAL(18,2)"
 
 
 def _resolve_col_case(
@@ -562,6 +620,7 @@ def _build_query_context(
         filter_values, join_graph, tables
     )
     _promote_types_from_filters(tables, filter_values)
+    _promote_types_from_expressions(sql_duckdb, tables)
 
     return {
         "name": sql_file.name,
@@ -1310,12 +1369,18 @@ def _mv_insert_row(
 ) -> bool:
     schema = (global_tables.get(table, {}).get("columns") or {})
     schema_cols = set(schema.keys())
-    cols = [c for c in values.keys() if c in schema_cols]
+    actual_by_lower = {c.lower(): c for c in schema_cols}
+    remapped: Dict[str, Any] = {}
+    for in_col, in_val in values.items():
+        actual = actual_by_lower.get(str(in_col).lower())
+        if actual:
+            remapped[actual] = in_val
+    cols = [c for c in remapped.keys() if c in schema_cols]
     if not cols:
         return False
     coerced: List[Any] = []
     for c in cols:
-        raw = values[c]
+        raw = remapped[c]
         ctype = _canonical_edge_type(schema.get(c, {}).get("type", ""))
         try:
             val = _coerce_edge_value(raw, ctype)
@@ -1559,7 +1624,8 @@ def _mv_recipe_query001_or_030(
         ratio_lo, ratio_hi = _mv_re_first_numeric_range(
             sql, "wr_return_amt", "wr_return_quantity", 120.0, 150.0
         )
-        ratio = max(1, int((ratio_lo + ratio_hi) / 2.0))
+        low_amt = max(1, int(ratio_lo + 1))
+        high_amt = max(low_amt, int(ratio_hi - 1))
 
         inserted += _mv_insert_rows(
             conn,
@@ -1600,7 +1666,16 @@ def _mv_recipe_query001_or_030(
                     "wr_returned_date_sk": 92001,
                     "wr_reason_sk": reason,
                     "wr_return_quantity": 1,
-                    "wr_return_amt": 1000.0,
+                    "wr_return_amt": float(high_amt),
+                },
+                {
+                    "wr_returning_customer_sk": 92030,
+                    "wr_returning_addr_sk": 92010,
+                    "wr_item_sk": 92020,
+                    "wr_returned_date_sk": 92001,
+                    "wr_reason_sk": reason,
+                    "wr_return_quantity": 1,
+                    "wr_return_amt": float(high_amt),
                 },
                 {
                     "wr_returning_customer_sk": 92031,
@@ -1609,7 +1684,7 @@ def _mv_recipe_query001_or_030(
                     "wr_returned_date_sk": 92001,
                     "wr_reason_sk": reason,
                     "wr_return_quantity": 1,
-                    "wr_return_amt": float(ratio),
+                    "wr_return_amt": float(low_amt),
                 },
             ],
         )
@@ -1784,8 +1859,19 @@ def _mv_recipe_query054(
     i_class = class_match.group(1) if class_match else "personal"
     state = str(_mv_first_filter_value(qctx, global_tables, "store", "s_state", "TX"))
     birth_lo, _ = _mv_filter_bounds(qctx, "customer", "c_birth_year", 1930, 1930)
-    ws_lo, ws_hi = _mv_re_first_numeric_range(sql, "wholesale_cost", "wholesale_cost", 35.0, 65.0)
+    m_wh = re.search(
+        r"wholesale_cost\s+between\s+([0-9]+(?:\.[0-9]+)?)\s+and\s+([0-9]+(?:\.[0-9]+)?)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    if m_wh:
+        ws_lo = float(m_wh.group(1))
+        ws_hi = float(m_wh.group(2))
+    else:
+        ws_lo, ws_hi = _mv_filter_bounds(qctx, "catalog_sales", "cs_wholesale_cost", 35.0, 65.0)
+    ss_lo, ss_hi = _mv_filter_bounds(qctx, "store_sales", "ss_wholesale_cost", ws_lo, ws_hi)
     wholesale = (ws_lo + ws_hi) / 2.0
+    wholesale_ss = (ss_lo + ss_hi) / 2.0
     inserted = 0
     inserted += _mv_insert_rows(
         conn,
@@ -1810,7 +1896,7 @@ def _mv_recipe_query054(
         conn,
         global_tables,
         "store_sales",
-        [{"ss_sold_date_sk": 96002, "ss_customer_sk": 96030, "ss_wholesale_cost": wholesale, "ss_ext_sales_price": 200.0}],
+        [{"ss_sold_date_sk": 96002, "ss_customer_sk": 96030, "ss_wholesale_cost": wholesale_ss, "ss_ext_sales_price": 200.0}],
     )
     return inserted > 0
 
@@ -2215,10 +2301,43 @@ def _mv_recipe_query085(
     qctx: QueryContext,
     global_tables: Dict[str, Dict[str, Any]],
 ) -> bool:
+    sql = str(qctx.get("sql_duckdb", ""))
     year = int(_mv_first_filter_value(qctx, global_tables, "date_dim", "d_year", 2000))
-    state = str(_mv_first_filter_value(qctx, global_tables, "customer_address", "ca_state", "TX"))
-    marital = str(_mv_first_filter_value(qctx, global_tables, "customer_demographics", "cd_marital_status", "S"))
-    education = str(_mv_first_filter_value(qctx, global_tables, "customer_demographics", "cd_education_status", "College"))
+
+    demo_match = re.search(
+        r"cd1\.cd_marital_status\s*=\s*'([^']+)'.*?"
+        r"cd1\.cd_education_status\s*=\s*'([^']+)'.*?"
+        r"ws_sales_price\s+between\s+([0-9.]+)\s+and\s+([0-9.]+)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if demo_match:
+        marital = demo_match.group(1)
+        education = demo_match.group(2)
+        ws_low = float(demo_match.group(3))
+        ws_high = float(demo_match.group(4))
+    else:
+        marital = str(_mv_first_filter_value(qctx, global_tables, "customer_demographics", "cd_marital_status", "S"))
+        education = str(_mv_first_filter_value(qctx, global_tables, "customer_demographics", "cd_education_status", "College"))
+        ws_low, ws_high = 100.0, 150.0
+
+    addr_match = re.search(
+        r"ca_state\s+in\s*\(([^)]+)\)\s*and\s*ws_net_profit\s+between\s+([0-9.]+)\s+and\s+([0-9.]+)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if addr_match:
+        states_blob = addr_match.group(1)
+        raw_states = re.findall(r"'([^']+)'", states_blob)
+        state = raw_states[0] if raw_states else "TX"
+        np_low = float(addr_match.group(2))
+        np_high = float(addr_match.group(3))
+    else:
+        state = str(_mv_first_filter_value(qctx, global_tables, "customer_address", "ca_state", "TX"))
+        np_low, np_high = 100.0, 200.0
+
+    ws_price = (ws_low + ws_high) / 2.0
+    ws_profit = (np_low + np_high) / 2.0
     inserted = 0
     inserted += _mv_insert_rows(conn, global_tables, "date_dim", [{"d_date_sk": 99401, "d_year": year}])
     inserted += _mv_insert_rows(conn, global_tables, "web_page", [{"wp_web_page_sk": 99402}])
@@ -2237,7 +2356,7 @@ def _mv_recipe_query085(
         conn,
         global_tables,
         "web_sales",
-        [{"ws_web_page_sk": 99402, "ws_item_sk": 99407, "ws_order_number": 99408, "ws_sold_date_sk": 99401, "ws_sales_price": 120.0, "ws_net_profit": 160.0, "ws_quantity": 1}],
+        [{"ws_web_page_sk": 99402, "ws_item_sk": 99407, "ws_order_number": 99408, "ws_sold_date_sk": 99401, "ws_sales_price": ws_price, "ws_net_profit": ws_profit, "ws_quantity": 1}],
     )
     inserted += _mv_insert_rows(
         conn,

@@ -44,6 +44,8 @@ Success criterion per query:
 - Some query shapes still need pure-graph solving instead of family-specific recipe logic.
 - Ambiguous query variants that are semantically contradictory should be marked UNSAT deterministically.
 - Need wider arithmetic-constraint solver coverage (beyond current hardcoded patterns).
+- Example contradictory variant in current DSB76 set:
+  - `query064_multi_i2`: `cd1.cd_marital_status <> cd2.cd_marital_status` while both sides are constrained to `'S'` only.
 
 ## Next Work (In Order)
 1. Replace family recipes with generic DAG/constraint solver passes:
