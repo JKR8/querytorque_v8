@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     openai_api_key: str = ""
     openrouter_api_key: str = ""
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = "qwen2.5-coder:7b-instruct"
     llm_provider: str = ""
     llm_model: str = ""
     manual_mode: bool = False
@@ -113,17 +115,19 @@ class Settings(BaseSettings):
         model = self.llm_model
 
         if provider == "deepseek":
-            return provider, model or "deepseek-reasoner", self.deepseek_api_key
+            return provider, model, self.deepseek_api_key
         elif provider == "gemini-api":
-            return provider, model or "gemini-3-flash-preview", self.gemini_api_key
+            return provider, model, self.gemini_api_key
         elif provider == "gemini-cli":
             return provider, model, ""
         elif provider == "groq":
-            return provider, model or "llama-3.3-70b-versatile", self.groq_api_key
+            return provider, model, self.groq_api_key
         elif provider == "openai":
-            return provider, model or "gpt-4o", self.openai_api_key
+            return provider, model, self.openai_api_key
         elif provider == "openrouter":
-            return provider, model or "moonshotai/kimi-k2.5", self.openrouter_api_key
+            return provider, model, self.openrouter_api_key
+        elif provider == "ollama":
+            return provider, model, ""
         return "", "", ""
 
 

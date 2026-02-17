@@ -20,8 +20,9 @@ def create_llm_client(
     If no arguments are provided, uses settings from environment.
 
     Args:
-        provider: LLM provider name (deepseek, gemini-api, gemini-cli, groq, openai, openrouter)
-        model: Model name (optional, uses provider default if not specified)
+        provider: LLM provider name
+            (deepseek, gemini-api, gemini-cli, groq, openai, openrouter)
+        model: Model name (required; no implicit provider defaults)
         api_key: API key (optional, uses environment if not specified)
 
     Returns:
@@ -37,6 +38,10 @@ def create_llm_client(
 
     if not provider:
         return None
+    if not (model or "").strip():
+        raise ValueError(
+            "LLM model is required. Set QT_LLM_MODEL or pass model explicitly."
+        )
 
     # Get API key from settings if not provided
     if api_key is None:
@@ -57,14 +62,14 @@ def create_llm_client(
             raise ValueError("DeepSeek API key required")
         return DeepSeekClient(
             api_key=api_key,
-            model=model or "deepseek-reasoner",
+            model=model,
         )
     elif provider in ("gemini-api", "gemini"):
         if not api_key:
             raise ValueError("Gemini API key required")
         return GeminiAPIClient(
             api_key=api_key,
-            model=model or "gemini-3-flash-preview",
+            model=model,
         )
     elif provider == "gemini-cli":
         return GeminiCLIClient(model=model)
@@ -73,21 +78,21 @@ def create_llm_client(
             raise ValueError("Groq API key required")
         return GroqClient(
             api_key=api_key,
-            model=model or "llama-3.3-70b-versatile",
+            model=model,
         )
     elif provider == "openai":
         if not api_key:
             raise ValueError("OpenAI API key required")
         return OpenAIClient(
             api_key=api_key,
-            model=model or "gpt-4o",
+            model=model,
         )
     elif provider == "openrouter":
         if not api_key:
             raise ValueError("OpenRouter API key required")
         return OpenAIClient(
             api_key=api_key,
-            model=model or "moonshotai/kimi-k2.5",
+            model=model,
             base_url="https://openrouter.ai/api/v1",
         )
     else:

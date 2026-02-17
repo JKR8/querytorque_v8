@@ -350,10 +350,7 @@ class BeamSession(OptimizationSession):
         )
         self._save_to_disk(session_dir, 0, "strike_prompt", strike_prompt)
 
-        worker_model = getattr(
-            self.pipeline.config, "wide_worker_model", None
-        ) or getattr(self.pipeline.config, "worker_model", None)
-        worker_call_fn = self._make_llm_call_fn(worker_model)
+        worker_call_fn = self._make_llm_call_fn()
 
         if self.on_phase_change:
             self.on_phase_change(phase="strike_worker", iteration=0)
@@ -675,7 +672,6 @@ class BeamSession(OptimizationSession):
         Modifies patches in-place: sets semantic_passed, speedup, status, explain_text.
         """
         from ..validation.mini_validator import MiniValidator
-        from ..validation.synthetic_validator import SyntheticValidator
         from ..execution.factory import create_executor_from_dsn
         from ..validation.equivalence_checker import EquivalenceChecker
         from ..execution.database_utils import run_explain_analyze
@@ -696,37 +692,42 @@ class BeamSession(OptimizationSession):
             else:
                 p.semantic_passed = True
 
-        # ── Synthetic semantic gate (fast, deterministic) ─────────────
+        # ── Synthetic semantic gate (optional) ────────────────────────
         synth_passed = [p for p in applied if p.semantic_passed]
-        if synth_passed:
-            try:
-                synth = SyntheticValidator(reference_db=db_path, dialect=self.dialect)
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Synthetic validator init failed: {e}")
-                for p in synth_passed:
+        if self.pipeline.config.semantic_validation_enabled:
+            from ..validation.synthetic_validator import SyntheticValidator
+
+            if synth_passed:
+                try:
+                    synth = SyntheticValidator(reference_db=db_path, dialect=self.dialect)
+                except Exception as e:
+                    logger.warning(f"[{self.query_id}] Synthetic validator init failed: {e}")
+                    for p in synth_passed:
+                        p.semantic_passed = False
+                        p.status = "ERROR"
+                        p.apply_error = f"Synthetic semantic gate unavailable: {e}"
+                    synth_passed = []
+
+            for p in synth_passed:
+                try:
+                    synth_result = synth.validate_sql_pair(
+                        original_sql=self.original_sql,
+                        optimized_sql=p.output_sql or "",
+                        target_rows=100,
+                    )
+                except Exception as e:
                     p.semantic_passed = False
                     p.status = "ERROR"
-                    p.apply_error = f"Synthetic semantic gate unavailable: {e}"
-                synth_passed = []
+                    p.apply_error = f"Synthetic semantic check failed: {e}"
+                    continue
 
-        for p in synth_passed:
-            try:
-                synth_result = synth.validate_sql_pair(
-                    original_sql=self.original_sql,
-                    optimized_sql=p.output_sql or "",
-                    target_rows=100,
-                )
-            except Exception as e:
-                p.semantic_passed = False
-                p.status = "ERROR"
-                p.apply_error = f"Synthetic semantic check failed: {e}"
-                continue
-
-            if not synth_result.get("match", False):
-                p.semantic_passed = False
-                p.status = "FAIL"
-                reason = synth_result.get("reason") or "Synthetic semantic mismatch"
-                p.apply_error = f"Synthetic semantic mismatch: {reason}"
+                if not synth_result.get("match", False):
+                    p.semantic_passed = False
+                    p.status = "FAIL"
+                    reason = synth_result.get("reason") or "Synthetic semantic mismatch"
+                    p.apply_error = f"Synthetic semantic mismatch: {reason}"
+        else:
+            logger.info(f"[{self.query_id}] Synthetic validation disabled; using structural + equivalence gates")
 
         # ── Full-dataset equivalence (after synthetic gate) ───────────
         equiv_passed = [p for p in synth_passed if p.semantic_passed]
@@ -850,11 +851,7 @@ class BeamSession(OptimizationSession):
         if self.on_phase_change:
             self.on_phase_change(phase="analyst", iteration=0)
 
-        analyst_model = (
-            getattr(self.pipeline.config, "wide_dispatcher_model", None)
-            or getattr(self.pipeline.config, "analyst_model", None)
-        )
-        analyst_call_fn = self._make_llm_call_fn(analyst_model)
+        analyst_call_fn = self._make_llm_call_fn()
 
         shot1_prompt = build_reasoning_prompt(
             query_id=self.query_id,
@@ -1048,11 +1045,7 @@ class BeamSession(OptimizationSession):
         if self.on_phase_change:
             self.on_phase_change(phase="analyst", iteration=0)
 
-        dispatcher_model = (
-            getattr(self.pipeline.config, "wide_dispatcher_model", None)
-            or getattr(self.pipeline.config, "analyst_model", None)
-        )
-        analyst_call_fn = self._make_llm_call_fn(dispatcher_model)
+        analyst_call_fn = self._make_llm_call_fn()
 
         dispatcher_prompt_base = build_beam_dispatcher_prompt(
             query_id=self.query_id,
@@ -1131,10 +1124,7 @@ class BeamSession(OptimizationSession):
         if self.on_phase_change:
             self.on_phase_change(phase="workers", iteration=0)
 
-        worker_model = getattr(
-            self.pipeline.config, "wide_worker_model", None
-        ) or getattr(self.pipeline.config, "worker_model", None)
-        worker_call_fn = self._make_llm_call_fn(worker_model)
+        worker_call_fn = self._make_llm_call_fn()
 
         patches: List[AppliedPatch] = []
         worker_parallelism = max(
@@ -1736,18 +1726,32 @@ class BeamSession(OptimizationSession):
         """Create an LLM call function for a specific model.
 
         Args:
-            model_spec: Model identifier string (e.g., "deepseek/deepseek-r1")
-                or None to use the pipeline's default.
-                The model spec is passed as the model name to the pipeline's
-                provider (typically OpenRouter, which accepts "vendor/model").
+            model_spec: Deprecated per-call override. Ignored when provided.
+                The global pipeline model is always used.
 
         Returns:
             Callable that takes prompt string, returns response string.
         """
         from ..generate import CandidateGenerator
 
-        effective_model = model_spec or self.pipeline.model
-        effective_provider = self.pipeline.provider
+        effective_model = str(getattr(self.pipeline, "model", "") or "").strip()
+        effective_provider = str(getattr(self.pipeline, "provider", "") or "").strip()
+
+        if not effective_provider:
+            raise RuntimeError(
+                f"[{self.query_id}] Missing global LLM provider. "
+                "Set QT_LLM_PROVIDER explicitly."
+            )
+        if not effective_model:
+            raise RuntimeError(
+                f"[{self.query_id}] Missing global LLM model. "
+                "Set QT_LLM_MODEL explicitly."
+            )
+        if model_spec and str(model_spec).strip() and str(model_spec).strip() != effective_model:
+            logger.info(
+                f"[{self.query_id}] Ignoring per-phase model override "
+                f"({model_spec}); using global model {effective_model}"
+            )
 
         logger.info(
             f"[{self.query_id}] LLM call fn: "
@@ -2087,8 +2091,8 @@ class BeamSession(OptimizationSession):
             "scale_factor": self.pipeline.config.scale_factor,
             "max_iterations": self.max_iterations,
             "target_speedup": self.target_speedup,
-            "analyst_model": getattr(self.pipeline.config, "analyst_model", "?"),
-            "worker_model": getattr(self.pipeline.config, "worker_model", "?"),
+            "llm_provider": self.pipeline.provider or "?",
+            "llm_model": self.pipeline.model or "?",
             "provider": self.pipeline.provider or "?",
             "semantic_validation_enabled": self.pipeline.config.semantic_validation_enabled,
             "semantic_sample_pct": self.pipeline.config.semantic_sample_pct,

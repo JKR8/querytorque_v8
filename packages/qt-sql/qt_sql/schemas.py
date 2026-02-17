@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 class OptimizationMode(str, Enum):
     """Optimization mode selection."""
     BEAM = "beam"           # Automated search: analyst → N workers → validate → snipe
+    REASONING = "reasoning"  # Analyst-only 2-shot reasoning loop
 
 
 class ValidationStatus(str, Enum):
@@ -118,17 +119,20 @@ class BenchmarkConfig:
 
     # Tiered patch mode (analyst + worker split) — legacy flag
     tiered_patch_enabled: bool = False
-    analyst_model: str = "deepseek/deepseek-r1"
-    worker_model: str = "qwen/qwen3-coder"
+    # Legacy per-role model fields (deprecated; global pipeline model is authoritative)
+    analyst_model: Optional[str] = None
+    worker_model: Optional[str] = None
     target_speedup: float = 100.0
     snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
 
     # Beam execution mode (single-mode runtime; legacy values tolerated)
-    beam_mode: str = "beam"       # canonical: "beam" (legacy: "wide", "auto", "focused")
+    beam_mode: str = "beam"       # canonical: "beam" | "reasoning" (legacy: "wide", "auto", "focused")
+    enable_reasoning_mode: bool = False  # Safety gate: reasoning path disabled unless explicitly enabled
     wide_max_probes: int = 16     # Max probes for wide mode
+    wide_worker_parallelism: int = 8  # Max concurrent worker LLM calls per query in beam mode
     focused_max_sorties: int = 5  # Legacy field (unused in single-mode runtime)
-    wide_dispatcher_model: Optional[str] = None  # Override analyst model for wide dispatcher
-    wide_worker_model: Optional[str] = None  # Override worker model for wide (default: use worker_model)
+    wide_dispatcher_model: Optional[str] = None  # Legacy override field (deprecated)
+    wide_worker_model: Optional[str] = None  # Legacy override field (deprecated)
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -154,15 +158,17 @@ class BenchmarkConfig:
             semantic_sample_pct=data.get("semantic_sample_pct", 2.0),
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
             tiered_patch_enabled=data.get("tiered_patch_enabled", False),
-            analyst_model=data.get("analyst_model", "deepseek/deepseek-r1"),
-            worker_model=data.get("worker_model", "qwen/qwen3-coder"),
+            analyst_model=data.get("analyst_model"),
+            worker_model=data.get("worker_model"),
             target_speedup=data.get("target_speedup", 100.0),
             snipe_rounds=data.get("snipe_rounds", 2),
             beam_mode=data.get("beam_mode", "beam"),
+            enable_reasoning_mode=data.get("enable_reasoning_mode", False),
             wide_max_probes=data.get("wide_max_probes", 16),
+            wide_worker_parallelism=data.get("wide_worker_parallelism", 8),
             focused_max_sorties=data.get("focused_max_sorties", 5),
-            wide_dispatcher_model=data.get("wide_dispatcher_model", None),
-            wide_worker_model=data.get("wide_worker_model", None),
+            wide_dispatcher_model=data.get("wide_dispatcher_model"),
+            wide_worker_model=data.get("wide_worker_model"),
         )
 
 
@@ -422,4 +428,9 @@ class SessionResult:
     iterations: List[Any] = field(default_factory=list)
     n_iterations: int = 0
     n_api_calls: int = 0
+    beam_cost_usd: float = 0.0
+    beam_cost_priced_calls: int = 0
+    beam_cost_unpriced_calls: int = 0
+    beam_token_totals: Dict[str, int] = field(default_factory=dict)
+    api_call_costs: List[Dict[str, Any]] = field(default_factory=list)
     config_changes: List[str] = field(default_factory=list)

@@ -65,9 +65,27 @@ class Pipeline:
         self.config = BenchmarkConfig.from_file(
             self.benchmark_dir / "config.json"
         )
+        resolved_provider = (provider or "").strip()
+        resolved_model = (model or "").strip()
+        if not resolved_provider or not resolved_model:
+            try:
+                from qt_shared.config import get_settings
 
-        self.provider = provider
-        self.model = model
+                settings = get_settings()
+                if not resolved_provider:
+                    resolved_provider = str(
+                        getattr(settings, "llm_provider", "") or ""
+                    ).strip()
+                if not resolved_model:
+                    resolved_model = str(
+                        getattr(settings, "llm_model", "") or ""
+                    ).strip()
+            except Exception:
+                # qt_shared is optional in some tooling contexts.
+                pass
+
+        self.provider = resolved_provider
+        self.model = resolved_model
         self.analyze_fn = analyze_fn
         self.use_analyst = use_analyst
         self._allow_intelligence_bootstrap = (
@@ -106,6 +124,23 @@ class Pipeline:
                 )
             except Exception as e:
                 logger.warning(f"Failed to load semantic_intents.json: {e}")
+
+    def _require_llm_config(self, *, context: str = "LLM call") -> tuple[str, str]:
+        """Return configured provider/model or raise a hard configuration error."""
+        provider = str(self.provider or "").strip()
+        model = str(self.model or "").strip()
+        missing = []
+        if not provider:
+            missing.append("QT_LLM_PROVIDER")
+        if not model:
+            missing.append("QT_LLM_MODEL")
+        if missing:
+            missing_str = ", ".join(missing)
+            raise RuntimeError(
+                f"{context} blocked: missing global LLM config ({missing_str}). "
+                "Set both and rerun."
+            )
+        return provider, model
 
     def _resolve_engine_version(self) -> Optional[str]:
         """Detect the target engine version for prompt context."""
@@ -576,9 +611,12 @@ class Pipeline:
 
         # Generate candidates via parallel workers
         from .generate import CandidateGenerator
+        provider, model = self._require_llm_config(
+            context=f"[{query_id}] candidate generation"
+        )
         generator = CandidateGenerator(
-            provider=self.provider,
-            model=self.model,
+            provider=provider,
+            model=model,
             analyze_fn=self.analyze_fn,
         )
 
@@ -810,10 +848,22 @@ class Pipeline:
         Returns:
             SessionResult with the best result across all iterations
         """
-        # Beam mode: analyst → N workers → validate → snipe
+        # Session mode routing (beam | reasoning, with legacy aliases tolerated).
         from .sessions.beam_session import BeamSession
+        mode_value = mode.value if isinstance(mode, OptimizationMode) else str(mode or "")
+        reasoning_requested = mode_value in ("reasoning", "focused")
+        if reasoning_requested and not bool(
+            getattr(self.config, "enable_reasoning_mode", False)
+        ):
+            logger.info(
+                "Reasoning mode requested but disabled by config; using beam mode"
+            )
+            mode_value = "beam"
+        if mode_value:
+            self.config.beam_mode = mode_value
         self.config.tiered_patch_enabled = True
-        self.config.benchmark_dsn = self.config.db_path_or_dsn
+        if not self.config.benchmark_dsn:
+            self.config.benchmark_dsn = self.config.db_path_or_dsn
         # max_iterations = snipe_rounds + 1 (1 analyst + N snipes)
         effective_max_iterations = self.config.snipe_rounds + 1
         session = BeamSession(
@@ -964,9 +1014,12 @@ class Pipeline:
 
         try:
             from .generate import CandidateGenerator
+            provider, model = self._require_llm_config(
+                context=f"[{query_id}] promotion analysis"
+            )
             generator = CandidateGenerator(
-                provider=self.provider,
-                model=self.model,
+                provider=provider,
+                model=model,
                 analyze_fn=self.analyze_fn,
             )
             response = generator._analyze(prompt)
@@ -1180,9 +1233,12 @@ class Pipeline:
         # Send to LLM
         try:
             from .generate import CandidateGenerator
+            provider, model = self._require_llm_config(
+                context=f"[{query_id}] analyst briefing"
+            )
             generator = CandidateGenerator(
-                provider=self.provider,
-                model=self.model,
+                provider=provider,
+                model=model,
                 analyze_fn=self.analyze_fn,
             )
             raw_response = generator._analyze(analysis_prompt)

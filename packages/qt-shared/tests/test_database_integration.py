@@ -251,3 +251,18 @@ class TestLLMIntegration:
 
         # Protocol should define analyze
         assert hasattr(LLMClient, "analyze") or "analyze" in dir(LLMClient)
+
+    def test_create_ollama_client_without_api_key(self):
+        """Ollama is local and should not require an API key."""
+        from qt_shared.llm.factory import create_llm_client
+        from qt_shared.llm.ollama import OllamaClient
+
+        client = create_llm_client(provider="ollama", model="qwen2.5-coder:7b-instruct")
+        assert isinstance(client, OllamaClient)
+
+    def test_create_llm_client_requires_model(self):
+        """Provider-only configuration should hard-fail without a model."""
+        from qt_shared.llm.factory import create_llm_client
+
+        with pytest.raises(ValueError, match="LLM model is required"):
+            create_llm_client(provider="openrouter", model="")
