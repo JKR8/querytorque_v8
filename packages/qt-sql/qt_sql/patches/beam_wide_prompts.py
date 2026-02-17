@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,84 @@ from qt_sql.knowledge.normalization import normalize_dialect
 logger = logging.getLogger(__name__)
 
 EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
+PROMPT_TEMPLATES_DIR = (
+    Path(__file__).resolve().parent.parent / "prompts" / "samples" / "V3"
+)
+IR_SCHEMA_REFERENCE = """## IR Patch Contract Reference
+- `S0` = top-level SELECT statement for this query mission.
+- Use `target: {"by_node_id": "S0"}` for all coarse-grained edits.
+- Use `by_anchor_hash` only for exact expression/predicate subtree edits.
+- Anchor hashes are parser-generated and formatting-stable; copy verbatim.
+- If anchor is ambiguous, prefer safe coarse ops (`replace_where_predicate`) or no-op."""
+
+
+@lru_cache(maxsize=8)
+def _load_prompt_template(filename: str) -> str:
+    """Load a prompt template from prompts/samples/V3."""
+    path = PROMPT_TEMPLATES_DIR / filename
+    if not path.exists():
+        logger.warning("Prompt template missing: %s", path)
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.warning("Failed loading prompt template %s: %s", path, e)
+        return ""
+
+
+@lru_cache(maxsize=1)
+def _load_transform_index() -> Dict[str, Dict[str, Any]]:
+    """Load transform catalog indexed by transform id."""
+    from ..detection import load_transforms
+
+    transforms = load_transforms()
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for t in transforms:
+        if isinstance(t, dict) and t.get("id"):
+            by_id[str(t["id"])] = t
+    return by_id
+
+
+def _build_transform_recipe_section(transform_id: str) -> str:
+    """Build a compact, transform-specific execution recipe for workers."""
+    by_id = _load_transform_index()
+    t = by_id.get(transform_id)
+    if not t:
+        return "### Transform Recipe\nNo transform recipe found; follow probe assignment strictly."
+
+    lines = [
+        "### Transform Recipe",
+        f"- `transform_id`: `{transform_id}`",
+        f"- `family`: `{t.get('family', '?')}`",
+    ]
+    principle = t.get("principle")
+    if principle:
+        lines.append(f"- `principle`: {principle}")
+
+    pre = t.get("precondition_features") or []
+    if pre:
+        lines.append(
+            "- `expected_features`: "
+            + ", ".join(f"`{str(x)}`" for x in pre[:8])
+        )
+
+    contra = t.get("contraindications") or []
+    if contra:
+        caution_bits = []
+        for c in contra[:4]:
+            if isinstance(c, dict):
+                cid = c.get("id", "unknown")
+                instr = c.get("instruction", "")
+                caution_bits.append(f"{cid}: {instr}".strip(": "))
+            else:
+                caution_bits.append(str(c))
+        lines.append("- `contraindications`: " + " | ".join(caution_bits))
+
+    confirm = t.get("confirm_with_explain")
+    if confirm is True:
+        lines.append("- `confirm_with_explain`: true")
+
+    return "\n".join(lines)
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -37,6 +116,8 @@ class ProbeSpec:
     recommended_examples: List[str] = field(default_factory=list)
     node_contract: Optional[Dict[str, Any]] = None
     gates_checked: List[str] = field(default_factory=list)
+    expected_explain_delta: str = ""
+    recommended_patch_ops: List[str] = field(default_factory=list)
     phase: Optional[int] = None
     exploration: bool = False
     exploration_hypothesis: str = ""
@@ -48,6 +129,36 @@ class ScoutResult:
     hypothesis: str       # compressed bottleneck reasoning
     probes: List[ProbeSpec]
     dropped: List[Dict[str, str]]  # [{transform_id, reason}]
+    equivalence_tier: str = ""
+    reasoning_trace: List[str] = field(default_factory=list)
+    do_not_do: List[str] = field(default_factory=list)
+
+
+def _extract_cte_names(sql: str) -> List[str]:
+    """Extract top-level CTE names from SQL for collision-avoidance hints."""
+    if not sql:
+        return []
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(sql, error_level=sqlglot.ErrorLevel.IGNORE)
+        if not parsed:
+            return []
+        names: List[str] = []
+        for cte in parsed.find_all(exp.CTE):
+            alias = cte.alias_or_name
+            if alias:
+                names.append(str(alias))
+        # Preserve order, deduplicate.
+        return list(dict.fromkeys(names))
+    except Exception:
+        pass
+
+    # Regex fallback for common WITH cte_name AS (...) patterns.
+    import re
+    ctes = re.findall(r"(?i)\bwith\s+(?:recursive\s+)?([a-z_][a-z0-9_]*)\s+as\b", sql)
+    return list(dict.fromkeys(ctes))
 
 
 # ── Gold Example Loader ───────────────────────────────────────────────────────
@@ -157,131 +268,59 @@ def build_beam_dispatcher_prompt(
     gold_examples: Optional[Dict[str, Dict[str, Any]]] = None,
     dialect: str = "postgres",
     intelligence_brief: str = "",
+    importance_stars: int = 2,
+    budget_hint: str = "",
+    schema_context: str = "",
+    engine_knowledge: str = "",
 ) -> str:
-    """Build the beam dispatcher prompt — diagnose bottleneck, design 8-16 probes.
+    """Build dispatcher prompt from beam_dispatcher_v3 template + dynamic tail."""
+    template = _load_prompt_template("beam_dispatcher_v3.txt")
+    stars = max(1, min(3, int(importance_stars or 1)))
+    star_label = "*" * stars
 
-    Shows all transforms from catalog with match/no-match annotations.
-    No AST gate — the dispatcher sees everything and decides what to fire.
+    dynamic_sections = [
+        f"## Query ID\n{query_id}",
+        (
+            "## Runtime Dialect Contract\n"
+            f"- target_dialect: {dialect}\n"
+            "- runtime_dialect_is_source_of_truth: true\n"
+            "- if static examples conflict, follow runtime dialect behavior"
+        ),
+        (
+            "## Query Importance\n"
+            f"- importance_stars: {stars}\n"
+            f"- importance_label: {star_label}\n"
+            f"- budget_hint: {budget_hint or 'n/a'}"
+        ),
+        f"## Original SQL\n```sql\n{original_sql}\n```",
+        f"## Execution Plan\n```\n{explain_text}\n```",
+        IR_SCHEMA_REFERENCE,
+        f"## IR Structure + Anchor Hashes\n```\n{ir_node_map}\n```",
+        _build_transform_catalog_section(dialect),
+    ]
+    if schema_context:
+        dynamic_sections.append(f"## Schema / Index / Stats Context\n{schema_context}")
+    if engine_knowledge:
+        dynamic_sections.append(f"## Engine-Specific Knowledge\n{engine_knowledge}")
+    if intelligence_brief:
+        dynamic_sections.append(
+            "## Additional Intelligence\n"
+            f"{intelligence_brief}"
+        )
 
-    Args:
-        query_id: Query identifier.
-        original_sql: Full original SQL.
-        explain_text: EXPLAIN ANALYZE output.
-        ir_node_map: IR node map (from render_ir_node_map).
-        gold_examples: Dict mapping family ID to gold example JSON.
-        dialect: SQL dialect.
-        intelligence_brief: Pre-computed detection + classification summary.
+    if template:
+        return f"{template}\n\n" + "\n\n".join(dynamic_sections)
 
-    Returns:
-        Complete dispatcher prompt.
-    """
-    from .beam_prompt_builder import (
-        _build_prompt_body,
-        _build_explain_analysis_procedure_section,
-        _build_pathology_routing_section,
-        _build_regression_registry_section,
-        _build_aggregation_equivalence_rules_section,
+    # Minimal fallback if template file is unavailable.
+    return "\n\n".join(
+        [
+            "## Role",
+            "You are the Beam Dispatcher. Return JSON with dispatch+hypothesis+probes+dropped.",
+            "## Cache Boundary",
+            "Everything below is query-specific input.",
+        ]
+        + dynamic_sections
     )
-
-    engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
-    role_text = (
-        f"You are a SQL optimization analyst for {engine_name}. "
-        "Diagnose the bottleneck from EXPLAIN and design 8-16 independent transform probes.\n\n"
-        "Each probe is executed by one worker and must describe exactly where to apply one transform.\n"
-        "Use dialect profile + family cards + transform radar to target known engine gaps."
-    )
-
-    static, dynamic, n_families = _build_prompt_body(
-        query_id=query_id,
-        original_sql=original_sql,
-        explain_text=explain_text,
-        ir_node_map=ir_node_map,
-        all_5_examples=gold_examples or {},
-        dialect=dialect,
-        role_text=role_text,
-        include_patch_plans=False,
-        intelligence_brief=intelligence_brief,
-        phase_a_items=[
-            "Dialect Profile",
-            "Optimization Families (with decision gates)",
-            "EXPLAIN Analysis Procedure",
-            "Pathology Routing + Pruning",
-            "Regression Registry",
-            "Aggregation Equivalence Rules",
-            "Task Contract",
-        ],
-        phase_b_items=[
-            "Query SQL",
-            "Execution Plan",
-            "IR Structure",
-            "Detected Patterns / Transform Radar",
-        ],
-        extra_static_sections=[
-            _build_explain_analysis_procedure_section(),
-            _build_pathology_routing_section(),
-            _build_regression_registry_section(),
-            _build_aggregation_equivalence_rules_section(),
-        ],
-    )
-
-    # Task section in static prefix (system instructions)
-    static.append("""## Your Task
-
-1. Run EXPLAIN procedure -> produce bottleneck hypothesis.
-2. Route candidate families, then prune using stop-gates.
-3. Check every candidate against regression registry.
-4. Design 8-16 probes:
-- one probe = one transform
-- one probe = one precise target
-- include node contract + gates checked
-- reserve 1-2 probes for exploration
-
-Output JSON:
-```json
-{
-  "explain_analysis": {
-    "cost_spine": "...",
-    "bottleneck_hypothesis": "...",
-    "scan_count": {"table": 3}
-  },
-  "hypothesis": "...",
-  "probes": [
-    {
-      "probe_id": "p01",
-      "transform_id": "decorrelate",
-      "family": "B",
-      "target": "...",
-      "node_contract": {"from":"...","where":"...","output":["..."]},
-      "gates_checked": ["not_simple_exists:PASS"],
-      "phase": 2,
-      "exploration": false,
-      "confidence": 0.91,
-      "recommended_examples": ["early_filter_decorrelate"]
-    }
-  ],
-  "dropped": [{"transform_id":"...","family":"...","reason":"gate failed: ..."}]
-}
-```
-
-Rules:
-- rank by phase then expected impact
-- phase ordering: row-volume reduction -> redundancy elimination -> topology repair
-- use canonical family codes A-F
-- include all dropped candidates with explicit gate-failure reason
-- exploration probes must include `exploration_hypothesis`""")
-
-    # Cache boundary
-    static.append(
-        "---\n\n"
-        "## Cache Boundary\n"
-        "Everything below is query-specific input.\n\n"
-        "## Query to Analyze"
-    )
-
-    # Transform Catalog (per-query: AST match annotations depend on SQL)
-    dynamic.append(_build_transform_catalog_section(original_sql, dialect))
-
-    return "\n\n".join(static + dynamic)
 
 
 # Keep old names as aliases for backwards compatibility
@@ -298,118 +337,68 @@ def build_beam_worker_prompt(
     probe: ProbeSpec,
     gold_patch_plan: Optional[Dict[str, Any]] = None,
     dialect: str = "postgres",
+    schema_context: str = "",
+    equivalence_tier: str = "",
+    reasoning_trace: Optional[List[str]] = None,
+    engine_knowledge: str = "",
+    do_not_do: Optional[List[str]] = None,
 ) -> str:
-    """Build a single strike worker prompt for beam wide.
-
-    Same structure as focused worker: IR + PatchPlan JSON output.
-    Worker gets the analyst's target description and derives target IR.
-
-    Args:
-        original_sql: Full original SQL.
-        ir_node_map: Current IR node map (from render_ir_node_map).
-        hypothesis: Analyst's bottleneck hypothesis (shared context).
-        probe: The specific probe to execute.
-        gold_patch_plan: The patch_plan field from the recommended gold example.
-        dialect: SQL dialect.
-
-    Returns:
-        Strike worker prompt.
-    """
-    engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
-
-    # ═══ STATIC PREFIX (cached across all probes) ═════════════════
+    """Build worker prompt from beam_worker_v3 template + dynamic tail."""
+    template = _load_prompt_template("beam_worker_v3.txt")
     lines = [
-        "## Role\n",
-        "Transform a SQL query by applying ONE specific optimization. "
-        f"Target engine: {engine_name}.",
-        "Output a PatchPlan JSON that transforms the query's IR structure.",
-        "",
-        "## Prompt Map\n",
-        "### Phase A — Cached Instructions",
-        "A1. Patch operations and output rules",
-        "A2. Verification checklist",
-        "A3. Gold pattern reference (if provided)",
-        "",
-        "### Phase B — Probe-Specific Input",
-        "B1. Probe assignment + node contract",
-        "B2. Original SQL",
-        "B3. Current IR node map",
-        "",
-        "## Patch Operations\n",
-        "| Op | Description | Payload |",
-        "|----|-------------|---------|",
-        "| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |",
-        "| replace_from | Replace the FROM clause | from_sql |",
-        "| replace_where_predicate | Replace the WHERE clause | expr_sql |",
-        "| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |",
-        "| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |",
-        "| delete_expr_subtree | Remove a specific expression | (target only, no payload) |",
-        "",
-        "## Instructions\n",
-        "1. Read the **Target** description — it tells you WHERE and HOW to apply the transform",
-        "2. Respect **Node Contract** as target-state spec (FROM/WHERE/OUTPUT).",
-        "3. Design a target IR showing what the optimized query should look like",
-        "4. Build patch steps to get from current IR → target IR",
-        "5. Adapt the gold pattern shape; never copy literal SQL",
-        "6. All SQL in payloads must be complete, executable fragments (no ellipsis)",
-        f"7. Use dialect: \"{dialect}\" in the output",
-        "8. Target all steps at by_node_id: \"S0\" (the main statement)",
-        "",
-        "**Semantic guards** — MUST preserve:",
-        "- All WHERE/HAVING/ON conditions exactly",
-        "- All literal values unchanged (35*0.01 stays as 35*0.01)",
-        "- Column names, aliases, ORDER BY, and LIMIT exactly",
-        "- Do NOT add new filter conditions",
-        "- No orphaned CTEs or duplicated source scans after replacement",
-        "",
-        "## Verification Checklist",
-        "- [ ] every new CTE has a selective WHERE",
-        "- [ ] no orphaned CTEs/tables remain",
-        "- [ ] EXISTS semantics preserved unless anti-join decorrelation is explicit",
-        "- [ ] same-column OR conditions were not split into UNION branches",
-        "- [ ] downstream consumers have all required projected columns",
-        "",
-        "Output ONLY the JSON object (no markdown, no explanation).",
-        "",
-        "---",
-        "",
-        "## Cache Boundary",
-        "Everything below is probe-specific input.",
-        "",
+        f"## Shared Dispatcher Hypothesis\n{hypothesis or '(none)'}",
+        (
+            "## Runtime Dialect Contract\n"
+            f"- target_dialect: {dialect}\n"
+            "- runtime_dialect_is_source_of_truth: true\n"
+            "- if static examples conflict, follow runtime dialect behavior"
+        ),
         "## Probe Assignment",
-        "",
+        f"- transform_id: {probe.transform_id}",
+        f"- family: {probe.family}",
+        f"- target: {probe.target}",
+        f"- phase: {probe.phase if probe.phase is not None else '?'}",
+        f"- exploration: {'yes' if probe.exploration else 'no'}",
+        f"- dialect: {dialect}",
     ]
-
-    # ═══ DYNAMIC SUFFIX (unique per probe) ════════════════════════
-    lines.extend([
-        f"**Transform**: {probe.transform_id} (Family {probe.family})",
-        f"**Hypothesis**: {hypothesis}",
-        f"**Target**: {probe.target}",
-        f"**Phase**: {probe.phase if probe.phase is not None else '?'}",
-        f"**Exploration**: {'yes' if probe.exploration else 'no'}",
-        "",
-    ])
     if probe.recommended_examples:
-        lines.extend([
-            "**Recommended examples**: "
-            + ", ".join(f"`{e}`" for e in probe.recommended_examples[:4]),
-            "",
-        ])
+        lines.append(
+            "- recommended_examples: "
+            + ", ".join(f"`{e}`" for e in probe.recommended_examples[:6])
+        )
+    if probe.recommended_patch_ops:
+        lines.append(
+            "- recommended_patch_ops: "
+            + ", ".join(f"`{op}`" for op in probe.recommended_patch_ops[:8])
+        )
+    if probe.expected_explain_delta:
+        lines.append(f"- expected_explain_delta: {probe.expected_explain_delta}")
+    if equivalence_tier:
+        lines.append(f"- equivalence_tier: {equivalence_tier}")
     if probe.exploration and probe.exploration_hypothesis:
-        lines.extend([
-            f"**Exploration hypothesis**: {probe.exploration_hypothesis}",
-            "",
-        ])
+        lines.append(f"- exploration_hypothesis: {probe.exploration_hypothesis}")
+    existing_ctes = _extract_cte_names(original_sql)
+    lines.append(
+        "- existing_ctes: "
+        + (", ".join(f"`{name}`" for name in existing_ctes[:24]) if existing_ctes else "(none)")
+    )
+
+    lines.append("")
     lines.append("### Gates Checked")
     if probe.gates_checked:
         lines.append("; ".join(probe.gates_checked[:8]))
     else:
         lines.append("not provided")
     lines.append("")
+    lines.append("### Dispatcher Do-Not-Do")
+    if do_not_do:
+        for item in do_not_do[:8]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("not provided")
+    lines.append("")
 
-    lines.extend([
-        "### Node Contract\n",
-    ])
+    lines.extend(["### Node Contract\n"])
     if probe.node_contract:
         lines.extend([
             "```json",
@@ -422,90 +411,210 @@ def build_beam_worker_prompt(
             "not provided",
             "",
         ])
-    lines.extend([
-        "### Original SQL\n",
-        f"```sql\n{original_sql}\n```",
-        "",
-        "### Current IR Node Map\n",
-        f"```\n{ir_node_map}\n```",
-        "",
-    ])
+    lines.extend(
+        [
+            "### Original SQL\n",
+            f"```sql\n{original_sql}\n```",
+            "",
+            "### Current IR Node Map\n",
+            f"```\n{ir_node_map}\n```",
+            "",
+        ]
+    )
+    if reasoning_trace:
+        lines.append("### Dispatcher Reasoning Trace")
+        for item in reasoning_trace[:4]:
+            lines.append(f"- {item}")
+        lines.append("")
+    if schema_context:
+        lines.append("### Schema / Index / Stats Context")
+        lines.append(schema_context)
+        lines.append("")
+    if engine_knowledge:
+        lines.append("### Engine-Specific Knowledge")
+        lines.append(engine_knowledge)
+        lines.append("")
+    lines.append(_build_transform_recipe_section(probe.transform_id))
+    lines.append("")
 
     # Gold patch plan pattern (compact)
     if gold_patch_plan:
         lines.extend(_format_gold_patch_hint(gold_patch_plan))
 
-    return "\n".join(lines)
+    dynamic = "\n".join(lines)
+    if template:
+        return f"{template}\n\n{dynamic}"
+
+    return "\n".join(
+        [
+            "## Role",
+            "You are a Beam Worker. Output ONLY one PatchPlan JSON object.",
+            "First character must be `{` with no leading whitespace.",
+            "## Cache Boundary",
+            "Everything below is probe-specific input.",
+            dynamic,
+        ]
+    )
+
+
+def build_beam_editor_strike_prompt(
+    *,
+    query_id: str,
+    original_sql: str,
+    explain_text: str,
+    ir_node_map: str,
+    transform_id: str,
+    dialect: str = "postgres",
+    schema_context: str = "",
+) -> str:
+    """Build dedicated single-call Strike prompt for editor mode.
+
+    This path intentionally avoids dispatcher/scout overhead and injects one
+    explicit transform target for the worker model.
+    """
+    template = _load_prompt_template("beam_strike_worker_v1.txt")
+    tid = (transform_id or "").strip()
+    if not tid:
+        tid = "auto"
+
+    dynamic_sections: List[str] = [
+        f"## Query ID\n{query_id}",
+        "## Strike Assignment",
+        f"- mode: editor_strike",
+        f"- transform_id: {tid}",
+        f"- dialect: {dialect}",
+        "- objective: one candidate rewrite using the selected transform",
+        f"## Original SQL\n```sql\n{original_sql}\n```",
+        f"## Execution Plan\n```\n{explain_text}\n```",
+        IR_SCHEMA_REFERENCE,
+        f"## IR Structure + Anchor Hashes\n```\n{ir_node_map}\n```",
+        _build_transform_recipe_section(tid),
+    ]
+
+    if schema_context:
+        dynamic_sections.append(f"## Schema / Index / Stats Context\n{schema_context}")
+
+    dynamic = "\n\n".join(dynamic_sections)
+    if template:
+        return f"{template}\n\n{dynamic}"
+
+    return "\n\n".join(
+        [
+            "## Role",
+            "You are an editor strike worker. Return ONLY one PatchPlan JSON object.",
+            "First character must be `{` with no leading whitespace.",
+            "## Cache Boundary",
+            "Everything below is strike-specific input.",
+            dynamic,
+        ]
+    )
+
+
+def build_beam_worker_retry_prompt(
+    worker_prompt: str,
+    *,
+    probe_id: str,
+    transform_id: str,
+    gate_name: str,
+    gate_error: str,
+    failed_sql: str = "",
+    previous_response: str = "",
+) -> str:
+    """Append structured gate-failure feedback for one worker retry."""
+    parts = [
+        worker_prompt,
+        "",
+        "## RETRY — Gate failure feedback (attempt 2/2)",
+        "Your previous patch failed validation. Return a corrected PatchPlan JSON only.",
+        "First character must be `{` and output must contain no markdown/prose.",
+        "",
+        "### Failure Object",
+        "```json",
+        json.dumps(
+            {
+                "probe_id": probe_id,
+                "transform_id": transform_id,
+                "gate": gate_name,
+                "status": "FAIL",
+                "error": gate_error,
+            },
+            indent=2,
+        ),
+        "```",
+    ]
+    if failed_sql:
+        parts.extend(
+            [
+                "",
+                "### Failed SQL (from attempt 1)",
+                "```sql",
+                failed_sql,
+                "```",
+            ]
+        )
+    if previous_response:
+        parts.extend(
+            [
+                "",
+                "### Previous Worker Output (attempt 1)",
+                "```",
+                previous_response,
+                "```",
+            ]
+        )
+    parts.extend(
+        [
+            "",
+            "Fix only what caused the gate failure while preserving transform intent and semantics.",
+            "Output ONLY valid PatchPlan JSON.",
+            "Never emit payload.sql; use payload.sql_fragment where SQL fragments are required.",
+        ]
+    )
+    return "\n".join(parts)
 
 
 # Keep old name as alias
-build_wide_strike_prompt = build_beam_worker_prompt
+build_wide_strike_prompt = build_beam_editor_strike_prompt
 
 
 # ── Transform Catalog (all transforms with match annotations) ────────────────
 
-def _build_transform_catalog_section(
-    sql: str,
-    dialect: str,
-) -> str:
-    """Build compact transform radar for dispatcher probe planning.
-
-    Args:
-        sql: Original SQL for AST detection.
-        dialect: SQL dialect.
-
-    Returns:
-        Formatted catalog section string.
-    """
-    from ..detection import detect_transforms, load_transforms
+def _build_transform_catalog_section(dialect: str) -> str:
+    """Build full transform catalog (no pre-filter/radar)."""
+    from ..detection import load_transforms
 
     transforms = load_transforms()
-    by_id = {
-        t["id"]: t for t in transforms
-        if isinstance(t, dict) and t.get("id")
-    }
-
-    try:
-        matches = detect_transforms(sql, transforms, dialect_filter=dialect, dialect=dialect)
-    except Exception as e:
-        logger.warning("AST detection failed, showing fallback transform buckets: %s", e)
-        matches = []
-
-    lines = ["## Transform Radar", ""]
-
-    if matches:
-        strong = [m for m in matches if m.overlap_ratio >= 0.5]
-        if not strong:
-            strong = matches[:8]
-        strong = strong[:12]
-
-        lines.append("### High-Fit Candidates")
-        for m in strong:
-            t = by_id.get(m.id, {})
-            family = t.get("family", "?")
-            gap = t.get("gap") or m.gap or "-"
-            feats = ", ".join(m.matched_features[:4]) if m.matched_features else "-"
-            lines.append(
-                f"- `{m.id}` (Family {family}, {m.overlap_ratio:.0%}, gap `{gap}`) matched: {feats}"
-            )
-        lines.append("")
-
     dialect_norm = normalize_dialect(dialect)
-    eligible = [
+    catalog = [
         t for t in transforms
-        if not t.get("engines") or dialect_norm in (t.get("engines") or [])
+        if isinstance(t, dict)
+        and t.get("id")
     ]
-    buckets: Dict[str, List[str]] = {}
-    for t in eligible:
-        fam = str(t.get("family", "?"))
-        buckets.setdefault(fam, []).append(t["id"])
+    catalog.sort(key=lambda t: (str(t.get("family", "?")), str(t.get("id"))))
 
-    lines.append("### Reserve Catalog by Family")
-    for fam in sorted(buckets):
-        ids = sorted(buckets[fam])[:6]
-        lines.append(f"- Family {fam}: {', '.join(f'`{tid}`' for tid in ids)}")
+    lines = [
+        "## Transform Catalog (full list; not pre-filtered)",
+        "",
+        f"- runtime_dialect: `{dialect_norm}`",
+        "- selection_policy: prioritize native/universal transforms first.",
+        "- portability_policy: non-native transforms may be used as exploration probes "
+        "when runtime syntax/semantics remain valid and engine knowledge does not contraindicate.",
+        "",
+    ]
+    for t in catalog:
+        tid = t.get("id", "?")
+        fam = t.get("family", "?")
+        gap = t.get("gap", "-")
+        principle = t.get("principle") or t.get("description") or "-"
+        engines = t.get("engines") or []
+        engines_list = ", ".join(sorted(str(e) for e in engines)) if engines else "all"
+        is_native = not engines or dialect_norm in engines or "all" in engines
+        support = "native_or_universal" if is_native else "portability_candidate"
+        lines.append(
+            f"- `{tid}` (Family {fam}, gap `{gap}`, support `{support}`, "
+            f"engines `{engines_list}`): {principle}"
+        )
     lines.append("")
-
     return "\n".join(lines)
 
 
@@ -528,7 +637,7 @@ def parse_scout_response(response: str) -> Optional[ScoutResult]:
         json_text = json_match.group(1).strip()
     else:
         # Try raw JSON
-        json_match = re.search(r'\{[\s\S]*"hypothesis"[\s\S]*\}', response)
+        json_match = re.search(r'\{[\s\S]*\}', response)
         if json_match:
             json_text = json_match.group(0).strip()
         else:
@@ -541,9 +650,12 @@ def parse_scout_response(response: str) -> Optional[ScoutResult]:
         logger.warning(f"Failed to parse dispatcher JSON: {e}")
         return None
 
+    dispatch = data.get("dispatch") if isinstance(data.get("dispatch"), dict) else {}
     explain_analysis = data.get("explain_analysis") or {}
-    hypothesis = data.get("hypothesis", "") or explain_analysis.get(
-        "bottleneck_hypothesis", ""
+    hypothesis = (
+        data.get("hypothesis", "")
+        or dispatch.get("hypothesis", "")
+        or explain_analysis.get("bottleneck_hypothesis", "")
     )
     probes_raw = data.get("probes", [])
     dropped = data.get("dropped", [])
@@ -556,23 +668,57 @@ def parse_scout_response(response: str) -> Optional[ScoutResult]:
         gates = p.get("gates_checked", [])
         if not isinstance(gates, list):
             gates = [str(gates)]
-        probes.append(ProbeSpec(
-            probe_id=p.get("probe_id", f"p{i+1:02d}"),
-            transform_id=p.get("transform_id", "unknown"),
-            family=p.get("family", "?"),
-            target=p.get("target", ""),
-            confidence=float(p.get("confidence", 0.5)),
-            gold_example_id=p.get("gold_example_id"),
-            recommended_examples=[str(x) for x in rec if x],
-            node_contract=p.get("node_contract"),
-            gates_checked=[str(x) for x in gates if x],
-            phase=int(p["phase"]) if isinstance(p.get("phase"), (int, float, str)) and str(p.get("phase")).strip().isdigit() else None,
-            exploration=bool(p.get("exploration", False)),
-            exploration_hypothesis=str(p.get("exploration_hypothesis", "")),
-        ))
+        rec_ops = p.get("recommended_patch_ops", [])
+        if not isinstance(rec_ops, list):
+            rec_ops = [str(rec_ops)]
+        try:
+            confidence = float(p.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        probes.append(
+            ProbeSpec(
+                probe_id=p.get("probe_id", f"p{i+1:02d}"),
+                transform_id=p.get("transform_id", "unknown"),
+                family=p.get("family", "?"),
+                target=p.get("target", ""),
+                confidence=confidence,
+                gold_example_id=p.get("gold_example_id"),
+                recommended_examples=[str(x) for x in rec if x],
+                node_contract=p.get("node_contract"),
+                gates_checked=[str(x) for x in gates if x],
+                expected_explain_delta=str(p.get("expected_explain_delta", "")),
+                recommended_patch_ops=[
+                    str(x)
+                    for x in rec_ops
+                    if x
+                ],
+                phase=(
+                    int(p["phase"])
+                    if isinstance(p.get("phase"), (int, float, str))
+                    and str(p.get("phase")).strip().isdigit()
+                    else None
+                ),
+                exploration=bool(p.get("exploration", False)),
+                exploration_hypothesis=str(p.get("exploration_hypothesis", "")),
+            )
+        )
+
+    probe_count = dispatch.get("probe_count")
+    if isinstance(probe_count, int) and probe_count > 0:
+        probes = probes[:probe_count]
+
+    dispatch_trace = dispatch.get("reasoning_trace") or []
+    if not isinstance(dispatch_trace, list):
+        dispatch_trace = [str(dispatch_trace)]
+    do_not_do = dispatch.get("do_not_do") or []
+    if not isinstance(do_not_do, list):
+        do_not_do = [str(do_not_do)]
 
     return ScoutResult(
         hypothesis=hypothesis,
         probes=probes,
         dropped=dropped,
+        equivalence_tier=str(dispatch.get("equivalence_tier", "")),
+        reasoning_trace=[str(x) for x in dispatch_trace if x],
+        do_not_do=[str(x) for x in do_not_do if x],
     )

@@ -4,7 +4,7 @@ BEAM pipeline:
 1. Dispatcher (R1) → 8-16 independent transform probes
 2. Workers (qwen, parallel) → PatchPlan JSON per probe
 3. Validate (structural + equivalence + benchmark)
-4. R1 Sniper 2-shot → 4 more candidates via cache-hit pattern
+4. R1 Sniper shot 1 always; shot 2 only on retryable syntax/error paths
 """
 
 from __future__ import annotations
@@ -12,12 +12,14 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, Tuple
 
 from .base_session import OptimizationSession
 from ..schemas import SessionResult
@@ -54,6 +56,7 @@ class AppliedPatch:
     worker_prompt: Optional[str] = None   # raw prompt sent to worker LLM
     worker_response: Optional[str] = None  # raw response from worker LLM
     worker_role: Optional[str] = None      # W1/W2/W3/W4
+    description: Optional[str] = None      # analyst-provided probe target/intent
 
 
 @dataclass
@@ -76,21 +79,361 @@ class PatchIterationResult:
 
 
 class BeamSession(OptimizationSession):
-    """Single-mode patch optimization: BEAM (dispatcher + workers + sniper)."""
+    """Patch optimization session supporting BEAM and REASONING modes."""
+
+    # Pricing is configurable via QT_LLM_PRICING_OVERRIDES_JSON.
+    # Values are USD per 1M tokens.
+    _DEFAULT_PRICING_PER_1M: Dict[str, Dict[str, float]] = {
+        # OpenRouter DeepSeek R1 (documented in repo notes)
+        "deepseek/deepseek-r1": {"input": 0.55, "output": 2.19},
+        "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+        "deepseek/deepseek-r1-0528": {"input": 0.55, "output": 2.19},
+        # OpenRouter DeepSeek V3.2 family
+        "deepseek/deepseek-v3.2": {"input": 0.26, "output": 0.38},
+        "deepseek/deepseek-v3.2-exp": {"input": 0.27, "output": 0.41},
+        "deepseek/deepseek-v3.2-speciale": {"input": 0.27, "output": 0.41},
+        # Common OpenAI reference models
+        "gpt-4o": {"input": 2.50, "output": 10.00},
+        "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    }
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._llm_calls_lock = threading.Lock()
+        self._llm_call_seq = 0
+        self._api_call_costs: List[Dict[str, Any]] = []
+        self._beam_cost_usd = 0.0
+        self._beam_cost_priced_calls = 0
+        self._beam_cost_unpriced_calls = 0
+        self._beam_token_totals: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        self._session_dir: Optional[Path] = None
+        self._pricing_per_1m = dict(self._DEFAULT_PRICING_PER_1M)
+        self._load_pricing_overrides()
+
+    def _load_pricing_overrides(self) -> None:
+        """Load optional pricing overrides from environment JSON."""
+        raw = os.environ.get("QT_LLM_PRICING_OVERRIDES_JSON", "").strip()
+        if not raw:
+            return
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("expected top-level object")
+            for model_name, spec in parsed.items():
+                if not isinstance(model_name, str) or not isinstance(spec, dict):
+                    continue
+                in_rate = spec.get("input")
+                out_rate = spec.get("output")
+                if isinstance(in_rate, (int, float)) and isinstance(out_rate, (int, float)):
+                    self._pricing_per_1m[model_name.lower()] = {
+                        "input": float(in_rate),
+                        "output": float(out_rate),
+                    }
+        except Exception as e:
+            logger.warning(
+                f"[{self.query_id}] Invalid QT_LLM_PRICING_OVERRIDES_JSON: {e}"
+            )
+
+    def _reset_cost_tracking(self, session_dir: Path) -> None:
+        with self._llm_calls_lock:
+            self._session_dir = session_dir
+            self._llm_call_seq = 0
+            self._api_call_costs = []
+            self._beam_cost_usd = 0.0
+            self._beam_cost_priced_calls = 0
+            self._beam_cost_unpriced_calls = 0
+            for k in self._beam_token_totals:
+                self._beam_token_totals[k] = 0
+        self._write_cost_summary()
+
+    @staticmethod
+    def _int_usage(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _normalize_model_key(model: str) -> str:
+        key = (model or "").strip().lower()
+        if ":" in key:
+            # OpenRouter suffixes like ":free"
+            key = key.split(":", 1)[0]
+        return key
+
+    def _resolve_pricing(self, model: str) -> Optional[Tuple[float, float]]:
+        key = self._normalize_model_key(model)
+        if not key:
+            return None
+        spec = self._pricing_per_1m.get(key)
+        if spec:
+            return spec["input"], spec["output"]
+        # Try suffix match for vendor/model aliases.
+        for known, rates in self._pricing_per_1m.items():
+            if key.endswith(known):
+                return rates["input"], rates["output"]
+        return None
+
+    def _estimate_call_cost_usd(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> Optional[float]:
+        rates = self._resolve_pricing(model)
+        if not rates:
+            return None
+        input_per_1m, output_per_1m = rates
+        cost = (prompt_tokens * input_per_1m + completion_tokens * output_per_1m) / 1_000_000.0
+        return round(cost, 8)
+
+    def _write_json_atomic(self, path: Path, payload: Dict[str, Any]) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        tmp.replace(path)
+
+    def _cost_summary_payload(self) -> Dict[str, Any]:
+        with self._llm_calls_lock:
+            return {
+                "query_id": self.query_id,
+                "beam_cost_usd": round(self._beam_cost_usd, 8),
+                "beam_cost_priced_calls": self._beam_cost_priced_calls,
+                "beam_cost_unpriced_calls": self._beam_cost_unpriced_calls,
+                "n_api_calls": len(self._api_call_costs),
+                "beam_token_totals": dict(self._beam_token_totals),
+                "models_seen": sorted(
+                    {
+                        str(c.get("model", ""))
+                        for c in self._api_call_costs
+                        if c.get("model")
+                    }
+                ),
+            }
+
+    def _write_cost_summary(self) -> None:
+        session_dir = self._session_dir
+        if not session_dir:
+            return
+        try:
+            self._write_json_atomic(
+                session_dir / "llm_cost_summary.json",
+                self._cost_summary_payload(),
+            )
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Failed to write llm_cost_summary.json: {e}")
+
+    def _record_api_call_cost(self, call_record: Dict[str, Any]) -> None:
+        with self._llm_calls_lock:
+            self._api_call_costs.append(call_record)
+            self._beam_token_totals["prompt_tokens"] += self._int_usage(
+                call_record.get("prompt_tokens")
+            )
+            self._beam_token_totals["completion_tokens"] += self._int_usage(
+                call_record.get("completion_tokens")
+            )
+            self._beam_token_totals["total_tokens"] += self._int_usage(
+                call_record.get("total_tokens")
+            )
+            self._beam_token_totals["prompt_cache_hit_tokens"] += self._int_usage(
+                call_record.get("prompt_cache_hit_tokens")
+            )
+            self._beam_token_totals["prompt_cache_miss_tokens"] += self._int_usage(
+                call_record.get("prompt_cache_miss_tokens")
+            )
+            self._beam_token_totals["cached_tokens"] += self._int_usage(
+                call_record.get("cached_tokens")
+            )
+            self._beam_token_totals["reasoning_tokens"] += self._int_usage(
+                call_record.get("reasoning_tokens")
+            )
+            estimated_cost = call_record.get("estimated_cost_usd")
+            if isinstance(estimated_cost, (int, float)):
+                self._beam_cost_priced_calls += 1
+                self._beam_cost_usd += float(estimated_cost)
+            else:
+                self._beam_cost_unpriced_calls += 1
+            session_dir = self._session_dir
+
+            if session_dir:
+                try:
+                    with (session_dir / "llm_calls.jsonl").open(
+                        "a", encoding="utf-8"
+                    ) as f:
+                        f.write(json.dumps(call_record, default=str) + "\n")
+                except Exception as e:
+                    logger.warning(f"[{self.query_id}] Failed to append llm_calls.jsonl: {e}")
+
+        self._write_cost_summary()
+
+    def _session_cost_fields(self) -> Dict[str, Any]:
+        with self._llm_calls_lock:
+            return {
+                "beam_cost_usd": round(self._beam_cost_usd, 8),
+                "beam_cost_priced_calls": self._beam_cost_priced_calls,
+                "beam_cost_unpriced_calls": self._beam_cost_unpriced_calls,
+                "beam_token_totals": dict(self._beam_token_totals),
+                "api_call_costs": list(self._api_call_costs),
+            }
 
     def run(self) -> SessionResult:
-        """Execute the single BEAM optimization loop.
-
-        Legacy `beam_mode` values are ignored; all sessions run BEAM.
-        """
+        """Execute optimization loop by configured beam mode."""
         mode = str(getattr(self.pipeline.config, "beam_mode", "beam") or "beam")
-        if mode not in ("beam", "wide"):
-            logger.info(
-                f"[{self.query_id}] Legacy beam_mode={mode!r} ignored; forcing BEAM"
-            )
-        else:
-            logger.info(f"[{self.query_id}] BEAM MODE: BEAM (single mode)")
+        if mode in ("reasoning", "focused"):
+            if not bool(getattr(self.pipeline.config, "enable_reasoning_mode", False)):
+                logger.info(
+                    f"[{self.query_id}] Reasoning mode requested but disabled; forcing BEAM"
+                )
+                return self._run_beam()
+            logger.info(f"[{self.query_id}] BEAM MODE: REASONING")
+            return self._run_reasoning()
+        logger.info(f"[{self.query_id}] BEAM MODE: BEAM")
         return self._run_beam()
+
+    def run_editor_strike(self, transform_id: str = "") -> SessionResult:
+        """Single-call strike path for editor mode.
+
+        Strike mode is intentionally lightweight:
+        - no dispatcher phase
+        - no probe fan-out
+        - no sniper rounds
+        - one worker LLM call scoped to one transform id
+        """
+        from ..ir import build_script_ir, render_ir_node_map, Dialect
+        from ..patches.beam_wide_prompts import build_beam_editor_strike_prompt
+        from ..execution.database_utils import run_explain_analyze
+
+        strike_transform = (transform_id or "").strip() or "auto"
+        logger.info(
+            f"[{self.query_id}] STRIKE MODE: transform={strike_transform}"
+        )
+
+        db_path = (
+            self.pipeline.config.benchmark_dsn
+            or self.pipeline.config.db_path_or_dsn
+        )
+        dialect_upper = self.dialect.upper()
+        dialect_enum = (
+            Dialect[dialect_upper]
+            if dialect_upper in Dialect.__members__
+            else Dialect.POSTGRES
+        )
+        transform_family = self._lookup_transform_family(strike_transform)
+        session_dir = self._create_session_dir()
+        script_ir = build_script_ir(self.original_sql, dialect_enum)
+        ir_node_map = render_ir_node_map(script_ir)
+
+        if self.on_phase_change:
+            self.on_phase_change(phase="strike_prepare", iteration=0)
+
+        explain_result = run_explain_analyze(db_path, self.original_sql)
+        original_explain = self._render_explain_compact(
+            explain_result, self.dialect
+        )
+        schema_context = self._build_schema_context(db_path)
+
+        strike_prompt = build_beam_editor_strike_prompt(
+            query_id=self.query_id,
+            original_sql=self.original_sql,
+            explain_text=original_explain,
+            ir_node_map=ir_node_map,
+            transform_id=strike_transform,
+            dialect=self.dialect,
+            schema_context=schema_context,
+        )
+        self._save_to_disk(session_dir, 0, "strike_prompt", strike_prompt)
+
+        worker_model = getattr(
+            self.pipeline.config, "wide_worker_model", None
+        ) or getattr(self.pipeline.config, "worker_model", None)
+        worker_call_fn = self._make_llm_call_fn(worker_model)
+
+        if self.on_phase_change:
+            self.on_phase_change(phase="strike_worker", iteration=0)
+        strike_response = worker_call_fn(strike_prompt)
+        self._save_to_disk(session_dir, 0, "strike_response", strike_response)
+
+        output_sql = self._apply_wide_worker_response(
+            strike_response, script_ir, dialect_enum
+        )
+        patch = AppliedPatch(
+            patch_id="strike_01",
+            family=transform_family,
+            transform=strike_transform,
+            relevance_score=1.0,
+            output_sql=output_sql,
+            status="applied" if output_sql else "FAIL",
+            worker_prompt=strike_prompt,
+            worker_response=strike_response,
+            description=f"Editor strike for transform={strike_transform}",
+        )
+        if not output_sql:
+            patch.apply_error = "Failed to parse/apply strike response"
+
+        if output_sql:
+            if self.on_phase_change:
+                self.on_phase_change(phase="benchmark", iteration=0)
+            self._validate_and_benchmark_patches(
+                [patch], db_path, session_dir, 0
+            )
+
+        explains = (
+            {patch.patch_id: patch.explain_text}
+            if patch.explain_text
+            else {}
+        )
+        best_speedup = 0.0
+        best_sql = self.original_sql
+        best_transforms: List[str] = []
+        best_status = "NEUTRAL"
+
+        if patch.semantic_passed and patch.speedup is not None:
+            best_speedup = patch.speedup
+            best_sql = patch.output_sql or self.original_sql
+            best_transforms = [patch.transform]
+            best_status = self._classify_speedup(patch.speedup)
+        elif patch.status in ("FAIL", "ERROR"):
+            best_status = patch.status
+
+        iter_result = PatchIterationResult(
+            iteration=0,
+            prompt=strike_prompt,
+            response=strike_response,
+            n_api_calls=1,
+            patches=[patch],
+            explains=explains,
+            best_speedup=best_speedup,
+            best_patch_id=patch.patch_id if best_transforms else None,
+            best_sql=best_sql if best_transforms else None,
+        )
+
+        self._save_to_disk(
+            session_dir,
+            0,
+            "result",
+            json.dumps(self._serialize_iteration(iter_result), indent=2, default=str),
+        )
+
+        return SessionResult(
+            query_id=self.query_id,
+            mode="strike",
+            best_speedup=best_speedup,
+            best_sql=best_sql,
+            original_sql=self.original_sql,
+            best_transforms=best_transforms,
+            status=best_status,
+            iterations=[self._serialize_iteration(iter_result)],
+            n_iterations=1,
+            n_api_calls=1,
+            **self._session_cost_fields(),
+        )
 
     @staticmethod
     def _render_explain_compact(explain_result: Optional[dict], dialect: str = "duckdb") -> str:
@@ -154,9 +497,16 @@ class BeamSession(OptimizationSession):
         from ..patches.beam_patch_validator import _extract_json_array
         from ..ir import dict_to_plan, apply_patch_plan
 
+        def _is_patchplan_obj(obj: Any) -> bool:
+            return isinstance(obj, dict) and isinstance(obj.get("steps"), list)
+
         plans_data = _extract_json_array(response)
+        if plans_data:
+            # Keep only patch-plan-like dicts with steps[].
+            plans_data = [p for p in plans_data if _is_patchplan_obj(p)]
+
         if not plans_data:
-            logger.warning(f"[{self.query_id}] No JSON array found in R1 response")
+            logger.warning(f"[{self.query_id}] No PatchPlan JSON found in R1 response")
             return []
 
         patches = []
@@ -179,6 +529,26 @@ class BeamSession(OptimizationSession):
             if "dialect" not in plan_data:
                 plan_data["dialect"] = self.dialect
 
+            # Compatibility normalization: some responses still emit payload.sql
+            # for fragment-based ops. Canonical key is payload.sql_fragment.
+            for step in plan_data.get("steps", []):
+                if not isinstance(step, dict):
+                    continue
+                payload = step.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if "sql_fragment" in payload:
+                    continue
+                raw_sql = payload.get("sql")
+                if not isinstance(raw_sql, str):
+                    continue
+                if step.get("op") in {
+                    "replace_body",
+                    "replace_select",
+                    "replace_block_with_cte_pair",
+                }:
+                    payload["sql_fragment"] = raw_sql
+
             try:
                 ir_copy = _copy.deepcopy(script_ir)
                 plan = dict_to_plan(plan_data)
@@ -199,6 +569,100 @@ class BeamSession(OptimizationSession):
 
         return patches
 
+    def _is_sniper_tier0_shape_failure(self, response: str) -> bool:
+        """True when sniper output violates the top-level PatchPlan array contract."""
+        from ..patches.beam_patch_validator import _extract_json_array
+
+        def _is_patchplan_obj(obj: Any) -> bool:
+            return isinstance(obj, dict) and isinstance(obj.get("steps"), list)
+
+        plans_data = _extract_json_array(response)
+        if not isinstance(plans_data, list):
+            return True
+        if len(plans_data) == 0:
+            return True
+        if any(not _is_patchplan_obj(item) for item in plans_data):
+            return True
+        return False
+
+    def _build_sniper_tier0_retry_prompt(self, base_prompt: str) -> str:
+        """Append hard shape feedback for one sniper retry."""
+        return (
+            base_prompt
+            + "\n\n## RETRY — Tier-0 Output Contract Failure\n"
+            + "Your previous output had invalid JSON shape for PatchPlans.\n"
+            + "Return valid JSON only.\n"
+            + "Contract:\n"
+            + "- first character must be [\n"
+            + "- no leading whitespace/newlines\n"
+            + "- top-level value must be an array of exactly 2 objects\n"
+            + "- no markdown fences, no prose, no commentary\n"
+            + "- based_on must be a string (not an array)\n"
+            + "- never emit payload.sql; use payload.sql_fragment\n"
+        )
+
+    def _is_sniper_retry_error_patch(self, patch: AppliedPatch) -> bool:
+        """True when a patch indicates retry-worthy syntax/parse/error failures."""
+        status = str(patch.status or "").upper()
+        err = str(patch.apply_error or "").lower()
+
+        if status == "ERROR":
+            return True
+        if status == "FAIL" and not (patch.output_sql or "").strip():
+            # Parse/apply failure before SQL is even runnable.
+            return True
+
+        retry_markers = (
+            "tier-1:",
+            "syntax",
+            "parse",
+            "json",
+            "structural",
+            "failed to parse/apply",
+        )
+        return any(marker in err for marker in retry_markers)
+
+    def _categorize_probe_failure(self, patch: AppliedPatch) -> str:
+        """Classify probe outcome for sniper evidence synthesis."""
+        status = str(patch.status or "").upper()
+        err = str(patch.apply_error or "").lower()
+
+        if status in {"WIN", "IMPROVED", "NEUTRAL"}:
+            return "none"
+        if status == "REGRESSION":
+            return "regression"
+        if "timeout" in err:
+            return "timeout"
+
+        if any(
+            marker in err
+            for marker in (
+                "row count:",
+                "checksum mismatch",
+                "synthetic semantic mismatch",
+                "equivalence check unavailable",
+            )
+        ):
+            return "equivalence_fail"
+
+        if any(
+            marker in err
+            for marker in (
+                "tier-1:",
+                "syntax",
+                "parse",
+                "json",
+                "failed to parse/apply",
+                "execution:",
+            )
+        ):
+            return "syntax_error"
+
+        if "semantic" in err:
+            return "semantic_violation"
+
+        return "semantic_violation"
+
     def _validate_and_benchmark_patches(
         self,
         patches: List[AppliedPatch],
@@ -206,11 +670,12 @@ class BeamSession(OptimizationSession):
         session_dir: Path,
         shot: int,
     ) -> None:
-        """Validate (structural + equivalence) and benchmark patches in-place.
+        """Validate (structural + synthetic semantics + equivalence) and benchmark patches in-place.
 
         Modifies patches in-place: sets semantic_passed, speedup, status, explain_text.
         """
         from ..validation.mini_validator import MiniValidator
+        from ..validation.synthetic_validator import SyntheticValidator
         from ..execution.factory import create_executor_from_dsn
         from ..validation.equivalence_checker import EquivalenceChecker
         from ..execution.database_utils import run_explain_analyze
@@ -231,8 +696,40 @@ class BeamSession(OptimizationSession):
             else:
                 p.semantic_passed = True
 
-        # ── Full-dataset equivalence ──────────────────────────────────
-        equiv_passed = [p for p in applied if p.semantic_passed]
+        # ── Synthetic semantic gate (fast, deterministic) ─────────────
+        synth_passed = [p for p in applied if p.semantic_passed]
+        if synth_passed:
+            try:
+                synth = SyntheticValidator(reference_db=db_path, dialect=self.dialect)
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Synthetic validator init failed: {e}")
+                for p in synth_passed:
+                    p.semantic_passed = False
+                    p.status = "ERROR"
+                    p.apply_error = f"Synthetic semantic gate unavailable: {e}"
+                synth_passed = []
+
+        for p in synth_passed:
+            try:
+                synth_result = synth.validate_sql_pair(
+                    original_sql=self.original_sql,
+                    optimized_sql=p.output_sql or "",
+                    target_rows=100,
+                )
+            except Exception as e:
+                p.semantic_passed = False
+                p.status = "ERROR"
+                p.apply_error = f"Synthetic semantic check failed: {e}"
+                continue
+
+            if not synth_result.get("match", False):
+                p.semantic_passed = False
+                p.status = "FAIL"
+                reason = synth_result.get("reason") or "Synthetic semantic mismatch"
+                p.apply_error = f"Synthetic semantic mismatch: {reason}"
+
+        # ── Full-dataset equivalence (after synthetic gate) ───────────
+        equiv_passed = [p for p in synth_passed if p.semantic_passed]
         if equiv_passed:
             checker = EquivalenceChecker()
             try:
@@ -272,6 +769,12 @@ class BeamSession(OptimizationSession):
                             p.apply_error = f"Execution: {e}"
             except Exception as e:
                 logger.warning(f"[{self.query_id}] Equiv check failed: {e}")
+                # Do not allow structurally-valid patches to pass without
+                # full-dataset equivalence confirmation.
+                for p in equiv_passed:
+                    p.semantic_passed = False
+                    p.status = "ERROR"
+                    p.apply_error = f"Equivalence check unavailable: {e}"
 
         # ── Benchmark ─────────────────────────────────────────────────
         sem_passed = [p for p in applied if p.semantic_passed]
@@ -290,26 +793,181 @@ class BeamSession(OptimizationSession):
                 except Exception as e:
                     logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
 
+    # ── REASONING Mode ────────────────────────────────────────────────────
+
+    def _run_reasoning(self) -> SessionResult:
+        """REASONING mode: analyst 2-shot PatchPlan search (no worker swarm)."""
+        from ..ir import build_script_ir, render_ir_node_map, Dialect
+        from ..patches.beam_prompt_builder import (
+            load_gold_examples,
+            build_reasoning_prompt,
+            append_reasoning_shot_results,
+        )
+        from ..execution.database_utils import run_explain_analyze
+
+        db_path = (
+            self.pipeline.config.benchmark_dsn
+            or self.pipeline.config.db_path_or_dsn
+        )
+        dialect_upper = self.dialect.upper()
+        dialect_enum = (
+            Dialect[dialect_upper]
+            if dialect_upper in Dialect.__members__
+            else Dialect.POSTGRES
+        )
+
+        session_dir = self._create_session_dir()
+        script_ir = build_script_ir(self.original_sql, dialect_enum)
+        ir_node_map = render_ir_node_map(script_ir)
+
+        explain_result = run_explain_analyze(db_path, self.original_sql)
+        original_explain = self._render_explain_compact(
+            explain_result, self.dialect
+        )
+
+        total_api_calls = 0
+        gold_examples = load_gold_examples(self.dialect)
+
+        intelligence_brief = ""
+        try:
+            from ..detection import detect_transforms, load_transforms
+            from ..patches.pathology_classifier import build_intelligence_brief
+
+            transforms_catalog = load_transforms()
+            detected = detect_transforms(
+                self.original_sql, transforms_catalog,
+                dialect=self.dialect,
+            )
+            classification = self._load_cached_classification(self.query_id)
+            intelligence_brief = build_intelligence_brief(
+                detected,
+                classification,
+                runtime_dialect=self.dialect,
+            )
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
+
+        if self.on_phase_change:
+            self.on_phase_change(phase="analyst", iteration=0)
+
+        analyst_model = (
+            getattr(self.pipeline.config, "wide_dispatcher_model", None)
+            or getattr(self.pipeline.config, "analyst_model", None)
+        )
+        analyst_call_fn = self._make_llm_call_fn(analyst_model)
+
+        shot1_prompt = build_reasoning_prompt(
+            query_id=self.query_id,
+            original_sql=self.original_sql,
+            explain_text=original_explain,
+            ir_node_map=ir_node_map,
+            all_5_examples=gold_examples,
+            dialect=self.dialect,
+            intelligence_brief=intelligence_brief,
+        )
+        self._save_to_disk(session_dir, 0, "reasoning_shot1_prompt", shot1_prompt)
+        shot1_response = analyst_call_fn(shot1_prompt)
+        total_api_calls += 1
+        self._save_to_disk(session_dir, 0, "reasoning_shot1_response", shot1_response)
+
+        shot1_patches = self._apply_patchplan_array(
+            shot1_response, script_ir, dialect_enum, prefix="r1"
+        )
+
+        if self.on_phase_change:
+            self.on_phase_change(phase="benchmark", iteration=0)
+        self._validate_and_benchmark_patches(shot1_patches, db_path, session_dir, 0)
+
+        shot2_prompt = append_reasoning_shot_results(
+            base_prompt=shot1_prompt,
+            patches=shot1_patches,
+            explains={p.patch_id: p.explain_text or "" for p in shot1_patches},
+        )
+        self._save_to_disk(session_dir, 0, "reasoning_shot2_prompt", shot2_prompt)
+        shot2_response = analyst_call_fn(shot2_prompt)
+        total_api_calls += 1
+        self._save_to_disk(session_dir, 0, "reasoning_shot2_response", shot2_response)
+
+        shot2_patches = self._apply_patchplan_array(
+            shot2_response, script_ir, dialect_enum, prefix="r2"
+        )
+        self._validate_and_benchmark_patches(shot2_patches, db_path, session_dir, 1)
+
+        all_patches = shot1_patches + shot2_patches
+        final_patches = [p for p in all_patches if p.semantic_passed]
+        explains = {p.patch_id: p.explain_text for p in all_patches if p.explain_text}
+
+        best_speedup = 0.0
+        best_sql = self.original_sql
+        best_transforms: List[str] = []
+        best_status = "NEUTRAL"
+
+        candidates = [
+            p for p in final_patches
+            if p.speedup is not None and p.speedup >= 1.0
+        ]
+        if candidates:
+            best_patch = max(candidates, key=lambda p: p.speedup)
+            best_speedup = best_patch.speedup
+            best_sql = best_patch.output_sql or self.original_sql
+            best_transforms = [best_patch.transform]
+            best_status = self._classify_speedup(best_speedup)
+
+        iter_result = PatchIterationResult(
+            iteration=0,
+            prompt=shot1_prompt,
+            response=shot1_response,
+            n_api_calls=total_api_calls,
+            patches=all_patches,
+            explains=explains,
+            best_speedup=best_speedup,
+            best_patch_id=max(candidates, key=lambda p: p.speedup).patch_id if candidates else None,
+            best_sql=best_sql,
+        )
+
+        self._save_to_disk(
+            session_dir,
+            0,
+            "result",
+            json.dumps(self._serialize_iteration(iter_result), indent=2, default=str),
+        )
+
+        return SessionResult(
+            query_id=self.query_id,
+            mode="reasoning",
+            best_speedup=best_speedup,
+            best_sql=best_sql,
+            original_sql=self.original_sql,
+            best_transforms=best_transforms,
+            status=best_status,
+            iterations=[self._serialize_iteration(iter_result)],
+            n_iterations=1,
+            n_api_calls=total_api_calls,
+            **self._session_cost_fields(),
+        )
+
     # ── BEAM Mode ─────────────────────────────────────────────────────────
 
     def _run_beam(self, baseline_ms: Optional[float] = None) -> SessionResult:
-        """BEAM mode: cheap qwen probes + R1 sniper 2-shot.
+        """BEAM mode: cheap qwen probes + R1 sniper with retry-gated shot2.
 
         Pipeline:
         1. Dispatcher (R1) → 8-16 independent transform probes
         2. Workers (qwen, parallel) → execute probes → PatchPlan JSON
         3. Validate + benchmark all probes
-        4. R1 Sniper 2-shot → 4 more candidates via cache-hit pattern
+        4. R1 Sniper shot1, then shot2 only for retryable syntax/error failures
         """
         from ..ir import build_script_ir, render_ir_node_map, Dialect
         from ..patches.beam_prompt_builder import (
             load_gold_examples,
             build_beam_sniper_prompt,
             append_shot_results,
+            _load_engine_intelligence,
         )
         from ..patches.beam_wide_prompts import (
             build_beam_dispatcher_prompt,
             build_beam_worker_prompt,
+            build_beam_worker_retry_prompt,
             parse_scout_response,
             _load_gold_example_for_family,
             _load_gold_example_by_id,
@@ -346,6 +1004,22 @@ class BeamSession(OptimizationSession):
         original_explain = self._render_explain_compact(
             explain_result, self.dialect
         )
+        baseline_ms = None
+        if isinstance(explain_result, dict):
+            ems = explain_result.get("execution_time_ms")
+            if isinstance(ems, (int, float)) and ems > 0:
+                baseline_ms = float(ems)
+        importance_stars = self._compute_importance_stars(baseline_ms)
+        logger.info(
+            f"[{self.query_id}] Runtime importance: {'*' * importance_stars} "
+            f"(baseline={baseline_ms if baseline_ms is not None else 'unknown'}ms)"
+        )
+        schema_context = self._build_schema_context(db_path)
+        if schema_context:
+            logger.info(f"[{self.query_id}] Schema context attached to beam prompts")
+        engine_knowledge = _load_engine_intelligence(self.dialect) or ""
+        if engine_knowledge:
+            logger.info(f"[{self.query_id}] Engine knowledge attached to beam prompts")
 
         gold_examples = load_gold_examples(self.dialect)
         total_api_calls = 0
@@ -359,10 +1033,14 @@ class BeamSession(OptimizationSession):
             transforms_catalog = load_transforms()
             detected = detect_transforms(
                 self.original_sql, transforms_catalog,
-                engine=self.engine, dialect=self.dialect,
+                dialect=self.dialect,
             )
             classification = self._load_cached_classification(self.query_id)
-            intelligence_brief = build_intelligence_brief(detected, classification)
+            intelligence_brief = build_intelligence_brief(
+                detected,
+                classification,
+                runtime_dialect=self.dialect,
+            )
         except Exception as e:
             logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
 
@@ -376,7 +1054,7 @@ class BeamSession(OptimizationSession):
         )
         analyst_call_fn = self._make_llm_call_fn(dispatcher_model)
 
-        dispatcher_prompt = build_beam_dispatcher_prompt(
+        dispatcher_prompt_base = build_beam_dispatcher_prompt(
             query_id=self.query_id,
             original_sql=self.original_sql,
             explain_text=original_explain,
@@ -384,15 +1062,47 @@ class BeamSession(OptimizationSession):
             gold_examples=gold_examples,
             dialect=self.dialect,
             intelligence_brief=intelligence_brief,
+            importance_stars=importance_stars,
+            schema_context=schema_context,
+            engine_knowledge=engine_knowledge,
         )
 
-        dispatcher_response = analyst_call_fn(dispatcher_prompt)
-        total_api_calls += 1
+        max_dispatcher_attempts = max(
+            1, int(getattr(self.pipeline.config, "dispatcher_max_attempts", 2) or 1)
+        )
+        dispatcher_prompt = dispatcher_prompt_base
+        dispatcher_response = ""
+        scout_result = None
+        for attempt in range(1, max_dispatcher_attempts + 1):
+            if attempt > 1:
+                dispatcher_prompt = (
+                    dispatcher_prompt_base
+                    + "\n\n## Retry Requirements\n"
+                    + "Your prior response was not parseable. Return ONLY valid JSON "
+                    + "with keys: dispatch, probes, dropped. No markdown fences."
+                )
+            dispatcher_response = analyst_call_fn(dispatcher_prompt)
+            total_api_calls += 1
+            prompt_label = (
+                "dispatcher_prompt"
+                if attempt == 1
+                else f"dispatcher_prompt_retry{attempt - 1}"
+            )
+            response_label = (
+                "dispatcher_response"
+                if attempt == 1
+                else f"dispatcher_response_retry{attempt - 1}"
+            )
+            self._save_to_disk(session_dir, 0, prompt_label, dispatcher_prompt)
+            self._save_to_disk(session_dir, 0, response_label, dispatcher_response)
+            scout_result = parse_scout_response(dispatcher_response)
+            if scout_result and scout_result.probes:
+                break
+            logger.warning(
+                f"[{self.query_id}] Dispatcher parse failed (attempt "
+                f"{attempt}/{max_dispatcher_attempts})"
+            )
 
-        self._save_to_disk(session_dir, 0, "dispatcher_prompt", dispatcher_prompt)
-        self._save_to_disk(session_dir, 0, "dispatcher_response", dispatcher_response)
-
-        scout_result = parse_scout_response(dispatcher_response)
         if not scout_result or not scout_result.probes:
             logger.warning(f"[{self.query_id}] Dispatcher returned no probes")
             return SessionResult(
@@ -403,6 +1113,7 @@ class BeamSession(OptimizationSession):
                 original_sql=self.original_sql,
                 status="ERROR",
                 n_api_calls=total_api_calls,
+                **self._session_cost_fields(),
             )
 
         probes = sorted(
@@ -426,7 +1137,15 @@ class BeamSession(OptimizationSession):
         worker_call_fn = self._make_llm_call_fn(worker_model)
 
         patches: List[AppliedPatch] = []
-        n_workers = min(len(probes), 8)
+        worker_parallelism = max(
+            1,
+            int(getattr(self.pipeline.config, "wide_worker_parallelism", 8) or 8),
+        )
+        n_workers = min(len(probes), worker_parallelism)
+        logger.info(
+            f"[{self.query_id}] Worker parallelism: {n_workers} "
+            f"(cap={worker_parallelism}, probes={len(probes)})"
+        )
 
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {}
@@ -453,6 +1172,11 @@ class BeamSession(OptimizationSession):
                     probe=probe,
                     gold_patch_plan=gold_patch_plan,
                     dialect=self.dialect,
+                    schema_context=schema_context,
+                    equivalence_tier=scout_result.equivalence_tier,
+                    reasoning_trace=scout_result.reasoning_trace,
+                    engine_knowledge=engine_knowledge,
+                    do_not_do=scout_result.do_not_do,
                 )
 
                 future = pool.submit(worker_call_fn, worker_prompt)
@@ -481,6 +1205,7 @@ class BeamSession(OptimizationSession):
                         status="applied" if output_sql else "FAIL",
                         worker_prompt=w_prompt,
                         worker_response=response,
+                        description=probe.target,
                     )
                     if not output_sql:
                         patch.apply_error = "Failed to parse/apply PatchPlan"
@@ -502,6 +1227,7 @@ class BeamSession(OptimizationSession):
                         relevance_score=probe.confidence,
                         apply_error=str(e),
                         status="ERROR",
+                        description=probe.target,
                     ))
 
         applied = [p for p in patches if p.output_sql]
@@ -519,6 +1245,7 @@ class BeamSession(OptimizationSession):
                 original_sql=self.original_sql,
                 status="NEUTRAL",
                 n_api_calls=total_api_calls,
+                **self._session_cost_fields(),
             )
 
         # ── Dedup identical SQL ────────────────────────────────────────
@@ -541,6 +1268,17 @@ class BeamSession(OptimizationSession):
             self.on_phase_change(phase="benchmark", iteration=0)
 
         self._validate_and_benchmark_patches(applied, db_path, session_dir, 0)
+        retry_calls = self._retry_tier1_worker_failures(
+            patches=applied,
+            worker_call_fn=worker_call_fn,
+            build_retry_prompt_fn=build_beam_worker_retry_prompt,
+            script_ir=script_ir,
+            dialect_enum=dialect_enum,
+            db_path=db_path,
+            session_dir=session_dir,
+            shot=0,
+        )
+        total_api_calls += retry_calls
 
         sem_passed = [p for p in applied if p.semantic_passed]
         logger.info(
@@ -548,18 +1286,24 @@ class BeamSession(OptimizationSession):
             f"{len(sem_passed)}/{len(applied)} passed"
         )
 
-        # ── Phase 4: R1 Sniper 2-shot ─────────────────────────────────
+        # ── Phase 4: R1 Sniper (shot2 only on retryable syntax/error) ─
         sniper_patches: List[AppliedPatch] = []
         winners = [p for p in sem_passed if p.speedup and p.speedup >= 1.05]
+        retry_error_candidates = [
+            p for p in patches if self._is_sniper_retry_error_patch(p)
+        ]
+        has_retry_errors = bool(retry_error_candidates)
         snipe_rounds = int(getattr(self.pipeline.config, "snipe_rounds", 2) or 0)
 
-        if len(sem_passed) >= 2 and winners and snipe_rounds > 0:
+        should_snipe = snipe_rounds > 0 and (bool(sem_passed) or has_retry_errors)
+        if should_snipe:
             if self.on_phase_change:
                 self.on_phase_change(phase="snipe", iteration=0)
 
             logger.info(
-                f"[{self.query_id}] Phase 4: R1 sniper 2-shot "
-                f"({len(winners)} winners, {len(sem_passed)} total)"
+                f"[{self.query_id}] Phase 4: R1 sniper "
+                f"(winners={len(winners)}, sem_passed={len(sem_passed)}, "
+                f"retryable_errors={len(retry_error_candidates)})"
             )
 
             strike_results = [
@@ -568,10 +1312,12 @@ class BeamSession(OptimizationSession):
                     "transform_id": p.transform,
                     "family": p.family,
                     "status": p.status,
+                    "failure_category": self._categorize_probe_failure(p),
                     "speedup": p.speedup,
                     "error": p.apply_error,
                     "explain_text": p.explain_text,
                     "sql": p.output_sql,
+                    "description": p.description or "",
                 }
                 for p in patches
             ]
@@ -586,6 +1332,12 @@ class BeamSession(OptimizationSession):
                 dialect=self.dialect,
                 intelligence_brief=intelligence_brief,
                 strike_results=strike_results,
+                importance_stars=importance_stars,
+                schema_context=schema_context,
+                engine_knowledge=engine_knowledge,
+                dispatch_hypothesis=scout_result.hypothesis,
+                dispatch_reasoning_trace=scout_result.reasoning_trace,
+                equivalence_tier=scout_result.equivalence_tier,
             )
 
             self._save_to_disk(
@@ -600,6 +1352,24 @@ class BeamSession(OptimizationSession):
             shot1_sniper = self._apply_patchplan_array(
                 sniper_shot1_response, script_ir, dialect_enum, prefix="s1"
             )
+            if not shot1_sniper and self._is_sniper_tier0_shape_failure(sniper_shot1_response):
+                logger.warning(
+                    f"[{self.query_id}] Sniper shot 1 Tier-0 shape failure, retrying once"
+                )
+                sniper_shot1_retry_prompt = self._build_sniper_tier0_retry_prompt(
+                    sniper_shot1_prompt
+                )
+                self._save_to_disk(
+                    session_dir, 0, "sniper_shot1_retry_prompt", sniper_shot1_retry_prompt
+                )
+                sniper_shot1_retry_response = analyst_call_fn(sniper_shot1_retry_prompt)
+                total_api_calls += 1
+                self._save_to_disk(
+                    session_dir, 0, "sniper_shot1_retry_response", sniper_shot1_retry_response
+                )
+                shot1_sniper = self._apply_patchplan_array(
+                    sniper_shot1_retry_response, script_ir, dialect_enum, prefix="s1r"
+                )
             logger.info(
                 f"[{self.query_id}] Sniper shot 1: {len(shot1_sniper)} patches"
             )
@@ -609,36 +1379,66 @@ class BeamSession(OptimizationSession):
             )
             sniper_patches.extend(shot1_sniper)
 
-            # Shot 2: append results (cache hit) → 2 more PatchPlans
-            sniper_shot2_prompt = append_shot_results(
-                base_prompt=sniper_shot1_prompt,
-                patches=shot1_sniper,
-                explains={
-                    p.patch_id: p.explain_text or ""
-                    for p in shot1_sniper
-                },
+            # Shot 2 is reserved for retry paths (syntax/parse/error), not for speed-only cases.
+            shot1_retry_errors = [
+                p for p in shot1_sniper if self._is_sniper_retry_error_patch(p)
+            ]
+            should_run_shot2 = snipe_rounds > 1 and (
+                has_retry_errors or bool(shot1_retry_errors)
             )
+            if should_run_shot2:
+                sniper_shot2_prompt = append_shot_results(
+                    base_prompt=sniper_shot1_prompt,
+                    patches=shot1_sniper,
+                    explains={
+                        p.patch_id: p.explain_text or ""
+                        for p in shot1_sniper
+                    },
+                )
 
-            self._save_to_disk(
-                session_dir, 0, "sniper_shot2_prompt", sniper_shot2_prompt
-            )
-            sniper_shot2_response = analyst_call_fn(sniper_shot2_prompt)
-            total_api_calls += 1
-            self._save_to_disk(
-                session_dir, 0, "sniper_shot2_response", sniper_shot2_response
-            )
+                self._save_to_disk(
+                    session_dir, 0, "sniper_shot2_prompt", sniper_shot2_prompt
+                )
+                sniper_shot2_response = analyst_call_fn(sniper_shot2_prompt)
+                total_api_calls += 1
+                self._save_to_disk(
+                    session_dir, 0, "sniper_shot2_response", sniper_shot2_response
+                )
 
-            shot2_sniper = self._apply_patchplan_array(
-                sniper_shot2_response, script_ir, dialect_enum, prefix="s2"
-            )
-            logger.info(
-                f"[{self.query_id}] Sniper shot 2: {len(shot2_sniper)} patches"
-            )
+                shot2_sniper = self._apply_patchplan_array(
+                    sniper_shot2_response, script_ir, dialect_enum, prefix="s2"
+                )
+                if not shot2_sniper and self._is_sniper_tier0_shape_failure(sniper_shot2_response):
+                    logger.warning(
+                        f"[{self.query_id}] Sniper shot 2 Tier-0 shape failure, retrying once"
+                    )
+                    sniper_shot2_retry_prompt = self._build_sniper_tier0_retry_prompt(
+                        sniper_shot2_prompt
+                    )
+                    self._save_to_disk(
+                        session_dir, 0, "sniper_shot2_retry_prompt", sniper_shot2_retry_prompt
+                    )
+                    sniper_shot2_retry_response = analyst_call_fn(sniper_shot2_retry_prompt)
+                    total_api_calls += 1
+                    self._save_to_disk(
+                        session_dir, 0, "sniper_shot2_retry_response", sniper_shot2_retry_response
+                    )
+                    shot2_sniper = self._apply_patchplan_array(
+                        sniper_shot2_retry_response, script_ir, dialect_enum, prefix="s2r"
+                    )
+                logger.info(
+                    f"[{self.query_id}] Sniper shot 2 (retry path): {len(shot2_sniper)} patches"
+                )
 
-            self._validate_and_benchmark_patches(
-                shot2_sniper, db_path, session_dir, 2
-            )
-            sniper_patches.extend(shot2_sniper)
+                self._validate_and_benchmark_patches(
+                    shot2_sniper, db_path, session_dir, 2
+                )
+                sniper_patches.extend(shot2_sniper)
+            else:
+                logger.info(
+                    f"[{self.query_id}] Sniper shot 2 skipped "
+                    f"(no retryable syntax/error failures)"
+                )
 
         # ── Collect all results ────────────────────────────────────────
         all_final = list(sem_passed) + [
@@ -705,7 +1505,124 @@ class BeamSession(OptimizationSession):
             iterations=[self._serialize_iteration(iter_result)],
             n_iterations=1,
             n_api_calls=total_api_calls,
+            **self._session_cost_fields(),
         )
+
+    def _retry_tier1_worker_failures(
+        self,
+        *,
+        patches: List[AppliedPatch],
+        worker_call_fn: Callable[[str], str],
+        build_retry_prompt_fn: Callable[..., str],
+        script_ir,
+        dialect_enum,
+        db_path: str,
+        session_dir: Path,
+        shot: int,
+    ) -> int:
+        """Retry workers once with structured gate feedback for Tier-1 failures."""
+        max_retry_attempts = max(
+            0,
+            int(
+                getattr(
+                    self.pipeline.config,
+                    "worker_retry_on_tier1_max_attempts",
+                    1,
+                )
+                or 0
+            ),
+        )
+        if max_retry_attempts <= 0:
+            return 0
+
+        retryable = [
+            p
+            for p in patches
+            if p.output_sql
+            and p.apply_error
+            and str(p.apply_error).startswith("Tier-1:")
+        ]
+        if not retryable:
+            return 0
+
+        logger.info(
+            f"[{self.query_id}] Retrying {len(retryable)} Tier-1 worker failures"
+        )
+
+        retry_calls = 0
+        retry_candidates: List[AppliedPatch] = []
+        max_workers = min(4, len(retryable))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {}
+            for patch in retryable:
+                retry_prompt = build_retry_prompt_fn(
+                    patch.worker_prompt or "",
+                    probe_id=patch.patch_id,
+                    transform_id=patch.transform,
+                    gate_name="tier1_structural",
+                    gate_error=patch.apply_error or "Tier-1 structural failure",
+                    failed_sql=patch.output_sql or "",
+                    previous_response=patch.worker_response or "",
+                )
+                self._save_to_disk(
+                    session_dir,
+                    shot,
+                    f"worker_{patch.patch_id}_retry_prompt",
+                    retry_prompt,
+                )
+                future = pool.submit(worker_call_fn, retry_prompt)
+                futures[future] = (patch, retry_prompt)
+
+            for future in as_completed(futures):
+                patch, retry_prompt = futures[future]
+                retry_calls += 1
+                try:
+                    retry_response = future.result()
+                except Exception as e:
+                    patch.status = "ERROR"
+                    patch.semantic_passed = False
+                    patch.apply_error = f"Worker retry failed: {e}"
+                    continue
+
+                self._save_to_disk(
+                    session_dir,
+                    shot,
+                    f"worker_{patch.patch_id}_retry_response",
+                    retry_response,
+                )
+                output_sql = self._apply_wide_worker_response(
+                    retry_response, script_ir, dialect_enum
+                )
+                if not output_sql:
+                    patch.status = "FAIL"
+                    patch.semantic_passed = False
+                    patch.apply_error = "Retry failed: Failed to parse/apply PatchPlan"
+                    patch.worker_prompt = retry_prompt
+                    patch.worker_response = retry_response
+                    continue
+
+                patch.output_sql = output_sql
+                patch.worker_prompt = retry_prompt
+                patch.worker_response = retry_response
+                patch.status = "applied"
+                patch.semantic_passed = False
+                patch.speedup = None
+                patch.explain_text = None
+                patch.original_ms = None
+                patch.patch_ms = None
+                patch.apply_error = None
+                retry_candidates.append(patch)
+
+        if retry_candidates:
+            self._validate_and_benchmark_patches(
+                retry_candidates,
+                db_path=db_path,
+                session_dir=session_dir,
+                shot=shot,
+            )
+
+        return retry_calls
 
     def _apply_wide_worker_response(
         self,
@@ -837,13 +1754,16 @@ class BeamSession(OptimizationSession):
             f"provider={effective_provider}, model={effective_model}"
         )
 
-        generator = CandidateGenerator(
-            provider=effective_provider,
-            model=effective_model,
-            analyze_fn=self.pipeline.analyze_fn,
-        )
-
         def call_fn(prompt: str) -> str:
+            with self._llm_calls_lock:
+                self._llm_call_seq += 1
+                call_id = self._llm_call_seq
+
+            generator = CandidateGenerator(
+                provider=effective_provider,
+                model=effective_model,
+                analyze_fn=self.pipeline.analyze_fn,
+            )
             logger.info(
                 f"[{self.query_id}] LLM call → {effective_model} "
                 f"({len(prompt)} chars prompt)"
@@ -851,9 +1771,91 @@ class BeamSession(OptimizationSession):
             t0 = time.time()
             result = self._call_llm_with_timeout(generator, prompt)
             elapsed = time.time() - t0
+
+            usage = {}
+            client = getattr(generator, "_llm_client", None)
+            if client is not None:
+                raw_usage = getattr(client, "last_usage", {})
+                if isinstance(raw_usage, dict):
+                    usage = dict(raw_usage)
+
+            prompt_tokens = self._int_usage(usage.get("prompt_tokens"))
+            completion_tokens = self._int_usage(usage.get("completion_tokens"))
+            total_tokens = self._int_usage(usage.get("total_tokens"))
+            if total_tokens <= 0:
+                total_tokens = prompt_tokens + completion_tokens
+            prompt_cache_hit_tokens = self._int_usage(
+                usage.get("prompt_cache_hit_tokens")
+            )
+            prompt_cache_miss_tokens = self._int_usage(
+                usage.get("prompt_cache_miss_tokens")
+            )
+            cached_tokens = self._int_usage(usage.get("cached_tokens"))
+            reasoning_tokens = self._int_usage(
+                usage.get("reasoning_tokens") or usage.get("reasoningTokens")
+            )
+
+            explicit_cost = usage.get("cost_usd")
+            if explicit_cost is None:
+                explicit_cost = usage.get("estimated_cost_usd")
+            if explicit_cost is None:
+                explicit_cost = usage.get("cost")
+            if isinstance(explicit_cost, str):
+                try:
+                    explicit_cost = float(explicit_cost.strip())
+                except Exception:
+                    explicit_cost = None
+            has_usage_tokens = any(
+                v > 0
+                for v in (
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    prompt_cache_hit_tokens,
+                    prompt_cache_miss_tokens,
+                    cached_tokens,
+                    reasoning_tokens,
+                )
+            )
+            estimated_cost = None
+            if isinstance(explicit_cost, (int, float)):
+                estimated_cost = float(explicit_cost)
+            elif has_usage_tokens:
+                estimated_cost = self._estimate_call_cost_usd(
+                    model=str(effective_model or ""),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
+            call_record = {
+                "call_id": call_id,
+                "timestamp": datetime.now().isoformat(),
+                "provider": effective_provider,
+                "model": effective_model,
+                "prompt_chars": len(prompt),
+                "response_chars": len(result or ""),
+                "elapsed_seconds": round(elapsed, 3),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+                "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
+                "cached_tokens": cached_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "estimated_cost_usd": estimated_cost,
+                "usage_raw": usage,
+            }
+            self._record_api_call_cost(call_record)
+
+            cost_msg = (
+                f"${estimated_cost:.6f}"
+                if isinstance(estimated_cost, (int, float))
+                else "unpriced"
+            )
             logger.info(
                 f"[{self.query_id}] LLM done ← {effective_model} "
-                f"({len(result)} chars response, {elapsed:.1f}s)"
+                f"({len(result)} chars response, {elapsed:.1f}s, "
+                f"{total_tokens} tok, {cost_msg})"
             )
             return result
 
@@ -902,6 +1904,168 @@ class BeamSession(OptimizationSession):
             logger.debug(f"[{query_id}] No cached classification: {e}")
             return None
 
+    def _load_workload_baselines(self) -> Dict[str, float]:
+        """Load cached baseline runtimes from benchmark explains."""
+        baselines: Dict[str, float] = {}
+        explains_dir = self.pipeline.benchmark_dir / "explains"
+        if not explains_dir.exists():
+            return baselines
+
+        candidate_files: List[Path] = sorted(explains_dir.glob("*.json"))
+        for legacy_dir in ("sf10", "sf5"):
+            subdir = explains_dir / legacy_dir
+            if subdir.exists():
+                candidate_files.extend(sorted(subdir.glob("*.json")))
+
+        for path in candidate_files:
+            qid = path.stem
+            if qid in baselines:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                ms = data.get("execution_time_ms")
+                if isinstance(ms, (int, float)) and ms > 0:
+                    baselines[qid] = float(ms)
+            except Exception:
+                continue
+        return baselines
+
+    def _lookup_transform_family(self, transform_id: str) -> str:
+        """Return transform family id (A/B/C/...) when known."""
+        try:
+            from ..detection import load_transforms
+
+            for transform in load_transforms():
+                if (
+                    isinstance(transform, dict)
+                    and str(transform.get("id", "")) == transform_id
+                ):
+                    return str(transform.get("family", "?"))
+        except Exception:
+            pass
+        return "?"
+
+    def _compute_importance_stars(self, current_baseline_ms: Optional[float]) -> int:
+        """Assign importance stars from workload distribution (80/10/10)."""
+        try:
+            from ..patches.beam_router import assign_importance_stars
+
+            baselines = self._load_workload_baselines()
+            if (
+                self.query_id not in baselines
+                and isinstance(current_baseline_ms, (int, float))
+                and current_baseline_ms > 0
+            ):
+                baselines[self.query_id] = float(current_baseline_ms)
+            if not baselines:
+                return 2
+            stars_map = assign_importance_stars(
+                baselines,
+                high_workload_pct=80.0,
+                medium_workload_pct=10.0,
+            )
+            return int(stars_map.get(self.query_id, 2))
+        except Exception as e:
+            logger.debug(f"[{self.query_id}] Importance score failed: {e}")
+            return 2
+
+    def _build_schema_context(self, db_path: str) -> str:
+        """Build compact schema/index/stats context for prompt grounding."""
+        from ..execution.database_utils import fetch_schema_with_stats
+
+        try:
+            schema = fetch_schema_with_stats(database_path=db_path, sql=self.original_sql)
+        except Exception as e:
+            logger.debug(f"[{self.query_id}] Schema context fetch failed: {e}")
+            return ""
+
+        if not isinstance(schema, dict):
+            return ""
+        tables = schema.get("tables")
+        if not isinstance(tables, list) or not tables:
+            return ""
+
+        def _fmt_index(idx: Any) -> str:
+            if isinstance(idx, str):
+                return idx
+            if isinstance(idx, dict):
+                for k in ("name", "indexname", "index_name"):
+                    v = idx.get(k)
+                    if v:
+                        return str(v)
+                cols = idx.get("columns")
+                if isinstance(cols, list) and cols:
+                    return "idx(" + ", ".join(str(c) for c in cols[:4]) + ")"
+            return str(idx)
+
+        lines = [
+            f"- source: {schema.get('source', self.dialect)}",
+            f"- referenced_tables: {len(tables)}",
+            "",
+            "| Table | Rows(est) | PK | Indexes |",
+            "|-------|-----------|----|---------|",
+        ]
+        for table in tables:
+            name = str(table.get("name") or table.get("table_name") or "?")
+            row_count = table.get("row_count")
+            rows = str(int(row_count)) if isinstance(row_count, (int, float)) else "?"
+            pk = table.get("primary_key") or []
+            pk_str = ", ".join(str(c) for c in pk) if isinstance(pk, list) and pk else "-"
+            indexes = table.get("indexes") or []
+            if isinstance(indexes, list) and indexes:
+                idx_str = ", ".join(_fmt_index(i) for i in indexes[:6])
+            else:
+                idx_str = "-"
+            lines.append(f"| {name} | {rows} | {pk_str} | {idx_str} |")
+
+        lines.extend(
+            [
+                "",
+                "### Column Signatures",
+                "| Table | Column | Type | Nullable | Key Hint |",
+                "|-------|--------|------|----------|----------|",
+            ]
+        )
+        for table in tables:
+            table_name = str(table.get("name") or table.get("table_name") or "?")
+            pk = table.get("primary_key") or []
+            pk_set = {
+                str(col).lower()
+                for col in pk
+                if isinstance(col, (str, int, float))
+            }
+            columns = table.get("columns") or []
+            if not isinstance(columns, list):
+                continue
+            for col in columns[:24]:
+                if isinstance(col, dict):
+                    col_name = str(
+                        col.get("name")
+                        or col.get("column_name")
+                        or col.get("field")
+                        or "?"
+                    )
+                    col_type = str(col.get("type") or col.get("data_type") or "?")
+                    nullable_raw = col.get("nullable")
+                    if nullable_raw is None:
+                        nullable_raw = col.get("is_nullable")
+                    if isinstance(nullable_raw, bool):
+                        nullable = "YES" if nullable_raw else "NO"
+                    elif isinstance(nullable_raw, str):
+                        nullable = nullable_raw.upper()
+                    else:
+                        nullable = "?"
+                else:
+                    col_name = str(col)
+                    col_type = "?"
+                    nullable = "?"
+                key_hint = "PK" if col_name.lower() in pk_set else "-"
+                lines.append(
+                    f"| {table_name} | {col_name} | {col_type} | {nullable} | {key_hint} |"
+                )
+
+        return "\n".join(lines)
+
     def _create_session_dir(self) -> Path:
         """Create a session directory for disk persistence."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -933,6 +2097,7 @@ class BeamSession(OptimizationSession):
         (session_dir / "metadata.json").write_text(
             json.dumps(metadata, indent=2)
         )
+        self._reset_cost_tracking(session_dir)
         return session_dir
 
     def _save_to_disk(self, session_dir: Path, iteration: int, label: str, content: str) -> None:
@@ -963,10 +2128,8 @@ class BeamSession(OptimizationSession):
     def _sequential_benchmark(
         self, patches: List[AppliedPatch], db_path: str
     ) -> None:
-        """5x trimmed-mean sequential benchmark when race is skipped.
+        """Sequential benchmark (3-run: warmup + average of 2 measured runs).
 
-        Each query (original + each patch) is executed 5 times.
-        Min and max are dropped, middle 3 are averaged.
         Correctness gate: row count + checksum must match original.
         """
         from ..execution.factory import create_executor_from_dsn
@@ -983,9 +2146,9 @@ class BeamSession(OptimizationSession):
 
         try:
             with create_executor_from_dsn(db_path) as executor:
-                # Measure original (5x trimmed mean) + capture rows for correctness
+                # Measure original and capture rows for correctness.
                 logger.info(
-                    f"[{self.query_id}] Baseline: {BENCH_RUNS}x trimmed mean..."
+                    f"[{self.query_id}] Baseline: {BENCH_RUNS}x..."
                 )
                 orig_ms, orig_rows, orig_times = _timed_runs_pg(
                     executor, self.original_sql, runs=BENCH_RUNS,
@@ -1071,9 +2234,14 @@ class BeamSession(OptimizationSession):
 
     def _serialize_iteration(self, it: PatchIterationResult) -> dict:
         """Serialize iteration result for SessionResult.iterations."""
+        cost_fields = self._session_cost_fields()
         return {
             "iteration": it.iteration,
             "n_api_calls": it.n_api_calls,
+            "beam_cost_usd": cost_fields.get("beam_cost_usd", 0.0),
+            "beam_cost_priced_calls": cost_fields.get("beam_cost_priced_calls", 0),
+            "beam_cost_unpriced_calls": cost_fields.get("beam_cost_unpriced_calls", 0),
+            "beam_token_totals": cost_fields.get("beam_token_totals", {}),
             "best_speedup": round(it.best_speedup, 2),
             "best_patch_id": it.best_patch_id,
             "best_sql": it.best_sql,
@@ -1091,6 +2259,7 @@ class BeamSession(OptimizationSession):
                     "patch_ms": round(p.patch_ms, 1) if p.patch_ms is not None else None,
                     "output_sql": p.output_sql,
                     "has_explain": bool(p.explain_text),
+                    "description": p.description,
                 }
                 for p in it.patches
             ],
