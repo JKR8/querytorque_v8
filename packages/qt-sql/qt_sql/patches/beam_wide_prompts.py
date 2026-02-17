@@ -220,39 +220,50 @@ def _load_gold_example_by_id(
     return None
 
 
-def _format_gold_patch_hint(gold_patch_plan: Dict[str, Any]) -> List[str]:
-    """Compact gold patch-plan hint (avoid large JSON blocks in worker prompt)."""
+def _format_gold_dag_hint(gold_dag_example: Dict[str, Any]) -> List[str]:
+    """Compact gold DAG hint (avoid large JSON blocks in worker prompt)."""
     lines: List[str] = []
-    if not isinstance(gold_patch_plan, dict):
+    if not isinstance(gold_dag_example, dict):
         return lines
 
-    def _norm(op: str) -> str:
-        if op == "replace_block_with_cte_pair":
-            return "insert_cte+replace_from"
-        return op
+    dag = gold_dag_example.get("dag")
+    if not isinstance(dag, dict):
+        # Allow bare DAG payloads.
+        if isinstance(gold_dag_example.get("nodes"), list):
+            dag = gold_dag_example
+        else:
+            return lines
 
-    steps = [
-        s for s in gold_patch_plan.get("steps", [])
-        if isinstance(s, dict)
-    ]
-    ops = [_norm(s.get("op")) for s in steps if s.get("op")]
-    ctes = [
-        s.get("payload", {}).get("cte_name")
-        for s in steps
-        if isinstance(s.get("payload"), dict) and s.get("payload", {}).get("cte_name")
-    ]
-    if not ops and not ctes:
+    nodes = dag.get("nodes") or []
+    if not isinstance(nodes, list) or not nodes:
         return lines
+
+    node_ids = [
+        str(n.get("node_id", "")).strip()
+        for n in nodes
+        if isinstance(n, dict) and str(n.get("node_id", "")).strip()
+    ]
+    changed_nodes = [
+        str(n.get("node_id", "")).strip()
+        for n in nodes
+        if isinstance(n, dict)
+        and n.get("changed") is True
+        and str(n.get("node_id", "")).strip()
+    ]
+    final_node = str(dag.get("final_node_id", "")).strip() or "final_select"
 
     lines.extend([
-        "### Gold Pattern Reference",
-        f"- `plan_id`: `{gold_patch_plan.get('plan_id', 'gold')}`",
+        "### Gold DAG Pattern Reference",
+        f"- `plan_id`: `{gold_dag_example.get('plan_id', 'gold_dag')}`",
+        f"- `final_node_id`: `{final_node}`",
     ])
-    if ops:
-        lines.append(f"- `step_ops`: {' -> '.join(ops[:8])}")
-    if ctes:
-        lines.append(f"- `ctes`: {', '.join(f'`{c}`' for c in ctes[:6])}")
-    lines.append("- Reuse pattern shape, not literal table/column names.")
+    if node_ids:
+        lines.append("- `order`: " + ", ".join(f"`{n}`" for n in (dag.get("order") or node_ids)[:10]))
+    if changed_nodes:
+        lines.append(
+            "- `changed_nodes`: " + ", ".join(f"`{n}`" for n in changed_nodes[:6])
+        )
+    lines.append("- Reuse DAG shape and invariants, not literal table/column names.")
     lines.append("")
     return lines
 
@@ -331,16 +342,24 @@ def build_beam_worker_prompt(
     ir_node_map: str,
     hypothesis: str,
     probe: ProbeSpec,
-    gold_patch_plan: Optional[Dict[str, Any]] = None,
+    current_dag_map: str = "",
+    gold_dag_example: Optional[Dict[str, Any]] = None,
     dialect: str = "postgres",
     schema_context: str = "",
     equivalence_tier: str = "",
     reasoning_trace: Optional[List[str]] = None,
     engine_knowledge: str = "",
     do_not_do: Optional[List[str]] = None,
+    worker_lane: str = "qwen",
 ) -> str:
-    """Build worker prompt from beam_worker_v3 template + dynamic tail."""
-    template = _load_prompt_template("beam_worker_v3.txt")
+    """Build worker prompt from lane template + dynamic tail."""
+    lane = str(worker_lane or "qwen").strip().lower()
+    template_name = (
+        "beam_reasoning_worker_v1.txt"
+        if lane == "reasoner"
+        else "beam_worker_v3.txt"
+    )
+    template = _load_prompt_template(template_name)
     lines = [
         f"## Shared Analyst Hypothesis\n{hypothesis or '(none)'}",
         (
@@ -355,6 +374,7 @@ def build_beam_worker_prompt(
         f"- target: {probe.target}",
         f"- phase: {probe.phase if probe.phase is not None else '?'}",
         f"- exploration: {'yes' if probe.exploration else 'no'}",
+        f"- worker_lane: {lane}",
         f"- dialect: {dialect}",
     ]
     if probe.recommended_examples:
@@ -415,6 +435,9 @@ def build_beam_worker_prompt(
             "### Current IR Node Map\n",
             f"```\n{ir_node_map}\n```",
             "",
+            "### Current DAG Node Map\n",
+            f"```\n{current_dag_map or '(not provided)'}\n```",
+            "",
         ]
     )
     if reasoning_trace:
@@ -433,9 +456,9 @@ def build_beam_worker_prompt(
     lines.append(_build_transform_recipe_section(probe.transform_id))
     lines.append("")
 
-    # Gold patch plan pattern (compact)
-    if gold_patch_plan:
-        lines.extend(_format_gold_patch_hint(gold_patch_plan))
+    # Gold DAG pattern (compact)
+    if gold_dag_example:
+        lines.extend(_format_gold_dag_hint(gold_dag_example))
 
     dynamic = "\n".join(lines)
     if template:
@@ -444,7 +467,7 @@ def build_beam_worker_prompt(
     return "\n".join(
         [
             "## Role",
-            "You are a Beam Worker. Output ONLY one PatchPlan JSON object.",
+            "You are a Beam Worker. Output ONLY one DAG JSON object.",
             "First character must be `{` with no leading whitespace.",
             "## Cache Boundary",
             "Everything below is probe-specific input.",
@@ -497,7 +520,7 @@ def build_beam_editor_strike_prompt(
     return "\n\n".join(
         [
             "## Role",
-            "You are an editor strike worker. Return ONLY one PatchPlan JSON object.",
+            "You are an editor strike worker. Return ONLY one strict JSON object.",
             "First character must be `{` with no leading whitespace.",
             "## Cache Boundary",
             "Everything below is strike-specific input.",
@@ -515,13 +538,20 @@ def build_beam_worker_retry_prompt(
     gate_error: str,
     failed_sql: str = "",
     previous_response: str = "",
+    output_mode: str = "dag",
 ) -> str:
     """Append structured gate-failure feedback for one worker retry."""
+    mode = str(output_mode or "dag").strip().lower()
+    dag_mode = mode != "patchplan"
     parts = [
         worker_prompt,
         "",
         "## RETRY — Gate failure feedback (attempt 2/2)",
-        "Your previous patch failed validation. Return a corrected PatchPlan JSON only.",
+        (
+            "Your previous rewrite failed validation. Return a corrected DAG JSON object only."
+            if dag_mode
+            else "Your previous patch failed validation. Return a corrected PatchPlan JSON only."
+        ),
         "First character must be `{` and output must contain no markdown/prose.",
         "",
         "### Failure Object",
@@ -562,8 +592,16 @@ def build_beam_worker_retry_prompt(
         [
             "",
             "Fix only what caused the gate failure while preserving transform intent and semantics.",
-            "Output ONLY valid PatchPlan JSON.",
-            "Never emit payload.sql; use payload.sql_fragment where SQL fragments are required.",
+            (
+                "Output ONLY valid DAG JSON."
+                if dag_mode
+                else "Output ONLY valid PatchPlan JSON."
+            ),
+            (
+                "Do not emit PatchPlan `steps`/`payload` fields in DAG mode."
+                if dag_mode
+                else "Never emit payload.sql; use payload.sql_fragment where SQL fragments are required."
+            ),
         ]
     )
     return "\n".join(parts)

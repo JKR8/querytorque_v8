@@ -2,7 +2,7 @@
 
 BEAM pipeline:
 1. Analyst (R1) → 8-16 independent transform probes
-2. Workers (qwen, parallel) → PatchPlan JSON per probe
+2. Workers (qwen/reasoner, parallel) → DAG JSON per probe
 3. Validate (structural + equivalence + benchmark)
 4. R1 Compiler shot 1 always; shot 2 only on retryable syntax/error paths
 """
@@ -321,8 +321,8 @@ class BeamSession(OptimizationSession):
         ir_node_map = render_ir_node_map(script_ir)
         beam_edit_mode = self._beam_edit_mode()
         dag_mode = beam_edit_mode == "dag"
-        base_dag = self._build_base_dag(self.original_sql) if dag_mode else None
-        base_dag_prompt = self._render_dag_for_prompt(base_dag) if base_dag else ""
+        base_dag = self._build_base_dag(self.original_sql)
+        base_dag_prompt = self._render_dag_for_prompt(base_dag)
         beam_provider_override, beam_model_override = self._beam_llm_override()
         logger.info(f"[{self.query_id}] BEAM edit mode: {beam_edit_mode}")
 
@@ -367,7 +367,7 @@ class BeamSession(OptimizationSession):
             strike_response,
             script_ir,
             dialect_enum,
-            dag_base=base_dag,
+            dag_base=base_dag if dag_mode else None,
         )
         patch = AppliedPatch(
             patch_id="strike_01",
@@ -507,10 +507,12 @@ class BeamSession(OptimizationSession):
     def _beam_edit_mode(self) -> str:
         """Return BEAM edit representation mode."""
         mode = str(
-            getattr(self.pipeline.config, "beam_edit_mode", "patchplan")
-            or "patchplan"
+            getattr(self.pipeline.config, "beam_edit_mode", "dag")
+            or "dag"
         ).strip().lower()
-        return "dag" if mode == "dag" else "patchplan"
+        if mode in {"patchplan", "patch_plan"}:
+            return "patchplan"
+        return "dag"
 
     @staticmethod
     def _extract_json_value(text: str) -> Optional[Any]:
@@ -744,7 +746,7 @@ class BeamSession(OptimizationSession):
         """Worker DAG-mode runtime contract (takes precedence over template text)."""
         return (
             "## Runtime Override: DAG Mode (Takes Precedence)\n"
-            "Ignore PatchPlan output requirements above.\n"
+            "Ignore any conflicting output-shape instructions above.\n"
             "Output ONE JSON object with a `dag` payload.\n"
             "Worker constraints:\n"
             "- exactly ONE changed node\n"
@@ -793,7 +795,7 @@ class BeamSession(OptimizationSession):
         """Compiler DAG-mode runtime contract (takes precedence over template text)."""
         return (
             "## Runtime Override: DAG Mode (Takes Precedence)\n"
-            "Ignore PatchPlan output requirements above.\n"
+            "Ignore any conflicting output-shape instructions above.\n"
             "Compiler may output ONE or TWO attempts.\n"
             "No constraint on number of changed nodes.\n"
             "Output must be JSON object or JSON array (length 1-2), no prose/markdown.\n"
@@ -1351,8 +1353,8 @@ class BeamSession(OptimizationSession):
         ir_node_map = render_ir_node_map(script_ir)
         beam_edit_mode = self._beam_edit_mode()
         dag_mode = beam_edit_mode == "dag"
-        base_dag = self._build_base_dag(self.original_sql) if dag_mode else None
-        base_dag_prompt = self._render_dag_for_prompt(base_dag) if base_dag else ""
+        base_dag = self._build_base_dag(self.original_sql)
+        base_dag_prompt = self._render_dag_for_prompt(base_dag)
         beam_provider_override, beam_model_override = self._beam_llm_override()
         logger.info(f"[{self.query_id}] BEAM edit mode: {beam_edit_mode}")
 
@@ -1608,20 +1610,27 @@ class BeamSession(OptimizationSession):
                     gold_ex = _load_gold_example_for_family(
                         probe.family, self.dialect
                     )
-                gold_patch_plan = gold_ex.get("patch_plan") if gold_ex else None
+                gold_dag_example = None
+                if gold_ex:
+                    gold_dag_example = (
+                        gold_ex.get("dag_example")
+                        or gold_ex.get("dag")
+                    )
 
                 worker_prompt = build_beam_worker_prompt(
                     original_sql=self.original_sql,
                     ir_node_map=ir_node_map,
+                    current_dag_map=base_dag_prompt,
                     hypothesis=scout_result.hypothesis,
                     probe=probe,
-                    gold_patch_plan=gold_patch_plan,
+                    gold_dag_example=gold_dag_example,
                     dialect=self.dialect,
                     schema_context=schema_context,
                     equivalence_tier=scout_result.equivalence_tier,
                     reasoning_trace=scout_result.reasoning_trace,
                     engine_knowledge=engine_knowledge,
                     do_not_do=scout_result.do_not_do,
+                    worker_lane=lane,
                 )
                 worker_prompt = (
                     worker_prompt
@@ -1655,7 +1664,7 @@ class BeamSession(OptimizationSession):
                         response,
                         script_ir,
                         dialect_enum,
-                        dag_base=base_dag,
+                        dag_base=base_dag if dag_mode else None,
                     )
 
                     patch = AppliedPatch(
@@ -1743,7 +1752,7 @@ class BeamSession(OptimizationSession):
             db_path=db_path,
             session_dir=session_dir,
             shot=0,
-            dag_base=base_dag,
+            dag_base=base_dag if dag_mode else None,
             worker_call_fn_by_patch_id=worker_call_fn_by_patch_id,
         )
         total_api_calls += retry_calls
@@ -2074,6 +2083,7 @@ class BeamSession(OptimizationSession):
                     gate_error=patch.apply_error or "Tier-1 structural failure",
                     failed_sql=patch.output_sql or "",
                     previous_response=patch.worker_response or "",
+                    output_mode="dag" if dag_base is not None else "patchplan",
                 )
                 self._save_to_disk(
                     session_dir,
@@ -2149,11 +2159,11 @@ class BeamSession(OptimizationSession):
         *,
         dag_base: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Parse a wide worker's PatchPlan JSON and apply to IR → SQL.
+        """Parse a wide worker response and apply to IR/DAG → SQL.
 
-        Wide workers output PatchPlan JSON. We parse it, apply to a copy
-        of the script IR, and render to SQL. Falls back to treating the
-        response as raw SQL if JSON parsing fails.
+        DAG mode parses a DAG candidate and compiles executable SQL from
+        base + changed nodes. PatchPlan mode remains supported for legacy
+        flows and applies plans to a copy of script IR.
 
         Returns:
             Output SQL string, or None if both approaches fail.
@@ -2755,7 +2765,7 @@ class BeamSession(OptimizationSession):
             "beam_qwen_model": getattr(self.pipeline.config, "beam_qwen_model", "") or "",
             "beam_reasoner_provider": getattr(self.pipeline.config, "beam_reasoner_provider", "") or "",
             "beam_reasoner_model": getattr(self.pipeline.config, "beam_reasoner_model", "") or "",
-            "beam_edit_mode": getattr(self.pipeline.config, "beam_edit_mode", "patchplan"),
+            "beam_edit_mode": getattr(self.pipeline.config, "beam_edit_mode", "dag"),
             "provider": self.pipeline.provider or "?",
             "semantic_validation_enabled": self.pipeline.config.semantic_validation_enabled,
             "semantic_sample_pct": self.pipeline.config.semantic_sample_pct,

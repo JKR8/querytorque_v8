@@ -121,7 +121,7 @@ class BenchmarkConfig:
     snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
 
     # Beam execution mode (single-mode runtime)
-    beam_edit_mode: str = "patchplan"  # "patchplan" | "dag"
+    beam_edit_mode: str = "dag"  # "dag" | "patchplan"
     wide_max_probes: int = 16     # Max probes for wide mode
     wide_worker_parallelism: int = 8  # Max concurrent worker LLM calls per query in beam mode
     beam_llm_provider: str = ""   # Optional BEAM-only provider override
@@ -159,7 +159,7 @@ class BenchmarkConfig:
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
             target_speedup=data.get("target_speedup", 100.0),
             snipe_rounds=data.get("snipe_rounds", 2),
-            beam_edit_mode=data.get("beam_edit_mode", "patchplan"),
+            beam_edit_mode=data.get("beam_edit_mode", "dag"),
             wide_max_probes=data.get("wide_max_probes", 16),
             wide_worker_parallelism=data.get("wide_worker_parallelism", 8),
             beam_llm_provider=data.get("beam_llm_provider", ""),

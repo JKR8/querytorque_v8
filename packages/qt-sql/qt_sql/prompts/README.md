@@ -8,6 +8,7 @@
 ## Current BEAM Prompt Names (V3)
 - `beam_analyst_v3.txt` (top-level planner)
 - `beam_worker_v3.txt` (single-probe DAG worker)
+- `beam_reasoning_worker_v1.txt` (reasoner-lane DAG worker)
 - `beam_compiler_v3.txt` (final synthesis/compile stage)
 - `beam_strike_worker_v1.txt` (single-call editor strike worker)
 

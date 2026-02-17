@@ -506,6 +506,14 @@ def test_compiler_dag_shape_accepts_single_object_or_array() -> None:
     assert session._is_compiler_tier0_shape_failure(as_array, dag_mode=True) is False
 
 
+def test_beam_edit_mode_defaults_to_dag_but_allows_patchplan_override() -> None:
+    session = _make_session()
+    assert session._beam_edit_mode() == "dag"
+
+    session.pipeline.config.beam_edit_mode = "patchplan"
+    assert session._beam_edit_mode() == "patchplan"
+
+
 def test_apply_dag_compiler_response_accepts_single_plan_object() -> None:
     session = _make_session()
     base_dag = {

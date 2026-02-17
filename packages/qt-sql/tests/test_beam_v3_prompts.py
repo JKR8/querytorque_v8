@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from types import SimpleNamespace
 
 from qt_sql.patches.beam_router import assign_importance_stars
@@ -19,9 +20,12 @@ from qt_sql.patches.beam_prompt_builder import (
 from qt_sql.patches.pathology_classifier import build_intelligence_brief
 
 
-TEMPLATE_DIR = (
-    Path(__file__).resolve().parent.parent / "prompts" / "templates" / "V3"
-)
+PROMPTS_ROOT = Path(__file__).resolve().parent.parent / "qt_sql" / "prompts"
+TEMPLATE_DIR = PROMPTS_ROOT / "templates" / "V3"
+SAMPLES_DIR = PROMPTS_ROOT / "samples" / "V3"
+VERSIONS_TEMPLATE_DIR = PROMPTS_ROOT / "versions" / "V3" / "templates"
+VERSIONS_EXAMPLES_DIR = PROMPTS_ROOT / "versions" / "V3" / "examples"
+GOLD_EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "qt_sql" / "examples"
 
 
 def test_assign_importance_stars_uses_80_10_10_workload_split() -> None:
@@ -156,6 +160,7 @@ def test_worker_prompt_contains_transform_recipe_section() -> None:
     prompt = build_beam_worker_prompt(
         original_sql="SELECT * FROM t WHERE x IN (SELECT y FROM u)",
         ir_node_map="S0: SELECT ...",
+        current_dag_map="node: final_select\n  deps: []\n  outputs: [x]\norder: [final_select]",
         hypothesis="Nested loop decorrelation",
         probe=probe,
         dialect="postgres",
@@ -175,9 +180,33 @@ def test_worker_prompt_contains_transform_recipe_section() -> None:
     assert "avoid_or_to_union" in prompt
     assert "existing_ctes" in prompt
     assert "### Engine-Specific Knowledge" in prompt
+    assert "### Current DAG Node Map" in prompt
+    assert "node: final_select" in prompt
     assert "## DAG Output Contract (MUST follow)" in prompt
     assert "\"verification\"" in prompt
     assert "one changed node" in prompt
+
+
+def test_reasoner_worker_lane_uses_reasoning_worker_template() -> None:
+    probe = ProbeSpec(
+        probe_id="p11",
+        transform_id="decorrelate",
+        family="B",
+        target="Rewrite correlated aggregate into set form",
+        confidence=0.9,
+    )
+    prompt = build_beam_worker_prompt(
+        original_sql="SELECT * FROM t",
+        ir_node_map="S0: SELECT * FROM t",
+        hypothesis="Nested loop correlation hotspot",
+        probe=probe,
+        dialect="duckdb",
+        worker_lane="reasoner",
+    )
+    assert "Senior SQL Architect" in prompt
+    assert "Reasoning-Lane Strategy Freedom" in prompt
+    assert "main objective" in prompt
+    assert "- worker_lane: reasoner" in prompt
 
 
 def test_worker_retry_prompt_includes_structured_gate_failure_feedback() -> None:
@@ -193,6 +222,7 @@ def test_worker_retry_prompt_includes_structured_gate_failure_feedback() -> None
     assert "## RETRY — Gate failure feedback" in retry_prompt
     assert '"gate": "tier1_structural"' in retry_prompt
     assert "Tier-1: missing alias x in FROM" in retry_prompt
+    assert "Output ONLY valid DAG JSON." in retry_prompt
 
 
 def test_editor_strike_prompt_injects_selected_transform() -> None:
@@ -209,6 +239,8 @@ def test_editor_strike_prompt_injects_selected_transform() -> None:
     assert "transform_id: decorrelate" in prompt
     assert "`transform_id`: `decorrelate`" in prompt
     assert "## Schema / Index / Stats Context" in prompt
+    assert "Editor strike is a fast, single-call pathway" in prompt
+    assert "Worked Strike Example" in prompt
 
 
 def test_compiler_template_matches_runtime_evidence_contract() -> None:
@@ -217,11 +249,61 @@ def test_compiler_template_matches_runtime_evidence_contract() -> None:
     assert "DAG Output Contract (MUST follow)" in text
     assert "top-level value may be:" in text
     assert "changed nodes MUST include full executable SQL in `sql`" in text
+    assert "## Terminology (normative)" in text
+    assert "## Input Contract" in text
+    assert "## Decision Priority Ladder" in text
+    assert "## Distinct Pathway Decision Matrix" in text
+    assert "Per-attempt schema:" in text
+    assert "## Worked Valid Example (two-attempt array)" in text
+    assert "## Worked Invalid Example (do not produce)" in text
+    assert "## Safe No-Change Fallback (required capability)" in text
     assert "PatchPlan" not in text
 
 
+def test_analyst_template_has_strict_schema_and_invalid_boundary_examples() -> None:
+    text = (TEMPLATE_DIR / "beam_analyst_v3.txt").read_text(encoding="utf-8")
+    assert "## Terminology (normative)" in text
+    assert "## Input Contract" in text
+    assert "## Decision Priority Ladder" in text
+    assert "## Probe-count Policy (deterministic)" in text
+    assert "### Complexity evidence score (CES)" in text
+    assert "Top-level schema:" in text
+    assert "Dispatch schema:" in text
+    assert "Probe item schema:" in text
+    assert "Dropped item schema:" in text
+    assert "## Worked Invalid Example (do not produce)" in text
+    assert "Corrective action:" in text
+
+
+def test_worker_templates_have_strict_schema_and_invalid_boundary_examples() -> None:
+    worker_text = (TEMPLATE_DIR / "beam_worker_v3.txt").read_text(encoding="utf-8")
+    reasoner_text = (TEMPLATE_DIR / "beam_reasoning_worker_v1.txt").read_text(
+        encoding="utf-8"
+    )
+
+    for text in (worker_text, reasoner_text):
+        assert "## Terminology (normative)" in text
+        assert "## Input Contract" in text
+        assert "## Decision Priority Ladder" in text
+        assert "Top-level schema:" in text
+        assert "Verification schema:" in text
+        assert "DAG schema:" in text
+        assert "Node schema:" in text
+        assert "## Worked Invalid Example (do not produce)" in text
+        assert "Corrective action:" in text
+
+    assert "## Worker Procedure (reasoning checklist)" in worker_text
+    assert "## Reasoning Procedure (required)" in reasoner_text
+    assert "## Reasoning-Lane Strategy Freedom" in reasoner_text
+
+
 def test_v3_templates_avoid_sql_ellipsis_placeholders() -> None:
-    for name in ("beam_analyst_v3.txt", "beam_worker_v3.txt", "beam_compiler_v3.txt"):
+    for name in (
+        "beam_analyst_v3.txt",
+        "beam_worker_v3.txt",
+        "beam_reasoning_worker_v1.txt",
+        "beam_compiler_v3.txt",
+    ):
         text = (TEMPLATE_DIR / name).read_text(encoding="utf-8")
         assert "SELECT ..." not in text
         assert "..." not in text
@@ -262,3 +344,36 @@ def test_intelligence_brief_labels_portability_candidates() -> None:
         runtime_dialect="postgres",
     )
     assert "SUPPORT: portability_candidate" in brief
+
+
+def test_v3_prompt_files_are_synced_across_template_sample_and_versions() -> None:
+    files = (
+        "beam_analyst_v3.txt",
+        "beam_worker_v3.txt",
+        "beam_reasoning_worker_v1.txt",
+        "beam_compiler_v3.txt",
+        "beam_strike_worker_v1.txt",
+    )
+    for name in files:
+        template_text = (TEMPLATE_DIR / name).read_text(encoding="utf-8")
+        sample_text = (SAMPLES_DIR / name).read_text(encoding="utf-8")
+        versions_template_text = (VERSIONS_TEMPLATE_DIR / name).read_text(
+            encoding="utf-8"
+        )
+        versions_example_text = (VERSIONS_EXAMPLES_DIR / name).read_text(
+            encoding="utf-8"
+        )
+        assert sample_text == template_text
+        assert versions_template_text == template_text
+        assert versions_example_text == template_text
+
+
+def test_gold_examples_use_dag_example_not_patch_plan() -> None:
+    for path in sorted(GOLD_EXAMPLES_DIR.rglob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            continue
+        if "optimized_sql" not in data:
+            continue
+        assert "dag_example" in data
+        assert "patch_plan" not in data

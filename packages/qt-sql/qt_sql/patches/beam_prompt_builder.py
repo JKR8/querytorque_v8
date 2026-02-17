@@ -154,30 +154,20 @@ def _compact_text(value: Any, max_len: int = 220) -> str:
     return text[: max_len - 1].rstrip() + "…"
 
 
-def _normalize_patch_op_name(op: str) -> str:
-    """Map legacy/composite op labels to supported op vocabulary."""
-    if not op:
-        return op
-    aliases = {
-        "replace_block_with_cte_pair": "insert_cte+replace_from",
-    }
-    return aliases.get(op, op)
-
-
 # ── Build Individual Family Sections ───────────────────────────────────────
 
 def format_family_section(
     family_id: str,
     gold_example: Dict[str, Any],
-    include_patch_plans: bool = True,
+    include_dag_examples: bool = True,
     analyst_only: bool = False,
 ) -> str:
     """Format a single family section with description + gold example.
 
     Args:
         family_id: Family letter (A-F).
-        gold_example: Gold example dict with original_sql, optimized_sql, ir_*, patch_plan.
-        include_patch_plans: If False, omit the PATCH PLAN JSON block.
+        gold_example: Gold example dict with original_sql, optimized_sql, ir_*, dag_example.
+        include_dag_examples: If False, omit DAG-shape hints.
         analyst_only: If True, only emit family description + example ID.
             The analyst picks strategies; workers get the full examples.
     """
@@ -231,16 +221,28 @@ def format_family_section(
     if analyst_only:
         return "\n".join(lines)
 
-    if include_patch_plans:
-        patch_plan = gold_example.get("patch_plan")
-        if isinstance(patch_plan, dict):
-            step_ops = [
-                _normalize_patch_op_name(s.get("op"))
-                for s in patch_plan.get("steps", [])
-                if isinstance(s, dict) and s.get("op")
-            ]
-            if step_ops:
-                lines.append(f"**Patch shape**: {' → '.join(step_ops[:6])}")
+    if include_dag_examples:
+        dag_example = gold_example.get("dag_example") or gold_example.get("dag")
+        dag_payload = None
+        if isinstance(dag_example, dict):
+            dag_payload = dag_example.get("dag") if isinstance(dag_example.get("dag"), dict) else dag_example
+        if isinstance(dag_payload, dict):
+            nodes = dag_payload.get("nodes") or []
+            if isinstance(nodes, list):
+                changed_nodes = [
+                    str(n.get("node_id", "")).strip()
+                    for n in nodes
+                    if isinstance(n, dict)
+                    and n.get("changed") is True
+                    and str(n.get("node_id", "")).strip()
+                ]
+                if changed_nodes:
+                    lines.append(
+                        f"**DAG shape**: changed nodes {', '.join(f'`{n}`' for n in changed_nodes[:4])}"
+                    )
+                final_node = str(dag_payload.get("final_node_id", "")).strip()
+                if final_node:
+                    lines.append(f"**Final node**: `{final_node}`")
 
     return "\n".join(lines)
 
@@ -429,7 +431,7 @@ def _build_prompt_body(
     all_5_examples: Dict[str, Dict[str, Any]],
     dialect: str,
     role_text: str,
-    include_patch_plans: bool = True,
+    include_dag_examples: bool = True,
     intelligence_brief: str = "",
     phase_a_items: Optional[List[str]] = None,
     phase_b_items: Optional[List[str]] = None,
@@ -485,11 +487,18 @@ def _build_prompt_body(
 
     # ── Families with examples ─────────────────────────────────────
     all_family_ids = ["A", "B", "C", "D", "E", "F"]
-    families_with_plans = [f for f in all_family_ids
-                           if f in all_5_examples and all_5_examples[f].get("patch_plan")]
+    families_with_plans = [
+        f
+        for f in all_family_ids
+        if f in all_5_examples
+        and (
+            all_5_examples[f].get("dag_example")
+            or all_5_examples[f].get("dag")
+        )
+    ]
     n_families = len(families_with_plans)
 
-    analyst_only = not include_patch_plans
+    analyst_only = not include_dag_examples
     family_intro = (
         f"{n_families}/6 families have validated gold examples on this dialect. "
         "Treat these as priors, not hard rules.\n\n"
@@ -499,9 +508,9 @@ def _build_prompt_body(
 
     for family_id in all_family_ids:
         ex = all_5_examples.get(family_id)
-        if ex and ex.get("patch_plan"):
+        if ex and (ex.get("dag_example") or ex.get("dag")):
             static.append(format_family_section(
-                family_id, ex, include_patch_plans, analyst_only=analyst_only,
+                family_id, ex, include_dag_examples, analyst_only=analyst_only,
             ))
             static.append("")
         else:
