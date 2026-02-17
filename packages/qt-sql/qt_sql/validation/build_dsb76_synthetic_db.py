@@ -1846,6 +1846,51 @@ def _mv_recipe_query031(
     return inserted > 0
 
 
+def _mv_recipe_query039(
+    conn: duckdb.DuckDBPyConnection,
+    qctx: QueryContext,
+    global_tables: Dict[str, Dict[str, Any]],
+) -> bool:
+    sql = str(qctx.get("sql_duckdb", ""))
+    year = int(_mv_first_filter_value(qctx, global_tables, "date_dim", "d_year", 2002))
+    base_moy = _mv_re_first_int(sql, r"inv1\.d_moy\s*=\s*([0-9]+)", 2)
+    next_moy = base_moy + 1
+    category = str(_mv_first_filter_value(qctx, global_tables, "item", "i_category", "Jewelry"))
+    manager_lo, _ = _mv_filter_bounds(qctx, "item", "i_manager_id", 1, 100)
+    q_low, q_high = _mv_filter_bounds(qctx, "inventory", "inv_quantity_on_hand", 0, 200)
+
+    # Build extreme points inside bounds to maximize stddev/mean in each month-group.
+    low_q = int(max(q_low, 1))
+    high_q = int(max(low_q + 1, q_high))
+
+    inserted = 0
+    inserted += _mv_insert_rows(conn, global_tables, "warehouse", [{"w_warehouse_sk": 95901, "w_warehouse_name": "MV039"}])
+    inserted += _mv_insert_rows(conn, global_tables, "item", [{"i_item_sk": 95902, "i_category": category, "i_manager_id": int(manager_lo)}])
+    inserted += _mv_insert_rows(
+        conn,
+        global_tables,
+        "date_dim",
+        [
+            {"d_date_sk": 95911, "d_year": year, "d_moy": base_moy},
+            {"d_date_sk": 95912, "d_year": year, "d_moy": base_moy},
+            {"d_date_sk": 95913, "d_year": year, "d_moy": next_moy},
+            {"d_date_sk": 95914, "d_year": year, "d_moy": next_moy},
+        ],
+    )
+    inserted += _mv_insert_rows(
+        conn,
+        global_tables,
+        "inventory",
+        [
+            {"inv_warehouse_sk": 95901, "inv_item_sk": 95902, "inv_date_sk": 95911, "inv_quantity_on_hand": low_q},
+            {"inv_warehouse_sk": 95901, "inv_item_sk": 95902, "inv_date_sk": 95912, "inv_quantity_on_hand": high_q},
+            {"inv_warehouse_sk": 95901, "inv_item_sk": 95902, "inv_date_sk": 95913, "inv_quantity_on_hand": low_q},
+            {"inv_warehouse_sk": 95901, "inv_item_sk": 95902, "inv_date_sk": 95914, "inv_quantity_on_hand": high_q},
+        ],
+    )
+    return inserted > 0
+
+
 def _mv_recipe_query054(
     conn: duckdb.DuckDBPyConnection,
     qctx: QueryContext,
@@ -1873,6 +1918,16 @@ def _mv_recipe_query054(
     wholesale = (ws_lo + ws_hi) / 2.0
     wholesale_ss = (ss_lo + ss_hi) / 2.0
     inserted = 0
+    # Stabilize scalar subqueries:
+    #   (select distinct d_month_seq+1 from date_dim where d_year=? and d_moy=?)
+    # Keep a single anchor row for (year, month) to avoid nondeterministic scalar choice.
+    try:
+        conn.execute(
+            "DELETE FROM date_dim WHERE d_year = ? AND d_moy = ?",
+            [int(base_year), int(base_moy)],
+        )
+    except Exception:
+        pass
     inserted += _mv_insert_rows(
         conn,
         global_tables,
@@ -2461,6 +2516,8 @@ def _apply_mvrows_recipe(
         return _mv_recipe_query013(conn, qctx, global_tables)
     if qname.startswith("query031_"):
         return _mv_recipe_query031(conn, qctx, global_tables)
+    if qname.startswith("query039_"):
+        return _mv_recipe_query039(conn, qctx, global_tables)
     if qname.startswith("query054_"):
         return _mv_recipe_query054(conn, qctx, global_tables)
     if qname.startswith("query059_"):
@@ -2533,6 +2590,23 @@ def _is_obviously_unsat(
             concrete.add(str(raw).strip())
         if len(concrete) == 1:
             return True
+
+    # Variance-to-mean constraints can be impossible under tight positive bounds.
+    # Pattern: stddev_samp(inv_quantity_on_hand)/avg(inv_quantity_on_hand) > 1
+    # with inv_quantity_on_hand BETWEEN low AND high and low > 0, high-low <= low.
+    lower_sql = sql.lower()
+    cov_pred = re.search(r"stdev\s*/\s*mean\s*end\s*>\s*1", lower_sql) is not None
+    if "stddev_samp(inv_quantity_on_hand)" in lower_sql and cov_pred:
+        m = re.search(
+            r"inv_quantity_on_hand\s+between\s+([0-9]+(?:\.[0-9]+)?)\s+and\s+([0-9]+(?:\.[0-9]+)?)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            low = float(m.group(1))
+            high = float(m.group(2))
+            if low > 0 and (high - low) <= low:
+                return True
 
     return False
 
