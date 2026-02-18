@@ -134,7 +134,7 @@ def benchmark_query_patches(
     collect_explain: bool = True,
     classify_speedup_fn: Optional[Callable[[float], str]] = None,
     sample_db_path: Optional[str] = None,
-    render_explain_fn: Optional[Callable] = None,
+    collect_explain_fn: Optional[Callable] = None,
     dialect: str = "duckdb",
 ) -> BenchmarkSummary:
     """Benchmark all candidate patches for a single query.
@@ -159,7 +159,9 @@ def benchmark_query_patches(
         collect_explain: Whether to collect EXPLAIN ANALYZE for passing candidates.
         classify_speedup_fn: Function to classify speedup into status string.
         sample_db_path: Optional DuckDB path for TABLESAMPLE equivalence check.
-        render_explain_fn: Optional function to render EXPLAIN results compactly.
+        collect_explain_fn: Optional callback(executor, sql) -> str that collects
+            EXPLAIN on the open executor and returns compact formatted text.
+            If None, falls back to raw EXPLAIN ANALYZE text.
         dialect: Database dialect (duckdb/postgres/snowflake).
 
     Returns:
@@ -198,17 +200,39 @@ def benchmark_query_patches(
             )
         else:
             logger.info(f"[{query_id}] Baseline: {baseline_runs}x...")
-            orig_ms, orig_rows, orig_times = _timed_runs(
-                executor, original_sql,
-                runs=baseline_runs, capture_rows=True, timeout_ms=timeout_ms,
-            )
+            try:
+                orig_ms, orig_rows, orig_times = _timed_runs(
+                    executor, original_sql,
+                    runs=baseline_runs, capture_rows=True, timeout_ms=timeout_ms,
+                )
+            except Exception as e:
+                logger.error(f"[{query_id}] Baseline execution FAILED: {e}")
+                # Mark all patches as ERROR and return early
+                for patch in patches:
+                    patch.speedup = 0.0
+                    patch.status = "ERROR"
+                    patch.apply_error = f"Baseline failed: {e}"
+                return BenchmarkSummary(
+                    baseline_ms=0.0, baseline_rows=0,
+                    baseline_checksum=None,
+                    n_benchmarked=len(patches), n_passed=0,
+                    best_speedup=0.0, best_patch_idx=None,
+                )
             orig_count = len(orig_rows) if orig_rows else 0
+            if orig_count == 0:
+                logger.warning(
+                    f"[{query_id}] Baseline returned 0 rows — "
+                    f"correctness checks will be unreliable"
+                )
             orig_checksum = None
             if orig_rows:
                 try:
                     orig_checksum = checker.compute_checksum(orig_rows)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"[{query_id}] Baseline checksum compute failed "
+                        f"(non-blocking): {e}"
+                    )
             logger.info(
                 f"[{query_id}] Baseline: {orig_ms:.1f}ms "
                 f"({orig_count} rows, checksum={orig_checksum}) "
@@ -245,6 +269,7 @@ def benchmark_query_patches(
                     candidate_runs=candidate_runs,
                     timeout_ms=timeout_ms,
                     query_id=query_id,
+                    original_sql=original_sql,
                     sample_db_path=sample_db_path,
                 )
                 candidate_results.append(result)
@@ -274,11 +299,20 @@ def benchmark_query_patches(
                             f"[{query_id}]   winner confirm: {patch.patch_id} "
                             f"{candidate_runs}x->{winner_runs}x"
                         )
-                        win_ms, win_rows, win_times = _timed_runs(
-                            executor, patch.output_sql,
-                            runs=winner_runs, capture_rows=True,
-                            timeout_ms=timeout_ms,
-                        )
+                        try:
+                            win_ms, win_rows, win_times = _timed_runs(
+                                executor, patch.output_sql,
+                                runs=winner_runs, capture_rows=True,
+                                timeout_ms=timeout_ms,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[{query_id}]   winner confirm FAILED: {e}"
+                            )
+                            # Keep candidate result from initial runs
+                            if result.passed and result.speedup > current_best_speedup:
+                                current_best_speedup = result.speedup
+                            continue
                         win_count = len(win_rows) if win_rows else 0
 
                         # Re-verify correctness after winner runs
@@ -308,8 +342,11 @@ def benchmark_query_patches(
                                         )
                                         result.passed = False
                                         win_ok = False
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.warning(
+                                        f"[{query_id}]   winner checksum "
+                                        f"compute failed (non-blocking): {e}"
+                                    )
 
                         if win_ok:
                             patch.patch_ms = win_ms
@@ -357,34 +394,39 @@ def benchmark_query_patches(
                 if cr and not cr.passed:
                     continue
                 try:
-                    explain_rows = executor.execute(
-                        f"EXPLAIN ANALYZE {patch.output_sql}",
-                        timeout_ms=timeout_ms,
-                    )
-                    # Format EXPLAIN output
-                    if explain_rows and isinstance(explain_rows, list):
-                        if isinstance(explain_rows[0], dict):
-                            # PG/SF returns rows with a single column
-                            lines = []
-                            for row in explain_rows:
-                                for v in row.values():
-                                    lines.append(str(v))
-                            explain_text = "\n".join(lines)
+                    if collect_explain_fn:
+                        # Caller controls EXPLAIN format + rendering
+                        patch.explain_text = collect_explain_fn(
+                            executor, patch.output_sql,
+                        )
+                    else:
+                        # Fallback: raw EXPLAIN ANALYZE text
+                        explain_rows = executor.execute(
+                            f"EXPLAIN ANALYZE {patch.output_sql}",
+                            timeout_ms=timeout_ms,
+                        )
+                        if explain_rows and isinstance(explain_rows, list):
+                            if isinstance(explain_rows[0], dict):
+                                lines = []
+                                for row in explain_rows:
+                                    for v in row.values():
+                                        lines.append(str(v))
+                                explain_text = "\n".join(lines)
+                            else:
+                                explain_text = "\n".join(
+                                    str(r) for r in explain_rows
+                                )
+                        elif isinstance(explain_rows, str):
+                            explain_text = explain_rows
                         else:
-                            explain_text = "\n".join(str(r) for r in explain_rows)
-                    elif isinstance(explain_rows, str):
-                        explain_text = explain_rows
-                    else:
-                        explain_text = str(explain_rows) if explain_rows else ""
+                            explain_text = str(explain_rows) if explain_rows else ""
 
-                    # Truncate to 80 lines max
-                    explain_lines = explain_text.split("\n")
-                    if len(explain_lines) > 80:
-                        explain_text = "\n".join(explain_lines[:80]) + "\n... (truncated)"
-
-                    if render_explain_fn:
-                        patch.explain_text = render_explain_fn(explain_text)
-                    else:
+                        explain_lines = explain_text.split("\n")
+                        if len(explain_lines) > 80:
+                            explain_text = (
+                                "\n".join(explain_lines[:80])
+                                + "\n... (truncated)"
+                            )
                         patch.explain_text = explain_text
 
                 except Exception as e:
@@ -424,6 +466,7 @@ def _benchmark_single_candidate(
     candidate_runs: int,
     timeout_ms: int,
     query_id: str,
+    original_sql: str = "",
     sample_db_path: Optional[str] = None,
 ) -> CandidateResult:
     """Benchmark a single candidate with fail-fast correctness.
@@ -434,6 +477,7 @@ def _benchmark_single_candidate(
     """
     all_times: List[float] = []
     captured_rows = None
+    sample_equivalent = False  # True if 0-row but passed sample check
 
     # Warmup for runs >= 3
     if candidate_runs >= 3:
@@ -455,34 +499,48 @@ def _benchmark_single_candidate(
             if orig_count is not None:
                 # Row count mismatch
                 if row_count != orig_count:
-                    # Check sample DB for timeout recovery
+                    # Check sample DB for timeout recovery (0-row = likely timeout)
                     if row_count == 0 and sample_db_path:
                         from .sample_checker import SampleChecker
                         sc = SampleChecker(sample_db_path)
                         sr = sc.check_semantic_equivalence(
-                            patch.original_sql if hasattr(patch, 'original_sql') else "",
+                            original_sql,
                             patch.output_sql,
                         )
                         if sr.equivalent:
                             logger.info(
                                 f"[{query_id}]   0-row but sample-equivalent "
-                                f"({sr.original_sample_rows} rows) — continuing"
+                                f"({sr.original_sample_rows} rows) — "
+                                f"continuing with timing only"
                             )
-                            # Continue with timing but mark correctness unverified
-                            continue
-                    return CandidateResult(
-                        patch_idx=patch_idx,
-                        passed=False,
-                        row_count=row_count,
-                        error=(
-                            f"Row count mismatch: "
-                            f"original={orig_count}, patch={row_count}"
-                        ),
-                        all_times=all_times,
-                    )
+                            sample_equivalent = True
+                            # Don't return — continue timing runs
+                        else:
+                            return CandidateResult(
+                                patch_idx=patch_idx,
+                                passed=False,
+                                row_count=row_count,
+                                error=(
+                                    f"Row count mismatch: "
+                                    f"original={orig_count}, patch={row_count} "
+                                    f"(sample check also failed)"
+                                ),
+                                all_times=all_times,
+                            )
+                    else:
+                        return CandidateResult(
+                            patch_idx=patch_idx,
+                            passed=False,
+                            row_count=row_count,
+                            error=(
+                                f"Row count mismatch: "
+                                f"original={orig_count}, patch={row_count}"
+                            ),
+                            all_times=all_times,
+                        )
 
-                # Checksum mismatch
-                if orig_checksum and captured_rows:
+                # Checksum mismatch (skip if sample-equivalent — no rows to check)
+                if not sample_equivalent and orig_checksum and captured_rows:
                     try:
                         patch_checksum = checker.compute_checksum(captured_rows)
                         if patch_checksum != orig_checksum:
@@ -498,8 +556,11 @@ def _benchmark_single_candidate(
                                 ),
                                 all_times=all_times,
                             )
-                    except Exception:
-                        pass  # checksum compute failed — don't block
+                    except Exception as e:
+                        logger.warning(
+                            f"[{query_id}]   checksum compute failed "
+                            f"(non-blocking): {e}"
+                        )
 
     # All runs complete — compute timing
     row_count = len(captured_rows) if captured_rows else 0
@@ -512,6 +573,7 @@ def _benchmark_single_candidate(
         speedup=speedup,
         avg_ms=avg_ms,
         row_count=row_count,
-        correctness_verified=orig_count is not None,
+        # Correctness is NOT verified if we only passed sample check
+        correctness_verified=orig_count is not None and not sample_equivalent,
         all_times=all_times,
     )

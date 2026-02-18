@@ -1665,10 +1665,63 @@ class BeamSession(OptimizationSession):
         per-candidate, fail-fast correctness on run 1.
         """
         from ..validation.benchmark import benchmark_query_patches
+        from ..execution.database_utils import _extract_first_statement
 
         sem_passed = [p for p in patches if p.output_sql and p.semantic_passed]
         if not sem_passed:
             return
+
+        dialect = self.dialect
+
+        def _collect_explain(executor, sql):
+            """Collect EXPLAIN on existing executor, return compact text.
+
+            Uses JSON format for DuckDB (compact operator tree), raw text for PG/SF.
+            """
+            import json as _json
+
+            explain_sql = _extract_first_statement(sql)
+            explain_result = {"plan_text": None, "plan_json": None}
+
+            if dialect.lower() == "duckdb":
+                # Try JSON format first (structured plan with timing)
+                try:
+                    rows = executor.execute(
+                        f"EXPLAIN (ANALYZE, FORMAT JSON) {explain_sql}"
+                    )
+                    if rows and isinstance(rows, list):
+                        for row in rows:
+                            plan_type = row.get("explain_key", "")
+                            plan_json_str = row.get("explain_value", "")
+                            if not plan_type and not plan_json_str:
+                                # DuckDB returns (type, json) tuples as dict
+                                vals = list(row.values())
+                                if len(vals) >= 2:
+                                    plan_type, plan_json_str = vals[0], vals[1]
+                            if "analyzed" in str(plan_type).lower():
+                                parsed = _json.loads(plan_json_str)
+                                if isinstance(parsed, dict):
+                                    explain_result["plan_json"] = parsed
+                                    break
+                except Exception:
+                    pass  # Fall through to text EXPLAIN
+
+            if not explain_result["plan_json"]:
+                # Text fallback (PG/SF/DuckDB without JSON)
+                try:
+                    rows = executor.execute(f"EXPLAIN ANALYZE {explain_sql}")
+                    if rows and isinstance(rows, list):
+                        if isinstance(rows[0], dict):
+                            lines = [str(v) for row in rows for v in row.values()]
+                        else:
+                            lines = [str(r) for r in rows]
+                        explain_result["plan_text"] = "\n".join(lines)
+                    elif isinstance(rows, str):
+                        explain_result["plan_text"] = rows
+                except Exception:
+                    pass
+
+            return self._render_explain_compact(explain_result, dialect)
 
         benchmark_query_patches(
             patches=sem_passed,
@@ -1685,8 +1738,8 @@ class BeamSession(OptimizationSession):
             timeout_seconds=getattr(self.pipeline.config, "timeout_seconds", 300),
             collect_explain=True,
             classify_speedup_fn=self._classify_speedup,
-            render_explain_fn=lambda text: text,  # raw text, compact rendering done elsewhere
-            dialect=self.dialect,
+            collect_explain_fn=_collect_explain,
+            dialect=dialect,
         )
 
     def run_compiler_phase(self, ctx: "BeamContext", patches: List["AppliedPatch"],

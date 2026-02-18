@@ -86,9 +86,8 @@ class WaveRunner:
 
         # Wave 2: Probe Benchmark
         if not self.api_only:
-            bench_items = self._collect_benchmark_items(probe=True)
             self._print_wave_header(console, 2, "Probe Benchmark",
-                                    f"{len(bench_items)} patches, db_slots={self.db_slots}")
+                                    f"db_slots={self.db_slots}")
             self._run_benchmark_wave(console, probe=True, wave_num=2)
             self._save_wave_checkpoint(out, 2)
 
@@ -102,9 +101,8 @@ class WaveRunner:
 
         # Wave 4: Compiler Benchmark
         if not self.api_only:
-            comp_items = self._collect_benchmark_items(compiler=True)
             self._print_wave_header(console, 4, "Compiler Benchmark",
-                                    f"{len(comp_items)} patches, db_slots={self.db_slots}")
+                                    f"db_slots={self.db_slots}")
             self._run_benchmark_wave(console, compiler=True, wave_num=4)
             self._save_wave_checkpoint(out, 4)
 
@@ -191,6 +189,7 @@ class WaveRunner:
 
         done = [0]
         total = len(active)
+        api_lock = threading.Lock()
 
         def _run_api_one(qid: str, state: QueryState) -> None:
             try:
@@ -237,16 +236,18 @@ class WaveRunner:
                         seen[norm] = p.patch_id
 
                 valid_count = sum(1 for p in applied if p.semantic_passed)
-                done[0] += 1
-                console.print(
-                    f"  [{done[0]}/{total}] {qid}: {len(patches)} probes, "
-                    f"{valid_count}/{len(applied)} valid SQL"
-                )
+                with api_lock:
+                    done[0] += 1
+                    console.print(
+                        f"  [{done[0]}/{total}] {qid}: {len(patches)} probes, "
+                        f"{valid_count}/{len(applied)} valid SQL"
+                    )
             except Exception as e:
                 state.error = str(e)
                 state.completed = True
-                done[0] += 1
-                console.print(f"  [{done[0]}/{total}] {qid}: [red]ERROR[/red] {e}")
+                with api_lock:
+                    done[0] += 1
+                    console.print(f"  [{done[0]}/{total}] {qid}: [red]ERROR[/red] {e}")
 
         with ThreadPoolExecutor(max_workers=self.api_slots) as pool:
             futures = {
@@ -280,6 +281,7 @@ class WaveRunner:
 
         done = [0]
         total = len(active)
+        compiler_lock = threading.Lock()
 
         def _run_compiler_one(qid: str, state: QueryState) -> None:
             try:
@@ -306,13 +308,15 @@ class WaveRunner:
                     state.session.check_sqlglot_parse(compiler_patches)
 
                 valid = sum(1 for p in compiler_patches if p.semantic_passed)
-                done[0] += 1
-                console.print(
-                    f"  [{done[0]}/{total}] {qid}: "
-                    f"{len(compiler_patches)} compiler patches, {valid} valid"
-                )
+                with compiler_lock:
+                    done[0] += 1
+                    console.print(
+                        f"  [{done[0]}/{total}] {qid}: "
+                        f"{len(compiler_patches)} compiler patches, {valid} valid"
+                    )
             except Exception as e:
-                done[0] += 1
+                with compiler_lock:
+                    done[0] += 1
                 logger.warning(f"[{qid}] Compiler phase failed: {e}")
                 console.print(f"  [{done[0]}/{total}] {qid}: [red]compiler error[/red] {e}")
 
@@ -333,42 +337,19 @@ class WaveRunner:
 
     # ── Shared Benchmark Wave ────────────────────────────────────────────
 
-    def _collect_benchmark_items(
-        self,
-        probe: bool = False,
-        compiler: bool = False,
-        filter_fn=None,
-    ) -> List[tuple]:
-        """Collect (qid, patch) pairs for benchmarking."""
-        items = []
-        for qid, state in self.states.items():
-            if state.completed or not state.session:
-                continue
-            if probe:
-                for p in state.patches:
-                    if not p.output_sql or not p.semantic_passed:
-                        continue
-                    if filter_fn and not filter_fn(p):
-                        continue
-                    items.append((qid, p, state))
-            if compiler:
-                for p in state.compiler_patches:
-                    if not p.output_sql or not p.semantic_passed:
-                        continue
-                    if filter_fn and not filter_fn(p):
-                        continue
-                    items.append((qid, p, state))
-        return items
-
     def _run_benchmark_wave(
         self,
         console: Any,
         probe: bool = False,
         compiler: bool = False,
         wave_num: int = 0,
-        filter_fn=None,
     ) -> None:
-        """Benchmark patches across all queries using db_slots connections."""
+        """Benchmark patches across all queries using db_slots connections.
+
+        Concurrency model: ThreadPoolExecutor(max_workers=db_slots) limits
+        concurrent queries. Each query opens exactly ONE connection inside
+        benchmark_query_patches(). Max open connections = db_slots.
+        """
         # Group patches by query for per-query benchmarking
         active = {}
         for qid, state in self.states.items():
@@ -379,16 +360,12 @@ class WaveRunner:
                 for p in state.patches:
                     if not p.output_sql or not p.semantic_passed:
                         continue
-                    if filter_fn and not filter_fn(p):
-                        continue
                     if p.speedup is not None:
                         continue  # already benchmarked
                     patches_to_bench.append(p)
             if compiler:
                 for p in state.compiler_patches:
                     if not p.output_sql or not p.semantic_passed:
-                        continue
-                    if filter_fn and not filter_fn(p):
                         continue
                     if p.speedup is not None:
                         continue
@@ -406,14 +383,9 @@ class WaveRunner:
         improved = [0]
         neutral = [0]
         regression = [0]
-
-        bench_sem = threading.Semaphore(self.db_slots)
+        counter_lock = threading.Lock()
 
         def _benchmark_query(qid: str, state: QueryState, patches: list) -> None:
-            # Semaphore owned by wave_runner — ensures at most db_slots
-            # concurrent connections. benchmark_query_patches opens exactly
-            # ONE connection internally.
-            bench_sem.acquire()
             try:
                 shot = 0 if probe else 1
                 state.session.run_benchmark_patches(
@@ -421,34 +393,34 @@ class WaveRunner:
                     session_dir=state.ctx.session_dir, shot=shot,
                 )
 
-                for p in patches:
-                    done[0] += 1
-                    status = str(p.status or "?").upper()
-                    speedup = p.speedup
-                    if status == "WIN":
-                        wins[0] += 1
-                    elif status == "IMPROVED":
-                        improved[0] += 1
-                    elif status == "NEUTRAL":
-                        neutral[0] += 1
-                    elif status == "REGRESSION":
-                        regression[0] += 1
+                with counter_lock:
+                    for p in patches:
+                        done[0] += 1
+                        status = str(p.status or "?").upper()
+                        speedup = p.speedup
+                        if status == "WIN":
+                            wins[0] += 1
+                        elif status == "IMPROVED":
+                            improved[0] += 1
+                        elif status == "NEUTRAL":
+                            neutral[0] += 1
+                        elif status == "REGRESSION":
+                            regression[0] += 1
 
-                    speedup_str = f"{speedup:.2f}x" if speedup else "?"
-                    orig_str = f"{p.original_ms:.0f}ms" if p.original_ms else "?"
-                    patch_str = f"{p.patch_ms:.0f}ms" if p.patch_ms else "?"
-                    console.print(
-                        f"  [{done[0]}/{total_patches}] {qid}/{p.patch_id}: "
-                        f"{orig_str}->{patch_str} {speedup_str} {status}"
-                    )
+                        speedup_str = f"{speedup:.2f}x" if speedup else "?"
+                        orig_str = f"{p.original_ms:.0f}ms" if p.original_ms else "?"
+                        patch_str = f"{p.patch_ms:.0f}ms" if p.patch_ms else "?"
+                        console.print(
+                            f"  [{done[0]}/{total_patches}] {qid}/{p.patch_id}: "
+                            f"{orig_str}->{patch_str} {speedup_str} {status}"
+                        )
             except Exception as e:
                 logger.warning(f"[{qid}] Benchmark failed: {e}")
-                for p in patches:
-                    done[0] += 1
-                    p.status = "ERROR"
-                    p.apply_error = str(e)
-            finally:
-                bench_sem.release()
+                with counter_lock:
+                    for p in patches:
+                        done[0] += 1
+                        p.status = "ERROR"
+                        p.apply_error = str(e)
 
         # Run benchmarks with db_slots concurrency at the query level
         max_concurrent = min(self.db_slots, len(active))
@@ -463,6 +435,13 @@ class WaveRunner:
                 except Exception as e:
                     qid = futures[future]
                     logger.warning(f"Wave {wave_num} unhandled error for {qid}: {e}")
+                    # Mark all patches for this query as failed
+                    state, patches = active[qid]
+                    with counter_lock:
+                        for p in patches:
+                            if not p.status or p.status == "?":
+                                p.status = "ERROR"
+                                p.apply_error = f"Unhandled: {e}"
 
         console.print(
             f"  Wave {wave_num} complete: {wins[0]} WIN, {improved[0]} IMPROVED, "
@@ -577,16 +556,6 @@ class WaveRunner:
             },
         }
         _write_json_atomic(out / "wave_checkpoint.json", payload)
-
-    def _load_wave_checkpoint(self, out: Path) -> Optional[dict]:
-        """Load wave checkpoint from disk."""
-        cp_path = out / "wave_checkpoint.json"
-        if not cp_path.exists():
-            return None
-        try:
-            return json.loads(cp_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
 
     # ── Helpers ──────────────────────────────────────────────────────────
 

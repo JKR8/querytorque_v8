@@ -79,6 +79,14 @@ class PostgresExecutor:
     def close(self) -> None:
         """Close connection to PostgreSQL."""
         if self._conn is not None:
+            try:
+                # Clean up temp tables, prepared statements, and advisory locks
+                # before releasing the connection back / closing it.
+                with self._conn.cursor() as cur:
+                    cur.execute("DISCARD ALL")
+                self._conn.commit()
+            except Exception:
+                pass
             self._conn.close()
             self._conn = None
 
@@ -111,25 +119,21 @@ class PostgresExecutor:
         """
         conn = self._ensure_connected()
 
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            try:
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if timeout_ms > 0:
-                    cur.execute(f"SET statement_timeout = {timeout_ms}")
+                    # SET LOCAL so the timeout reverts automatically on commit/rollback
+                    cur.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
                 if params:
                     cur.execute(sql, params)
                 else:
                     cur.execute(sql)
-
-                if cur.description:
-                    rows = cur.fetchall()
-                    return [dict(row) for row in rows]
-                return []
-            finally:
-                if timeout_ms > 0:
-                    try:
-                        cur.execute("SET statement_timeout = 0")
-                    except Exception:
-                        pass
+                rows = [dict(row) for row in cur.fetchall()] if cur.description else []
+            conn.commit()
+            return rows
+        except Exception:
+            conn.rollback()
+            raise
 
     def execute_script(self, sql_script: str) -> None:
         """Execute multi-statement SQL script.
@@ -168,9 +172,10 @@ class PostgresExecutor:
         if analyze:
             explain_options = "ANALYZE, FORMAT JSON, COSTS, TIMING"
 
-        with conn.cursor() as cur:
-            try:
-                cur.execute(f"SET statement_timeout = {timeout_ms}")
+        try:
+            with conn.cursor() as cur:
+                # SET LOCAL so the timeout reverts automatically on commit/rollback
+                cur.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
                 cur.execute(f"EXPLAIN ({explain_options}) {sql}")
                 plan_result = cur.fetchall()
 
@@ -191,22 +196,13 @@ class PostgresExecutor:
                         plan = plan_data.get("Plan", {})
                         result["rows_returned"] = plan.get("Actual Rows", plan.get("Plan Rows", 0))
                         result["children"] = [plan]
-
-            except psycopg2.Error as e:
-                # Rollback on error
-                conn.rollback()
-                return {
-                    "error": str(e),
-                    "type": "error_plan",
-                }
-            finally:
-                try:
-                    cur.execute("SET statement_timeout = 0")
-                except Exception:
-                    pass
-
-        # Commit any changes from ANALYZE
-        conn.commit()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return {
+                "error": str(e),
+                "type": "error_plan",
+            }
         return result
 
     def get_schema_info(self, include_row_counts: bool = True) -> dict[str, Any]:
