@@ -384,55 +384,54 @@ Corrective action:
 Everything below is probe-specific input.
 
 ## Shared Analyst Hypothesis
-The plan shows two large fact-table scans (WEB_SALES 460GB, WEB_RETURNS 39GB) without pushed date_sk filter from date_dim (d_year=2002), causing full partition scans. OR conditions on customer_demographics and customer_address are applied as late join filters, preventing efficient join planning and predicate pushdown.
+Complex OR conditions on dimension filters are applied as join filters after large fact table scans, preventing early micro-partition pruning. Decomposing OR into UNION ALL branches may enable partition-level filtering. Additionally, aggregation pushdown can reduce row volume before expensive joins, and date filter pushdown may prune fact scans.
 ## Runtime Dialect Contract
 - target_dialect: snowflake
 - runtime_dialect_is_source_of_truth: true
 - if static examples conflict, follow runtime dialect behavior
 ## Probe Assignment
-- transform_id: dimension_cte_isolate
-- family: A
-- target: Isolate each dimension table into its own CTE with filters applied, then join with fact tables.
+- transform_id: inner_join_conversion
+- family: F
+- target: Convert implicit joins in FROM clause to explicit INNER JOIN syntax and consider reordering joins based on selectivity of dimension filters.
 - phase: ?
 - exploration: yes
 - worker_lane: scout
 - dialect: snowflake
-- recommended_examples: `dimension_cte_isolate`
-- recommended_patch_ops: `insert_cte`, `replace_from`
-- expected_explain_delta: Dimension scans become CTE scans; join operators may show smaller build sides.
+- recommended_examples: `inner_join_conversion`
+- recommended_patch_ops: `convert_to_explicit_joins`, `reorder_joins_based_selectivity`
+- expected_explain_delta: Potential change in join order or join type, leading to reduced intermediate row sets.
 - equivalence_tier: unordered
-- exploration_hypothesis: CTE isolation may help Snowflake materialize small dimension results and improve join planning.
+- exploration_hypothesis: Explicit join syntax might provide better hints to Snowflake's cost-based optimizer for join ordering, especially with selective dimension filters.
 - existing_ctes: (none)
 
 ### Gates Checked
-no_unfiltered_large_cte:PASS; cross_cte_predicate_blindness:CAUTION (portability candidate)
+join_multiplicity_safe:PASS; portability_candidate:CAUTION
 
 ### Analyst Do-Not-Do
-- do not wrap date_sk or filter columns in functions that break micro‑partition pruning
-- do not materialize EXISTS/NOT EXISTS patterns (none present)
-- do not introduce unfiltered large CTEs
-- avoid same‑column OR to UNION ALL unless evidence shows OR blocks pruning
+- avoid materializing EXISTS paths (none present)
+- avoid unfiltered large CTEs
+- do not wrap partition keys in functions that hinder micro-partition pruning
 
 ### Node Contract
 
 ```json
 {
   "from_must_include": [
-    "date_dim d",
+    "web_sales",
+    "web_returns",
+    "date_dim",
     "customer_demographics cd1",
     "customer_demographics cd2",
-    "customer_address ca",
-    "reason r"
+    "customer_address",
+    "reason",
+    "web_page"
   ],
   "where_must_preserve": [
-    "d.d_year = 2002",
-    "cd1.cd_marital_status IN ('S','M','U')",
-    "cd1.cd_education_status IN ('Primary','Secondary','2 yr Degree')",
-    "ca.ca_country = 'United States'",
-    "ca.ca_state IN (...)"
+    "all join conditions and filters",
+    "final result set"
   ],
   "output_must_preserve": [
-    "All join keys and relationships"
+    "same rows and columns as original"
   ]
 }
 ```
@@ -596,10 +595,10 @@ root_node_id: final_select
 ```
 
 ### Analyst Reasoning Trace
-- WEB_SALES scan reads 27574 parts (460GB) without date_sk filter; WEB_RETURNS scan reads 2289 parts (39GB) without date_sk filter.
-- Date_dim filter (d_year=2002) applied at node 1.14 but not pushed into fact scans, indicating predicate transitivity failure.
-- OR conditions on customer_demographics/ws_sales_price and customer_address/ws_net_profit appear as join filters (nodes 1.17, 1.11), applied after join materialization.
-- Aggregation occurs in multiple stages; final group by r_reason_desc suggests early aggregation pushdown may reduce join volume.
+- WEB_SALES scan is the largest I/O contributor with 460GB scanned, and OR conditions on ws_sales_price and ws_net_profit are evaluated in join nodes after the scan.
+- WEB_RETURNS scan is significant with 39GB scanned, and filters are applied late via joins.
+- Nested aggregates indicate high input volume from joins before aggregation, suggesting pushdown opportunities.
+- Date filter d_year=2002 is selective but may not push range to fact scans effectively due to join structure.
 
 ### Engine-Specific Knowledge
 ## Dialect Intelligence (SNOWFLAKE)
@@ -715,18 +714,11 @@ Use numbered pattern blocks below as independent decision scopes; evaluate each 
 - Consider promoting this pattern into the Snowflake engine profile to keep profile and playbook fully aligned.
 
 ### Transform Recipe
-- `transform_id`: `dimension_cte_isolate`
-- `family`: `A`
-- `principle`: Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
-- `expected_features`: `DATE_DIM`, `GROUP_BY`, `MULTI_TABLE_5+`
-- `contraindications`: CROSS_JOIN_3_DIMS: NEVER cross-join 3+ dimension CTEs — Cartesian explosion | UNFILTERED_CTE: Every CTE must have a WHERE clause — unfiltered CTE = pure overhead
-
-### Gold TREE Pattern Reference
-- `plan_id`: `gold_snowflake_sf_inline_decorrelate`
-- `root_node_id`: `final_select`
-- `nodes`: `final_select`
-- `changed_nodes`: `final_select`
-- Reuse TREE shape and invariants, not literal table/column names.
+- `transform_id`: `inner_join_conversion`
+- `family`: `F`
+- `principle`: When a LEFT JOIN is immediately followed by a WHERE filter on the right table that eliminates NULL rows, convert to INNER JOIN + early filter CTE. The WHERE clause already makes the LEFT JOIN behave as an INNER JOIN, but the optimizer keeps the LEFT JOIN semantics (preserving all left rows), wasting work on rows that are filtered out.
+- `expected_features`: `LEFT_JOIN`, `LEFT_JOIN_RIGHT_FILTER`, `AGG_SUM`, `GROUP_BY`
+- `contraindications`: NULL_DEPENDENT_LOGIC: Do NOT convert if CASE WHEN checks for sr_return_quantity IS NULL — the NULL branch is semantically meaningful
 
 
 ## Runtime Override: Scout Lane
@@ -756,7 +748,7 @@ First character must be `{` and output must contain no markdown/prose.
 ```json
 {
   "probe_id": "p07",
-  "transform_id": "dimension_cte_isolate",
+  "transform_id": "inner_join_conversion",
   "gate": "any_failure",
   "status": "FAIL",
   "error": "Missing SQL for tree node `web_sales`"

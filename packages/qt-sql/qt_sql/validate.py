@@ -439,24 +439,9 @@ class Validator:
         self._validator = None
 
     def _get_validator(self):
-        """Get or create the SQLValidator instance."""
+        """Get or create the validator instance."""
         if self._validator is None:
-            try:
-                # Detect database type from connection string
-                db_lower = self.db_dsn.lower()
-                if db_lower.startswith("postgres://") or db_lower.startswith("postgresql://"):
-                    self._validator = ExecutorValidatorWrapper(self.db_dsn)
-                elif db_lower.startswith("snowflake://"):
-                    self._validator = ExecutorValidatorWrapper(self.db_dsn)
-                else:
-                    # DuckDB - use SQLValidator directly
-                    from .validation.sql_validator import SQLValidator
-                    self._validator = SQLValidator(database=self.db_dsn)
-
-            except ImportError as e:
-                logger.warning(f"SQLValidator not available: {e}")
-                self._validator = None
-
+            self._validator = ExecutorValidatorWrapper(self.db_dsn)
         return self._validator
 
     def validate(

@@ -30,7 +30,6 @@ from .knowledge.normalization import (
 from .learn import Learner
 from .schemas import (
     BenchmarkConfig,
-    OptimizationMode,
     PipelineResult,
     PromotionAnalysis,
     SessionResult,
@@ -857,60 +856,6 @@ class Pipeline:
         self.learner.generate_benchmark_history(self.benchmark_dir)
 
         return results
-    def run_optimization_session(
-        self,
-        query_id: str,
-        sql: str,
-        max_iterations: int = 3,
-        target_speedup: float = 2.0,
-        n_workers: int = 3,
-        mode: OptimizationMode = OptimizationMode.BEAM,
-        orchestrator=None,
-        patch: bool = False,
-        benchmark_lock=None,
-        on_phase_change=None,
-        resume_dir=None,
-    ) -> SessionResult:
-        """Run optimization session in BEAM mode.
-
-        Args:
-            query_id: Query identifier (e.g., 'query_88')
-            sql: Original SQL query
-            max_iterations: Max optimization rounds
-            target_speedup: Stop early when this speedup is reached
-            n_workers: Parallel workers per iteration
-            mode: Optimization mode (must be beam)
-            orchestrator: Optional Orchestrator for declarative composition
-            benchmark_lock: Optional threading.Lock for serializing benchmark
-                phases when running multiple sessions concurrently.
-
-        Returns:
-            SessionResult with the best result across all iterations
-        """
-        from .sessions.beam_session import BeamSession
-        mode_value = mode.value if isinstance(mode, OptimizationMode) else str(mode or "")
-        if mode_value and mode_value != OptimizationMode.BEAM.value:
-            raise ValueError(
-                f"Unsupported optimization mode '{mode_value}'. Only 'beam' is supported."
-            )
-        if not self.config.benchmark_dsn:
-            self.config.benchmark_dsn = self.config.db_path_or_dsn
-        # max_iterations = compiler_rounds + 1 (1 analyst/workers + N compiler)
-        effective_max_iterations = self.config.compiler_rounds + 1
-        session = BeamSession(
-            pipeline=self,
-            query_id=query_id,
-            original_sql=sql,
-            target_speedup=target_speedup,
-            max_iterations=effective_max_iterations,
-            patch=True,
-            benchmark_lock=benchmark_lock,
-            resume_dir=resume_dir,
-        )
-
-        if on_phase_change:
-            session.on_phase_change = on_phase_change
-        return session.run()
 
     def promote(self, state_num: int) -> str:
         """Create state_{N+1} from state_N with enriched promotion context.

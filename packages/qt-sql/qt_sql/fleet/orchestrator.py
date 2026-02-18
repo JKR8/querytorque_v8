@@ -91,7 +91,6 @@ class FleetOrchestrator:
         self,
         pipeline: "Pipeline",
         benchmark_dir: Path,
-        concurrency: int = 4,
         dashboard: Optional["FleetDashboard"] = None,
         event_bus: Optional[Any] = None,
         triage_gate: Optional[threading.Event] = None,
@@ -99,12 +98,21 @@ class FleetOrchestrator:
     ) -> None:
         self.pipeline = pipeline
         self.benchmark_dir = benchmark_dir
-        self.concurrency = concurrency
         self.dashboard = dashboard
         self.event_bus = event_bus
         self.triage_gate = triage_gate
         self.pause_event = pause_event
-        self.benchmark_lock = threading.Lock()
+        # Global benchmark slot pool — each individual cloud compute connection
+        # acquires a slot. Default 8 from config.
+        bench_cfg = {}
+        try:
+            cfg_path = benchmark_dir / "config.json"
+            if cfg_path.exists():
+                bench_cfg = json.loads(cfg_path.read_text())
+        except Exception:
+            pass
+        n_bench_slots = max(1, int(bench_cfg.get("benchmark_slots", 8) or 8))
+        self.benchmark_sem = threading.Semaphore(n_bench_slots)
         self._prior_history_cache: Optional[Dict[str, PriorOptimization]] = None
 
     def _emit(self, event_type: EventType | str, **data) -> None:
@@ -734,13 +742,13 @@ class FleetOrchestrator:
                 target_speedup=10.0,  # intentional: fleet always aims for 10x
                 mode=OptimizationMode.BEAM,
                 patch=True,
-                benchmark_lock=self.benchmark_lock,
+                benchmark_sem=self.benchmark_sem,
                 on_phase_change=_on_phase,
             )
 
             return qid, result
 
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+        with ThreadPoolExecutor(max_workers=len(work_items)) as pool:
             futures = {
                 pool.submit(_run_one, item): item.query_id
                 for item in work_items
@@ -902,7 +910,7 @@ class FleetOrchestrator:
             f"**Benchmark:** {self.benchmark_dir.name}",
             f"**Engine:** {self.pipeline.config.engine}",
             f"**Timestamp:** {datetime.now().isoformat()}",
-            f"**Concurrency:** {self.concurrency}",
+            f"**Benchmark Slots:** {self.benchmark_sem._value}",
             "",
             "## Summary",
             "",

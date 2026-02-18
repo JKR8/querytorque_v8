@@ -384,55 +384,51 @@ Corrective action:
 Everything below is probe-specific input.
 
 ## Shared Analyst Hypothesis
-The plan shows two large fact-table scans (WEB_SALES 460GB, WEB_RETURNS 39GB) without pushed date_sk filter from date_dim (d_year=2002), causing full partition scans. OR conditions on customer_demographics and customer_address are applied as late join filters, preventing efficient join planning and predicate pushdown.
+Complex OR conditions on dimension filters are applied as join filters after large fact table scans, preventing early micro-partition pruning. Decomposing OR into UNION ALL branches may enable partition-level filtering. Additionally, aggregation pushdown can reduce row volume before expensive joins, and date filter pushdown may prune fact scans.
 ## Runtime Dialect Contract
 - target_dialect: snowflake
 - runtime_dialect_is_source_of_truth: true
 - if static examples conflict, follow runtime dialect behavior
 ## Probe Assignment
-- transform_id: multi_dimension_prefetch
+- transform_id: dimension_cte_isolate
 - family: A
-- target: Pre‑filter selective dimension tables (date_dim, customer_demographics, customer_address, reason) into separate CTEs, then join with fact tables.
+- target: Pre-filter dimension tables (date_dim, customer_demographics cd1/cd2, customer_address, reason) into separate CTEs returning only surrogate keys, then join with fact tables.
 - phase: ?
 - exploration: yes
 - worker_lane: scout
 - dialect: snowflake
 - recommended_examples: `multi_dimension_prefetch`
-- recommended_patch_ops: `insert_cte`, `replace_from`
-- expected_explain_delta: Dimension scans become CTE scans; join operators may show smaller build sides.
+- recommended_patch_ops: `insert_cte_for_dim`, `replace_join_with_cte`
+- expected_explain_delta: Dimension scans replaced with CTE reads, potentially reducing join work and improving cardinality estimates.
 - equivalence_tier: unordered
-- exploration_hypothesis: Pre‑filtering dimensions may create smaller hash tables and improve join performance, though Snowflake may already push filters.
+- exploration_hypothesis: Pre-materializing small dimension filters may create tiny hash tables for faster joins, even though dimensions are already pruned, potentially improving join efficiency.
 - existing_ctes: (none)
 
 ### Gates Checked
-no_unfiltered_large_cte:PASS (dimension CTEs are tiny); cross_cte_predicate_blindness:CAUTION (portability candidate)
+dimension_small:PASS; portability_candidate:CAUTION; no_unfiltered_cte:PASS
 
 ### Analyst Do-Not-Do
-- do not wrap date_sk or filter columns in functions that break micro‑partition pruning
-- do not materialize EXISTS/NOT EXISTS patterns (none present)
-- do not introduce unfiltered large CTEs
-- avoid same‑column OR to UNION ALL unless evidence shows OR blocks pruning
+- avoid materializing EXISTS paths (none present)
+- avoid unfiltered large CTEs
+- do not wrap partition keys in functions that hinder micro-partition pruning
 
 ### Node Contract
 
 ```json
 {
   "from_must_include": [
-    "date_dim d",
+    "date_dim",
     "customer_demographics cd1",
     "customer_demographics cd2",
-    "customer_address ca",
-    "reason r"
+    "customer_address",
+    "reason"
   ],
   "where_must_preserve": [
-    "d.d_year = 2002",
-    "cd1.cd_marital_status IN ('S','M','U')",
-    "cd1.cd_education_status IN ('Primary','Secondary','2 yr Degree')",
-    "ca.ca_country = 'United States'",
-    "ca.ca_state IN (...)"
+    "all dimension filters (e.g., d_year=2002, cd1.cd_marital_status IN...)",
+    "join key relationships"
   ],
   "output_must_preserve": [
-    "All original join keys and relationships"
+    "surrogate keys for joins, no additional rows"
   ]
 }
 ```
@@ -596,10 +592,10 @@ root_node_id: final_select
 ```
 
 ### Analyst Reasoning Trace
-- WEB_SALES scan reads 27574 parts (460GB) without date_sk filter; WEB_RETURNS scan reads 2289 parts (39GB) without date_sk filter.
-- Date_dim filter (d_year=2002) applied at node 1.14 but not pushed into fact scans, indicating predicate transitivity failure.
-- OR conditions on customer_demographics/ws_sales_price and customer_address/ws_net_profit appear as join filters (nodes 1.17, 1.11), applied after join materialization.
-- Aggregation occurs in multiple stages; final group by r_reason_desc suggests early aggregation pushdown may reduce join volume.
+- WEB_SALES scan is the largest I/O contributor with 460GB scanned, and OR conditions on ws_sales_price and ws_net_profit are evaluated in join nodes after the scan.
+- WEB_RETURNS scan is significant with 39GB scanned, and filters are applied late via joins.
+- Nested aggregates indicate high input volume from joins before aggregation, suggesting pushdown opportunities.
+- Date filter d_year=2002 is selective but may not push range to fact scans effectively due to join structure.
 
 ### Engine-Specific Knowledge
 ## Dialect Intelligence (SNOWFLAKE)
@@ -715,11 +711,11 @@ Use numbered pattern blocks below as independent decision scopes; evaluate each 
 - Consider promoting this pattern into the Snowflake engine profile to keep profile and playbook fully aligned.
 
 ### Transform Recipe
-- `transform_id`: `multi_dimension_prefetch`
+- `transform_id`: `dimension_cte_isolate`
 - `family`: `A`
-- `principle`: Multi-Dimension Prefetch: when multiple dimension tables have selective filters, pre-filter ALL of them into CTEs before the fact table join. Combined selectivity compounds — each dimension CTE reduces the fact scan further.
-- `expected_features`: `AGG_SUM`, `CASE_EXPR`, `DATE_DIM`, `GROUP_BY`
-- `confirm_with_explain`: true
+- `principle`: Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+- `expected_features`: `DATE_DIM`, `GROUP_BY`, `MULTI_TABLE_5+`
+- `contraindications`: CROSS_JOIN_3_DIMS: NEVER cross-join 3+ dimension CTEs — Cartesian explosion | UNFILTERED_CTE: Every CTE must have a WHERE clause — unfiltered CTE = pure overhead
 
 ### Gold TREE Pattern Reference
 - `plan_id`: `gold_snowflake_sf_inline_decorrelate`
@@ -756,7 +752,7 @@ First character must be `{` and output must contain no markdown/prose.
 ```json
 {
   "probe_id": "p05",
-  "transform_id": "multi_dimension_prefetch",
+  "transform_id": "dimension_cte_isolate",
   "gate": "any_failure",
   "status": "FAIL",
   "error": "Missing SQL for tree node `web_page`"

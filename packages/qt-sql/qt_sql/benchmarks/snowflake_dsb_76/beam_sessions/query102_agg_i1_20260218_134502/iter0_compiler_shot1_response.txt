@@ -1,0 +1,96 @@
+[
+  {
+    "plan_id": "compile_p1",
+    "dialect": "snowflake",
+    "confidence": 0.75,
+    "based_on": "p01,p03",
+    "strategy": "Push date_sk range predicates into fact scans via explicit join and derived date ranges.",
+    "hypothesis": "Primary hotspot is unpruned fact scans (STORE_SALES 1.2TB, WEB_SALES 460GB). Date filters on d1 (d_year=2001) and d2 range condition are not pushed into fact scans. Use explicit join syntax and derived date_sk ranges to enable micro-partition pruning.",
+    "expected_explain_delta": "STORE_SALES and WEB_SALES scans show reduced partitions/bytes; date_dim filters pushed into fact scans.",
+    "target_ir": "Replace comma joins with explicit INNER JOIN, add CTEs for d1 and d2 date_sk ranges, push ss_sold_date_sk and ws_sold_date_sk BETWEEN predicates.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["d1_range", "d2_range", "store_sales", "web_sales", "customer", "inventory", "store", "warehouse", "item", "customer_demographics", "household_demographics", "customer_address"],
+          "outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "cnt"],
+          "changed": true,
+          "sql": "WITH d1_range AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n  WHERE d_year = 2001\n),\nd2_range AS (\n  SELECT d2.d_date_sk, d2.d_date\n  FROM date_dim d2\n  JOIN d1_range d1 ON d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30 day')\n)\nSELECT \n    cd.cd_gender,\n    cd.cd_marital_status,\n    cd.cd_education_status,\n    hd.hd_vehicle_count,\n    COUNT(*) AS cnt\nFROM store_sales ss\nJOIN d1_range d1 ON ss.ss_sold_date_sk = d1.d_date_sk\nJOIN web_sales ws ON ws.ws_item_sk = ss.ss_item_sk\nJOIN d2_range d2 ON ws.ws_sold_date_sk = d2.d_date_sk\nJOIN customer c ON ss.ss_customer_sk = c.c_customer_sk AND ws.ws_bill_customer_sk = c.c_customer_sk\nJOIN inventory inv ON inv.inv_item_sk = ss.ss_item_sk AND inv.inv_date_sk = ss.ss_sold_date_sk AND inv.inv_warehouse_sk = ws.ws_warehouse_sk\nJOIN store s ON s.s_state = s.s_state\nJOIN warehouse w ON ws.ws_warehouse_sk = w.w_warehouse_sk\nJOIN item i ON ss.ss_item_sk = i.i_item_sk\nJOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\nJOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\nJOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nWHERE inv.inv_quantity_on_hand >= ss.ss_quantity\n  AND i.i_category IN ('Children', 'Jewelry', 'Men')\n  AND i.i_manager_id IN (21, 22, 38, 39, 46, 47, 66, 67, 74, 93)\n  AND ca.ca_state IN ('AZ', 'KS', 'OH', 'TX', 'WA')\n  AND ws.ws_wholesale_cost BETWEEN 35 AND 55\n  AND s.s_state = w.w_state\nGROUP BY cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, hd.hd_vehicle_count\nORDER BY cnt"
+        },
+        {
+          "node_id": "d1_range",
+          "parent_node_id": "final_select",
+          "sources": ["date_dim"],
+          "outputs": ["d_date_sk", "d_date"],
+          "changed": true,
+          "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2001"
+        },
+        {
+          "node_id": "d2_range",
+          "parent_node_id": "final_select",
+          "sources": ["date_dim", "d1_range"],
+          "outputs": ["d_date_sk", "d_date"],
+          "changed": true,
+          "sql": "SELECT d2.d_date_sk, d2.d_date FROM date_dim d2 JOIN d1_range d1 ON d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30 day')"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_p2",
+    "dialect": "snowflake",
+    "confidence": 0.65,
+    "based_on": "p02",
+    "strategy": "Pre-aggregate fact tables by join keys before joining to dimensions to reduce data volume.",
+    "hypothesis": "Secondary hotspot is repeated aggregation and large intermediate rows. Pre-aggregating STORE_SALES and WEB_SALES by their join keys reduces rows before expensive joins, while preserving COUNT(*) semantics.",
+    "expected_explain_delta": "Aggregate nodes appear earlier; fact scans may still be large but fewer rows flow into joins.",
+    "target_ir": "Add CTEs for pre-aggregated store_sales and web_sales, then join to dimensions.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["preagg_store_sales", "preagg_web_sales", "date_dim_d1", "date_dim_d2", "customer", "inventory", "store", "warehouse", "item", "customer_demographics", "household_demographics", "customer_address"],
+          "outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "cnt"],
+          "changed": true,
+          "sql": "WITH preagg_store_sales AS (\n  SELECT ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity, COUNT(*) AS ss_count\n  FROM store_sales\n  GROUP BY ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity\n),\npreagg_web_sales AS (\n  SELECT ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_warehouse_sk, ws_wholesale_cost, COUNT(*) AS ws_count\n  FROM web_sales\n  WHERE ws_wholesale_cost BETWEEN 35 AND 55\n  GROUP BY ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_warehouse_sk, ws_wholesale_cost\n),\ndate_dim_d1 AS (\n  SELECT d_date_sk, d_date, d_year\n  FROM date_dim\n  WHERE d_year = 2001\n),\ndate_dim_d2 AS (\n  SELECT d_date_sk, d_date\n  FROM date_dim\n)\nSELECT \n    cd.cd_gender,\n    cd.cd_marital_status,\n    cd.cd_education_status,\n    hd.hd_vehicle_count,\n    SUM(ss_count * ws_count) AS cnt\nFROM preagg_store_sales ss\nJOIN preagg_web_sales ws ON ss.ss_item_sk = ws.ws_item_sk\nJOIN date_dim_d1 d1 ON ss.ss_sold_date_sk = d1.d_date_sk\nJOIN date_dim_d2 d2 ON ws.ws_sold_date_sk = d2.d_date_sk\nJOIN customer c ON ss.ss_customer_sk = c.c_customer_sk AND ws.ws_bill_customer_sk = c.c_customer_sk\nJOIN inventory inv ON inv.inv_item_sk = ss.ss_item_sk AND inv.inv_date_sk = ss.ss_sold_date_sk AND inv.inv_warehouse_sk = ws.ws_warehouse_sk\nJOIN store s ON s.s_state = s.s_state\nJOIN warehouse w ON ws.ws_warehouse_sk = w.w_warehouse_sk\nJOIN item i ON ss.ss_item_sk = i.i_item_sk\nJOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk\nJOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk\nJOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nWHERE d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30 day')\n  AND inv.inv_quantity_on_hand >= ss.ss_quantity\n  AND i.i_category IN ('Children', 'Jewelry', 'Men')\n  AND i.i_manager_id IN (21, 22, 38, 39, 46, 47, 66, 67, 74, 93)\n  AND ca.ca_state IN ('AZ', 'KS', 'OH', 'TX', 'WA')\n  AND s.s_state = w.w_state\nGROUP BY cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, hd.hd_vehicle_count\nORDER BY cnt"
+        },
+        {
+          "node_id": "preagg_store_sales",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales"],
+          "outputs": ["ss_item_sk", "ss_sold_date_sk", "ss_customer_sk", "ss_quantity", "ss_count"],
+          "changed": true,
+          "sql": "SELECT ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity, COUNT(*) AS ss_count FROM store_sales GROUP BY ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity"
+        },
+        {
+          "node_id": "preagg_web_sales",
+          "parent_node_id": "final_select",
+          "sources": ["web_sales"],
+          "outputs": ["ws_item_sk", "ws_sold_date_sk", "ws_bill_customer_sk", "ws_warehouse_sk", "ws_wholesale_cost", "ws_count"],
+          "changed": true,
+          "sql": "SELECT ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_warehouse_sk, ws_wholesale_cost, COUNT(*) AS ws_count FROM web_sales WHERE ws_wholesale_cost BETWEEN 35 AND 55 GROUP BY ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_warehouse_sk, ws_wholesale_cost"
+        },
+        {
+          "node_id": "date_dim_d1",
+          "parent_node_id": "final_select",
+          "sources": ["date_dim"],
+          "outputs": ["d_date_sk", "d_date", "d_year"],
+          "changed": true,
+          "sql": "SELECT d_date_sk, d_date, d_year FROM date_dim WHERE d_year = 2001"
+        },
+        {
+          "node_id": "date_dim_d2",
+          "parent_node_id": "final_select",
+          "sources": ["date_dim"],
+          "outputs": ["d_date_sk", "d_date"],
+          "changed": true,
+          "sql": "SELECT d_date_sk, d_date FROM date_dim"
+        }
+      ]
+    }
+  }
+]

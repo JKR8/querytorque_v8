@@ -1,0 +1,253 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Complex OR conditions on dimension filters are applied as join filters after large fact table scans, preventing early micro-partition pruning. Decomposing OR into UNION ALL branches may enable partition-level filtering. Additionally, aggregation pushdown can reduce row volume before expensive joins, and date filter pushdown may prune fact scans.",
+    "reasoning_trace": [
+      "WEB_SALES scan is the largest I/O contributor with 460GB scanned, and OR conditions on ws_sales_price and ws_net_profit are evaluated in join nodes after the scan.",
+      "WEB_RETURNS scan is significant with 39GB scanned, and filters are applied late via joins.",
+      "Nested aggregates indicate high input volume from joins before aggregation, suggesting pushdown opportunities.",
+      "Date filter d_year=2002 is selective but may not push range to fact scans effectively due to join structure."
+    ],
+    "cost_spine": ["TableScan (WEB_SALES)", "InnerJoin with OR filter [1.17]", "InnerJoin with OR filter [1.11]", "Aggregate [1.2]"],
+    "hotspots": [
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "largest I/O volume with late application of OR filters on ws_sales_price and ws_net_profit",
+        "evidence": "parts=27574/27579 bytes=460956759040"
+      },
+      {
+        "op": "InnerJoin [1.17]",
+        "why": "OR condition on cd1.cd_marital_status, cd1.cd_education_status, and ws_sales_price applied as join filter, potentially blocking early pruning",
+        "evidence": "joinFilter: ((CD1.CD_MARITAL_STATUS = 'S') AND ... OR ...)"
+      },
+      {
+        "op": "InnerJoin [1.11]",
+        "why": "OR condition on ca_state and ws_net_profit applied as join filter, delaying filtering on large scans",
+        "evidence": "joinFilter: ((CUSTOMER_ADDRESS.CA_STATE IN 'KY' ...) AND ... OR ...)"
+      },
+      {
+        "op": "Aggregate [1.2]",
+        "why": "processes large data after joins, with nested aggregates indicating high amplification",
+        "evidence": "multiple aggregate levels in plan"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS paths (none present)",
+      "avoid unfiltered large CTEs",
+      "do not wrap partition keys in functions that hinder micro-partition pruning"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Decompose the OR condition on cd1.cd_marital_status, cd1.cd_education_status, and ws_sales_price into separate UNION ALL branches, each with focused predicates for 'S'/'Primary'/100-150, 'M'/'Secondary'/50-100, and 'U'/'2 yr Degree'/150-200.",
+      "dag_target_hint": "Replace the joinFilter in node [1.17] with a UNION ALL of pre-filtered branches from web_sales and customer_demographics.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2", "web_sales"],
+        "where_must_preserve": ["cd1.cd_demo_sk = wr_refunded_cdemo_sk", "cd2.cd_demo_sk = wr_returning_cdemo_sk", "ws_item_sk = wr_item_sk", "ws_order_number = wr_order_number"],
+        "output_must_preserve": ["all columns needed for downstream joins and aggregates, with same multiplicity"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.8,
+      "expected_explain_delta": "OR condition replaced with UNION ALL, allowing partition pruning on each branch and reducing web_sales scan volume.",
+      "recommended_patch_ops": ["split_or_to_union", "add_cte_for_branches", "adjust_join_conditions"],
+      "recommended_examples": ["intersect_to_exists"],
+      "rank_rationale": "Targets primary hotspot by enabling early filtering on web_sales via decomposed OR, highest expected impact.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Decompose the OR condition on ca_state and ws_net_profit into separate UNION ALL branches for state groups (KY/NC/SD with profit 100-200, AR/GA/IN with 150-300, KS/OH/VA with 50-250).",
+      "dag_target_hint": "Replace the joinFilter in node [1.11] with a UNION ALL of pre-filtered branches from web_sales and customer_address.",
+      "node_contract": {
+        "from_must_include": ["customer_address", "web_sales"],
+        "where_must_preserve": ["ca_address_sk = wr_refunded_addr_sk", "ca_country = 'United States'"],
+        "output_must_preserve": ["all columns needed for downstream joins and aggregates, with same multiplicity"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.8,
+      "expected_explain_delta": "OR condition replaced with UNION ALL, enabling partition pruning on each branch and reducing scan pressure on web_sales and customer_address.",
+      "recommended_patch_ops": ["split_or_to_union", "add_cte_for_branches", "adjust_join_conditions"],
+      "recommended_examples": ["intersect_to_exists"],
+      "rank_rationale": "Targets secondary hotspot with similar high impact on web_sales filtering, complementing p01.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk range derived from d_year=2002 into web_sales scan by adding WHERE ws_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_year=2002) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_year=2002).",
+      "dag_target_hint": "Modify the TableScan (WEB_SALES) node to include the date_sk range predicate for micro-partition pruning.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "web_sales"],
+        "where_must_preserve": ["ws_sold_date_sk = d_date_sk", "d_year = 2002"],
+        "output_must_preserve": ["same join results and row counts"]
+      },
+      "gates_checked": ["date_filter_present:PASS", "scan_pressure:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.7,
+      "expected_explain_delta": "Reduced partitions scanned in web_sales due to pushed date range, lowering I/O volume.",
+      "recommended_patch_ops": ["add_predicate_to_scan", "compute_date_range_cte"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Addresses date filter pushdown gap on primary fact table, with moderate confidence based on selective filter.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate web_sales and web_returns by join keys (e.g., ws_web_page_sk, wr_reason_sk) into CTEs before joining with dimension tables, computing partial sums and counts for AVG.",
+      "dag_target_hint": "Insert CTEs that aggregate ws_quantity, wr_refunded_cash, wr_fee with COUNTs, and replace the base FROM clause with joins to these CTEs.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns"],
+        "where_must_preserve": ["join conditions and all filters", "aggregate semantics for AVG with preserved counts"],
+        "output_must_preserve": ["grouping key compatibility with final projection, exact row counts for averages"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:AVG preserved with counts"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.7,
+      "expected_explain_delta": "Smaller row sets flowing into joins and higher-level aggregates, reducing compute and memory pressure.",
+      "recommended_patch_ops": ["insert_cte_for_agg", "replace_from", "preserve_avg_counts"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Targets aggregate hotspot by reducing data volume before expensive joins, high expected impact.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter dimension tables (date_dim, customer_demographics cd1/cd2, customer_address, reason) into separate CTEs returning only surrogate keys, then join with fact tables.",
+      "dag_target_hint": "Extract dimension filters into CTEs and modify the FROM clause to join these CTEs instead of base tables.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer_demographics cd1", "customer_demographics cd2", "customer_address", "reason"],
+        "where_must_preserve": ["all dimension filters (e.g., d_year=2002, cd1.cd_marital_status IN...)", "join key relationships"],
+        "output_must_preserve": ["surrogate keys for joins, no additional rows"]
+      },
+      "gates_checked": ["dimension_small:PASS", "portability_candidate:CAUTION", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-materializing small dimension filters may create tiny hash tables for faster joins, even though dimensions are already pruned, potentially improving join efficiency.",
+      "confidence": 0.5,
+      "expected_explain_delta": "Dimension scans replaced with CTE reads, potentially reducing join work and improving cardinality estimates.",
+      "recommended_patch_ops": ["insert_cte_for_dim", "replace_join_with_cte"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration targeting secondary dimension joins, low risk with potential join speedup.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize filtered web_sales and web_returns as CTEs with all applicable filters applied, then join these CTEs with dimensions to avoid rescanning.",
+      "dag_target_hint": "Create CTEs for web_sales and web_returns that include filters from OR conditions and date range, then use them in main FROM.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns"],
+        "where_must_preserve": ["all filters on these tables", "join conditions"],
+        "output_must_preserve": ["columns for downstream processing, same row set"]
+      },
+      "gates_checked": ["no_repeated_scans:PASS", "portability_candidate:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing fact tables with filters may provide fixed intermediate results that help the optimizer, especially with complex OR conditions.",
+      "confidence": 0.4,
+      "expected_explain_delta": "Fact scans materialized once, potentially reducing repeated filter evaluation and improving plan stability.",
+      "recommended_patch_ops": ["insert_cte_for_fact", "replace_scan_with_cte"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration for family E, targeting fact table materialization with low confidence due to no repeated scans.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit joins in FROM clause to explicit INNER JOIN syntax and consider reordering joins based on selectivity of dimension filters.",
+      "dag_target_hint": "Rewrite the FROM clause to use explicit JOIN ... ON syntax and potentially reorder joins to start with most selective dimensions.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns", "date_dim", "customer_demographics cd1", "customer_demographics cd2", "customer_address", "reason", "web_page"],
+        "where_must_preserve": ["all join conditions and filters", "final result set"],
+        "output_must_preserve": ["same rows and columns as original"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS", "portability_candidate:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax might provide better hints to Snowflake's cost-based optimizer for join ordering, especially with selective dimension filters.",
+      "confidence": 0.5,
+      "expected_explain_delta": "Potential change in join order or join type, leading to reduced intermediate row sets.",
+      "recommended_patch_ops": ["convert_to_explicit_joins", "reorder_joins_based_selectivity"],
+      "recommended_examples": ["inner_join_conversion"],
+      "rank_rationale": "Exploration for family F, testing join topology sensitivity with moderate confidence.",
+      "gold_example_id": "inner_join_conversion"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "As an exploratory probe, consider if any implicit correlation exists in filter logic and decorrelate by pre-computing key sets, though no explicit correlated subqueries are present.",
+      "dag_target_hint": "Inspect filter dependencies and create CTEs for any potential correlated patterns, such as thresholds based on aggregates.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns"],
+        "where_must_preserve": ["all filters and join conditions"],
+        "output_must_preserve": ["same result semantics"]
+      },
+      "gates_checked": ["no_correlated_subquery:WARN", "portability_candidate:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Even without explicit subqueries, filter dependencies might benefit from decorrelation to avoid per-row evaluation, though evidence is weak.",
+      "confidence": 0.3,
+      "expected_explain_delta": "Minimal change; if correlation is found, reduced repeated computation.",
+      "recommended_patch_ops": ["analyze_filter_deps", "create_threshold_cte_if_needed"],
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "rank_rationale": "Exploration for underrepresented family B, very low confidence due to lack of evidence, included for diversity.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in the query; only OR conditions present."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries detected in the SQL; transform requires correlation evidence."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Engine-specific to PostgreSQL and no self-join patterns with different filters in this query."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Date filter is single range (d_year=2002), not multiple ranges; no TABLE_REPEAT_3+ pattern."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "No repeated scans of the same fact table for different channels; single scan patterns observed."
+    }
+  ]
+}

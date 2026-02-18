@@ -15,11 +15,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
-class OptimizationMode(str, Enum):
-    """Optimization mode selection."""
-    BEAM = "beam"           # Automated search: analyst → N workers → validate → snipe
-
-
 class ValidationStatus(str, Enum):
     PASS = "pass"
     FAIL = "fail"

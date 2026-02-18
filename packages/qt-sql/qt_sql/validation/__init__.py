@@ -1,29 +1,9 @@
 """SQL Validation module for QueryTorque SQL.
 
-This module provides tools for validating that optimized SQL queries
-produce equivalent results to the original queries.
-
-Key components:
-- SQLValidator: Main orchestrator for validation pipeline
-- ValidationResult: Complete validation output with all metrics
-- ValidationMode: SAMPLE (signal) or FULL (confidence)
+Kept components:
 - EquivalenceChecker: Row count, checksum, and value comparison
-- QueryBenchmarker: 1-1-2-2 benchmarking pattern
-- QueryNormalizer: LIMIT/ORDER BY handling
-
-Example usage:
-    from qt_sql.validation import SQLValidator, ValidationMode
-
-    with SQLValidator(
-        database="tpcds_sf100.duckdb",
-        mode=ValidationMode.FULL,
-    ) as validator:
-        result = validator.validate(original_sql, optimized_sql)
-
-        if result.status == "pass":
-            print(f"Validation passed! Speedup: {result.speedup:.2f}x")
-        else:
-            print(f"Validation failed: {result.errors}")
+- SQLDiffer: SQL diff utilities for retry prompt enrichment
+- schemas: Validation result types
 """
 
 from .schemas import (
@@ -42,35 +22,11 @@ from .equivalence_checker import (
     RowCountResult,
     ValueComparisonResult,
 )
-from .query_normalizer import (
-    NormalizationResult,
-    QueryNormalizer,
-)
-from .benchmarker import (
-    BenchmarkResult,
-    QueryBenchmarker,
-)
-from .sql_validator import (
-    SQLValidator,
-    validate_sql_files,
-)
-from .mini_validator import (
-    MiniValidator,
-)
-from .synthetic_validator import (
-    SyntheticValidator,
-)
 from .sql_differ import (
     SQLDiffer,
 )
-from .witness_generator import (
-    MultiRowWitnessGenerator,
-)
 
 __all__ = [
-    # Main validator
-    "SQLValidator",
-    "validate_sql_files",
     # Schemas
     "ValidationMode",
     "ValidationStatus",
@@ -85,15 +41,6 @@ __all__ = [
     "ChecksumResult",
     "RowCountResult",
     "ValueComparisonResult",
-    # Normalizer
-    "QueryNormalizer",
-    "NormalizationResult",
-    # Benchmarker
-    "QueryBenchmarker",
-    "BenchmarkResult",
-    # Semantic validation
-    "MiniValidator",
-    "SyntheticValidator",
+    # SQL differ
     "SQLDiffer",
-    "MultiRowWitnessGenerator",
 ]

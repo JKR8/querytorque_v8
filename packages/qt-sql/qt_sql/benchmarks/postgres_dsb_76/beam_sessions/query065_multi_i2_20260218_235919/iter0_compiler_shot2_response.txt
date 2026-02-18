@@ -1,0 +1,108 @@
+[
+  {
+    "plan_id": "compile_p1",
+    "dialect": "postgres",
+    "confidence": 0.85,
+    "based_on": "p01,p02",
+    "strategy": "Consolidate duplicate store_sales-date_dim scans into a single CTE, then compute store-level average and store-item revenue from it, using explicit JOINs.",
+    "hypothesis": "Probe p01 (self-join decomposition) failed with syntax error but its core idea is sound: compute the common store-item revenue once. Probe p02 (single-pass aggregation) also aimed at the same hotspot. This rewrite eliminates the duplicate nested-loop scans visible in the original plan (two ~2.4s scans).",
+    "expected_explain_delta": "Eliminate one of the two identical Nested Loop → Aggregate subplans; reduce Merge Join input from two separate aggregates to a single source.",
+    "target_ir": "Add store_item_revenue CTE; derive sb and sc from it; convert comma joins to explicit INNER JOINs.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["store", "item", "sb", "sc"],
+          "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+          "changed": true,
+          "sql": "SELECT s.s_store_name, i.i_item_desc, sc.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM store s JOIN sc ON s.s_store_sk = sc.ss_store_sk JOIN item i ON i.i_item_sk = sc.ss_item_sk JOIN sb ON sc.ss_store_sk = sb.ss_store_sk WHERE sc.revenue <= 0.1 * sb.ave AND i.i_manager_id BETWEEN 10 AND 14 AND s.s_state IN ('KS','OH','SD') ORDER BY s.s_store_name, i.i_item_desc LIMIT 100"
+        },
+        {
+          "node_id": "store",
+          "parent_node_id": "final_select",
+          "sources": [],
+          "outputs": ["s_store_sk", "s_store_name", "s_state"],
+          "changed": false
+        },
+        {
+          "node_id": "item",
+          "parent_node_id": "final_select",
+          "sources": [],
+          "outputs": ["i_item_sk", "i_item_desc", "i_current_price", "i_wholesale_cost", "i_brand", "i_manager_id"],
+          "changed": false
+        },
+        {
+          "node_id": "sb",
+          "parent_node_id": "final_select",
+          "sources": ["store_item_revenue"],
+          "outputs": ["ss_store_sk", "ave"],
+          "changed": true,
+          "sql": "SELECT ss_store_sk, AVG(revenue) AS ave FROM store_item_revenue GROUP BY ss_store_sk"
+        },
+        {
+          "node_id": "sc",
+          "parent_node_id": "final_select",
+          "sources": ["store_item_revenue"],
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+          "changed": true,
+          "sql": "SELECT ss_store_sk, ss_item_sk, revenue FROM store_item_revenue"
+        },
+        {
+          "node_id": "store_item_revenue",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales", "date_dim"],
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+          "changed": true,
+          "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_month_seq BETWEEN 1215 AND 1215+11 AND ss_sales_price / ss_list_price BETWEEN 79 * 0.01 AND 89 * 0.01 GROUP BY ss_store_sk, ss_item_sk"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_p2",
+    "dialect": "postgres",
+    "confidence": 0.8,
+    "based_on": "p02",
+    "strategy": "Compute store-item revenue and store-level average in a single scan using a window function, then filter directly without a self-join.",
+    "hypothesis": "Probe p02 attempted a single-pass aggregation via GROUPING SETS; this version uses a window function to compute the per-store average and avoids the join between sb and sc, further simplifying the plan.",
+    "expected_explain_delta": "Replace the two separate aggregates and their Merge Join with a single aggregate and a window function, then filter directly.",
+    "target_ir": "Replace sb and sc with a single CTE that includes revenue and store average via window function; join directly to store and item.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["store", "item", "store_item_revenue_window"],
+          "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+          "changed": true,
+          "sql": "SELECT s.s_store_name, i.i_item_desc, sir.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM store s JOIN store_item_revenue_window sir ON s.s_store_sk = sir.ss_store_sk JOIN item i ON i.i_item_sk = sir.ss_item_sk WHERE sir.revenue <= 0.1 * sir.ave AND i.i_manager_id BETWEEN 10 AND 14 AND s.s_state IN ('KS','OH','SD') ORDER BY s.s_store_name, i.i_item_desc LIMIT 100"
+        },
+        {
+          "node_id": "store",
+          "parent_node_id": "final_select",
+          "sources": [],
+          "outputs": ["s_store_sk", "s_store_name", "s_state"],
+          "changed": false
+        },
+        {
+          "node_id": "item",
+          "parent_node_id": "final_select",
+          "sources": [],
+          "outputs": ["i_item_sk", "i_item_desc", "i_current_price", "i_wholesale_cost", "i_brand", "i_manager_id"],
+          "changed": false
+        },
+        {
+          "node_id": "store_item_revenue_window",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales", "date_dim"],
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue", "ave"],
+          "changed": true,
+          "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue, AVG(SUM(ss_sales_price)) OVER (PARTITION BY ss_store_sk) AS ave FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_month_seq BETWEEN 1215 AND 1215+11 AND ss_sales_price / ss_list_price BETWEEN 79 * 0.01 AND 89 * 0.01 GROUP BY ss_store_sk, ss_item_sk"
+        }
+      ]
+    }
+  }
+]

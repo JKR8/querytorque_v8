@@ -384,51 +384,47 @@ Corrective action:
 Everything below is probe-specific input.
 
 ## Shared Analyst Hypothesis
-The plan shows two large fact-table scans (WEB_SALES 460GB, WEB_RETURNS 39GB) without pushed date_sk filter from date_dim (d_year=2002), causing full partition scans. OR conditions on customer_demographics and customer_address are applied as late join filters, preventing efficient join planning and predicate pushdown.
+Complex OR conditions on dimension filters are applied as join filters after large fact table scans, preventing early micro-partition pruning. Decomposing OR into UNION ALL branches may enable partition-level filtering. Additionally, aggregation pushdown can reduce row volume before expensive joins, and date filter pushdown may prune fact scans.
 ## Runtime Dialect Contract
 - target_dialect: snowflake
 - runtime_dialect_is_source_of_truth: true
 - if static examples conflict, follow runtime dialect behavior
 ## Probe Assignment
-- transform_id: prefetch_fact_join
-- family: A
-- target: Build staged CTE chain: filter dimensions first, join with fact tables progressively, reducing fact rows before later joins.
+- transform_id: materialize_cte
+- family: E
+- target: Materialize filtered web_sales and web_returns as CTEs with all applicable filters applied, then join these CTEs with dimensions to avoid rescanning.
 - phase: ?
 - exploration: yes
 - worker_lane: scout
 - dialect: snowflake
-- recommended_patch_ops: `insert_cte`, `replace_from`
-- expected_explain_delta: Fewer rows in intermediate joins; earlier aggregation opportunities.
+- recommended_patch_ops: `insert_cte_for_fact`, `replace_scan_with_cte`
+- expected_explain_delta: Fact scans materialized once, potentially reducing repeated filter evaluation and improving plan stability.
 - equivalence_tier: unordered
-- exploration_hypothesis: Staged reduction may improve join order and reduce intermediate row counts.
+- exploration_hypothesis: Materializing fact tables with filters may provide fixed intermediate results that help the optimizer, especially with complex OR conditions.
 - existing_ctes: (none)
 
 ### Gates Checked
-no_unfiltered_large_cte:PASS (CTEs are filtered); cross_cte_predicate_blindness:CAUTION (portability candidate)
+no_repeated_scans:PASS; portability_candidate:CAUTION
 
 ### Analyst Do-Not-Do
-- do not wrap date_sk or filter columns in functions that break micro‑partition pruning
-- do not materialize EXISTS/NOT EXISTS patterns (none present)
-- do not introduce unfiltered large CTEs
-- avoid same‑column OR to UNION ALL unless evidence shows OR blocks pruning
+- avoid materializing EXISTS paths (none present)
+- avoid unfiltered large CTEs
+- do not wrap partition keys in functions that hinder micro-partition pruning
 
 ### Node Contract
 
 ```json
 {
   "from_must_include": [
-    "date_dim d",
-    "customer_demographics cd1",
-    "customer_demographics cd2",
-    "customer_address ca",
-    "web_sales ws",
-    "web_returns wr"
+    "web_sales",
+    "web_returns"
   ],
   "where_must_preserve": [
-    "All original filter and join predicates"
+    "all filters on these tables",
+    "join conditions"
   ],
   "output_must_preserve": [
-    "All original columns and aggregates"
+    "columns for downstream processing, same row set"
   ]
 }
 ```
@@ -592,10 +588,10 @@ root_node_id: final_select
 ```
 
 ### Analyst Reasoning Trace
-- WEB_SALES scan reads 27574 parts (460GB) without date_sk filter; WEB_RETURNS scan reads 2289 parts (39GB) without date_sk filter.
-- Date_dim filter (d_year=2002) applied at node 1.14 but not pushed into fact scans, indicating predicate transitivity failure.
-- OR conditions on customer_demographics/ws_sales_price and customer_address/ws_net_profit appear as join filters (nodes 1.17, 1.11), applied after join materialization.
-- Aggregation occurs in multiple stages; final group by r_reason_desc suggests early aggregation pushdown may reduce join volume.
+- WEB_SALES scan is the largest I/O contributor with 460GB scanned, and OR conditions on ws_sales_price and ws_net_profit are evaluated in join nodes after the scan.
+- WEB_RETURNS scan is significant with 39GB scanned, and filters are applied late via joins.
+- Nested aggregates indicate high input volume from joins before aggregation, suggesting pushdown opportunities.
+- Date filter d_year=2002 is selective but may not push range to fact scans effectively due to join structure.
 
 ### Engine-Specific Knowledge
 ## Dialect Intelligence (SNOWFLAKE)
@@ -711,19 +707,10 @@ Use numbered pattern blocks below as independent decision scopes; evaluate each 
 - Consider promoting this pattern into the Snowflake engine profile to keep profile and playbook fully aligned.
 
 ### Transform Recipe
-- `transform_id`: `prefetch_fact_join`
-- `family`: `A`
-- `principle`: Staged Join Pipeline: build a CTE chain that progressively reduces data — first CTE filters the dimension, second CTE pre-joins filtered dimension keys with the fact table, subsequent CTEs join remaining dimensions against the already-reduced fact set.
-- `expected_features`: `AGG_SUM`, `DATE_DIM`, `GROUP_BY`, `STAR_JOIN`
-- `contraindications`: MAX_2_CHAINS: Max 2 cascading fact-table CTE chains — 3rd causes excessive materialization
-- `confirm_with_explain`: true
-
-### Gold TREE Pattern Reference
-- `plan_id`: `gold_snowflake_sf_inline_decorrelate`
-- `root_node_id`: `final_select`
-- `nodes`: `final_select`
-- `changed_nodes`: `final_select`
-- Reuse TREE shape and invariants, not literal table/column names.
+- `transform_id`: `materialize_cte`
+- `family`: `E`
+- `principle`: Shared Materialization: extract repeated subquery patterns into CTEs to avoid recomputation. When the same logical check appears multiple times, compute it once and reference the result.
+- `expected_features`: `AGG_COUNT`, `AGG_SUM`, `BETWEEN`, `CTE`, `DATE_DIM`
 
 
 ## Runtime Override: Scout Lane
@@ -753,10 +740,10 @@ First character must be `{` and output must contain no markdown/prose.
 ```json
 {
   "probe_id": "p06",
-  "transform_id": "prefetch_fact_join",
+  "transform_id": "materialize_cte",
   "gate": "execution_failure",
   "status": "FAIL",
-  "error": "Execution: 000904 (42000): 01c27c77-3205-67d8-0002-fcfe000218e2: SQL compilation error: error line 25 at position 34\ninvalid identifier 'R.R_REASON_DESC'"
+  "error": "Execution: 000904 (42000): 01c27e7d-3205-67d8-0002-fcfe0002be1a: SQL compilation error: error line 25 at position 34\ninvalid identifier 'R.R_REASON_DESC'"
 }
 ```
 

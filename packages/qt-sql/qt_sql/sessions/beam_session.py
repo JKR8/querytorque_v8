@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING, Callable, Tuple
 
 from .base_session import OptimizationSession
+from ._beam_phases import BeamContext
 from ..schemas import SessionResult
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ class AppliedPatch:
     output_sql: Optional[str] = None
     apply_error: Optional[str] = None
     semantic_passed: bool = False
+    correctness_verified: bool = False  # True only after row count + checksum match
     speedup: Optional[float] = None
     status: str = "PENDING"
     explain_text: Optional[str] = None
@@ -78,6 +80,9 @@ class PatchIterationResult:
     best_speedup: float = 0.0
     best_patch_id: Optional[str] = None
     best_sql: Optional[str] = None
+
+
+# BeamContext is imported from ._beam_phases (single authoritative definition)
 
 
 # ── Session Class ───────────────────────────────────────────────────────────
@@ -123,6 +128,7 @@ class BeamSession(OptimizationSession):
         self._session_dir: Optional[Path] = None
         self._pricing_per_1m = dict(self._DEFAULT_PRICING_PER_1M)
         self._load_pricing_overrides()
+        self._rbot_timeouts: Optional[set] = None  # lazy-loaded by _load_rbot_timeouts()
 
     def _load_pricing_overrides(self) -> None:
         """Load optional pricing overrides from environment JSON."""
@@ -147,6 +153,43 @@ class BeamSession(OptimizationSession):
             logger.warning(
                 f"[{self.query_id}] Invalid QT_LLM_PRICING_OVERRIDES_JSON: {e}"
             )
+
+    # ── R-Bot timeout skip ─────────────────────────────────────────────
+
+    def _load_rbot_timeouts(self) -> set:
+        """Load query IDs that R-Bot marked as TIMEOUT from row_counts.json.
+
+        Returns a set of query IDs (e.g. {"query001_multi_i1", ...}).
+        Falls back to empty set if file is missing.
+        """
+        if self._rbot_timeouts is not None:
+            return self._rbot_timeouts
+        self._rbot_timeouts = set()
+        try:
+            rc_path = (
+                self.pipeline.benchmark_dir
+                / "reports"
+                / "beam_sweep_20260216"
+                / "row_counts.json"
+            )
+            if rc_path.exists():
+                with open(rc_path) as f:
+                    data = json.load(f)
+                self._rbot_timeouts = {
+                    k for k, v in data.items() if v == "TIMEOUT"
+                }
+                if self._rbot_timeouts:
+                    logger.info(
+                        f"Loaded {len(self._rbot_timeouts)} R-Bot timeout queries"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to load R-Bot row_counts.json: {e}")
+            self._rbot_timeouts = set()
+        return self._rbot_timeouts
+
+    def _is_known_timeout(self) -> bool:
+        """Check if current query_id is a known R-Bot timeout."""
+        return self.query_id in self._load_rbot_timeouts()
 
     # ── Resume helpers ──────────────────────────────────────────────────
 
@@ -340,10 +383,18 @@ class BeamSession(OptimizationSession):
                 "api_call_costs": list(self._api_call_costs),
             }
 
-    def run(self) -> SessionResult:
-        """Execute BEAM optimization loop (single mode)."""
-        logger.info(f"[{self.query_id}] BEAM MODE: BEAM")
-        return self._run_beam()
+    def check_sqlglot_parse(self, patches: List["AppliedPatch"]) -> None:
+        """Gate 1: sqlglot parse. Marks unparseable patches FAIL."""
+        for p in patches:
+            if not p.output_sql:
+                continue
+            err = self._sqlglot_parse_error(p.output_sql)
+            if err:
+                p.semantic_passed = False
+                p.status = "FAIL"
+                p.apply_error = f"SQLGlot parse error: {err}"
+            else:
+                p.semantic_passed = True
 
     def run_editor_strike(self, transform_id: str = "") -> SessionResult:
         """Single-call strike path for editor mode.
@@ -443,11 +494,11 @@ class BeamSession(OptimizationSession):
             patch.apply_error = "Failed to parse/apply strike response"
 
         if output_sql:
-            if self.on_phase_change:
-                self.on_phase_change(phase="benchmark", iteration=0)
-            self._validate_and_benchmark_patches(
-                [patch], db_path, session_dir, 0
-            )
+            self.check_sqlglot_parse([patch])
+            if patch.semantic_passed:
+                if self.on_phase_change:
+                    self.on_phase_change(phase="benchmark", iteration=0)
+                self._benchmark_validated_patches([patch], db_path)
 
         explains = (
             {patch.patch_id: patch.explain_text}
@@ -561,7 +612,13 @@ class BeamSession(OptimizationSession):
 
         # Test-stub fallback: use direct explain when Pipeline helper is unavailable.
         from ..execution.database_utils import run_explain_analyze
-        return run_explain_analyze(db_path, self.original_sql)
+        if self.benchmark_sem:
+            self.benchmark_sem.acquire()
+        try:
+            return run_explain_analyze(db_path, self.original_sql)
+        finally:
+            if self.benchmark_sem:
+                self.benchmark_sem.release()
 
     def _beam_edit_mode(self) -> str:
         """Return BEAM edit representation mode."""
@@ -1341,120 +1398,6 @@ class BeamSession(OptimizationSession):
 
         return "semantic_violation"
 
-    def _validate_patches(
-        self,
-        patches: List[AppliedPatch],
-        db_path: str,
-    ) -> None:
-        """Validate patches in-place without benchmarking.
-
-        Modifies patches in-place: sets semantic_passed, status, apply_error.
-        """
-        from ..validation.mini_validator import MiniValidator
-        from ..execution.factory import create_executor_from_dsn
-        from ..validation.equivalence_checker import EquivalenceChecker
-
-        applied = [p for p in patches if p.output_sql]
-        if not applied:
-            return
-
-        # ── Tier-1 structural check ───────────────────────────────────
-        tier1 = MiniValidator(db_path=db_path, dialect=self.dialect, sample_pct=0)
-        for p in applied:
-            t1 = tier1._tier1_structural(self.original_sql, p.output_sql)
-            if not t1.get("passed", True):
-                errors = t1.get("errors", ["Structural check failed"])
-                p.semantic_passed = False
-                p.status = "FAIL"
-                p.apply_error = f"Tier-1: {'; '.join(errors)}"
-            else:
-                p.semantic_passed = True
-
-        # ── Synthetic semantic gate (optional) ────────────────────────
-        synth_passed = [p for p in applied if p.semantic_passed]
-        if self.pipeline.config.semantic_validation_enabled:
-            from ..validation.synthetic_validator import SyntheticValidator
-
-            if synth_passed:
-                try:
-                    synth = SyntheticValidator(reference_db=db_path, dialect=self.dialect)
-                except Exception as e:
-                    logger.warning(f"[{self.query_id}] Synthetic validator init failed: {e}")
-                    for p in synth_passed:
-                        p.semantic_passed = False
-                        p.status = "ERROR"
-                        p.apply_error = f"Synthetic semantic gate unavailable: {e}"
-                    synth_passed = []
-
-            for p in synth_passed:
-                try:
-                    synth_result = synth.validate_sql_pair(
-                        original_sql=self.original_sql,
-                        optimized_sql=p.output_sql or "",
-                        target_rows=100,
-                    )
-                except Exception as e:
-                    p.semantic_passed = False
-                    p.status = "ERROR"
-                    p.apply_error = f"Synthetic semantic check failed: {e}"
-                    continue
-
-                if not synth_result.get("match", False):
-                    p.semantic_passed = False
-                    p.status = "FAIL"
-                    reason = synth_result.get("reason") or "Synthetic semantic mismatch"
-                    p.apply_error = f"Synthetic semantic mismatch: {reason}"
-        else:
-            logger.info(f"[{self.query_id}] Synthetic validation disabled; using structural + equivalence gates")
-
-        # ── Full-dataset equivalence (after synthetic gate) ───────────
-        equiv_passed = [p for p in synth_passed if p.semantic_passed]
-        if equiv_passed:
-            checker = EquivalenceChecker()
-            try:
-                with create_executor_from_dsn(db_path) as executor:
-                    orig_result = executor.execute(self.original_sql)
-                    orig_rows = orig_result if isinstance(orig_result, list) else []
-                    orig_count = len(orig_rows)
-                    orig_checksum = None
-                    if orig_rows:
-                        try:
-                            orig_checksum = checker.compute_checksum(orig_rows)
-                        except Exception:
-                            pass
-
-                    for p in equiv_passed:
-                        try:
-                            patch_result = executor.execute(p.output_sql)
-                            patch_rows = patch_result if isinstance(patch_result, list) else []
-                            patch_count = len(patch_rows)
-
-                            if patch_count != orig_count:
-                                p.semantic_passed = False
-                                p.status = "FAIL"
-                                p.apply_error = f"Row count: orig={orig_count}, patch={patch_count}"
-                            elif orig_checksum and patch_rows:
-                                try:
-                                    pc = checker.compute_checksum(patch_rows)
-                                    if pc != orig_checksum:
-                                        p.semantic_passed = False
-                                        p.status = "FAIL"
-                                        p.apply_error = "Checksum mismatch"
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            p.semantic_passed = False
-                            p.status = "ERROR"
-                            p.apply_error = f"Execution: {e}"
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Equiv check failed: {e}")
-                # Do not allow structurally-valid patches to pass without
-                # full-dataset equivalence confirmation.
-                for p in equiv_passed:
-                    p.semantic_passed = False
-                    p.status = "ERROR"
-                    p.apply_error = f"Equivalence check unavailable: {e}"
-
     def _benchmark_validated_patches(
         self,
         patches: List[AppliedPatch],
@@ -1470,94 +1413,45 @@ class BeamSession(OptimizationSession):
         )
         sem_passed = [p for p in patches if p.output_sql and p.semantic_passed]
         if sem_passed:
-            bench_ctx = self.benchmark_lock if self.benchmark_lock else nullcontext()
-            with bench_ctx:
-                if benchmark_slots > 1 and len(sem_passed) > 1:
-                    self._parallel_benchmark(sem_passed, db_path, benchmark_slots)
-                else:
-                    self._sequential_benchmark(sem_passed, db_path)
+            if benchmark_slots > 1 and len(sem_passed) > 1:
+                self._parallel_benchmark(sem_passed, db_path, benchmark_slots)
+            else:
+                self._sequential_benchmark(sem_passed, db_path)
 
         # ── EXPLAIN collection (post-benchmark evidence) ──────────────
         for p in sem_passed:
             if p.output_sql:
+                if self.benchmark_sem:
+                    self.benchmark_sem.acquire()
                 try:
                     exp_data = run_explain_analyze(db_path, p.output_sql)
                     p.explain_text = self._render_explain_compact(exp_data, self.dialect)
                 except Exception as e:
                     logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
+                finally:
+                    if self.benchmark_sem:
+                        self.benchmark_sem.release()
 
-    def _validate_and_benchmark_patches(
-        self,
-        patches: List[AppliedPatch],
-        db_path: str,
-        session_dir: Path,
-        shot: int,
-        mode: str = "both",
-    ) -> None:
-        """Compatibility wrapper for legacy call sites."""
-        _ = session_dir
-        run_mode = str(mode or "both").strip().lower()
-        if run_mode in ("both", "validate"):
-            self._validate_patches(patches, db_path)
-        if run_mode in ("both", "benchmark") and shot >= 0:
-            self._benchmark_validated_patches(patches, db_path)
+    # ── BEAM Phase Methods (for wave mode) ──────────────────────────────
 
-    # ── BEAM Mode ─────────────────────────────────────────────────────────
-
-    def _run_beam(self, baseline_ms: Optional[float] = None) -> SessionResult:
-        """BEAM mode: worker probes + compiler with retry-gated shot2.
-
-        Pipeline:
-        1. Analyst (R1) → 4-12 independent transform probes
-        2. Workers (parallel) → execute probes
-        3. Validate + benchmark all probes
-        4. R1 Compiler shot1, then shot2 only for retryable syntax/error failures
-        """
+    def prepare_context(self, resume_session_dir: Optional[Path] = None) -> "BeamContext":
+        """Build BeamContext with all shared state for phase methods."""
         from ..ir import build_script_ir, render_ir_node_map, Dialect
-        from ..patches.beam_prompt_builder import (
-            load_gold_examples,
-            build_beam_compiler_prompt,
-            append_shot_results,
-            _load_engine_intelligence,
-        )
-        from ..patches.beam_prompts import (
-            build_beam_analyst_prompt,
-            build_beam_worker_prompt,
-            build_beam_worker_retry_prompt,
-            parse_analyst_response,
-            _load_gold_example_for_family,
-            _load_gold_example_by_id,
-        )
+        from ..patches.beam_prompt_builder import load_gold_examples, _load_engine_intelligence
 
-        target_speedup = self.target_speedup or getattr(
-            self.pipeline.config, "target_speedup", 10.0
-        )
+        target_speedup = self.target_speedup or getattr(self.pipeline.config, "target_speedup", 10.0)
         max_probes = getattr(self.pipeline.config, "wide_max_probes", 16)
-
-        logger.info(
-            f"[{self.query_id}] BeamSession BEAM: "
-            f"max {max_probes} probes, target {target_speedup:.1f}x"
-        )
-
-        # ── Setup ──────────────────────────────────────────────────────
-        db_path = (
-            self.pipeline.config.benchmark_dsn
-            or self.pipeline.config.db_path_or_dsn
-        )
+        db_path = self.pipeline.config.benchmark_dsn or self.pipeline.config.db_path_or_dsn
         dialect_upper = self.dialect.upper()
-        dialect_enum = (
-            Dialect[dialect_upper]
-            if dialect_upper in Dialect.__members__
-            else Dialect.POSTGRES
-        )
+        dialect_enum = Dialect[dialect_upper] if dialect_upper in Dialect.__members__ else Dialect.POSTGRES
 
-        if self.resume_dir and self.resume_dir.is_dir():
+        if resume_session_dir and resume_session_dir.is_dir():
+            session_dir = resume_session_dir
+        elif self.resume_dir and self.resume_dir.is_dir():
             session_dir = self.resume_dir
-            logger.info(
-                f"[{self.query_id}] Resuming from existing session: {session_dir}"
-            )
         else:
             session_dir = self._create_session_dir()
+
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
         beam_edit_mode = self._beam_edit_mode()
@@ -1565,243 +1459,132 @@ class BeamSession(OptimizationSession):
         base_tree = self._build_base_tree(self.original_sql)
         base_tree_prompt = self._render_tree_for_prompt(base_tree)
         beam_provider_override, beam_model_override = self._beam_llm_override()
-        logger.info(f"[{self.query_id}] BEAM edit mode: {beam_edit_mode}")
 
         explain_result = self._get_original_explain_cached(db_path)
-        original_explain = self._render_explain_compact(
-            explain_result, self.dialect
-        )
+        original_explain = self._render_explain_compact(explain_result, self.dialect)
         baseline_ms = None
         if isinstance(explain_result, dict):
             ems = explain_result.get("execution_time_ms")
             if isinstance(ems, (int, float)) and ems > 0:
                 baseline_ms = float(ems)
         importance_stars = self._compute_importance_stars(baseline_ms)
-        logger.info(
-            f"[{self.query_id}] Runtime importance: {'*' * importance_stars} "
-            f"(baseline={baseline_ms if baseline_ms is not None else 'unknown'}ms)"
-        )
         schema_context = self._build_schema_context(db_path)
-        if schema_context:
-            logger.info(f"[{self.query_id}] Schema context attached to beam prompts")
         engine_knowledge = _load_engine_intelligence(self.dialect) or ""
-        if engine_knowledge:
-            logger.info(f"[{self.query_id}] Engine knowledge attached to beam prompts")
-
         gold_examples = load_gold_examples(self.dialect)
         qerror_analysis = self._load_qerror_analysis()
         iteration_history = self._load_recent_beam_attempts(self.query_id)
-        total_api_calls = 0
 
-        # ── Intelligence Brief ────────────────────────────────────────
         intelligence_brief = ""
         try:
             from ..detection import detect_transforms, load_transforms
             from ..patches.pathology_classifier import build_intelligence_brief
-
             transforms_catalog = load_transforms()
-            detected = detect_transforms(
-                self.original_sql, transforms_catalog,
-                dialect=self.dialect,
-            )
+            detected = detect_transforms(self.original_sql, transforms_catalog, dialect=self.dialect)
             classification = self._load_cached_classification(self.query_id)
-            intelligence_brief = build_intelligence_brief(
-                detected,
-                classification,
-                runtime_dialect=self.dialect,
-            )
+            intelligence_brief = build_intelligence_brief(detected, classification, runtime_dialect=self.dialect)
         except Exception as e:
             logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
 
-        # ── Phase 1: Analyst → 8-16 probes ─────────────────────────
-        if self.on_phase_change:
-            self.on_phase_change(phase="analyst", iteration=0)
-
         analyst_call_fn = self._make_llm_call_fn(
-            provider_spec=beam_provider_override,
-            model_spec=beam_model_override,
+            provider_spec=beam_provider_override, model_spec=beam_model_override,
             enable_reasoning=self._enable_reasoning_mode(),
         )
+        worker_provider_override, worker_model_override = self._beam_worker_llm_override(
+            beam_provider_override or getattr(self.pipeline, "provider", None),
+            beam_model_override or getattr(self.pipeline, "model", None),
+        )
+        worker_call_fn = None
+        if worker_provider_override and worker_model_override:
+            worker_call_fn = self._make_llm_call_fn(
+                provider_spec=worker_provider_override, model_spec=worker_model_override,
+            )
+
+        base_worker_slots = max(0, int(getattr(self.pipeline.config, "beam_workers",
+            max(1, int(getattr(self.pipeline.config, "wide_worker_parallelism", 8) or 8))) or 0))
+        stars = max(1, min(3, int(importance_stars or 1)))
+        per_star_bonus = max(0, int(getattr(self.pipeline.config, "beam_workers_per_star_bonus", 0) or 0))
+        worker_slots = base_worker_slots + (per_star_bonus * stars)
+        launch_interval_s = self._beam_api_launch_interval_seconds()
+
+        return BeamContext(
+            session_dir=session_dir, db_path=db_path, script_ir=script_ir,
+            ir_node_map=ir_node_map, base_tree=base_tree, base_tree_prompt=base_tree_prompt,
+            tree_mode=tree_mode, original_explain=original_explain, baseline_ms=baseline_ms,
+            importance_stars=importance_stars, schema_context=schema_context,
+            engine_knowledge=engine_knowledge, gold_examples=gold_examples,
+            intelligence_brief=intelligence_brief, analyst_call_fn=analyst_call_fn,
+            worker_call_fn=worker_call_fn, worker_call_fn_by_patch_id={},
+            max_probes=max_probes, beam_provider_override=beam_provider_override,
+            beam_model_override=beam_model_override,
+            worker_provider_override=worker_provider_override,
+            worker_model_override=worker_model_override, dialect_enum=dialect_enum,
+            qerror_analysis=qerror_analysis, iteration_history=iteration_history,
+            target_speedup=target_speedup, worker_slots=worker_slots,
+            launch_interval_s=launch_interval_s,
+        )
+
+    def run_analyst_phase(self, ctx: "BeamContext") -> Tuple[Optional[Any], str, str, int]:
+        """Phase 1: Analyst LLM call. Returns (scout_result, response, prompt, api_calls)."""
+        from ..patches.beam_prompts import build_beam_analyst_prompt, parse_analyst_response
 
         analyst_prompt_base = build_beam_analyst_prompt(
-            query_id=self.query_id,
-            original_sql=self.original_sql,
-            explain_text=original_explain,
-            ir_node_map=ir_node_map,
-            current_tree_map=base_tree_prompt,
-            gold_examples=gold_examples,
-            dialect=self.dialect,
-            intelligence_brief=intelligence_brief,
-            importance_stars=importance_stars,
-            schema_context=schema_context,
-            engine_knowledge=engine_knowledge,
-            qerror_analysis=qerror_analysis,
-            iteration_history=iteration_history,
+            query_id=self.query_id, original_sql=self.original_sql,
+            explain_text=ctx.original_explain, ir_node_map=ctx.ir_node_map,
+            current_tree_map=ctx.base_tree_prompt, gold_examples=ctx.gold_examples,
+            dialect=self.dialect, intelligence_brief=ctx.intelligence_brief,
+            importance_stars=ctx.importance_stars, schema_context=ctx.schema_context,
+            engine_knowledge=ctx.engine_knowledge, qerror_analysis=ctx.qerror_analysis,
+            iteration_history=ctx.iteration_history,
         )
-
-        max_analyst_attempts = max(
-            1, int(getattr(self.pipeline.config, "analyst_max_attempts", 2) or 1)
-        )
+        max_analyst_attempts = max(1, int(getattr(self.pipeline.config, "analyst_max_attempts", 2) or 1))
         analyst_prompt = analyst_prompt_base
         analyst_response = ""
         scout_result = None
+        api_calls = 0
 
-        # ── Resume: try loading analyst response from disk ────────────
-        cached_analyst = self._try_load_cached(
-            session_dir, 0, "analyst_response"
-        )
+        cached_analyst = self._try_load_cached(ctx.session_dir, 0, "analyst_response")
         if cached_analyst:
             analyst_response = cached_analyst
             scout_result = parse_analyst_response(analyst_response)
 
         if not scout_result or not scout_result.probes:
-            # Normal path: call analyst LLM
             for attempt in range(1, max_analyst_attempts + 1):
                 if attempt > 1:
-                    analyst_prompt = (
-                        analyst_prompt_base
+                    analyst_prompt = (analyst_prompt_base
                         + "\n\n## Retry Requirements\n"
                         + "Your prior response was not parseable. Return ONLY valid JSON "
-                        + "with keys: dispatch, probes, dropped. No markdown fences."
-                    )
-                analyst_response = analyst_call_fn(analyst_prompt)
-                total_api_calls += 1
-                prompt_label = (
-                    "analyst_prompt"
-                    if attempt == 1
-                    else f"analyst_prompt_retry{attempt - 1}"
-                )
-                response_label = (
-                    "analyst_response"
-                    if attempt == 1
-                    else f"analyst_response_retry{attempt - 1}"
-                )
-                self._save_to_disk(session_dir, 0, prompt_label, analyst_prompt)
-                self._save_to_disk(session_dir, 0, response_label, analyst_response)
+                        + "with keys: dispatch, probes, dropped. No markdown fences.")
+                analyst_response = ctx.analyst_call_fn(analyst_prompt)
+                api_calls += 1
+                plabel = "analyst_prompt" if attempt == 1 else f"analyst_prompt_retry{attempt - 1}"
+                rlabel = "analyst_response" if attempt == 1 else f"analyst_response_retry{attempt - 1}"
+                self._save_to_disk(ctx.session_dir, 0, plabel, analyst_prompt)
+                self._save_to_disk(ctx.session_dir, 0, rlabel, analyst_response)
                 scout_result = parse_analyst_response(analyst_response)
                 if scout_result and scout_result.probes:
                     break
-                logger.warning(
-                    f"[{self.query_id}] Analyst parse failed (attempt "
-                    f"{attempt}/{max_analyst_attempts})"
-                )
+                logger.warning(f"[{self.query_id}] Analyst parse failed (attempt {attempt}/{max_analyst_attempts})")
 
-        if not scout_result or not scout_result.probes:
-            logger.warning(f"[{self.query_id}] Analyst returned no probes")
-            return SessionResult(
-                query_id=self.query_id,
-                mode="beam",
-                best_speedup=0.0,
-                best_sql=self.original_sql,
-                original_sql=self.original_sql,
-                status="ERROR",
-                n_api_calls=total_api_calls,
-                **self._session_cost_fields(),
-            )
+        return scout_result, analyst_response, analyst_prompt, api_calls
 
-        probes = sorted(
-            scout_result.probes,
-            key=lambda p: (
-                p.phase if p.phase is not None else 99,
-                -(p.confidence or 0.0),
-            ),
-        )[:max_probes]
-        logger.info(
-            f"[{self.query_id}] Analyst: {len(probes)} probes designed"
-        )
+    def run_workers_phase(self, ctx: "BeamContext", scout_result: Any) -> Tuple[List["AppliedPatch"], int]:
+        """Phase 2: Parallel worker LLM calls. Returns (patches, api_calls)."""
+        from ..patches.beam_prompts import build_beam_worker_prompt, _load_gold_example_for_family, _load_gold_example_by_id
 
-        # ── Phase 2: Workers (parallel) ────────────────────────────────
-        if self.on_phase_change:
-            self.on_phase_change(phase="workers", iteration=0)
+        probes = sorted(scout_result.probes,
+            key=lambda p: (p.phase if p.phase is not None else 99, -(p.confidence or 0.0)))[:ctx.max_probes]
+        worker_parallelism = max(1, int(getattr(self.pipeline.config, "wide_worker_parallelism", 8) or 8))
+        selected = self._select_coverage_probes(probes, min(ctx.worker_slots, len(probes)))
 
-        worker_provider_override, worker_model_override = self._beam_worker_llm_override(
-            beam_provider_override or getattr(self.pipeline, "provider", None),
-            beam_model_override or getattr(self.pipeline, "model", None),
-        )
+        lane_assignments = [(probe, "scout", ctx.worker_call_fn, str(ctx.worker_model_override or "")) for probe in selected]
+        if not lane_assignments:
+            return [], 0
 
         patches: List[AppliedPatch] = []
-        worker_call_fn_by_patch_id: Dict[str, Callable[[str], str]] = {}
-        worker_parallelism = max(
-            1,
-            int(getattr(self.pipeline.config, "wide_worker_parallelism", 8) or 8),
-        )
-
-        base_worker_slots = max(
-            0,
-            int(
-                getattr(
-                    self.pipeline.config,
-                    "beam_workers",
-                    worker_parallelism,
-                )
-                or 0
-            ),
-        )
-        stars = max(1, min(3, int(importance_stars or 1)))
-        per_star_bonus = max(
-            0,
-            int(
-                getattr(
-                    self.pipeline.config,
-                    "beam_workers_per_star_bonus",
-                    0,
-                )
-                or 0
-            ),
-        )
-        worker_slots = base_worker_slots + (per_star_bonus * stars)
-
-        logger.info(
-            f"[{self.query_id}] Worker budget: stars={stars}, "
-            f"base={base_worker_slots}, star_bonus={per_star_bonus} "
-            f"-> worker_slots={worker_slots}"
-        )
-        if worker_slots > 0 and (
-            not worker_provider_override or not worker_model_override
-        ):
-            raise RuntimeError(
-                f"[{self.query_id}] beam_workers={worker_slots} "
-                "requires worker lane provider/model (beam_worker_* or beam_llm_*)"
-            )
-
-        selected = self._select_coverage_probes(
-            probes,
-            min(worker_slots, len(probes)),
-        )
-
-        worker_call_fn: Optional[Callable[[str], str]] = None
-        if selected:
-            worker_call_fn = self._make_llm_call_fn(
-                provider_spec=worker_provider_override,
-                model_spec=worker_model_override,
-            )
-
-        lane_assignments: List[Tuple[Any, str, Callable[[str], str], str]] = []
-        for probe in selected:
-            lane_assignments.append(
-                (
-                    probe,
-                    "scout",
-                    worker_call_fn,  # type: ignore[arg-type]
-                    str(worker_model_override or ""),
-                )
-            )
-
-        if not lane_assignments:
-            raise RuntimeError(
-                f"[{self.query_id}] No worker lanes scheduled. "
-                "Set beam_workers > 0."
-            )
-
+        api_calls = 0
         n_workers = min(len(lane_assignments), worker_parallelism)
-        logger.info(
-            f"[{self.query_id}] Worker lanes: scout={len(selected)}, "
-            f"parallelism={n_workers} "
-            f"(cap={worker_parallelism}, probes={len(probes)})"
-        )
-
-        launch_interval_s = self._beam_api_launch_interval_seconds()
         _cached_probe_ids: set = set()
+
         with ThreadPoolExecutor(max_workers=max(1, n_workers)) as pool:
             futures = {}
             for idx, (probe, lane, lane_call_fn, lane_model) in enumerate(lane_assignments):
@@ -1811,100 +1594,57 @@ class BeamSession(OptimizationSession):
                     if gold_ex:
                         break
                 if not gold_ex and probe.gold_example_id:
-                    gold_ex = _load_gold_example_by_id(
-                        probe.gold_example_id, self.dialect
-                    )
+                    gold_ex = _load_gold_example_by_id(probe.gold_example_id, self.dialect)
                 if not gold_ex:
-                    gold_ex = _load_gold_example_for_family(
-                        probe.family, self.dialect
-                    )
-                gold_tree_example = None
-                if gold_ex:
-                    gold_tree_example = (
-                        gold_ex.get("tree_example")
-                        or gold_ex.get("tree")
-                    )
+                    gold_ex = _load_gold_example_for_family(probe.family, self.dialect)
+                gold_tree_example = gold_ex.get("tree_example") or gold_ex.get("tree") if gold_ex else None
 
                 worker_prompt = build_beam_worker_prompt(
-                    original_sql=self.original_sql,
-                    ir_node_map=ir_node_map,
-                    current_tree_map=base_tree_prompt,
-                    hypothesis=scout_result.hypothesis,
-                    probe=probe,
-                    gold_tree_example=gold_tree_example,
-                    explain_text=original_explain,
-                    dialect=self.dialect,
-                    schema_context=schema_context,
+                    original_sql=self.original_sql, ir_node_map=ctx.ir_node_map,
+                    current_tree_map=ctx.base_tree_prompt, hypothesis=scout_result.hypothesis,
+                    probe=probe, gold_tree_example=gold_tree_example, explain_text=ctx.original_explain,
+                    dialect=self.dialect, schema_context=ctx.schema_context,
                     equivalence_tier=scout_result.equivalence_tier,
-                    reasoning_trace=scout_result.reasoning_trace,
-                    qerror_analysis=qerror_analysis,
-                    engine_knowledge=engine_knowledge,
-                    do_not_do=scout_result.do_not_do,
+                    reasoning_trace=scout_result.reasoning_trace, qerror_analysis=ctx.qerror_analysis,
+                    engine_knowledge=ctx.engine_knowledge, do_not_do=scout_result.do_not_do,
                     worker_lane=lane,
                 )
-                worker_prompt = (
-                    worker_prompt
-                    + "\n\n"
-                    + self._worker_lane_suffix(lane)
-                )
-                if tree_mode:
-                    worker_prompt = (
-                        worker_prompt
-                        + "\n\n"
-                        + self._worker_tree_mode_suffix("")
-                    )
+                worker_prompt += "\n\n" + self._worker_lane_suffix(lane)
+                if ctx.tree_mode:
+                    worker_prompt += "\n\n" + self._worker_tree_mode_suffix("")
 
                 probe_id = str(getattr(probe, "probe_id", ""))
                 if probe_id:
-                    worker_call_fn_by_patch_id[probe_id] = lane_call_fn
+                    ctx.worker_call_fn_by_patch_id[probe_id] = lane_call_fn
 
-                # ── Resume: wrap LLM call to check disk first ─────────
-                def _worker_call_or_load(
-                    call_fn, prompt, pid=probe_id, sdir=session_dir
-                ):
+                def _worker_call_or_load(call_fn, prompt, pid=probe_id, sdir=ctx.session_dir):
                     cached = self._try_load_cached(sdir, 0, f"worker_{pid}_response")
                     if cached is not None:
                         _cached_probe_ids.add(pid)
                         return cached
                     return call_fn(prompt)
 
-                future = pool.submit(
-                    _worker_call_or_load, lane_call_fn, worker_prompt,
-                )
+                future = pool.submit(_worker_call_or_load, lane_call_fn, worker_prompt)
                 futures[future] = (probe, worker_prompt, lane, lane_model)
-                if launch_interval_s > 0 and idx < (len(lane_assignments) - 1):
-                    time.sleep(launch_interval_s)
+                if ctx.launch_interval_s > 0 and idx < (len(lane_assignments) - 1):
+                    time.sleep(ctx.launch_interval_s)
 
             for future in as_completed(futures):
                 probe, w_prompt, lane, lane_model = futures[future]
                 was_cached = probe.probe_id in _cached_probe_ids
                 if not was_cached:
-                    total_api_calls += 1
+                    api_calls += 1
                 try:
                     response = future.result()
-                    self._save_to_disk(
-                        session_dir, 0,
-                        f"worker_{probe.probe_id}_response", response,
-                    )
-                    dag_candidates = (
-                        self._extract_tree_candidates(response)
-                        if tree_mode
-                        else []
-                    )
+                    self._save_to_disk(ctx.session_dir, 0, f"worker_{probe.probe_id}_response", response)
+                    dag_candidates = self._extract_tree_candidates(response) if ctx.tree_mode else []
 
                     apply_err: Optional[str] = None
-                    if tree_mode:
-                        output_sql, apply_err = self._apply_tree_worker_response_with_error(
-                            response,
-                            base_tree or {},
-                        )
+                    if ctx.tree_mode:
+                        output_sql, apply_err = self._apply_tree_worker_response_with_error(response, ctx.base_tree or {})
                     else:
-                        output_sql = self._apply_worker_response_compat(
-                            response,
-                            script_ir,
-                            dialect_enum,
-                            tree_base=base_tree if tree_mode else None,
-                        )
+                        output_sql = self._apply_worker_response_compat(response, ctx.script_ir, ctx.dialect_enum,
+                            tree_base=ctx.base_tree if ctx.tree_mode else None)
                         if output_sql:
                             parse_err = self._sqlglot_parse_error(output_sql)
                             if parse_err:
@@ -1912,14 +1652,10 @@ class BeamSession(OptimizationSession):
                                 output_sql = None
 
                     patch = AppliedPatch(
-                        patch_id=probe.probe_id,
-                        family=probe.family,
-                        transform=probe.transform_id,
-                        relevance_score=probe.confidence,
-                        output_sql=output_sql,
-                        status="applied" if output_sql else "FAIL",
-                        worker_prompt=w_prompt,
-                        worker_response=response,
+                        patch_id=probe.probe_id, family=probe.family,
+                        transform=probe.transform_id, relevance_score=probe.confidence,
+                        output_sql=output_sql, status="applied" if output_sql else "FAIL",
+                        worker_prompt=w_prompt, worker_response=response,
                         worker_role=f"{lane}:{lane_model}",
                         description=f"[{lane}:{lane_model}] {probe.target}",
                         rank_rationale=probe.rank_rationale,
@@ -1928,430 +1664,195 @@ class BeamSession(OptimizationSession):
                     if not output_sql:
                         patch.apply_error = apply_err or "Failed to parse/apply worker output"
                     patches.append(patch)
-
-                    logger.info(
-                        f"[{self.query_id}] Worker {probe.probe_id} "
-                        f"({lane}/{lane_model}, {probe.transform_id}): "
-                        f"{'OK' if output_sql else 'FAIL'}"
-                    )
                 except Exception as e:
-                    logger.warning(
-                        f"[{self.query_id}] Worker {probe.probe_id} "
-                        f"({lane}/{lane_model}) error: {e}"
-                    )
+                    logger.warning(f"[{self.query_id}] Worker {probe.probe_id} ({lane}/{lane_model}) error: {e}")
                     patches.append(AppliedPatch(
-                        patch_id=probe.probe_id,
-                        family=probe.family,
-                        transform=probe.transform_id,
-                        relevance_score=probe.confidence,
-                        apply_error=str(e),
-                        status="ERROR",
+                        patch_id=probe.probe_id, family=probe.family,
+                        transform=probe.transform_id, relevance_score=probe.confidence,
+                        apply_error=str(e), status="ERROR",
                         worker_role=f"{lane}:{lane_model}",
                         description=f"[{lane}:{lane_model}] {probe.target}",
                         rank_rationale=probe.rank_rationale,
                     ))
 
-        applied = [p for p in patches if p.output_sql]
-        logger.info(
-            f"[{self.query_id}] Workers: {len(applied)}/{len(patches)} "
-            f"produced SQL"
-        )
+        return patches, api_calls
 
-        if not applied:
-            return SessionResult(
-                query_id=self.query_id,
-                mode="beam",
-                best_speedup=0.0,
-                best_sql=self.original_sql,
-                original_sql=self.original_sql,
-                status="NEUTRAL",
-                n_api_calls=total_api_calls,
-                **self._session_cost_fields(),
-            )
-
-        # ── Dedup identical SQL ────────────────────────────────────────
-        seen_sql: Dict[str, str] = {}
-        deduped = []
-        for p in applied:
-            norm = " ".join(p.output_sql.split())
-            if norm in seen_sql:
-                logger.info(
-                    f"[{self.query_id}] Dedup: {p.patch_id} = {seen_sql[norm]}"
-                )
-                p.status = "DEDUP"
-            else:
-                seen_sql[norm] = p.patch_id
-                deduped.append(p)
-        applied = deduped
-
-        # ── Phase 3a: Validate probes (no benchmarking yet) ───────────
-        self._validate_and_benchmark_patches(
-            applied,
-            db_path=db_path,
-            session_dir=session_dir,
-            shot=-1,
-            mode="validate",
-        )
-        retry_default_fn = worker_call_fn
-        retry_calls = self._retry_tier1_worker_failures(
-            patches=patches,
-            worker_call_fn=retry_default_fn,  # type: ignore[arg-type]
+    def run_retry_phase(self, ctx: "BeamContext", patches: List["AppliedPatch"],
+                        api_only: bool = False) -> int:
+        """Retry failed worker probes. Returns api_calls count."""
+        from ..patches.beam_prompts import build_beam_worker_retry_prompt
+        return self._retry_tier1_worker_failures(
+            patches=patches, worker_call_fn=ctx.worker_call_fn,
             build_retry_prompt_fn=build_beam_worker_retry_prompt,
-            script_ir=script_ir,
-            dialect_enum=dialect_enum,
-            db_path=db_path,
-            session_dir=session_dir,
-            shot=0,
-            tree_base=base_tree if tree_mode else None,
-            worker_call_fn_by_patch_id=worker_call_fn_by_patch_id,
-        )
-        total_api_calls += retry_calls
-
-        # Include any retry-recovered worker outputs (including prior parse/apply
-        # failures) in downstream semantic/benchmark stages.
-        post_retry_applied = [
-            p
-            for p in patches
-            if p.output_sql and str(p.status or "").strip().upper() != "DEDUP"
-        ]
-        if post_retry_applied:
-            seen_sql_post_retry: Dict[str, str] = {}
-            deduped_post_retry: List[AppliedPatch] = []
-            for p in post_retry_applied:
-                norm = " ".join((p.output_sql or "").split())
-                if norm in seen_sql_post_retry:
-                    p.status = "DEDUP"
-                else:
-                    seen_sql_post_retry[norm] = p.patch_id
-                    deduped_post_retry.append(p)
-            applied = deduped_post_retry
-        else:
-            applied = []
-
-        sem_passed = [p for p in applied if p.semantic_passed]
-        logger.info(
-            f"[{self.query_id}] Probe validation: "
-            f"{len(sem_passed)}/{len(applied)} passed"
-        )
-        if self.on_phase_change:
-            self.on_phase_change(phase="benchmark", iteration=0)
-        self._validate_and_benchmark_patches(
-            applied,
-            db_path=db_path,
-            session_dir=session_dir,
-            shot=0,
-            mode="benchmark",
+            script_ir=ctx.script_ir, dialect_enum=ctx.dialect_enum,
+            db_path=ctx.db_path, session_dir=ctx.session_dir, shot=0,
+            tree_base=ctx.base_tree if ctx.tree_mode else None,
+            worker_call_fn_by_patch_id=ctx.worker_call_fn_by_patch_id,
+            api_only=api_only,
         )
 
-        # ── Phase 4: R1 Compiler (shot2 only on retryable syntax/error) ─
+    def run_benchmark_patches(self, patches: List["AppliedPatch"], db_path: str,
+                              session_dir: Optional[Path] = None, shot: int = 0) -> None:
+        """Benchmark already-validated patches. Modifies in-place."""
+        self._benchmark_validated_patches(patches, db_path)
+
+    def run_compiler_phase(self, ctx: "BeamContext", patches: List["AppliedPatch"],
+                           scout_result: Any) -> Tuple[List["AppliedPatch"], int]:
+        """R1 Compiler shots. Returns (compiler_patches, api_calls)."""
+        from ..patches.beam_prompt_builder import build_beam_compiler_prompt, append_shot_results
+
         compiler_patches: List[AppliedPatch] = []
-        winners = [p for p in sem_passed if p.speedup and p.speedup >= 1.05]
-        retry_error_candidates = [
-            p for p in patches if self._is_compiler_retry_error_patch(p)
-        ]
+        api_calls = 0
+        retry_error_candidates = [p for p in patches if self._is_compiler_retry_error_patch(p)]
         has_retry_errors = bool(retry_error_candidates)
-        compiler_rounds = int(
-            getattr(self.pipeline.config, "compiler_rounds",
-                    getattr(self.pipeline.config, "snipe_rounds", 2)) or 0
+        compiler_rounds = int(getattr(self.pipeline.config, "compiler_rounds",
+            getattr(self.pipeline.config, "snipe_rounds", 2)) or 0)
+        if compiler_rounds <= 0:
+            return [], 0
+
+        strike_results = []
+        for p in patches:
+            raw = p.raw_plan if isinstance(p.raw_plan, dict) else {}
+            strike_results.append({
+                "probe_id": p.patch_id, "transform_id": p.transform, "family": p.family,
+                "status": p.status, "failure_category": self._categorize_probe_failure(p),
+                "speedup": p.speedup, "original_ms": p.original_ms, "patch_ms": p.patch_ms,
+                "error": p.apply_error, "explain_text": p.explain_text, "sql": p.output_sql,
+                "raw_plan": p.raw_plan,
+                "tree": raw.get("tree") if isinstance(raw.get("tree"), dict) else p.raw_plan,
+                "description": p.description or "", "failure_reason": raw.get("failure_reason", ""),
+                "partial_work": raw.get("partial_work", {}), "rank_rationale": p.rank_rationale or "",
+            })
+
+        compiler_shot1_prompt = build_beam_compiler_prompt(
+            query_id=self.query_id, original_sql=self.original_sql,
+            explain_text=ctx.original_explain, ir_node_map=ctx.ir_node_map,
+            all_5_examples=ctx.gold_examples, dialect=self.dialect,
+            intelligence_brief=ctx.intelligence_brief, strike_results=strike_results,
+            importance_stars=ctx.importance_stars, current_tree_map=ctx.base_tree_prompt,
+            schema_context=ctx.schema_context, engine_knowledge=ctx.engine_knowledge,
+            dispatch_hypothesis=scout_result.hypothesis,
+            dispatch_reasoning_trace=scout_result.reasoning_trace,
+            equivalence_tier=scout_result.equivalence_tier, qerror_analysis=ctx.qerror_analysis,
         )
+        if ctx.tree_mode:
+            compiler_shot1_prompt += "\n\n" + self._compiler_tree_mode_suffix(ctx.base_tree_prompt)
 
-        should_snipe = compiler_rounds > 0
-        if should_snipe:
-            if self.on_phase_change:
-                self.on_phase_change(phase="snipe", iteration=0)
+        cached_shot1 = self._try_load_cached(ctx.session_dir, 0, "compiler_shot1_response")
+        if cached_shot1:
+            compiler_shot1_response = cached_shot1
+        else:
+            self._save_to_disk(ctx.session_dir, 0, "compiler_shot1_prompt", compiler_shot1_prompt)
+            compiler_shot1_response = ctx.analyst_call_fn(compiler_shot1_prompt)
+            api_calls += 1
+            self._save_to_disk(ctx.session_dir, 0, "compiler_shot1_response", compiler_shot1_response)
 
-            logger.info(
-                f"[{self.query_id}] Phase 4: R1 compiler "
-                f"(winners={len(winners)}, sem_passed={len(sem_passed)}, "
-                f"retryable_errors={len(retry_error_candidates)})"
-            )
-
-            strike_results = []
-            for p in patches:
-                raw = p.raw_plan if isinstance(p.raw_plan, dict) else {}
-                strike_results.append({
-                    "probe_id": p.patch_id,
-                    "transform_id": p.transform,
-                    "family": p.family,
-                    "status": p.status,
-                    "failure_category": self._categorize_probe_failure(p),
-                    "speedup": p.speedup,
-                    "original_ms": p.original_ms,
-                    "patch_ms": p.patch_ms,
-                    "error": p.apply_error,
-                    "explain_text": p.explain_text,
-                    "sql": p.output_sql,
-                    "raw_plan": p.raw_plan,
-                    "tree": (
-                        raw.get("tree")
-                        if isinstance(raw.get("tree"), dict)
-                        else p.raw_plan
-                    ),
-                    "description": p.description or "",
-                    "failure_reason": raw.get("failure_reason", ""),
-                    "partial_work": raw.get("partial_work", {}),
-                    "rank_rationale": p.rank_rationale or "",
-                })
-
-            # Shot 1: BDA + intelligence → 2 PatchPlans
-            compiler_shot1_prompt = build_beam_compiler_prompt(
-                query_id=self.query_id,
-                original_sql=self.original_sql,
-                explain_text=original_explain,
-                ir_node_map=ir_node_map,
-                all_5_examples=gold_examples,
-                dialect=self.dialect,
-                intelligence_brief=intelligence_brief,
-                strike_results=strike_results,
-                importance_stars=importance_stars,
-                current_tree_map=base_tree_prompt,
-                schema_context=schema_context,
-                engine_knowledge=engine_knowledge,
-                dispatch_hypothesis=scout_result.hypothesis,
-                dispatch_reasoning_trace=scout_result.reasoning_trace,
-                equivalence_tier=scout_result.equivalence_tier,
-                qerror_analysis=qerror_analysis,
-            )
-            if tree_mode:
-                compiler_shot1_prompt = (
-                    compiler_shot1_prompt
-                    + "\n\n"
-                    + self._compiler_tree_mode_suffix(base_tree_prompt)
-                )
-
-            # ── Resume: check for cached compiler shot 1 ─────────
-            cached_shot1 = self._try_load_cached(
-                session_dir, 0, "compiler_shot1_response"
-            )
-            if cached_shot1:
-                compiler_shot1_response = cached_shot1
+        if ctx.tree_mode:
+            shot1_compiler = self._apply_tree_compiler_response(compiler_shot1_response, ctx.base_tree or {}, prefix="s1")
+        else:
+            shot1_compiler = self._apply_patchplan_array(compiler_shot1_response, ctx.script_ir, ctx.dialect_enum, prefix="s1")
+        if not shot1_compiler and self._is_compiler_tier0_shape_failure(compiler_shot1_response, tree_mode=ctx.tree_mode):
+            retry_p = self._build_compiler_tier0_retry_prompt(compiler_shot1_prompt, tree_mode=ctx.tree_mode)
+            self._save_to_disk(ctx.session_dir, 0, "compiler_shot1_retry_prompt", retry_p)
+            retry_r = ctx.analyst_call_fn(retry_p)
+            api_calls += 1
+            self._save_to_disk(ctx.session_dir, 0, "compiler_shot1_retry_response", retry_r)
+            if ctx.tree_mode:
+                shot1_compiler = self._apply_tree_compiler_response(retry_r, ctx.base_tree or {}, prefix="s1r")
             else:
-                self._save_to_disk(
-                    session_dir, 0, "compiler_shot1_prompt", compiler_shot1_prompt
-                )
-                compiler_shot1_response = analyst_call_fn(compiler_shot1_prompt)
-                total_api_calls += 1
-                self._save_to_disk(
-                    session_dir, 0, "compiler_shot1_response", compiler_shot1_response
-                )
+                shot1_compiler = self._apply_patchplan_array(retry_r, ctx.script_ir, ctx.dialect_enum, prefix="s1r")
+        compiler_patches.extend(shot1_compiler)
 
-            if tree_mode:
-                shot1_compiler = self._apply_tree_compiler_response(
-                    compiler_shot1_response, base_tree or {}, prefix="s1"
-                )
+        # Shot 2 (retry path only)
+        shot1_retry_errors = [p for p in shot1_compiler if self._is_compiler_retry_error_patch(p)]
+        should_run_shot2 = compiler_rounds > 1 and (has_retry_errors or bool(shot1_retry_errors))
+        if should_run_shot2:
+            if ctx.tree_mode:
+                s2_prompt = self._append_tree_shot_results(base_prompt=compiler_shot1_prompt, patches=shot1_compiler)
             else:
-                shot1_compiler = self._apply_patchplan_array(
-                    compiler_shot1_response, script_ir, dialect_enum, prefix="s1"
-                )
-            if not shot1_compiler and self._is_compiler_tier0_shape_failure(
-                compiler_shot1_response,
-                tree_mode=tree_mode,
-            ):
-                logger.warning(
-                    f"[{self.query_id}] Compiler shot 1 Tier-0 shape failure, retrying once"
-                )
-                compiler_shot1_retry_prompt = self._build_compiler_tier0_retry_prompt(
-                    compiler_shot1_prompt,
-                    tree_mode=tree_mode,
-                )
-                self._save_to_disk(
-                    session_dir, 0, "compiler_shot1_retry_prompt", compiler_shot1_retry_prompt
-                )
-                compiler_shot1_retry_response = analyst_call_fn(compiler_shot1_retry_prompt)
-                total_api_calls += 1
-                self._save_to_disk(
-                    session_dir, 0, "compiler_shot1_retry_response", compiler_shot1_retry_response
-                )
-                if tree_mode:
-                    shot1_compiler = self._apply_tree_compiler_response(
-                        compiler_shot1_retry_response, base_tree or {}, prefix="s1r"
-                    )
-                else:
-                    shot1_compiler = self._apply_patchplan_array(
-                        compiler_shot1_retry_response, script_ir, dialect_enum, prefix="s1r"
-                    )
-            logger.info(
-                f"[{self.query_id}] Compiler shot 1: {len(shot1_compiler)} patches"
-            )
+                s2_prompt = append_shot_results(base_prompt=compiler_shot1_prompt, patches=shot1_compiler,
+                    explains={p.patch_id: p.explain_text or "" for p in shot1_compiler})
 
-            compiler_patches.extend(shot1_compiler)
-
-            # Shot 2 is reserved for retry paths (syntax/parse/error), not for speed-only cases.
-            shot1_retry_errors = [
-                p for p in shot1_compiler if self._is_compiler_retry_error_patch(p)
-            ]
-            should_run_shot2 = compiler_rounds > 1 and (
-                has_retry_errors or bool(shot1_retry_errors)
-            )
-            if should_run_shot2:
-                if tree_mode:
-                    compiler_shot2_prompt = self._append_tree_shot_results(
-                        base_prompt=compiler_shot1_prompt,
-                        patches=shot1_compiler,
-                    )
-                else:
-                    compiler_shot2_prompt = append_shot_results(
-                        base_prompt=compiler_shot1_prompt,
-                        patches=shot1_compiler,
-                        explains={
-                            p.patch_id: p.explain_text or ""
-                            for p in shot1_compiler
-                        },
-                    )
-
-                # ── Resume: check for cached compiler shot 2 ─────
-                cached_shot2 = self._try_load_cached(
-                    session_dir, 0, "compiler_shot2_response"
-                )
-                if cached_shot2:
-                    compiler_shot2_response = cached_shot2
-                else:
-                    self._save_to_disk(
-                        session_dir, 0, "compiler_shot2_prompt", compiler_shot2_prompt
-                    )
-                    compiler_shot2_response = analyst_call_fn(compiler_shot2_prompt)
-                    total_api_calls += 1
-                    self._save_to_disk(
-                        session_dir, 0, "compiler_shot2_response", compiler_shot2_response
-                    )
-
-                if tree_mode:
-                    shot2_compiler = self._apply_tree_compiler_response(
-                        compiler_shot2_response, base_tree or {}, prefix="s2"
-                    )
-                else:
-                    shot2_compiler = self._apply_patchplan_array(
-                        compiler_shot2_response, script_ir, dialect_enum, prefix="s2"
-                    )
-                if not shot2_compiler and self._is_compiler_tier0_shape_failure(
-                    compiler_shot2_response,
-                    tree_mode=tree_mode,
-                ):
-                    logger.warning(
-                        f"[{self.query_id}] Compiler shot 2 Tier-0 shape failure, retrying once"
-                    )
-                    compiler_shot2_retry_prompt = self._build_compiler_tier0_retry_prompt(
-                        compiler_shot2_prompt,
-                        tree_mode=tree_mode,
-                    )
-                    self._save_to_disk(
-                        session_dir, 0, "compiler_shot2_retry_prompt", compiler_shot2_retry_prompt
-                    )
-                    compiler_shot2_retry_response = analyst_call_fn(compiler_shot2_retry_prompt)
-                    total_api_calls += 1
-                    self._save_to_disk(
-                        session_dir, 0, "compiler_shot2_retry_response", compiler_shot2_retry_response
-                    )
-                    if tree_mode:
-                        shot2_compiler = self._apply_tree_compiler_response(
-                            compiler_shot2_retry_response, base_tree or {}, prefix="s2r"
-                        )
-                    else:
-                        shot2_compiler = self._apply_patchplan_array(
-                            compiler_shot2_retry_response, script_ir, dialect_enum, prefix="s2r"
-                        )
-                logger.info(
-                    f"[{self.query_id}] Compiler shot 2 (retry path): {len(shot2_compiler)} patches"
-                )
-
-                compiler_patches.extend(shot2_compiler)
+            cached_shot2 = self._try_load_cached(ctx.session_dir, 0, "compiler_shot2_response")
+            if cached_shot2:
+                s2_response = cached_shot2
             else:
-                logger.info(
-                    f"[{self.query_id}] Compiler shot 2 skipped "
-                    f"(no retryable syntax/error failures)"
-                )
+                self._save_to_disk(ctx.session_dir, 0, "compiler_shot2_prompt", s2_prompt)
+                s2_response = ctx.analyst_call_fn(s2_prompt)
+                api_calls += 1
+                self._save_to_disk(ctx.session_dir, 0, "compiler_shot2_response", s2_response)
 
-        # ── Phase 5: Validate + benchmark compiler candidates in batch ─
-        if compiler_patches:
-            self._validate_and_benchmark_patches(
-                compiler_patches,
-                db_path=db_path,
-                session_dir=session_dir,
-                shot=-1,
-                mode="validate",
-            )
-            compiler_sem_passed = [p for p in compiler_patches if p.semantic_passed]
-            logger.info(
-                f"[{self.query_id}] Compiler validation: "
-                f"{len(compiler_sem_passed)}/{len(compiler_patches)} passed"
-            )
-            if self.on_phase_change:
-                self.on_phase_change(phase="benchmark", iteration=1)
-            self._validate_and_benchmark_patches(
-                compiler_patches,
-                db_path=db_path,
-                session_dir=session_dir,
-                shot=1,
-                mode="benchmark",
-            )
+            if ctx.tree_mode:
+                shot2_compiler = self._apply_tree_compiler_response(s2_response, ctx.base_tree or {}, prefix="s2")
+            else:
+                shot2_compiler = self._apply_patchplan_array(s2_response, ctx.script_ir, ctx.dialect_enum, prefix="s2")
+            if not shot2_compiler and self._is_compiler_tier0_shape_failure(s2_response, tree_mode=ctx.tree_mode):
+                s2_retry_p = self._build_compiler_tier0_retry_prompt(s2_prompt, tree_mode=ctx.tree_mode)
+                self._save_to_disk(ctx.session_dir, 0, "compiler_shot2_retry_prompt", s2_retry_p)
+                s2_retry_r = ctx.analyst_call_fn(s2_retry_p)
+                api_calls += 1
+                self._save_to_disk(ctx.session_dir, 0, "compiler_shot2_retry_response", s2_retry_r)
+                if ctx.tree_mode:
+                    shot2_compiler = self._apply_tree_compiler_response(s2_retry_r, ctx.base_tree or {}, prefix="s2r")
+                else:
+                    shot2_compiler = self._apply_patchplan_array(s2_retry_r, ctx.script_ir, ctx.dialect_enum, prefix="s2r")
+            compiler_patches.extend(shot2_compiler)
 
-        # ── Collect all results ────────────────────────────────────────
-        all_final = list(sem_passed) + [
-            sp for sp in compiler_patches if sp.semantic_passed
-        ]
+        return compiler_patches, api_calls
 
+    def finalize_result(self, ctx: "BeamContext", patches: List["AppliedPatch"],
+                        compiler_patches: List["AppliedPatch"], analyst_prompt: str,
+                        analyst_response: str, total_api_calls: int) -> "SessionResult":
+        """Finalize beam results: find best, serialize, return SessionResult."""
+        sem_passed = [p for p in patches if p.semantic_passed]
+        all_final = list(sem_passed) + [sp for sp in compiler_patches if sp.semantic_passed]
         all_patches_full = patches + compiler_patches
-        iter_explains: Dict[str, str] = {
-            p.patch_id: p.explain_text
-            for p in all_patches_full
-            if p.explain_text
-        }
+        iter_explains: Dict[str, str] = {p.patch_id: p.explain_text for p in all_patches_full if p.explain_text}
         iter_result = PatchIterationResult(
-            iteration=0,
-            prompt=analyst_prompt,
-            response=analyst_response,
-            n_api_calls=total_api_calls,
-            patches=all_patches_full,
-            explains=iter_explains,
+            iteration=0, prompt=analyst_prompt, response=analyst_response,
+            n_api_calls=total_api_calls, patches=all_patches_full, explains=iter_explains,
         )
 
-        # Find best across probes + compiler
         best_speedup = 0.0
         best_sql = self.original_sql
         best_transforms: List[str] = []
         best_status = "NEUTRAL"
-
-        candidates = [
-            p for p in all_final
-            if p.speedup is not None and p.speedup >= 1.0
-        ]
+        candidates = [p for p in all_final if p.speedup is not None and p.speedup >= 1.0]
         if candidates:
             best_patch = max(candidates, key=lambda p: p.speedup)
             best_speedup = best_patch.speedup
             best_sql = best_patch.output_sql or self.original_sql
             best_transforms = [best_patch.transform]
             best_status = self._classify_speedup(best_speedup)
-
             iter_result.best_speedup = best_speedup
             iter_result.best_patch_id = best_patch.patch_id
             iter_result.best_sql = best_sql
 
-        logger.info(
-            f"[{self.query_id}] BEAM result: {best_speedup:.2f}x "
-            f"({best_status})"
-        )
-
-        self._save_to_disk(
-            session_dir, 0, "result",
-            json.dumps(
-                self._serialize_iteration(iter_result),
-                indent=2, default=str,
-            ),
-        )
+        self._save_to_disk(ctx.session_dir, 0, "result",
+            json.dumps(self._serialize_iteration(iter_result), indent=2, default=str))
 
         return SessionResult(
-            query_id=self.query_id,
-            mode="beam",
-            best_speedup=best_speedup,
-            best_sql=best_sql,
-            original_sql=self.original_sql,
-            best_transforms=best_transforms,
-            status=best_status,
+            query_id=self.query_id, mode="beam", best_speedup=best_speedup,
+            best_sql=best_sql, original_sql=self.original_sql,
+            best_transforms=best_transforms, status=best_status,
             iterations=[self._serialize_iteration(iter_result)],
-            n_iterations=1,
-            n_api_calls=total_api_calls,
-            **self._session_cost_fields(),
+            n_iterations=1, n_api_calls=total_api_calls, **self._session_cost_fields(),
         )
+
+    @staticmethod
+    def dedup_patches(patches: List["AppliedPatch"]) -> List["AppliedPatch"]:
+        """Deduplicate patches by normalized SQL. Modifies in-place, returns deduped list."""
+        applied = [p for p in patches if p.output_sql]
+        seen_sql: Dict[str, str] = {}
+        deduped = []
+        for p in applied:
+            norm = " ".join(p.output_sql.split())
+            if norm in seen_sql:
+                p.status = "DEDUP"
+            else:
+                seen_sql[norm] = p.patch_id
+                deduped.append(p)
+        return deduped
 
     def _retry_tier1_worker_failures(
         self,
@@ -2366,6 +1867,7 @@ class BeamSession(OptimizationSession):
         shot: int,
         tree_base: Optional[Dict[str, Any]] = None,
         worker_call_fn_by_patch_id: Optional[Dict[str, Callable[[str], str]]] = None,
+        api_only: bool = False,
     ) -> int:
         """Retry workers once with structured gate feedback for retryable failures."""
         max_retry_attempts = max(
@@ -2503,12 +2005,9 @@ class BeamSession(OptimizationSession):
                 retry_candidates.append(patch)
 
         if retry_candidates:
-            self._validate_and_benchmark_patches(
-                retry_candidates,
-                db_path=db_path,
-                session_dir=session_dir,
-                shot=-1,
-            )
+            # Gate 1: sqlglot parse (retried patches already passed inline
+            # parse during apply, so just mark them as passed)
+            self.check_sqlglot_parse(retry_candidates)
 
         return retry_calls
 
@@ -3199,7 +2698,13 @@ class BeamSession(OptimizationSession):
         from ..execution.database_utils import fetch_schema_with_stats
 
         try:
-            schema = fetch_schema_with_stats(database_path=db_path, sql=self.original_sql)
+            if self.benchmark_sem:
+                self.benchmark_sem.acquire()
+            try:
+                schema = fetch_schema_with_stats(database_path=db_path, sql=self.original_sql)
+            finally:
+                if self.benchmark_sem:
+                    self.benchmark_sem.release()
         except Exception as e:
             logger.debug(f"[{self.query_id}] Schema context fetch failed: {e}")
             return ""
@@ -3400,7 +2905,45 @@ class BeamSession(OptimizationSession):
         )
 
         try:
-            with create_executor_from_dsn(db_path) as executor:
+            if self.benchmark_sem:
+                self.benchmark_sem.acquire()
+            try:
+                self._sequential_benchmark_inner(
+                    patches, db_path, baseline_runs, candidate_runs, winner_runs, checker
+                )
+            finally:
+                if self.benchmark_sem:
+                    self.benchmark_sem.release()
+        except Exception as e:
+            logger.warning(f"Sequential benchmark failed: {e}")
+
+    def _sequential_benchmark_inner(
+        self,
+        patches: List,
+        db_path: str,
+        baseline_runs: int,
+        candidate_runs: int,
+        winner_runs: int,
+        checker,
+    ) -> None:
+        from ..execution.factory import create_executor_from_dsn
+        from ..validate import _timed_runs_pg
+
+        with create_executor_from_dsn(db_path) as executor:
+            # ── Baseline: skip if R-Bot marked TIMEOUT ─────────────
+            known_timeout = self._is_known_timeout()
+            if known_timeout:
+                timeout_s = getattr(
+                    self.pipeline.config, "timeout_seconds", 300
+                )
+                orig_ms = float(timeout_s * 1000)
+                orig_count = None  # type: ignore[assignment]
+                orig_checksum = None
+                logger.info(
+                    f"[{self.query_id}] Baseline: SKIPPED "
+                    f"(known R-Bot timeout, using {orig_ms:.0f}ms)"
+                )
+            else:
                 # Measure original and capture rows for correctness.
                 logger.info(
                     f"[{self.query_id}] Baseline: {baseline_runs}x..."
@@ -3422,121 +2965,129 @@ class BeamSession(OptimizationSession):
                     f"[{', '.join(f'{t:.0f}' for t in orig_times)}]"
                 )
 
-                # Current best valid candidate speedup in this shot.
-                current_winner_speedup = float("-inf")
+            # Current best valid candidate speedup in this shot.
+            current_winner_speedup = float("-inf")
 
-                def _mark_correctness_failure(
-                    patch: AppliedPatch,
-                    patch_count: int,
-                    patch_rows: List[Any],
-                ) -> bool:
-                    # ── Correctness gate: row count + checksum ──
-                    if patch_count != orig_count:
-                        patch.speedup = 0.0
-                        patch.status = "FAIL"
-                        patch.apply_error = (
-                            f"Row count mismatch: original={orig_count}, "
-                            f"patch={patch_count}"
-                        )
-                        logger.warning(
-                            f"[{self.query_id}]   FAIL: {patch.patch_id}: "
-                            f"{patch.apply_error}"
-                        )
-                        return True
-
-                    if orig_checksum and patch_rows:
-                        try:
-                            patch_checksum = checker.compute_checksum(patch_rows)
-                            if patch_checksum != orig_checksum:
-                                patch.speedup = 0.0
-                                patch.status = "FAIL"
-                                patch.apply_error = (
-                                    f"Checksum mismatch: original={orig_checksum}, "
-                                    f"patch={patch_checksum}"
-                                )
-                                logger.warning(
-                                    f"[{self.query_id}]   FAIL: {patch.patch_id}: "
-                                    f"{patch.apply_error}"
-                                )
-                                return True
-                        except Exception:
-                            # Checksum compute failed — do not block.
-                            pass
-
+            def _mark_correctness_failure(
+                patch: AppliedPatch,
+                patch_count: int,
+                patch_rows: List[Any],
+            ) -> bool:
+                # ── Correctness gate: skip if baseline was a timeout ──
+                if orig_count is None:
+                    # No baseline rows — correctness_verified stays False
                     return False
-
-                for idx, p in enumerate(patches):
-                    logger.info(
-                        f"[{self.query_id}] Benchmark {idx + 1}/{len(patches)}: "
-                        f"{p.patch_id} ({p.family}/{p.transform})"
+                # ── Correctness gate: row count + checksum ──
+                if patch_count != orig_count:
+                    patch.speedup = 0.0
+                    patch.status = "FAIL"
+                    patch.correctness_verified = False
+                    patch.apply_error = (
+                        f"Row count mismatch: original={orig_count}, "
+                        f"patch={patch_count}"
                     )
+                    logger.warning(
+                        f"[{self.query_id}]   FAIL: {patch.patch_id}: "
+                        f"{patch.apply_error}"
+                    )
+                    return True
+
+                if orig_checksum and patch_rows:
                     try:
-                        patch_ms, patch_rows, patch_times = _timed_runs_pg(
+                        patch_checksum = checker.compute_checksum(patch_rows)
+                        if patch_checksum != orig_checksum:
+                            patch.speedup = 0.0
+                            patch.status = "FAIL"
+                            patch.correctness_verified = False
+                            patch.apply_error = (
+                                f"Checksum mismatch: original={orig_checksum}, "
+                                f"patch={patch_checksum}"
+                            )
+                            logger.warning(
+                                f"[{self.query_id}]   FAIL: {patch.patch_id}: "
+                                f"{patch.apply_error}"
+                            )
+                            return True
+                    except Exception:
+                        # Checksum compute failed — do not block.
+                        pass
+
+                return False
+
+            for idx, p in enumerate(patches):
+                logger.info(
+                    f"[{self.query_id}] Benchmark {idx + 1}/{len(patches)}: "
+                    f"{p.patch_id} ({p.family}/{p.transform})"
+                )
+                try:
+                    patch_ms, patch_rows, patch_times = _timed_runs_pg(
+                        executor,
+                        p.output_sql,
+                        runs=candidate_runs,
+                        capture_rows=True,
+                    )
+                    patch_count = len(patch_rows) if patch_rows else 0
+
+                    if _mark_correctness_failure(p, patch_count, patch_rows):
+                        continue
+
+                    # Correctness gate passed (or skipped for timeout)
+                    if orig_count is not None:
+                        p.correctness_verified = True
+
+                    p.original_ms = orig_ms
+                    p.patch_ms = patch_ms
+                    p.speedup = orig_ms / patch_ms if patch_ms > 0 else 1.0
+                    p.status = self._classify_speedup(p.speedup)
+
+                    logger.info(
+                        f"[{self.query_id}]   result: orig={orig_ms:.1f}ms, "
+                        f"patch={patch_ms:.1f}ms, speedup={p.speedup:.2f}x "
+                        f"({p.status}, {patch_count} rows) "
+                        f"[{', '.join(f'{t:.0f}' for t in patch_times)}]"
+                    )
+
+                    # If this candidate becomes the current winner, confirm with
+                    # a fuller timing pass (e.g., 3x) for stability.
+                    if (
+                        winner_runs > candidate_runs
+                        and p.speedup > current_winner_speedup
+                    ):
+                        logger.info(
+                            f"[{self.query_id}]   winner confirm: {p.patch_id} "
+                            f"{candidate_runs}x→{winner_runs}x"
+                        )
+                        win_ms, win_rows, win_times = _timed_runs_pg(
                             executor,
                             p.output_sql,
-                            runs=candidate_runs,
+                            runs=winner_runs,
                             capture_rows=True,
                         )
-                        patch_count = len(patch_rows) if patch_rows else 0
+                        win_count = len(win_rows) if win_rows else 0
 
-                        if _mark_correctness_failure(p, patch_count, patch_rows):
+                        if _mark_correctness_failure(p, win_count, win_rows):
                             continue
 
-                        p.original_ms = orig_ms
-                        p.patch_ms = patch_ms
-                        p.speedup = orig_ms / patch_ms if patch_ms > 0 else 1.0
+                        p.patch_ms = win_ms
+                        p.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
                         p.status = self._classify_speedup(p.speedup)
 
                         logger.info(
-                            f"[{self.query_id}]   result: orig={orig_ms:.1f}ms, "
-                            f"patch={patch_ms:.1f}ms, speedup={p.speedup:.2f}x "
-                            f"({p.status}, {patch_count} rows) "
-                            f"[{', '.join(f'{t:.0f}' for t in patch_times)}]"
+                            f"[{self.query_id}]   winner confirmed: "
+                            f"patch={win_ms:.1f}ms, speedup={p.speedup:.2f}x "
+                            f"({p.status}, {win_count} rows) "
+                            f"[{', '.join(f'{t:.0f}' for t in win_times)}]"
                         )
 
-                        # If this candidate becomes the current winner, confirm with
-                        # a fuller timing pass (e.g., 3x) for stability.
-                        if (
-                            winner_runs > candidate_runs
-                            and p.speedup > current_winner_speedup
-                        ):
-                            logger.info(
-                                f"[{self.query_id}]   winner confirm: {p.patch_id} "
-                                f"{candidate_runs}x→{winner_runs}x"
-                            )
-                            win_ms, win_rows, win_times = _timed_runs_pg(
-                                executor,
-                                p.output_sql,
-                                runs=winner_runs,
-                                capture_rows=True,
-                            )
-                            win_count = len(win_rows) if win_rows else 0
-
-                            if _mark_correctness_failure(p, win_count, win_rows):
-                                continue
-
-                            p.patch_ms = win_ms
-                            p.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
-                            p.status = self._classify_speedup(p.speedup)
-
-                            logger.info(
-                                f"[{self.query_id}]   winner confirmed: "
-                                f"patch={win_ms:.1f}ms, speedup={p.speedup:.2f}x "
-                                f"({p.status}, {win_count} rows) "
-                                f"[{', '.join(f'{t:.0f}' for t in win_times)}]"
-                            )
-
-                        if p.speedup is not None and p.speedup > current_winner_speedup:
-                            current_winner_speedup = p.speedup
-                    except Exception as e:
-                        p.speedup = 0.0
-                        p.status = "ERROR"
-                        p.apply_error = str(e)
-                        logger.warning(
-                            f"[{self.query_id}]   ERROR: {p.patch_id}: {e}"
-                        )
-        except Exception as e:
-            logger.warning(f"Sequential benchmark failed: {e}")
+                    if p.speedup is not None and p.speedup > current_winner_speedup:
+                        current_winner_speedup = p.speedup
+                except Exception as e:
+                    p.speedup = 0.0
+                    p.status = "ERROR"
+                    p.apply_error = str(e)
+                    logger.warning(
+                        f"[{self.query_id}]   ERROR: {p.patch_id}: {e}"
+                    )
 
     def _parallel_benchmark(
         self,
@@ -3570,28 +3121,60 @@ class BeamSession(OptimizationSession):
             f"winner={winner_runs}x"
         )
 
-        try:
-            with create_executor_from_dsn(db_path) as executor:
-                orig_ms, orig_rows, orig_times = _timed_runs_pg(
-                    executor, self.original_sql, runs=baseline_runs, capture_rows=True
-                )
-            orig_count = len(orig_rows) if orig_rows else 0
-            orig_checksum = None
-            if orig_rows:
-                try:
-                    orig_checksum = checker.compute_checksum(orig_rows)
-                except Exception:
-                    pass
-            logger.info(
-                f"[{self.query_id}] Baseline: {orig_ms:.1f}ms "
-                f"({orig_count} rows, checksum={orig_checksum}) "
-                f"[{', '.join(f'{t:.0f}' for t in orig_times)}]"
+        bench_sem = self.benchmark_sem
+        known_timeout = self._is_known_timeout()
+        if known_timeout:
+            timeout_s = getattr(
+                self.pipeline.config, "timeout_seconds", 300
             )
-        except Exception as e:
-            logger.warning(f"[{self.query_id}] Parallel benchmark baseline failed: {e}")
-            return
+            orig_ms = float(timeout_s * 1000)
+            orig_count = None  # type: ignore[assignment]
+            orig_checksum = None
+            logger.info(
+                f"[{self.query_id}] Baseline: SKIPPED "
+                f"(known R-Bot timeout, using {orig_ms:.0f}ms)"
+            )
+        else:
+            try:
+                if bench_sem:
+                    bench_sem.acquire()
+                try:
+                    with create_executor_from_dsn(db_path) as executor:
+                        orig_ms, orig_rows, orig_times = _timed_runs_pg(
+                            executor, self.original_sql, runs=baseline_runs, capture_rows=True
+                        )
+                finally:
+                    if bench_sem:
+                        bench_sem.release()
+                orig_count = len(orig_rows) if orig_rows else 0
+                orig_checksum = None
+                if orig_rows:
+                    try:
+                        orig_checksum = checker.compute_checksum(orig_rows)
+                    except Exception:
+                        pass
+                logger.info(
+                    f"[{self.query_id}] Baseline: {orig_ms:.1f}ms "
+                    f"({orig_count} rows, checksum={orig_checksum}) "
+                    f"[{', '.join(f'{t:.0f}' for t in orig_times)}]"
+                )
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Parallel benchmark baseline failed: {e}")
+                return
 
         def _benchmark_one(patch: AppliedPatch) -> Tuple[AppliedPatch, Dict[str, Any]]:
+            try:
+                if bench_sem:
+                    bench_sem.acquire()
+                try:
+                    return _benchmark_one_inner(patch)
+                finally:
+                    if bench_sem:
+                        bench_sem.release()
+            except Exception as e:
+                return (patch, {"ok": False, "error": str(e), "status": "ERROR"})
+
+        def _benchmark_one_inner(patch: AppliedPatch) -> Tuple[AppliedPatch, Dict[str, Any]]:
             try:
                 with create_executor_from_dsn(db_path) as executor:
                     patch_ms, patch_rows, patch_times = _timed_runs_pg(
@@ -3602,34 +3185,36 @@ class BeamSession(OptimizationSession):
                     )
                 patch_count = len(patch_rows) if patch_rows else 0
 
-                if patch_count != orig_count:
-                    return (
-                        patch,
-                        {
-                            "ok": False,
-                            "error": (
-                                f"Row count mismatch: original={orig_count}, "
-                                f"patch={patch_count}"
-                            ),
-                        },
-                    )
+                # Skip correctness gate when baseline was a known timeout
+                if orig_count is not None:
+                    if patch_count != orig_count:
+                        return (
+                            patch,
+                            {
+                                "ok": False,
+                                "error": (
+                                    f"Row count mismatch: original={orig_count}, "
+                                    f"patch={patch_count}"
+                                ),
+                            },
+                        )
 
-                if orig_checksum and patch_rows:
-                    try:
-                        patch_checksum = checker.compute_checksum(patch_rows)
-                        if patch_checksum != orig_checksum:
-                            return (
-                                patch,
-                                {
-                                    "ok": False,
-                                    "error": (
-                                        f"Checksum mismatch: original={orig_checksum}, "
-                                        f"patch={patch_checksum}"
-                                    ),
-                                },
-                            )
-                    except Exception:
-                        pass
+                    if orig_checksum and patch_rows:
+                        try:
+                            patch_checksum = checker.compute_checksum(patch_rows)
+                            if patch_checksum != orig_checksum:
+                                return (
+                                    patch,
+                                    {
+                                        "ok": False,
+                                        "error": (
+                                            f"Checksum mismatch: original={orig_checksum}, "
+                                            f"patch={patch_checksum}"
+                                        ),
+                                    },
+                                )
+                        except Exception:
+                            pass
 
                 speedup = orig_ms / patch_ms if patch_ms > 0 else 1.0
                 return (
@@ -3640,6 +3225,7 @@ class BeamSession(OptimizationSession):
                         "speedup": speedup,
                         "patch_count": patch_count,
                         "patch_times": patch_times,
+                        "correctness_verified": orig_count is not None,
                     },
                 )
             except Exception as e:
@@ -3672,6 +3258,7 @@ class BeamSession(OptimizationSession):
                 patch.patch_ms = float(result["patch_ms"])
                 patch.speedup = float(result["speedup"])
                 patch.status = self._classify_speedup(patch.speedup)
+                patch.correctness_verified = bool(result.get("correctness_verified", False))
                 patch_count = int(result.get("patch_count", 0))
                 patch_times = result.get("patch_times") or []
                 logger.info(
@@ -3689,6 +3276,8 @@ class BeamSession(OptimizationSession):
             ]
             if candidates:
                 best = max(candidates, key=lambda p: p.speedup or 0.0)
+                if bench_sem:
+                    bench_sem.acquire()
                 try:
                     with create_executor_from_dsn(db_path) as executor:
                         win_ms, win_rows, win_times = _timed_runs_pg(
@@ -3698,34 +3287,34 @@ class BeamSession(OptimizationSession):
                             capture_rows=True,
                         )
                     win_count = len(win_rows) if win_rows else 0
-                    if win_count != orig_count:
-                        best.speedup = 0.0
-                        best.status = "FAIL"
-                        best.apply_error = (
-                            f"Row count mismatch: original={orig_count}, patch={win_count}"
-                        )
-                    elif orig_checksum and win_rows:
-                        try:
-                            win_checksum = checker.compute_checksum(win_rows)
-                            if win_checksum != orig_checksum:
-                                best.speedup = 0.0
-                                best.status = "FAIL"
-                                best.apply_error = (
-                                    f"Checksum mismatch: original={orig_checksum}, "
-                                    f"patch={win_checksum}"
-                                )
-                            else:
-                                best.patch_ms = win_ms
-                                best.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
-                                best.status = self._classify_speedup(best.speedup)
-                        except Exception:
-                            best.patch_ms = win_ms
-                            best.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
-                            best.status = self._classify_speedup(best.speedup)
-                    else:
+                    correctness_failed = False
+                    if orig_count is not None:
+                        if win_count != orig_count:
+                            best.speedup = 0.0
+                            best.status = "FAIL"
+                            best.apply_error = (
+                                f"Row count mismatch: original={orig_count}, patch={win_count}"
+                            )
+                            correctness_failed = True
+                        elif orig_checksum and win_rows:
+                            try:
+                                win_checksum = checker.compute_checksum(win_rows)
+                                if win_checksum != orig_checksum:
+                                    best.speedup = 0.0
+                                    best.status = "FAIL"
+                                    best.apply_error = (
+                                        f"Checksum mismatch: original={orig_checksum}, "
+                                        f"patch={win_checksum}"
+                                    )
+                                    correctness_failed = True
+                            except Exception:
+                                pass
+                    if not correctness_failed:
                         best.patch_ms = win_ms
                         best.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
                         best.status = self._classify_speedup(best.speedup)
+                        if orig_count is not None:
+                            best.correctness_verified = True
                     logger.info(
                         f"[{self.query_id}] winner confirm: {best.patch_id} "
                         f"patch={best.patch_ms or 0:.1f}ms, "
@@ -3737,6 +3326,9 @@ class BeamSession(OptimizationSession):
                     logger.warning(
                         f"[{self.query_id}] winner confirm failed for {best.patch_id}: {e}"
                     )
+                finally:
+                    if bench_sem:
+                        bench_sem.release()
 
     def _serialize_iteration(self, it: PatchIterationResult) -> dict:
         """Serialize iteration result for SessionResult.iterations."""
@@ -3760,6 +3352,7 @@ class BeamSession(OptimizationSession):
                     "status": p.status,
                     "speedup": round(p.speedup, 2) if p.speedup is not None else None,
                     "semantic_passed": p.semantic_passed,
+                    "correctness_verified": p.correctness_verified,
                     "error": p.apply_error,
                     "original_ms": round(p.original_ms, 1) if p.original_ms is not None else None,
                     "patch_ms": round(p.patch_ms, 1) if p.patch_ms is not None else None,

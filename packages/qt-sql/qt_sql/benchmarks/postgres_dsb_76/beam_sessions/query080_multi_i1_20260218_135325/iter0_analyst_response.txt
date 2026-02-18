@@ -1,1 +1,113 @@
-[]
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 2,
+    "early_stop": true,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three independent channel CTEs each scan the same dimension tables (date_dim, promotion, item) with identical filters, causing repeated work. The comma-join syntax may block optimal join ordering, and the web channel (wsr) is the dominant hotspot at 478ms. Pre-filtering dimensions once and converting to explicit joins can reduce repeated scans and improve join planning.",
+    "reasoning_trace": [
+      "wsr branch takes 478ms (48% of total time), ssr 263ms, csr 249ms.",
+      "Each channel CTE scans date_dim, promotion, and item separately with the same filters (date range, promotion channel filters, item price > 50 and category).",
+      "Plan shows comma joins (implicit joins) in all three CTEs, which can inhibit join reordering and predicate pushdown.",
+      "No nested loops with correlation or set operations, so families B and D are not indicated."
+    ],
+    "cost_spine": ["Nested Loop", "Hash Join", "Index Scan on web_sales", "Index Scan on catalog_sales", "Index Only Scan on store_sales"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (wsr branch)",
+        "why": "dominant time contributor, scans web_sales and joins with multiple dimensions",
+        "evidence": "time=478ms, rows=2509"
+      },
+      {
+        "op": "Hash Join (ssr branch)",
+        "why": "secondary hotspot, similar pattern with store_sales",
+        "evidence": "time=263ms, rows=4857"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR to UNION ALL (no OR predicates in query)",
+      "avoid materializing EXISTS paths (none present)",
+      "do not duplicate large CTE bodies (guard G_PG_CTE_DUPLICATION_STOP)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter date_dim, promotion, and item into separate CTEs with their selective filters, then rewrite each channel CTE (ssr, csr, wsr) to use explicit JOIN syntax referencing these pre-filtered CTEs.",
+      "dag_target_hint": "Replace comma joins in ssr, csr, wsr with explicit INNER JOINs on pre-filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "promotion", "item", "store_sales/catalog_sales/web_sales", "store_returns/catalog_returns/web_returns", "store/catalog_page/web_site"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29' + interval '30 day'", "p_channel_email = 'N' and p_channel_tv = 'N' and p_channel_radio = 'N' and p_channel_press = 'N' and p_channel_event = 'N'", "i_current_price > 50", "i_category IN ('Children', 'Sports')", "ss_wholesale_cost/cs_wholesale_cost/ws_wholesale_cost BETWEEN 23 AND 38"],
+        "output_must_preserve": ["store_id/catalog_page_id/web_site_id", "sales", "returns", "profit"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Comma joins become explicit hash joins; dimension scans reduce to one each; join order may improve.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Targets primary hotspot (wsr) and secondary hotspot (ssr) by addressing comma-join weakness and repeated dimension scans.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create a single CTE for each shared dimension (date_dim, promotion, item) with their filters, then reference these CTEs in all three channel CTEs (ssr, csr, wsr) to avoid repeated scans.",
+      "dag_target_hint": "Add three new CTEs (filtered_date, filtered_promotion, filtered_item) and modify ssr, csr, wsr to join with them.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "promotion", "item"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29' + interval '30 day'", "p_channel_email = 'N' and p_channel_tv = 'N' and p_channel_radio = 'N' and p_channel_press = 'N' and p_channel_event = 'N'", "i_current_price > 50", "i_category IN ('Children', 'Sports')"],
+        "output_must_preserve": ["All original dimension keys needed for joins"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_STOP:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Sharing dimension scans across channels may reduce total I/O and improve cache locality, though each scan is already small.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Three separate dimension scans per channel become one scan each, referenced via CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration probe targeting repeated dimension scans across channels, an underrepresented family (A).",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; guard G_PG_OR_INDEX_PROTECTED advises against default OR-to-UNION on PostgreSQL."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in the query; plan shows no nested loops with correlation."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregates are already at the top of each channel CTE; no evidence of late aggregation after large joins."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated subquery patterns; each channel CTE is scanned only once in the union."
+    }
+  ]
+}

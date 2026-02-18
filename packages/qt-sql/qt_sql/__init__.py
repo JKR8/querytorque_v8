@@ -9,14 +9,14 @@ Pipeline:
 
 Usage:
     from qt_sql.pipeline import Pipeline
+    from qt_sql.sessions.wave_runner import WaveRunner
     p = Pipeline("qt_sql/benchmarks/duckdb_tpcds")
-    result = p.run_optimization_session("query_88", sql)
+    runner = WaveRunner(pipeline=p, bench_dir=p.benchmark_dir)
 """
 
 from .pipeline import Pipeline
 from .schemas import (
     BenchmarkConfig,
-    OptimizationMode,
     PipelineResult,
     PromotionAnalysis,
     SessionResult,
@@ -32,7 +32,6 @@ from .sessions import (
 __all__ = [
     "Pipeline",
     "BenchmarkConfig",
-    "OptimizationMode",
     "OptimizationSession",
     "BeamSession",
     "PipelineResult",

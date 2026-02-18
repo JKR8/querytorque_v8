@@ -1,0 +1,167 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three independent channel CTEs (ssr, csr, wsr) each perform a large fact-table scan (store_sales, catalog_sales, web_sales) joined via comma syntax with dimensions, causing repeated scans of date_dim and promotion. The primary hotspot is the web_sales nested loop (478ms, 2509 rows actual vs 149 estimated). Secondary hotspots are store_sales (263ms) and catalog_sales (249ms) nested loops, each with similar cardinality underestimation.",
+    "reasoning_trace": [
+      "Plan shows three parallel CTE branches with similar nested-loop patterns and comma joins.",
+      "Each branch scans date_dim and promotion separately (date_dim_1, date_dim_2, promotion_1, promotion_2).",
+      "Q-error shows UNDER_EST at Nested Loop (est=149, act=2509) in web_sales path.",
+      "Total runtime ~990ms with web_sales branch consuming nearly half.",
+      "No correlated subqueries, set operations, or aggregation pushdown opportunities present."
+    ],
+    "cost_spine": ["Nested Loop (web_sales)", "Nested Loop (catalog_sales)", "Nested Loop (store_sales)", "Append", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (web_sales)",
+        "why": "largest runtime (478ms) and highest cardinality misestimation (2509 actual vs 149 estimated)",
+        "evidence": "time=478.131ms, rows=2509 actual, est=149 (16.8x underestimate)"
+      },
+      {
+        "op": "Nested Loop (store_sales)",
+        "why": "second largest runtime (263ms) with similar misestimation pattern",
+        "evidence": "time=263.135ms, rows=4857 actual"
+      },
+      {
+        "op": "Nested Loop (catalog_sales)",
+        "why": "third largest runtime (249ms) with similar misestimation pattern",
+        "evidence": "time=248.659ms, rows=9750 actual"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION transforms (no OR predicates in plan)",
+      "avoid decorrelation transforms (no correlated subqueries)",
+      "avoid materializing CTEs that block predicate pushdown without reuse evidence",
+      "avoid duplicating heavy fact-table CTE bodies"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma joins to explicit JOIN syntax and pre-filter selective dimensions (date_dim, promotion, item) into separate CTEs before joining with fact tables in each channel CTE.",
+      "dag_target_hint": "Replace ssr, csr, wsr CTE definitions with staged explicit joins using pre-filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "promotion", "item"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29'::date + interval '30 day'", "i_current_price > 50", "i_category IN ('Children', 'Sports')", "p_channel_email = 'N'", "p_channel_tv = 'N'", "p_channel_radio = 'N'", "p_channel_press = 'N'", "p_channel_event = 'N'", "ss_wholesale_cost BETWEEN 23 AND 38", "cs_wholesale_cost BETWEEN 23 AND 38", "ws_wholesale_cost BETWEEN 23 AND 38"],
+        "output_must_preserve": ["store_id", "catalog_page_id", "web_site_id", "sales", "returns", "profit aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins become explicit hash joins with small dimension CTEs; nested loops may convert to hash joins; date_dim and promotion scans reduce from 3 each to 1 each.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Targets primary hotspot (web_sales) and secondary hotspots via shared dimension prefetch and explicit join conversion, addressing COMMA_JOIN_WEAKNESS gap.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate date_dim filter into a single CTE and convert comma joins to explicit JOIN syntax in each channel CTE, leaving other dimensions inline.",
+      "dag_target_hint": "Add date_filter CTE and modify ssr, csr, wsr FROM clauses to use explicit JOINs with date_filter CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29'::date + interval '30 day'"],
+        "output_must_preserve": ["all original output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Date_dim scanned once; comma joins become explicit joins; nested loops may remain but with better cardinality estimates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Addresses repeated date_dim scans and comma join weakness with lower complexity than full dimension prefetch.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared dimension filters (date_dim, promotion, item) into a single CTE referenced by all three channel CTEs to avoid redundant scans.",
+      "dag_target_hint": "Create shared_dims CTE with date, promotion, item keys and filters; modify ssr, csr, wsr to join with shared_dims CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "promotion", "item"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29'::date + interval '30 day'", "i_current_price > 50", "i_category IN ('Children', 'Sports')", "p_channel_email = 'N'", "p_channel_tv = 'N'", "p_channel_radio = 'N'", "p_channel_press = 'N'", "p_channel_event = 'N'"],
+        "output_must_preserve": ["surrogate keys for joining with fact tables"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_STOP:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared dimension CTE may reduce repeated dimension scans and improve fact-table join cardinality estimates, but PostgreSQL's CTE materialization fence could block predicate pushdown.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date_dim, promotion, item scans reduce from 3 each to 1 each; CTE materialization may add fence cost but reduce total I/O.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot of repeated dimension scans; uses underrepresented family A.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert LEFT OUTER JOIN with returns tables to INNER JOIN since returns columns are coalesced with zero and profit calculation uses returns net loss.",
+      "dag_target_hint": "Change LEFT OUTER JOIN store_returns/catalog_returns/web_returns to INNER JOIN in ssr, csr, wsr CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "catalog_returns", "web_returns"],
+        "where_must_preserve": ["join conditions ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number", "coalesce(sr_return_amt, 0)", "coalesce(sr_net_loss, 0)"],
+        "output_must_preserve": ["returns and profit calculation semantics"]
+      },
+      "gates_checked": ["LEFT_JOIN:PASS", "join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Converting to INNER JOIN may allow optimizer to reorder joins or choose better plans, though returns tables are large and indexed.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Left join operators may become hash joins or merge joins with different order; possible reduction in nested loop inner index scans.",
+      "recommended_patch_ops": ["replace_join_type"],
+      "rank_rationale": "Exploration probe targeting join topology; low confidence due to indexed returns scans but worth testing.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; guardrail G_PG_OR_INDEX_PROTECTED prohibits default OR-to-UNION on PostgreSQL."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation already occurs at CTE level after all joins; no clear pushdown opportunity before joins."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join patterns in query; CTEs are independent channel aggregates."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join predicates; gap NON_EQUI_JOIN_INPUT_BLINDNESS not present."
+    }
+  ]
+}

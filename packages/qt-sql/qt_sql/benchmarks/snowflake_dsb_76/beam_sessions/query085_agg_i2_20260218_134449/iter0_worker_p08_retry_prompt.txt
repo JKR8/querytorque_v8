@@ -384,50 +384,47 @@ Corrective action:
 Everything below is probe-specific input.
 
 ## Shared Analyst Hypothesis
-The plan shows two large fact-table scans (WEB_SALES 460GB, WEB_RETURNS 39GB) without pushed date_sk filter from date_dim (d_year=2002), causing full partition scans. OR conditions on customer_demographics and customer_address are applied as late join filters, preventing efficient join planning and predicate pushdown.
+Complex OR conditions on dimension filters are applied as join filters after large fact table scans, preventing early micro-partition pruning. Decomposing OR into UNION ALL branches may enable partition-level filtering. Additionally, aggregation pushdown can reduce row volume before expensive joins, and date filter pushdown may prune fact scans.
 ## Runtime Dialect Contract
 - target_dialect: snowflake
 - runtime_dialect_is_source_of_truth: true
 - if static examples conflict, follow runtime dialect behavior
 ## Probe Assignment
-- transform_id: date_cte_isolate
-- family: A
-- target: Isolate date_dim filter into a CTE and join with fact tables, potentially improving date_sk pushdown.
+- transform_id: decorrelate
+- family: B
+- target: As an exploratory probe, consider if any implicit correlation exists in filter logic and decorrelate by pre-computing key sets, though no explicit correlated subqueries are present.
 - phase: ?
 - exploration: yes
 - worker_lane: scout
 - dialect: snowflake
-- recommended_patch_ops: `insert_cte`, `replace_from`
-- expected_explain_delta: Date_dim scan becomes CTE scan; fact scans may show reduced partitions.
+- recommended_examples: `sf_inline_decorrelate`
+- recommended_patch_ops: `analyze_filter_deps`, `create_threshold_cte_if_needed`
+- expected_explain_delta: Minimal change; if correlation is found, reduced repeated computation.
 - equivalence_tier: unordered
-- exploration_hypothesis: CTE isolation may help Snowflake push date_sk predicate into fact scans more effectively.
+- exploration_hypothesis: Even without explicit subqueries, filter dependencies might benefit from decorrelation to avoid per-row evaluation, though evidence is weak.
 - existing_ctes: (none)
 
 ### Gates Checked
-no_unfiltered_large_cte:PASS; cross_cte_predicate_blindness:CAUTION (portability candidate)
+no_correlated_subquery:WARN; portability_candidate:CAUTION
 
 ### Analyst Do-Not-Do
-- do not wrap date_sk or filter columns in functions that break micro‑partition pruning
-- do not materialize EXISTS/NOT EXISTS patterns (none present)
-- do not introduce unfiltered large CTEs
-- avoid same‑column OR to UNION ALL unless evidence shows OR blocks pruning
+- avoid materializing EXISTS paths (none present)
+- avoid unfiltered large CTEs
+- do not wrap partition keys in functions that hinder micro-partition pruning
 
 ### Node Contract
 
 ```json
 {
   "from_must_include": [
-    "date_dim d",
-    "web_sales ws",
-    "web_returns wr"
+    "web_sales",
+    "web_returns"
   ],
   "where_must_preserve": [
-    "d.d_year = 2002",
-    "ws.ws_sold_date_sk = d.d_date_sk",
-    "wr.wr_returned_date_sk? or infer from ws_sold_date_sk"
+    "all filters and join conditions"
   ],
   "output_must_preserve": [
-    "All original columns and join relationships"
+    "same result semantics"
   ]
 }
 ```
@@ -591,10 +588,10 @@ root_node_id: final_select
 ```
 
 ### Analyst Reasoning Trace
-- WEB_SALES scan reads 27574 parts (460GB) without date_sk filter; WEB_RETURNS scan reads 2289 parts (39GB) without date_sk filter.
-- Date_dim filter (d_year=2002) applied at node 1.14 but not pushed into fact scans, indicating predicate transitivity failure.
-- OR conditions on customer_demographics/ws_sales_price and customer_address/ws_net_profit appear as join filters (nodes 1.17, 1.11), applied after join materialization.
-- Aggregation occurs in multiple stages; final group by r_reason_desc suggests early aggregation pushdown may reduce join volume.
+- WEB_SALES scan is the largest I/O contributor with 460GB scanned, and OR conditions on ws_sales_price and ws_net_profit are evaluated in join nodes after the scan.
+- WEB_RETURNS scan is significant with 39GB scanned, and filters are applied late via joins.
+- Nested aggregates indicate high input volume from joins before aggregation, suggesting pushdown opportunities.
+- Date filter d_year=2002 is selective but may not push range to fact scans effectively due to join structure.
 
 ### Engine-Specific Knowledge
 ## Dialect Intelligence (SNOWFLAKE)
@@ -710,11 +707,12 @@ Use numbered pattern blocks below as independent decision scopes; evaluate each 
 - Consider promoting this pattern into the Snowflake engine profile to keep profile and playbook fully aligned.
 
 ### Transform Recipe
-- `transform_id`: `date_cte_isolate`
-- `family`: `A`
-- `principle`: Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.
-- `expected_features`: `GROUP_BY`, `HAVING`, `AGG_AVG`, `AGG_COUNT`, `DATE_DIM`, `MULTI_TABLE_5+`, `SCALAR_SUB_2+`
-- `contraindications`: LOW_BASELINE: Skip if baseline <100ms — CTE overhead exceeds filter savings | ROLLUP_PRESENT: CTE may prevent optimizer from pushing ROLLUP/window down through join tree
+- `transform_id`: `decorrelate`
+- `family`: `B`
+- `principle`: Decorrelation: convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once.
+- `expected_features`: `AGG_AVG`, `AGG_SUM`, `CORRELATED_SUB`, `CTE`, `DATE_DIM`, `GROUP_BY`
+- `contraindications`: MISSING_FILTER: Preserve ALL WHERE filters from original subquery — missing filter = cross-product | ALREADY_DECORRELATED: Check EXPLAIN — if hash join (not nested loop), optimizer already decorrelated
+- `confirm_with_explain`: true
 
 ### Gold TREE Pattern Reference
 - `plan_id`: `gold_snowflake_sf_inline_decorrelate`
@@ -751,7 +749,7 @@ First character must be `{` and output must contain no markdown/prose.
 ```json
 {
   "probe_id": "p08",
-  "transform_id": "date_cte_isolate",
+  "transform_id": "decorrelate",
   "gate": "any_failure",
   "status": "FAIL",
   "error": "Node `filtered_date_dim` missing parent_node_id"

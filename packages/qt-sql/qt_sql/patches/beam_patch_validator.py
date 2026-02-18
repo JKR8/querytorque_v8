@@ -16,7 +16,6 @@ from pathlib import Path
 
 from qt_sql.ir import build_script_ir, dict_to_plan, apply_patch_plan, Dialect
 from qt_sql.execution.factory import create_executor_from_dsn
-from qt_sql.validation.synthetic_validator import SyntheticValidator
 
 
 logger = logging.getLogger(__name__)

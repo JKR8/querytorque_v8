@@ -24,7 +24,6 @@ class TestQtSqlCoreImports:
         """Test root package import."""
         import qt_sql
         assert hasattr(qt_sql, "Pipeline")
-        assert hasattr(qt_sql, "OptimizationMode")
 
     def test_import_pipeline(self):
         """Test pipeline import."""
@@ -34,12 +33,10 @@ class TestQtSqlCoreImports:
     def test_import_schemas(self):
         """Test schemas import."""
         from qt_sql.schemas import (
-            OptimizationMode,
             SessionResult,
             WorkerResult,
             ValidationStatus,
         )
-        assert OptimizationMode is not None
         assert WorkerResult is not None
 
     def test_import_dag(self):
@@ -151,10 +148,15 @@ class TestQtSqlSessionImports:
 class TestQtSqlValidationImports:
     """Test validation module imports."""
 
-    def test_import_sql_validator(self):
-        """Test SQL validator import."""
-        from qt_sql.validation.sql_validator import SQLValidator
-        assert SQLValidator is not None
+    def test_import_equivalence_checker(self):
+        """Test equivalence checker import."""
+        from qt_sql.validation.equivalence_checker import EquivalenceChecker
+        assert EquivalenceChecker is not None
+
+    def test_import_sql_differ(self):
+        """Test SQL differ import."""
+        from qt_sql.validation.sql_differ import SQLDiffer
+        assert SQLDiffer is not None
 
 
 class TestQtSqlCrossPackageImports:

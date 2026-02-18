@@ -34,7 +34,7 @@ class OptimizationSession:
         n_workers: int = 3,
         orchestrator: Optional["Orchestrator"] = None,
         patch: bool = False,
-        benchmark_lock: Optional[threading.Lock] = None,
+        benchmark_sem: Optional[threading.Semaphore] = None,
     ):
         self.pipeline = pipeline
         self.query_id = query_id
@@ -44,7 +44,7 @@ class OptimizationSession:
         self.n_workers = n_workers
         self.orchestrator = orchestrator
         self.patch = patch
-        self.benchmark_lock = benchmark_lock
+        self.benchmark_sem = benchmark_sem
 
         # Optional callback for dashboard updates: fn(phase: str, iteration: int)
         self.on_phase_change = None
