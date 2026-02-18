@@ -1,0 +1,160 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The largest bottleneck is the full scan of CATALOG_RETURNS (82.5 GB) aggregated for all states, only to later filter to CA_STATE='OH'. The correlated subquery requiring a self-join on the same aggregated CTE creates a secondary hotspot. Pushing the state filter into the CTE and restructuring the self-join should significantly reduce I/O and compute.",
+    "reasoning_trace": [
+      "CATALOG_RETURNS scan is 82.5 GB across 4759 partitions, dominating I/O.",
+      "CTE groups by CA_STATE but main query filters to 'OH' - late filter wastes aggregation work.",
+      "Correlated subquery on CTR2 requires a self-join to compute per-state average - aggregated CTE is scanned twice.",
+      "CUSTOMER_ADDRESS scanned twice (CTE and main) but small (776 MB)."
+    ],
+    "cost_spine": ["TableScan CATALOG_RETURNS", "Aggregate (CTE)", "InnerJoin (CTR1 vs CTR2)", "Filter CA_STATE='OH'"],
+    "hotspots": [
+      {
+        "op": "TableScan CATALOG_RETURNS",
+        "why": "full fact table scan aggregated for all states before filtering",
+        "evidence": "parts=4759/4759 bytes=82532796416"
+      },
+      {
+        "op": "InnerJoin CTR1 vs CTR2",
+        "why": "self-join of aggregated CTE to compute correlated average per state",
+        "evidence": "joinKey: (CTR2.CTR_STATE = CTR1.CTR_STATE)"
+      }
+    ],
+    "do_not_do": [
+      "do not wrap date_sk or state columns in functions",
+      "do not materialize EXISTS patterns (none present)",
+      "do not convert to UNION ALL without cross-column OR evidence"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push CA_STATE='OH' filter into the CTE definition, so aggregation only processes rows for Ohio. Update main query to remove the CA_STATE='OH' filter from final join.",
+      "dag_target_hint": "Modify customer_total_return node WHERE clause to include AND customer_address.ca_state = 'OH'.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["cr_returned_date_sk = d_date_sk", "d_year = 2002", "cr_returning_addr_sk = ca_address_sk"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_state", "ctr_total_return", "group by cr_returning_customer_sk, ca_state"]
+      },
+      "gates_checked": ["G_SF_FILTER_FUNCTION_WRAP:PASS", "G_SF_JOINFILTER_PRESERVE:PASS", "no_or_to_union:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "CATALOG_RETURNS scan partitions reduced drastically, Aggregate rows shrink to Ohio-only groups.",
+      "recommended_patch_ops": ["modify_cte_where_predicate", "remove_outer_filter"],
+      "rank_rationale": "Targets primary I/O hotspot by pushing state filter early into the CTE scan.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery into separate CTE computing average per state for Ohio only, then join with main CTE. Avoid self-join on full aggregated CTE.",
+      "dag_target_hint": "Replace final_select WHERE clause with JOIN to new CTE state_avg precomputing AVG(ctr_total_return)*1.2 for Ohio.",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1", "customer_address", "customer"],
+        "where_must_preserve": ["ca_address_sk = c_current_addr_sk", "ctr1.ctr_customer_sk = c_customer_sk"],
+        "output_must_preserve": ["all original output columns and ORDER BY/LIMIT"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Correlated subquery branch becomes separate CTE scan, eliminating self-join on aggregated CTE.",
+      "recommended_patch_ops": ["insert_cte_state_avg", "replace_where_with_join", "ensure_state_filter_propagated"],
+      "rank_rationale": "Addresses secondary hotspot of correlated self-join with native Snowflake decorrelation pattern.",
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split CTE into two specialized CTEs: ctr_ohio for main data and ctr_state_avg for per-state averages. Each CTE filters by CA_STATE='OH' at definition.",
+      "dag_target_hint": "Replace customer_total_return CTE with two CTEs: ctr_ohio and ctr_state_avg.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["cr_returned_date_sk = d_date_sk", "d_year = 2002", "cr_returning_addr_sk = ca_address_sk", "customer_address.ca_state = 'OH'"],
+        "output_must_preserve": ["aggregate keys and sums compatible with downstream joins"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Splitting the CTE may allow Snowflake to optimize each usage independently and avoid materializing full aggregated dataset.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Two smaller CTE scans replace one large CTE, each with state filter applied early.",
+      "recommended_patch_ops": ["split_cte_into_two", "adjust_main_query_references"],
+      "rank_rationale": "Exploration targeting repeated CTE scan pattern; complements early filter by isolating aggregates.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_returns by cr_returning_customer_sk and cr_returning_addr_sk before joining with customer_address, then compute state-level grouping.",
+      "dag_target_hint": "Restructure customer_total_return CTE to aggregate before joining customer_address for state.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["cr_returned_date_sk = d_date_sk", "d_year = 2002"],
+        "output_must_preserve": ["final aggregated columns ctr_customer_sk, ctr_state, ctr_total_return"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Pushing aggregation below customer_address join may reduce rows before the join, though state grouping requires address key.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Aggregate node moves earlier in plan, reducing rows before joining customer_address.",
+      "recommended_patch_ops": ["reorder_aggregate_before_join", "adjust_group_by_keys"],
+      "rank_rationale": "Exploration targeting aggregate placement; may reduce join cardinality.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "No UNION ALL branches in query; date filter already present and joined on date_sk."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Only one fact table (catalog_returns); date filter already applied."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "No multiple channel CTEs with shared dimensions."
+    }
+  ]
+}

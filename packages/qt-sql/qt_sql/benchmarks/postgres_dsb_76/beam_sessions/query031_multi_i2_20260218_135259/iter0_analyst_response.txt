@@ -1,0 +1,167 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Sequential scan on store_sales (138k rows, 22s) dominates runtime. Comma-join pattern prevents optimal predicate pushdown, and selective dimension filters are applied after the large scan. Pre-filtering dimensions via CTEs and converting to explicit joins can shrink the fact scan. Self-join on aggregated CTE with quarter filters may also benefit from decomposition.",
+    "reasoning_trace": [
+      "Seq Scan on store_sales consumes 21992.784 ms (96% of total time).",
+      "Plan shows comma-join pattern (store_sales, date_dim, customer_address, item) with predicates in WHERE.",
+      "Item filtered via bitmap index (272 rows) and customer_address via index scan (0 rows), but store_sales scan remains unfiltered until join.",
+      "Final select self-joins ss CTE three times with different d_qoy filters; CTE aggregates all quarters then filters late.",
+      "ws CTE branch returns 0 rows; optimization can focus solely on ss path."
+    ],
+    "cost_spine": ["Seq Scan on store_sales", "Hash Join (store_sales × item)", "Nested Loop (customer_address)", "Nested Loop (date_dim)", "Aggregate", "Sort", "Gather Merge", "Aggregate", "Nested Loop (final select)"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_sales",
+        "why": "fact table scanned fully before dimension filters reduce rows",
+        "evidence": "rows=138412 time=21992.784 ms"
+      },
+      {
+        "op": "Hash Join (store_sales × item)",
+        "why": "wide row flow before selective item filter applied",
+        "evidence": "rows=138412 time=22878.752 ms"
+      },
+      {
+        "op": "Aggregate (ss CTE)",
+        "why": "aggregation after join amplifies input rows (138k → 33)",
+        "evidence": "rows_in=138412 rows_out=33 time=22942.617 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION splits (PostgreSQL uses BitmapOr for indexed OR)",
+      "avoid materializing EXISTS paths (none present)",
+      "avoid duplicating heavy CTE bodies",
+      "do not target web_sales path (returns 0 rows in plan)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (item, customer_address, date_dim) into separate CTEs, then join with store_sales using explicit JOIN syntax. Preserve all original filters and grouping.",
+      "dag_target_hint": "Replace ss CTE definition with staged CTE chain: item_filtered, addr_filtered, date_dim_keys, then join with store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "customer_address", "date_dim"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price BETWEEN 244 AND 258", "ca_state IN ('KS','OH')", "ss_sold_date_sk = d_date_sk", "ss_addr_sk = ca_address_sk", "ss_item_sk = i_item_sk"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Seq Scan on store_sales replaced by Index Scan or reduced rows; hash joins with tiny dimension CTEs; elimination of comma-join weakness.",
+      "recommended_patch_ops": ["insert_cte_item_filtered", "insert_cte_addr_filtered", "replace_ss_cte_definition", "convert_comma_to_explicit_join"],
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "rank_rationale": "Targets primary hotspot (store_sales scan) via dimension prefiltering and explicit join conversion, with strong PostgreSQL gold precedent.",
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Extract date_dim join into a CTE to create a small hash table, and convert comma joins to explicit INNER JOINs. Preserve all filters and aggregation.",
+      "dag_target_hint": "Modify ss CTE: create date_cte with d_date_sk, then join store_sales, item, customer_address explicitly.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price BETWEEN 244 AND 258", "ca_state IN ('KS','OH')", "join keys equality"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Date_dim scan becomes CTE scan; store_sales scan reduces via early join with tiny date set; comma joins become explicit hash joins.",
+      "recommended_patch_ops": ["insert_cte_date_keys", "replace_ss_cte_definition", "convert_comma_to_explicit_join"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Addresses comma-join weakness and reduces fact scan via date isolation, with proven gold example speedup.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Decompose ss CTE into three separate CTEs (ss1, ss2, ss3) each filtering d_qoy and d_year inline, eliminating post-aggregation filtering in final select.",
+      "dag_target_hint": "Replace ss CTE with three CTEs: ss1 (d_qoy=1, d_year=1999), ss2 (d_qoy=2, d_year=1999), ss3 (d_qoy=3, d_year=1999). Update final select to reference these directly.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["original dimension filters", "d_year=1999", "d_qoy per CTE"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:FAIL (but exploration)", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Self-join on aggregated CTE with quarter filters may cause full materialization of all quarters before filtering; decomposition could reduce aggregate input rows per quarter.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Three separate aggregates each with quarter filter, reducing rows per aggregate; possible elimination of final select filter branch.",
+      "recommended_patch_ops": ["replace_ss_cte_with_multiple_ctes", "update_final_select_references"],
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "rank_rationale": "Exploration targeting secondary hotspot (aggregate amplification) via CTE decomposition, using native PostgreSQL transform.",
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter item, customer_address, and date_dim into separate CTEs, then join with store_sales using explicit joins. Use portability candidate pattern from DuckDB adapted for PostgreSQL.",
+      "dag_target_hint": "Replace ss CTE with CTE chain: item_f, addr_f, date_f, then join with store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "customer_address", "date_dim"],
+        "where_must_preserve": ["all original dimension filters", "join key equalities"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:FAIL (exploration)", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Multi-dimension prefetch may compound selectivity and reduce store_sales scan rows more than single-dimension CTE, but portability from DuckDB requires validation.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Multiple small dimension CTEs; store_sales scan reduced via successive joins; comma joins become explicit.",
+      "recommended_patch_ops": ["insert_cte_item_filtered", "insert_cte_addr_filtered", "insert_cte_date_filtered", "replace_ss_cte_definition", "convert_comma_to_explicit_join"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration using underrepresented family A (early filtering) with portability candidate; tests multi-dimension compounding effect.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already optimal for indexed OR."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation already at fact table level; no clear pushdown opportunity below joins."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join present; transform targets non-equi join input blindness."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries to decorrelate."
+    }
+  ]
+}

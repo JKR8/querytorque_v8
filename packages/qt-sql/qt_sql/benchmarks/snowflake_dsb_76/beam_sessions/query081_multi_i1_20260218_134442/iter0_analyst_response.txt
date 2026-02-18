@@ -1,0 +1,153 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The execution plan shows a dominant full table scan on CATALOG_RETURNS (82.5 GB) for the CTE computation, with a correlated scalar aggregate subquery decorrelated into a self-join with aggregation. Optimizing the subquery execution and potentially reducing scan overhead through better predicate pushdown or aggregation strategies could improve performance.",
+    "reasoning_trace": [
+      "CATALOG_RETURNS scan accounts for 95% of total bytes scanned (82.5 GB out of 86.4 GB), indicating it is the primary I/O bottleneck.",
+      "Correlated subquery on the CTE leads to a self-join with per-state aggregation, which may add compute overhead despite decorrelation.",
+      "No additional selective filters beyond d_year=2000 are available to prune the fact table scan further, making subquery optimization a key target."
+    ],
+    "cost_spine": ["TableScan (CATALOG_RETURNS)", "Join with DATE_DIM and CUSTOMER_ADDRESS", "Aggregate for CTE", "Join for correlated subquery", "SortWithLimit"],
+    "hotspots": [
+      {
+        "op": "TableScan (CATALOG_RETURNS)",
+        "why": "largest I/O volume, primary bottleneck for the query",
+        "evidence": "bytes=82532796416, parts=4759/4759"
+      },
+      {
+        "op": "InnerJoin for correlated subquery",
+        "why": "self-join with aggregation may be compute-intensive and could be optimized",
+        "evidence": "joinFilter with SUM and COUNT aggregates per state in node [1.8]"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns unnecessarily, as Snowflake optimizes them well",
+      "preserve ORDER BY and LIMIT semantics in all transforms to maintain query correctness",
+      "do not introduce unfiltered large CTEs that could increase scan volume"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose the correlated scalar subquery into three CTEs: a shared base CTE for catalog_returns joins with date_dim and customer_address, a threshold CTE for per-state averages of ctr_total_return, and a filtered main query that joins these CTEs while preserving all original predicates and output.",
+      "dag_target_hint": "Change final_select to reference new CTEs instead of the original customer_total_return CTE, and adjust joins accordingly.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["d_year = 2000", "ca_state = 'IA'", "correlation on ctr_state"],
+        "output_must_preserve": ["all original output columns", "ORDER BY and LIMIT behavior", "ctr_total_return comparison semantics"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Correlated join replaced with pre-computed threshold CTE, reducing self-join overhead and potentially lowering aggregate compute time.",
+      "recommended_patch_ops": ["insert_cte_shared_scan", "insert_cte_threshold", "replace_final_select_joins"],
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "rank_rationale": "Targets the correlated subquery hotspot with a proven gold example transform expected to have high impact.",
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Use a shared-scan variant to decorrelate the subquery, creating a single CTE for the base scan of catalog_returns with joins, and deriving both the main data (ctr1) and threshold aggregates (ctr2) from it to avoid duplicate scans.",
+      "dag_target_hint": "Modify the CTE structure to compute shared scan once and reuse for both ctr1 and ctr2 references, optimizing aggregation paths.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["d_year = 2000", "correlation on ctr_state"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_state", "ctr_total_return", "final output columns and order"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared-scan approach might reduce scan overhead or improve cache efficiency by consolidating work, offering an alternative to inline decorrelation.",
+      "confidence": 0.75,
+      "expected_explain_delta": "Reduced scan duplication and optimized join path for thresholds, potentially lowering I/O and compute costs.",
+      "recommended_patch_ops": ["insert_cte_shared", "derive_threshold_from_shared", "adjust_main_query_joins"],
+      "recommended_examples": ["sf_shared_scan_decorrelate"],
+      "rank_rationale": "Exploration probe targeting the same hotspot with a different mechanism, ranked after the primary gold example.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate the catalog_returns data to a higher level (e.g., directly to per-state totals) in the CTE before further joins, to reduce the number of rows flowing into the correlated subquery and main joins.",
+      "dag_target_hint": "Change the customer_total_return CTE to aggregate directly to per-state or per-customer-state level as needed, ensuring compatibility with downstream operations.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["d_year = 2000"],
+        "output_must_preserve": ["grouping keys compatible with ctr_state and ctr_customer_sk for joins", "aggregate semantics for ctr_total_return"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none", "semantic_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pushing aggregation earlier might reduce the size of intermediate results, lowering join and compute costs in the correlated subquery path.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Fewer rows in the CTE, leading to smaller joins and aggregates, potentially reducing overall compute time.",
+      "recommended_patch_ops": ["modify_cte_aggregation_level", "verify_key_preservation", "adjust_final_joins"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Exploration probe from family C to test if earlier aggregation reduces compute overhead, ranked lower due to ambiguous evidence.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split the customer_total_return CTE into separate CTEs for ctr1 (main data) and ctr2 (threshold computation), embedding any necessary aggregations to eliminate the self-join and allow independent optimization.",
+      "dag_target_hint": "Create two CTEs: one for the main customer-state totals and another for per-state averages, each optimized for their role in the final query.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer_address"],
+        "where_must_preserve": ["d_year = 2000"],
+        "output_must_preserve": ["columns required for final output and subquery comparison", "join key semantics"]
+      },
+      "gates_checked": ["no_orphaned_scans:PASS", "semantic_equivalence:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Decomposing the self-join might allow the planner to optimize each CTE independently, potentially improving join order and reduce overhead.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Elimination of self-join, replaced with separate optimized CTEs, potentially lowering join complexity and compute time.",
+      "recommended_patch_ops": ["split_original_cte", "create_separate_ctes", "reconstruct_final_query"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe targeting the self-join hotspot with a different family, ranked lowest due to higher semantic risk and lower evidence.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in the query, making this transform inapplicable."
+    },
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Date filter (d_year=2000) is already applied early in the plan, and no additional selective filters are evident to push down."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in the query, so this transform does not apply."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "The CTE is already materialized in the plan, and no evidence of repeated scans or recomputation to justify additional materialization."
+    }
+  ]
+}

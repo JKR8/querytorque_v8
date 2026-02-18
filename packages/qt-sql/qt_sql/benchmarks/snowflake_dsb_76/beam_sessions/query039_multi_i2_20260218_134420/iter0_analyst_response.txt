@@ -1,0 +1,141 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Large scan on INVENTORY table dominates I/O due to lack of date-based micro-partition pruning. The CTE materializes aggregated data for all months before filtering to months 5 and 6, causing unnecessary computation. Early filtering and decomposition could reduce intermediate data volume.",
+    "reasoning_trace": [
+      "INVENTORY scan reads 279 parts and 3.66 GB, the largest I/O in the plan.",
+      "Filter on d_moy=5 and 6 is applied after CTE materialization, indicating late filter application.",
+      "Aggregation is performed after joining all tables, which might benefit from pushdown to reduce rows early."
+    ],
+    "cost_spine": ["TableScan (INVENTORY)", "InnerJoin with item", "InnerJoin with date_dim", "Aggregate", "WithClause (INV)", "Filter on D_MOY", "InnerJoin self-join", "Sort"],
+    "hotspots": [
+      {
+        "op": "TableScan (INVENTORY)",
+        "why": "largest I/O volume",
+        "evidence": "parts=279/279 bytes=3658746880"
+      },
+      {
+        "op": "WithClause (INV) with late filter",
+        "why": "full CTE materialized before selective month filters",
+        "evidence": "Filter expr=INV1.D_MOY = 5 applied after CTE reference in plan node 1.4"
+      }
+    ],
+    "do_not_do": [
+      "avoid introducing unfiltered large CTEs that increase intermediate data",
+      "avoid breaking micro-partition pruning by modifying date predicates without preserving semantics",
+      "avoid materializing EXISTS patterns as this query has none"
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN range derived from date_dim filters (d_year=2002, d_moy in (5,6)) to the inventory scan to enable micro-partition pruning on inv_date_sk.",
+      "dag_target_hint": "Modify the join condition between inventory and date_dim to include a range predicate on inv_date_sk based on date_dim filters.",
+      "node_contract": {
+        "from_must_include": ["inventory", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "d_moy in (5,6)", "inv_quantity_on_hand between 791 and 991", "i_category IN ('Shoes', 'Sports')", "i_manager_id BETWEEN 42 and 61"],
+        "output_must_preserve": ["all columns needed for aggregation in CTE 'inv'"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Reduced bytes scanned on INVENTORY table due to micro-partition pruning from date_sk range predicate.",
+      "recommended_patch_ops": ["add_predicate_to_join", "derive_date_range_from_filters"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary hotspot — large inventory scan with high I/O volume.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split the CTE 'inv' into two separate CTEs, 'inv5' for d_moy=5 and 'inv6' for d_moy=6, embedding the month filters early in their definitions to avoid materializing the full CTE.",
+      "dag_target_hint": "Replace the single CTE 'inv' with two CTEs 'inv5' and 'inv6' filtered on d_moy=5 and d_moy=6 respectively, and adjust the final select to join them.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "i_category IN ('Shoes', 'Sports')", "i_manager_id BETWEEN 42 and 61", "inv_quantity_on_hand between 791 and 991"],
+        "output_must_preserve": ["same aggregated columns (w_warehouse_sk, i_item_sk, d_moy, mean, cov) for each month, and final ORDER BY semantics"]
+      },
+      "gates_checked": ["semantic_risk_preservation:PASS", "no_orphaned_scans:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Splitting the CTE may reduce the materialized data size by applying filters early, potentially improving join efficiency and reducing intermediate storage.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Elimination of late filter nodes on CTE and reduced rows in self-join due to early filtering.",
+      "recommended_patch_ops": ["split_cte", "replace_cte_references", "adjust_final_join"],
+      "recommended_examples": [],
+      "rank_rationale": "Addresses secondary hotspot — CTE materialization and late filtering for months 5 and 6.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter dimension tables (item, warehouse, date_dim) into separate CTEs to create small hash tables before joining with inventory, reducing the fact scan rows.",
+      "dag_target_hint": "Extract filtered dimensions into CTEs (e.g., filtered_item, filtered_warehouse, filtered_date) and join them with inventory in the main CTE 'inv'.",
+      "node_contract": {
+        "from_must_include": ["item", "warehouse", "date_dim"],
+        "where_must_preserve": ["i_category IN ('Shoes', 'Sports')", "i_manager_id BETWEEN 42 and 61", "d_year=2002", "d_moy in (5,6)"],
+        "output_must_preserve": ["surrogate keys (i_item_sk, w_warehouse_sk, d_date_sk) and necessary columns for joins and aggregation"]
+      },
+      "gates_checked": ["cross_cte_predicate_blindness_risk:PASS", "semantic_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering dimensions may reduce the number of rows scanned in inventory by applying selective filters early, leveraging Snowflake's join optimization.",
+      "confidence": 0.70,
+      "expected_explain_delta": "Reduced scan rows on inventory due to early dimension filtering and smaller hash tables for joins.",
+      "recommended_patch_ops": ["create_dimension_ctes", "modify_main_cte_joins"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — targets early reduction of fact scan via dimension isolation, a secondary optimization path.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate inventory data by inv_item_sk, inv_warehouse_sk, inv_date_sk before joining with dimension tables to reduce row count early, while preserving dimension filter semantics.",
+      "dag_target_hint": "Modify the CTE 'inv' to aggregate inventory first on join keys, then join with filtered dimensions for additional attributes.",
+      "node_contract": {
+        "from_must_include": ["inventory"],
+        "where_must_preserve": ["inv_quantity_on_hand between 791 and 991"],
+        "output_must_preserve": ["aggregated values (stddev_samp, avg) compatible with dimension joins and final grouping"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:stddev_samp and avg require careful handling"],
+      "exploration": true,
+      "exploration_hypothesis": "Pushing aggregation down could reduce the data volume before expensive joins, but must ensure dimension filters are correctly applied to avoid semantic changes.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Aggregation node moves earlier in the plan, reducing rows fed into dimension joins and subsequent processing.",
+      "recommended_patch_ops": ["pre_aggregate_inventory", "adjust_join_structure"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Exploration — tests if early aggregation can reduce join cost, targeting a potential secondary hotspot.",
+      "gold_example_id": "aggregate_pushdown"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in the query to decompose."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation present in the query."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries detected in the query structure."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery pattern identified."
+    }
+  ]
+}

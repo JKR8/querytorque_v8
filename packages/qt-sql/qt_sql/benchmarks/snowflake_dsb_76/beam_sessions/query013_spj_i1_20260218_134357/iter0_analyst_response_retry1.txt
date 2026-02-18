@@ -1,0 +1,422 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows a massive 1.2TB store_sales scan (70412 parts) with late application of selective OR filters on customer_demographics, household_demographics, and customer_address, causing a full fact scan before join-filter evaluation. Nested aggregate layers amplify row flow before final min aggregates, and the comma-join shape may inhibit predicate pushdown across the OR branches.",
+    "reasoning_trace": [
+      "Primary hotspot: TableScan (STORE_SALES) parts=70412/72718 bytes=1212628258304 (1.2TB) with late joinFilter on customer_demographics and customer_address.",
+      "Secondary hotspot: Multiple nested Aggregate nodes (1.24, 1.19, 1.14, 1.9, 1.4, 1.3, 1.2, 1.1) each amplifying row flow before final min aggregation.",
+      "OR conditions on customer_demographics/household_demographics and customer_address are evaluated as joinFilter (nodes 1.5, 1.20), not pushed into fact scan.",
+      "Dimension tables (date_dim, store, customer_demographics, household_demographics) are fully pruned (parts=1/1), but customer_address scan is 256 parts (776MB).",
+      "No correlated subqueries present; plan is a star-join with comma-join syntax."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "Aggregate (1.24)", "InnerJoin (CUSTOMER_ADDRESS)", "Aggregate (1.19)", "InnerJoin (DATE_DIM)", "Aggregate (1.14)", "InnerJoin (HOUSEHOLD_DEMOGRAPHICS)", "Aggregate (1.9)", "InnerJoin (CUSTOMER_DEMOGRAPHICS)", "Aggregate (1.4)", "InnerJoin (STORE)", "Aggregate (1.3)", "Aggregate (1.2)", "Aggregate (1.1)"],
+    "hotspots": [
+      {
+        "op": "TableScan (CUSTOMER_ADDRESS) parts=256/256 bytes=776454656 (776MB) with filter on ca_country and ca_state, but joinFilter applied late.",
+      "No correlated subqueries present, so family B transforms are not directly applicable.",
+      "Plan shows no nested loops, repeated scans, or set operations, limiting families B, D, E."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "Aggregate (1.24)", "InnerJoin (CUSTOMER_ADDRESS)", "Aggregate (1.19)", "InnerJoin (DATE_DIM)", "Aggregate (1.14)", "InnerJoin (HOUSEHOLD_DEMOGRAPHICS)", "Aggregate (1.9)", "InnerJoin (CUSTOMER_DEMOGRAPHICS)", "Aggregate (1.4)", "InnerJoin (STORE)", "Aggregate (1.3)", "Aggregate (1.2)", "Aggregate (1.1)", "Result"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "Massive 1.2TB scan with late application of selective OR filters",
+        "evidence": "parts=70412/72718 bytes=1212628258304, joinFilter at nodes 1.5 and 1.20 applied after scan"
+      },
+      {
+        "op": "Aggregate (1.24)",
+        "why": "First aggregate after scan, groups by 7 keys, amplifies row flow before joins",
+        "evidence": "groupKeys: [SS_STORE_SK, SS_CDEMO_SK, SS_SALES_PRICE, SS_HDEMO_SK, SS_SOLD_DATE_SK, SS_ADDR_SK, SS_NET_PROFIT]"
+      },
+      {
+        "op": "InnerJoin (CUSTOMER_ADDRESS)",
+        "why": "JoinFilter with three OR branches on ca_state and ss_net_profit applied late, after large fact scan",
+        "evidence": "joinFilter at node 1.20 with three OR branches, scan of CUSTOMER_ADDRESS is 776MB"
+      }
+    ],
+    "do_not_do": [
+      "Avoid materializing EXISTS/NOT EXISTS (none present) per G_SF_EXISTS_PROTECTED",
+      "Avoid wrapping partition keys in functions that block micro-partition pruning",
+      "Avoid same-column OR to UNION ALL on Snowflake unless evidence shows OR blocks pruning",
+      "Avoid introducing unfiltered large CTEs that increase scan volume"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range derived from d_year=2001 to store_sales scan predicate to enable micro-partition pruning.",
+      "dag_target_hint": "Modify TableScan (STORE_SALES) filter to include ss_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_year=2001) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_year=2001).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "TableScan (STORE_SALES) parts reduced due to date_sk range pruning, bytes scanned drop significantly.",
+      "recommended_patch_ops": ["add_predicate_to_scan", "add_subquery_constants"],
+      "rank_rationale": "Primary hotspot: direct attack on largest fact scan with native Snowflake transform.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the three OR branches on customer_demographics/household_demographics into separate UNION ALL subqueries, each with its own focused filters, to allow per-branch pruning.",
+      "dag_target_hint": "Replace the OR joinFilter at node 1.5 with three UNION ALL branches, each joining store_sales with filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_demographics", "household_demographics"],
+        "where_must_preserve": ["cd_marital_status in ('M','U','S')", "cd_education_status in ('2 yr Degree','College','Unknown')", "hd_dep_count in (3,1)", "ss_sales_price ranges"],
+        "output_must_preserve": ["All original columns and aggregates, union branches must not duplicate rows"]
+      },
+      "gates_checked": ["G_SF_UNION_BRANCH_LIMIT:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Three separate scan/join paths with focused filters, reducing rows per branch before union.",
+      "recommended_patch_ops": ["split_or_to_union", "create_branch_ctes", "replace_join_filter"],
+      "rank_rationale": "Targets secondary hotspot: OR joinFilter on customer_demographics/household_demographics applied late.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the three OR branches on customer_address and ss_net_profit into separate UNION ALL subqueries to allow per-branch pruning on ca_state and net_profit ranges.",
+      "dag_target_hint": "Replace the OR joinFilter at node 1.20 with three UNION ALL branches, each joining store_sales with filtered customer_address CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_address"],
+        "where_must_preserve": ["ca_country = 'United States'", "ca_state in specified sets", "ss_net_profit ranges"],
+        "output_must_preserve": ["All original columns and aggregates, union branches must not duplicate rows"]
+      },
+      "gates_checked": ["G_SF_UNION_BRANCH_LIMIT:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Three separate scan/join paths with focused filters on ca_state and net_profit, reducing rows per branch.",
+      "recommended_patch_ops": ["split_or_to_union", "create_branch_ctes", "replace_join_filter"],
+      "rank_rationale": "Targets secondary hotspot: OR joinFilter on customer_address applied late after large scan.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by the seven grouping keys (ss_store_sk, ss_cdemo_sk, ss_sales_price, ss_hdemo_sk, ss_sold_date_sk, ss_addr_sk, ss_net_profit) before joining with dimensions, computing min aggregates early.",
+      "dag_target_hint": "Replace node 1.24 with a CTE that groups store_sales by the seven keys and computes min(ss_quantity), min(ss_ext_sales_price), min(ss_ext_wholesale_cost).",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["All existing store_sales filters (sales_price, net_profit ranges, not nulls)"],
+        "output_must_preserve": ["Grouping keys compatible with downstream joins", "Min aggregates"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Aggregate (1.24) disappears, rows flowing into joins reduced by grouping, downstream aggregates simplified.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "push_aggregate_below_join"],
+      "rank_rationale": "Targets aggregate amplification hotspot, reduces row flow into all subsequent joins.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit INNER JOIN syntax with ON clauses, potentially improving join order flexibility and predicate pushdown.",
+      "dag_target_hint": "Change FROM store_sales, store, ... to FROM store_sales INNER JOIN store ON ... INNER JOIN customer_demographics ON ... etc.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["All original join conditions and filters"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax may allow Snowflake's cost-based join order to reorder dimensions for better selectivity propagation.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Join order may change, potentially reducing build side sizes or enabling earlier filter application.",
+      "recommended_patch_ops": ["replace_from_with_explicit_joins"],
+      "rank_rationale": "Exploration: family F underrepresented, targets join topology for potential plan shape improvement.",
+      "recommended_examples": ["inner_join_conversion"],
+      "gold_example_id": "inner_join_conversion"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter all dimension tables (date_dim, customer_demographics, household_demographics, customer_address, store) into CTEs returning only surrogate keys and necessary attributes before joining with store_sales.",
+      "dag_target_hint": "Create CTEs for each dimension with their respective filters, then join them with store_sales in a single FROM clause.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_demographics", "household_demographics", "customer_address", "store"],
+        "where_must_preserve": ["All original dimension filters"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing filtered dimensions into CTEs may create tiny hash tables for faster probing and better predicate pushdown.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension scans become CTE scans, join filters may be pushed into CTE definitions, reducing fact scan rows.",
+      "recommended_patch_ops": ["create_dimension_ctes", "replace_from_with_ctes"],
+      "rank_rationale": "Exploration: family A, portability candidate, tests if pre-filtered dimension CTEs improve join performance.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Combine all selective dimension filters into a single prefetch CTE that joins store_sales with all dimensions early, applying all filters before subsequent aggregates.",
+      "dag_target_hint": "Create a CTE that joins store_sales with date_dim, customer_demographics, household_demographics, customer_address, store with all original filters, then compute aggregates.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_demographics", "household_demographics", "customer_address", "store"],
+        "where_must_preserve": ["All original filters and join conditions"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "A single prefetch CTE with all filters may allow Snowflake to push filters into the fact scan more effectively.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Single large CTE replaces multiple join nodes, may enable more aggressive filter pushdown and reduce intermediate aggregates.",
+      "recommended_patch_ops": ["create_prefetch_cte", "replace_from_with_cte"],
+      "rank_rationale": "Exploration: variant of dimension isolation, tests combined filter pushdown.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the filtered store_sales scan with all dimension keys and filters into a CTE to avoid repeated scans and allow reuse in multiple aggregate paths.",
+      "dag_target_hint": "Create a CTE that selects store_sales rows with all dimension keys and filters, then compute aggregates from that CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_demographics", "household_demographics", "customer_address", "store"],
+        "where_must_preserve": ["All original filters and join conditions"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the filtered fact rows may reduce repeated work in nested aggregates and joins.",
+      "confidence": 0.45,
+      "expected_explain_delta": "TableScan (STORE_SALES) replaced with CTE scan, aggregate nodes may be simplified.",
+      "recommended_patch_ops": ["create_materialized_cte", "replace_from_with_cte"],
+      "rank_rationale": "Exploration: family E underrepresented, tests materialization benefit for repeated aggregate patterns.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Apply date_sk BETWEEN pushdown to each UNION ALL branch if OR-to-UNION transforms are used, ensuring per-branch pruning.",
+      "dag_target_hint": "If OR branches are split via UNION ALL, add date_sk BETWEEN to each branch's store_sales scan.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Each UNION ALL branch benefits from date_sk pruning, reducing scan per branch.",
+      "recommended_patch_ops": ["add_predicate_to_union_branches", "add_subquery_constants"],
+      "rank_rationale": "Complements OR-to-UNION probes, ensures date pruning works per branch.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push customer_address and customer_demographics/household_demographics filters into subqueries that are joined with store_sales before other joins, reducing rows early.",
+      "dag_target_hint": "Create filtered CTEs for customer_address and customer_demographics/household_demographics, join them with store_sales before joining other dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_address", "customer_demographics", "household_demographics"],
+        "where_must_preserve": ["All original filters on these tables"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early application of selective dimension filters may reduce fact rows before expensive joins and aggregates.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Rows flowing into joins reduced, aggregate input sizes shrink.",
+      "recommended_patch_ops": ["create_filtered_ctes", "reorder_joins"],
+      "rank_rationale": "Exploration: family A, tests early filtering with CTEs for selective dimensions.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate nested aggregate layers into a single aggregate that computes min values per the seven grouping keys, eliminating intermediate aggregates.",
+      "dag_target_hint": "Replace the chain of aggregates (1.24, 1.19, 1.14, 1.9, 1.4, 1.3, 1.2, 1.1) with a single aggregate after all joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["All original filters and join conditions"],
+        "output_must_preserve": ["Min aggregates per original query"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Removing intermediate aggregates may reduce CPU overhead and simplify the plan.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Multiple Aggregate nodes collapse into one, reducing plan complexity and intermediate row flow.",
+      "recommended_patch_ops": ["consolidate_aggregates", "replace_aggregate_chain"],
+      "rank_rationale": "Exploration: family C, targets aggregate amplification by simplifying aggregate structure.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Build a staged join pipeline: first CTE filters date_dim and joins with store_sales, second CTE joins result with filtered customer_demographics/household_demographics, third with customer_address, etc.",
+      "dag_target_hint": "Create a chain of CTEs that progressively join filtered dimensions with the reducing fact set.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_demographics", "household_demographics", "customer_address", "store"],
+        "where_must_preserve": ["All original filters and join conditions"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may allow Snowflake to build smaller hash tables and reduce join work incrementally.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Plan shape changes to CTE chain, join sizes reduce progressively.",
+      "recommended_patch_ops": ["create_staged_cte_chain", "replace_from_with_cte_chain"],
+      "rank_rationale": "Exploration: family A, tests incremental reduction via CTE pipeline.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subqueries present in query; plan shows no correlation."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries; family B not applicable."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "rollup_to_union_windowing",
+      "family": "D",
+      "reason": "No GROUP BY ROLLUP in query."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No UNION or repeated CTE scans in query."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join patterns in query; engine is Snowflake, not PostgreSQL."
+    },
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "reason": "Portability candidate for PostgreSQL, not Snowflake; explicit join conversion already covered by inner_join_conversion."
+    },
+    {
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "reason": "Portability candidate for PostgreSQL, not Snowflake; similar to multi_dimension_prefetch."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "Portability candidate for PostgreSQL, not Snowflake; no non-equi joins present."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "No self-join patterns in query."
+    },
+    {
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "reason": "No correlated EXISTS subqueries in query."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries in query."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "No repeated scans of same fact table with different channels."
+    },
+    {
+      "transform_id": "deferred_window_aggregation",
+      "family": "C",
+      "reason": "No window functions in query."
+    },
+    {
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "reason": "Already selected as probe p11."
+    },
+    {
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "reason": "Similar to dimension_cte_isolate, but less comprehensive; prefer multi-dimension approaches."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "No multiple date ranges; only d_year=2001."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "No multiple channel CTEs with shared filters."
+    }
+  ]
+}

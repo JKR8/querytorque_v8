@@ -6,8 +6,8 @@
 |----------|---------|
 | **[PRODUCT_CONTRACT.md](PRODUCT_CONTRACT.md)** | Pipeline phases, success conditions, CLI commands, module responsibilities. The engineering contract — read this before changing anything. |
 | [`../prompts/sql_rewrite_spec.md`](../prompts/sql_rewrite_spec.md) | DAP (Decomposed Attention Protocol) v1.0 — output format spec for LLM rewrites |
-| [`../prompts/samples/PROMPT_SPEC.md`](../prompts/samples/PROMPT_SPEC.md) | Prompt builder reference — all modes, parameters, token budgets |
-| [`../prompts/samples/V0/`](../prompts/samples/V0/) | 11 rendered prompt samples covering every pipeline stage |
+| [`../prompts/archive/samples/PROMPT_SPEC.md`](../prompts/archive/samples/PROMPT_SPEC.md) | Archived prompt builder reference — legacy modes, parameters, token budgets |
+| [`../prompts/archive/samples/V0/`](../prompts/archive/samples/V0/) | Archived rendered prompt samples covering legacy pipeline stages |
 | [`../scanner_knowledge/README.md`](../scanner_knowledge/README.md) | Scanner knowledge pipeline (PG planner exploration → findings) |
 | [`../plan_scanner_spec.yaml`](../plan_scanner_spec.yaml) | Three-layer plan-space scanner architecture |
 

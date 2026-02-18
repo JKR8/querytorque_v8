@@ -1,0 +1,165 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan materializes a full-year CTE with grouped aggregates for all months, then self-joins two filtered months, causing redundant aggregation work and a large intermediate result. Pushing month filters into separate CTEs should reduce aggregation input and enable partition pruning on inventory.date_sk.",
+    "reasoning_trace": [
+      "INVENTORY scan is largest I/O (3.6 GB, 279 parts) and feeds a multi-level aggregate for all months.",
+      "CTE 'inv' groups by d_moy but outer query only uses months 2 and 3, wasting aggregation compute on other months.",
+      "Self-join on CTE with month filters (inv1.d_moy=2, inv2.d_moy=3) suggests separate materialization could prune earlier.",
+      "Date_dim filter (d_year=2002, d_moy IN (2,3)) is applied early but not pushed as date_sk range to inventory scan."
+    ],
+    "cost_spine": ["TableScan (INVENTORY)", "Aggregate (multi-level)", "InnerJoin (date_dim)", "Filter (cov>1)", "SelfJoin (inv1, inv2)", "Sort"],
+    "hotspots": [
+      {
+        "op": "TableScan (INVENTORY)",
+        "why": "largest I/O volume, scans 279 partitions without explicit date_sk range pruning",
+        "evidence": "parts=279/279 bytes=3658746880"
+      },
+      {
+        "op": "Aggregate (multi-level)",
+        "why": "computes stddev_samp and avg for all months, then discards most via outer filter",
+        "evidence": "aggregate nodes 1.7,1.8,1.11,1.15 feed into Filter 1.6 (cov>1)"
+      },
+      {
+        "op": "SelfJoin (inv1, inv2)",
+        "why": "self-join on CTE with month filters; CTE materializes full year",
+        "evidence": "WithReference nodes INV1 (d_moy=2) and INV2 (d_moy=3) from same CTE"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS/NOT EXISTS into broad CTE branches (Snowflake semi-join strength)",
+      "avoid wrapping partition keys in functions that block micro-partition pruning",
+      "do not split OR to UNION ALL without evidence of predicate blockage"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split CTE 'inv' into two separate CTEs, inv_2 and inv_3, each filtering d_moy=2 and d_moy=3 respectively in their definitions, and compute aggregates and cov filter per month.",
+      "dag_target_hint": "Replace CTE 'inv' with two CTEs, then rewrite final SELECT to join inv_2 and inv_3.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "i_category IN ('Jewelry','Men')", "i_manager_id BETWEEN 81 AND 100", "inv_quantity_on_hand BETWEEN 0 AND 200"],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "d_moy", "mean", "cov", "same cov>1 filter logic"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS", "G_SF_CTE_REUSE_RULE:DOWNRANK_TO_EXPLORATION"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Aggregate input rows reduce by filtering d_moy early; CTE materialization splits into two smaller CTEs; self-join becomes simple join of two pre-filtered CTEs.",
+      "recommended_patch_ops": ["replace_cte_definition", "split_cte", "replace_from"],
+      "rank_rationale": "Primary hotspot — eliminates full-year aggregation and reduces intermediate result size before self-join.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Derive date_sk range from date_dim filter (d_year=2002 AND d_moy IN (2,3)) and push as inv_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE ...) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE ...) into inventory scan.",
+      "dag_target_hint": "Add predicate to inventory scan or join condition.",
+      "node_contract": {
+        "from_must_include": ["inventory", "date_dim"],
+        "where_must_preserve": ["inv_date_sk = d_date_sk", "d_year=2002", "d_moy IN (2,3)"],
+        "output_must_preserve": ["all original rows; no change to join semantics"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Inventory scan shows reduced partitions read due to date_sk range pruning.",
+      "recommended_patch_ops": ["add_predicate", "insert_cte_for_range"],
+      "rank_rationale": "Targets largest I/O hotspot — potential for micro-partition pruning on inventory.date_sk.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter date_dim (d_year=2002, d_moy IN (2,3)), item (i_category IN, i_manager_id BETWEEN), and warehouse into separate CTEs returning only surrogate keys and needed attributes, then join with inventory.",
+      "dag_target_hint": "Insert CTEs before main FROM, replace original joins with joins to CTEs.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["all original dimension filters"],
+        "output_must_preserve": ["same join keys and grouping columns"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:DOWNRANK_TO_EXPLORATION", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already push filters, but pre-materializing tiny dimension CTEs could improve join order and reduce fact scan via better predicate propagation.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension scans become tiny CTE scans; join order may shift to build small hash tables first.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — tests if pre-materializing selective dimensions improves join planning and fact scan reduction.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate inventory by inv_item_sk, inv_warehouse_sk, inv_date_sk (sum, sum of squares, count) before joining with dimensions, then compute stddev and avg after joining with item, warehouse, date_dim.",
+      "dag_target_hint": "Insert CTE with partial aggregates, then join dimensions and compute final aggregates and cov filter.",
+      "node_contract": {
+        "from_must_include": ["inventory"],
+        "where_must_preserve": ["inv_quantity_on_hand BETWEEN 0 AND 200"],
+        "output_must_preserve": ["same aggregate results (stddev_samp, avg) and grouping keys"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:stdev/avg require careful recomposition"],
+      "exploration": true,
+      "exploration_hypothesis": "Pushing partial aggregates below joins may reduce rows flowing through joins, but must preserve exact statistical semantics.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Aggregate nodes shift earlier; join input rows reduce; final computation of stddev and avg occurs after dimension joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_aggregate"],
+      "rank_rationale": "Exploration — targets secondary aggregate hotspot; high risk due to statistical semantics but potential high reward.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in original SQL."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "CTE is already materialized (WithReference); no repeated scan pattern."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "All joins are already INNER; no LEFT JOIN with subsequent NULL filter."
+    }
+  ]
+}

@@ -1,0 +1,260 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Correlated scalar subquery (SubPlan 1) executes 1771 times per outer row, dominating runtime (cost 2403.87 per execution). The main Hash Join processes 10498 rows against a 30K-item hash table, but the late join filter with per-row subquery re‑execution is the primary bottleneck. Secondary hotspot is the large fact‑table scan (catalog_sales) that feeds the join before the correlated filter is applied.",
+    "reasoning_trace": [
+      "SubPlan 1 (correlated scalar aggregate) appears as a Join Filter in Hash Join node, executed for each of 1771 rows passing the hash condition.",
+      "Plan shows nested loop inside SubPlan (Bitmap Heap Scan + Index Scan) with correlation key cs_item_sk = item.i_item_sk.",
+      "Main fact scan (catalog_sales) returns 10498 rows via index scan on cs_sold_date_sk, but the correlated filter is applied after the join, preventing early row reduction.",
+      "Item table scan (30K rows) uses Seq Scan with OR filter; no index usage indicated for i_manufact_id or i_manager_id."
+    ],
+    "cost_spine": ["Hash Join", "Gather", "Nested Loop", "Parallel Seq Scan date_dim", "Index Scan catalog_sales", "Seq Scan item", "SubPlan 1 (Aggregate → Nested Loop)"],
+    "hotspots": [
+      {
+        "op": "Join Filter (SubPlan 1)",
+        "why": "correlated scalar subquery re‑executes 1771 times per outer row",
+        "evidence": "cost=2403.87 per execution, rows=1771, nested loop inside subplan"
+      },
+      {
+        "op": "Hash Join",
+        "why": "processes 10498 probe rows against 30367‑row hash table before applying expensive correlated filter",
+        "evidence": "cost=65026.70, rows=1771, join filter with SubPlan"
+      },
+      {
+        "op": "Seq Scan item",
+        "why": "full table scan with OR filter, no index usage, feeds hash build side",
+        "evidence": "rows=30367, cost=9137.50, filter uses i_manufact_id IN (...) OR i_manager_id BETWEEN"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union on item OR filter (PostgreSQL BitmapOr already optimal if indexes exist; here no index, but regression risk high)",
+      "avoid materializing EXISTS paths (none present)",
+      "avoid duplicating large CTE bodies (CTE_MATERIALIZATION_FENCE guard)",
+      "avoid unfiltered large CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Replace correlated scalar subquery with three MATERIALIZED CTEs: (1) filtered date_dim for date range, (2) filtered catalog_sales with date join and price filters, (3) per‑item aggregate threshold (1.3 * avg(cs_ext_discount_amt)). Then join threshold CTE in main query.",
+      "dag_target_hint": "Replace SubPlan 1 with CTE reference; modify final_select FROM and WHERE.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "d_date BETWEEN '2001-02-23' AND cast('2001-02-23' as date) + interval '90 day'", "cs_ext_discount_amt > threshold"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY sum(cs_ext_discount_amt)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECOMPOSED:FAIL (plan shows correlated)", "G_PG_CORR_EXISTS_PROTECTION:PASS (not EXISTS)", "G_PG_CORR_FACT_COUNT:PASS (single fact table in subquery)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "SubPlan 1 disappears; replaced by pre‑computed threshold CTE joined via hash join. Nested loop inside subplan eliminated.",
+      "recommended_patch_ops": ["insert_cte_date_filtered", "insert_cte_fact_filtered", "insert_cte_threshold", "replace_where_predicate", "replace_from_with_cte_joins"],
+      "rank_rationale": "Primary hotspot — eliminates per‑row correlated subquery execution, which dominates cost.",
+      "recommended_examples": ["pg_shared_scan_decorrelate", "inline_decorrelate_materialized"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Pre‑filter date_dim and item into CTEs, then decorrelate subquery by pre‑computing per‑item threshold from filtered catalog_sales. Use explicit JOIN syntax.",
+      "dag_target_hint": "Change final_select FROM to join CTEs; replace correlated subquery with CTE join.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "d_date BETWEEN '2001-02-23' AND cast('2001-02-23' as date) + interval '90 day'", "cs_ext_discount_amt > threshold"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECOMPOSED:FAIL", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Correlated subquery replaced by CTE join; date and item filters applied early in CTEs; hash join uses smaller dimension sets.",
+      "recommended_patch_ops": ["insert_cte_date_filtered", "insert_cte_item_filtered", "insert_cte_threshold", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Secondary decorrelation approach with early filtering; may improve join cardinality estimates.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": "early_filter_decorrelate"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim into a CTE, convert comma joins to explicit INNER JOIN syntax, and join with catalog_sales and item.",
+      "dag_target_hint": "Replace comma joins with explicit JOIN ... ON; add date_cte.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "d_date BETWEEN '2001-02-23' AND cast('2001-02-23' as date) + interval '90 day'", "cs_ext_discount_amt > (SubPlan 1)"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY and LIMIT"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS (single fact table)", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may improve planner's ability to reorder joins and propagate filters, though correlated subquery remains.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Comma joins become explicit INNER JOIN; date filter pushed into CTE; join order may change.",
+      "recommended_patch_ops": ["insert_cte_date_filtered", "replace_comma_with_explicit_join"],
+      "rank_rationale": "Exploration — addresses comma‑join weakness; may synergize with decorrelation probes.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre‑filter both date_dim and item into separate CTEs, then join with catalog_sales using explicit JOIN syntax.",
+      "dag_target_hint": "Add date_cte and item_cte; rewrite FROM with explicit joins.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "d_date BETWEEN '2001-02-23' AND cast('2001-02-23' as date) + interval '90 day'", "cs_ext_discount_amt > (SubPlan 1)"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY and LIMIT"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN (previous attempt failed)"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre‑filtering both dimensions may create tiny hash tables and improve join order, though correlated subquery remains unchanged.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date and item scans become CTE materializations; explicit joins may reduce build side size.",
+      "recommended_patch_ops": ["insert_cte_date_filtered", "insert_cte_item_filtered", "replace_comma_with_explicit_join"],
+      "rank_rationale": "Exploration — multi‑dimension prefetch; previous attempt failed but may combine with decorrelation.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "pg_materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered date_dim and pre‑filtered catalog_sales (with date join) into CTEs, then join with item and apply correlated subquery threshold via CTE.",
+      "dag_target_hint": "Create fact_prefilter CTE that joins catalog_sales with date_dim on date range; then join with item and threshold CTE.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "cs_ext_discount_amt > threshold"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY and LIMIT"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS (cs_ext_discount_amt > threshold)", "G_PG_NONEQUI_CARDINALITY:PASS (large fact scan)", "G_PG_NONEQUI_FILTER_QUALITY:PASS (tight date range)"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction of fact table before non‑equi join (cs_ext_discount_amt > threshold) may cut input size dramatically.",
+      "confidence": 0.70,
+      "expected_explain_delta": "Fact table scan reduced by early date join; threshold computed from pre‑filtered set; hash join inputs smaller.",
+      "recommended_patch_ops": ["insert_cte_date_filtered", "insert_cte_fact_prefilter", "insert_cte_threshold", "replace_from_with_cte_joins"],
+      "rank_rationale": "Exploration — targets non‑equi join input blindness; may complement decorrelation.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered catalog_sales scan (with date join) once, then derive both the main query rows and the subquery threshold from the same CTE.",
+      "dag_target_hint": "Create a shared CTE for catalog_sales joined with date_dim; reuse it for main query and threshold computation.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "d_date BETWEEN '2001-02-23' AND cast('2001-02-23' as date) + interval '90 day'", "cs_ext_discount_amt > threshold"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY and LIMIT"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS (single CTE, not duplicated)", "G_PG_CTE_REUSE_REQUIRED:PASS (two consumers: main query and threshold)", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS (no EXISTS/INTERSECT)"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared scan of catalog_sales may eliminate redundant index scans and improve data locality.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Redundant catalog_sales scans merge into one CTE; plan shows single scan instead of two.",
+      "recommended_patch_ops": ["insert_cte_shared_fact_scan", "replace_from_with_cte", "replace_subquery_with_cte"],
+      "rank_rationale": "Exploration — addresses repeated table scan pattern; may reduce I/O.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the filtered item table (with OR condition) into a CTE to create a small hash table for the join.",
+      "dag_target_hint": "Add item_cte with OR filter; replace item table reference with CTE.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "d_date BETWEEN '2001-02-23' AND cast('2001-02-23' as date) + interval '90 day'", "cs_ext_discount_amt > (SubPlan 1)"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY and LIMIT"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:FAIL (single use)", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the item filter may help planner choose a better join order or improve hash build efficiency, though reuse is low.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Item Seq Scan becomes CTE scan; hash build may be faster if CTE is materialized.",
+      "recommended_patch_ops": ["insert_cte_item_filtered", "replace_table_with_cte"],
+      "rank_rationale": "Exploration — secondary hotspot (item scan) with low expected impact but safe.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "decorrelate",
+      "family": "B",
+      "target": "Convert correlated subquery to a standalone CTE with GROUP BY i_item_sk, then JOIN. (Portability candidate from DuckDB; adapt to PostgreSQL syntax.)",
+      "dag_target_hint": "Replace SubPlan 1 with CTE that pre‑computes per‑item threshold.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id IN (184,307,365,560,681) OR i_manager_id BETWEEN 42 AND 71", "d_date BETWEEN '2001-02-23' AND cast('2001-02-23' as date) + interval '90 day'", "cs_ext_discount_amt > threshold"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as \"excess discount amount\"", "ORDER BY and LIMIT"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECOMPOSED:FAIL", "G_PG_CORR_EXISTS_PROTECTION:PASS", "portability_candidate:WARN (non‑native)"],
+      "exploration": true,
+      "exploration_hypothesis": "Alternative decorrelation shape may trigger different planner decisions; portability candidate with lower confidence on PostgreSQL.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Correlated subquery replaced by CTE join; may produce similar plan to inline_decorrelate_materialized but without MATERIALIZED hint.",
+      "recommended_patch_ops": ["insert_cte_threshold_grouped", "replace_where_predicate", "replace_from_with_cte_join"],
+      "rank_rationale": "Exploration — portability candidate; tests simpler decorrelation without early filtering.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "PostgreSQL regression guardrail G_PG_OR_INDEX_PROTECTED blocks splitting OR on same column; no evidence OR blocks index usage (item has no index on i_manufact_id or i_manager_id)."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "Portability candidate for Snowflake; PostgreSQL native inline_decorrelate_materialized is preferred."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY in main query; aggregation is inside correlated subquery, already addressed by decorrelation."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No UNION or repeated CTE with different filters."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN present."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "Not a self‑join pattern; pg_self_join_decomposition (family E) is more appropriate."
+    }
+  ]
+}

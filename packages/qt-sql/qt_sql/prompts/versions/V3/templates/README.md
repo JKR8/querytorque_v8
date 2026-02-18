@@ -1,6 +1,7 @@
 # V3 Templates
 
 Canonical runtime prompt templates live in this directory.
+Status: IN USE.
 
 Files:
 - beam_analyst_v3.txt

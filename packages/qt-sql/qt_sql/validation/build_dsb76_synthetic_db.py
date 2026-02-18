@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import duckdb
 import sqlglot
 
+from .patch_packs import available_patch_packs, load_witness_patch_pack
 from .synthetic_validator import (
     SchemaExtractor,
     SchemaFromDB,
@@ -2747,6 +2748,7 @@ def _count_query_rows(
 
 
 def main() -> int:
+    patch_pack_choices = ["none", *sorted(available_patch_packs().keys())]
     parser = argparse.ArgumentParser(
         description="Build persistent synthetic DuckDB DB for postgres_dsb_76 and verify 76 queries."
     )
@@ -2856,6 +2858,12 @@ def main() -> int:
         help="Generic edge rows inserted per table in addition to explicit template rows.",
     )
     parser.add_argument(
+        "--patch-pack",
+        choices=patch_pack_choices,
+        default="none",
+        help="Optional benchmark patch pack for witness fallback (default: none).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logs.",
@@ -2892,6 +2900,12 @@ def main() -> int:
         )
     else:
         logger.info("No reference DB provided; using AST-only synthetic schema inference.")
+
+    patch_pack = load_witness_patch_pack(args.patch_pack)
+    if patch_pack is None:
+        logger.info("Patch pack: none (core AST/general flow only)")
+    else:
+        logger.info("Patch pack: %s (%s)", patch_pack.name, patch_pack.description)
 
     # 1) Build per-query contexts and merge global schema/constraints.
     query_contexts: List[QueryContext] = []
@@ -3043,9 +3057,9 @@ def main() -> int:
                     query_result["forced_seed_attempts"] = seed_attempt
                     query_result["error"] = str(exc)
 
-        if not query_result["success"]:
+        if not query_result["success"] and patch_pack is not None:
             try:
-                recipe_applied = _apply_mvrows_recipe(conn, qctx, global_tables)
+                recipe_applied = bool(patch_pack.apply_recipe(conn, qctx, global_tables))
                 if recipe_applied:
                     rows = _count_query_rows(conn, sql_duckdb, args.query_timeout_s, probe_limit=probe_limit)
                     query_result["rows"] = rows
@@ -3089,6 +3103,7 @@ def main() -> int:
         "out_db": str(out_db),
         "reference_db": reference_db,
         "edge_template": str(edge_template_path),
+        "patch_pack": patch_pack.name if patch_pack else "none",
     }
 
     payload = {

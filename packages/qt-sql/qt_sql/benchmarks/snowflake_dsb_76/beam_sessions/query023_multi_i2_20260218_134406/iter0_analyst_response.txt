@@ -1,0 +1,381 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Multiple large fact table scans (STORE_SALES 1.2TB, CATALOG_SALES 923GB, WEB_SALES 461GB) dominate I/O, with repeated scans of STORE_SALES across CTEs. Correlated scalar subquery in best_ss_customer may cause per-row re-execution. Date filters on dimension tables may not be pushed into fact table scans due to union and multi-fact join shapes.",
+    "reasoning_trace": [
+      "STORE_SALES scanned 3 times (frequent_ss_items, max_store_sales, best_ss_customer) with overlapping filters and aggregations.",
+      "CATALOG_SALES and WEB_SALES each scanned once in union branches, with same date_dim filter (d_year=1999, d_moy=5).",
+      "Correlated subquery in best_ss_customer compares to max_store_sales, potentially causing repeated computation.",
+      "Date_dim filters appear selective (parts=1/1) but may not push sold_date_sk range to fact scans across UNION ALL.",
+      "Multiple aggregations on STORE_SALES (count(*), sum(ss_quantity*ss_sales_price)) could be consolidated."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "TableScan (CATALOG_SALES)", "TableScan (WEB_SALES)", "Aggregate", "Join"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "1.2TB scanned multiple times across CTEs with overlapping filters",
+        "evidence": "parts=72718/72718 bytes=1251924090880, scanned in [1.13], [2.23], [2.44]"
+      },
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "923GB scan in union branch with date filter",
+        "evidence": "parts=54922/54922 bytes=923617475584 in [2.29]"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "461GB scan in union branch with date filter",
+        "evidence": "parts=27579/27579 bytes=461041485824 in [2.52]"
+      },
+      {
+        "op": "Correlated subquery in best_ss_customer",
+        "why": "Scalar aggregate comparison may re-execute per row",
+        "evidence": "Filter expr=(SUM(...)) > ((95 / 100) * (Subquery(Step1))) at [2.34]"
+      }
+    ],
+    "do_not_do": [
+      "Avoid materializing EXISTS subqueries (Snowflake already optimizes semi-joins)",
+      "Do not wrap date_sk in functions that block micro-partition pruning",
+      "Avoid creating unfiltered large CTEs that increase memory pressure"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range derived from date_dim filters (d_year=1999, d_moy=5) to catalog_sales and web_sales scans in UNION ALL branches.",
+      "dag_target_hint": "Modify final_select UNION ALL branches to include AND cs_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_year=1999 AND d_moy=5) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_year=1999 AND d_moy=5) and similarly for web_sales.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_year=1999", "d_moy=5", "cs_wholesale_cost BETWEEN 26 AND 36", "ws_wholesale_cost BETWEEN 26 AND 36"],
+        "output_must_preserve": ["cs_quantity*cs_list_price", "ws_quantity*ws_list_price", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Reduced partitions scanned in CATALOG_SALES and WEB_SALES TableScan operators.",
+      "recommended_patch_ops": ["add_predicate_to_union_branch", "insert_subquery_range"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary I/O hotspots (CATALOG_SALES and WEB_SALES) with native Snowflake micro-partition pruning.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery in best_ss_customer HAVING clause into 3 CTEs: shared store_sales scan, per-customer aggregate threshold, filtered main query.",
+      "dag_target_hint": "Replace best_ss_customer CTE definition with non-correlated form using precomputed max_store_sales value.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer", "date_dim"],
+        "where_must_preserve": ["d_year=1999", "ss_wholesale_cost BETWEEN 26 AND 36", "c_birth_year BETWEEN 1987 AND 1993"],
+        "output_must_preserve": ["c_customer_sk", "sum(ss_quantity*ss_sales_price) as ssales", "HAVING > 0.95 * max_store_sales"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Correlated subquery filter replaced with join to precomputed scalar CTE, removing per-row re-execution.",
+      "recommended_patch_ops": ["insert_cte_max_store_sales", "rewrite_having_to_join", "replace_best_ss_customer_cte"],
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "rank_rationale": "Addresses correlated subquery hotspot with native Snowflake decorrelation pattern.",
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate three store_sales scans (frequent_ss_items, max_store_sales, best_ss_customer) into single scan with conditional aggregation.",
+      "dag_target_hint": "Replace frequent_ss_items, max_store_sales, best_ss_customer CTEs with single CTE that computes all needed aggregates in one pass.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "item", "customer"],
+        "where_must_preserve": ["d_year=1999", "i_manager_id BETWEEN 44 AND 63", "i_category IN ('Men','Music','Sports')", "ss_wholesale_cost BETWEEN 26 AND 36", "c_birth_year BETWEEN 1987 AND 1993"],
+        "output_must_preserve": ["substring(i_item_desc,1,30) itemdesc", "i_item_sk item_sk", "d_date solddate", "count(*) cnt", "c_customer_sk", "sum(ss_quantity*ss_sales_price) csales/ssales"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "agg_key_compatibility:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass aggregation may reduce 3 store_sales scans to 1, but requires careful handling of different grouping sets and filters.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Reduced TableScan (STORE_SALES) count from 3 to 1, with increased aggregation complexity.",
+      "recommended_patch_ops": ["consolidate_ctes", "add_conditional_aggregation", "rewrite_grouping_sets"],
+      "recommended_examples": ["channel_bitmap_aggregation"],
+      "rank_rationale": "Exploration targeting largest I/O source (STORE_SALES repeated scans) with high potential impact but moderate risk."
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk BETWEEN range to all store_sales scans in CTEs using same date_dim filter (d_year=1999).",
+      "dag_target_hint": "Add AND ss_sold_date_sk BETWEEN range to store_sales scans in frequent_ss_items, max_store_sales, and best_ss_customer CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year=1999"],
+        "output_must_preserve": ["All existing columns and aggregates from each CTE"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Reduced partitions scanned in STORE_SALES TableScan operators across multiple CTEs.",
+      "recommended_patch_ops": ["add_predicate_to_fact_scan", "insert_subquery_range"],
+      "recommended_examples": ["sf_sk_pushdown_3fact"],
+      "rank_rationale": "Extends date_sk pushdown to all store_sales scans, addressing primary I/O hotspot.",
+      "gold_example_id": "sf_sk_pushdown_3fact"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_item_sk, ss_sold_date_sk before joining with item and date_dim in frequent_ss_items CTE.",
+      "dag_target_hint": "Modify frequent_ss_items CTE to group store_sales first, then join with dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year=1999", "i_manager_id BETWEEN 44 AND 63", "i_category IN ('Men','Music','Sports')"],
+        "output_must_preserve": ["substring(i_item_desc,1,30) itemdesc", "i_item_sk item_sk", "d_date solddate", "count(*) cnt", "HAVING count(*) > 4"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Reduced rows flowing into joins, smaller intermediate results.",
+      "recommended_patch_ops": ["rewrite_cte_with_early_aggregation", "replace_from"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Targets join amplification in frequent_ss_items CTE by reducing rows before dimension joins.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize filtered date_dim (d_year=1999) as CTE and reuse across all queries to avoid repeated scans.",
+      "dag_target_hint": "Create date_filtered CTE and replace all date_dim references in CTEs and main query.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year=1999", "d_moy=5 where applicable"],
+        "output_must_preserve": ["d_date_sk", "d_date", "d_year", "d_moy"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already reuse dimension scans via caching, but explicit CTE could improve plan stability.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Single TableScan (DATE_DIM) instead of multiple scans, though impact may be small due to already pruned scans.",
+      "recommended_patch_ops": ["insert_cte_date_filtered", "replace_table_references"],
+      "recommended_examples": ["materialize_cte"],
+      "rank_rationale": "Exploration targeting repeated dimension scans, though parts=1/1 suggests limited gain."
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared date_dim filter (d_year=1999, d_moy=5) into CTE for both catalog_sales and web_sales union branches.",
+      "dag_target_hint": "Create date_may_1999 CTE and reference in both UNION ALL branches.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year=1999", "d_moy=5"],
+        "output_must_preserve": ["d_date_sk"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared dimension CTE may help optimizer recognize identical filter across branches.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Potential reduction in date_dim scan work, though already parts=1/1.",
+      "recommended_patch_ops": ["insert_cte_shared_dim", "replace_dimension_references"],
+      "recommended_examples": ["shared_dimension_multi_channel"],
+      "rank_rationale": "Exploration targeting dimension reuse across UNION ALL branches."
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate max_store_sales and best_ss_customer aggregations into single store_sales scan with CASE expressions.",
+      "dag_target_hint": "Combine max_store_sales and best_ss_customer CTEs into one that computes both aggregates.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer", "date_dim"],
+        "where_must_preserve": ["d_year=1999", "ss_wholesale_cost BETWEEN 26 AND 36", "c_birth_year BETWEEN 1987 AND 1993"],
+        "output_must_preserve": ["max(csales) tpcds_cmax", "c_customer_sk", "sum(ss_quantity*ss_sales_price) ssales"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "agg_key_compatibility:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Two store_sales scans with similar filters could be merged, but different grouping keys (c_customer_sk vs none) complicate.",
+      "confidence": 0.45,
+      "expected_explain_delta": "One less store_sales scan, but may increase aggregation complexity.",
+      "recommended_patch_ops": ["merge_cte_definitions", "add_case_aggregation"],
+      "recommended_examples": ["single_pass_aggregation"],
+      "rank_rationale": "Exploration targeting store_sales scan reduction with moderate risk due to different grouping."
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage join pipeline: filter date_dim first, join with store_sales to reduce rows early, then join with item/customer.",
+      "dag_target_hint": "Restructure frequent_ss_items CTE as chain: date_filtered -> store_sales_joined -> item_joined.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year=1999", "i_manager_id BETWEEN 44 AND 63", "i_category IN ('Men','Music','Sports')"],
+        "output_must_preserve": ["substring(i_item_desc,1,30) itemdesc", "i_item_sk item_sk", "d_date solddate", "count(*) cnt"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit staging may help optimizer push filters earlier, though Snowflake's cost-based join order may already be optimal.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Potential earlier reduction in store_sales rows via date_dim filter pushdown.",
+      "recommended_patch_ops": ["restructure_cte_as_chain", "insert_intermediate_ctes"],
+      "recommended_examples": ["prefetch_fact_join"],
+      "rank_rationale": "Exploration testing join order sensitivity for frequent_ss_items CTE."
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter item and customer tables into CTEs returning only surrogate keys before joining with store_sales.",
+      "dag_target_hint": "Create item_filtered and customer_filtered CTEs, use in frequent_ss_items and best_ss_customer.",
+      "node_contract": {
+        "from_must_include": ["item", "customer"],
+        "where_must_preserve": ["i_manager_id BETWEEN 44 AND 63", "i_category IN ('Men','Music','Sports')", "c_birth_year BETWEEN 1987 AND 1993"],
+        "output_must_preserve": ["i_item_sk", "c_customer_sk"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension hash tables may improve join performance, though dimension scans are already small.",
+      "confidence": 0.35,
+      "expected_explain_delta": "Potential faster dimension joins due to smaller hash tables.",
+      "recommended_patch_ops": ["insert_cte_dimension_filtered", "replace_dimension_references"],
+      "recommended_examples": ["dimension_cte_isolate"],
+      "rank_rationale": "Exploration targeting dimension join efficiency, low expected impact due to already pruned scans."
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Alternative decorrelation using shared scan: create CTE with store_sales aggregates needed for both max_store_sales and best_ss_customer.",
+      "dag_target_hint": "Combine store_sales scan with aggregations for both CTEs into shared CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_year=1999", "ss_wholesale_cost BETWEEN 26 AND 36", "c_birth_year BETWEEN 1987 AND 1993"],
+        "output_must_preserve": ["c_customer_sk", "sum(ss_quantity*ss_sales_price) csales", "max(csales) over () as tpcds_cmax"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared scan variant may be more efficient than inline decorrelation by avoiding separate store_sales scans.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced store_sales scans and correlated subquery removed.",
+      "recommended_patch_ops": ["insert_shared_scan_cte", "rewrite_having_to_join", "replace_cte_definitions"],
+      "recommended_examples": ["sf_shared_scan_decorrelate"],
+      "rank_rationale": "Exploration alternative to p02 with shared scan approach."
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax for clarity and potential optimizer hints.",
+      "dag_target_hint": "Change frequent_ss_items CTE from 'from store_sales, date_dim, item' to explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "item"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "ss_item_sk = i_item_sk", "d_year=1999", "i_manager_id BETWEEN 44 AND 63", "i_category IN ('Men','Music','Sports')"],
+        "output_must_preserve": ["All columns and aggregates"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax may help Snowflake optimizer in complex queries, though impact likely minimal.",
+      "confidence": 0.30,
+      "expected_explain_delta": "No change in plan shape, but may improve readability and future optimization.",
+      "recommended_patch_ops": ["replace_comma_joins_with_inner_join"],
+      "recommended_examples": ["inner_join_conversion"],
+      "rank_rationale": "Exploration with low risk, testing syntactic impact on optimizer."
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No repeated CTE scans with different filters requiring specialization."
+    },
+    {
+      "transform_id": "rollup_to_union_windowing",
+      "family": "D",
+      "reason": "No GROUP BY ROLLUP in query."
+    },
+    {
+      "transform_id": "deferred_window_aggregation",
+      "family": "C",
+      "reason": "No window functions in query."
+    },
+    {
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Engine-specific to PostgreSQL, not Snowflake."
+    },
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "reason": "Engine-specific to PostgreSQL, not Snowflake."
+    },
+    {
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "reason": "Engine-specific to PostgreSQL, not Snowflake."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "Engine-specific to PostgreSQL, not Snowflake."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "No CTE self-joins with different filters."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "Engine-specific to PostgreSQL, not Snowflake."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "Engine-specific to PostgreSQL, not Snowflake."
+    },
+    {
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "reason": "No multiple correlated EXISTS with common filters."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Date_dim joined only once per CTE, not multiple times with different filters."
+    }
+  ]
+}

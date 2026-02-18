@@ -1,0 +1,164 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a full parallel scan of the 133M-row inventory table (24M rows after filter) and a nested loop with a join filter that removes 2.3M rows per warehouse. The CTE computes aggregates for all months, but the outer query only needs months 5 and 6, indicating late filtering. Comma-join syntax may prevent optimal join reordering.",
+    "reasoning_trace": [
+      "Parallel Seq Scan on inventory scans 8,048,979 rows per worker (3 workers) after filter, total ~24M rows.",
+      "Nested Loop with join filter removes 2,292,381 rows per warehouse loop (10 warehouses), amplifying work.",
+      "CTE 'inv' groups by d_moy but outer query filters d_moy=5 and 6, computing unnecessary months.",
+      "Comma-separated joins in CTE definition may block predicate pushdown and optimal join planning."
+    ],
+    "cost_spine": ["Parallel Seq Scan on inventory", "Nested Loop", "GroupAggregate"],
+    "hotspots": [
+      {
+        "op": "Parallel Seq Scan on inventory",
+        "why": "full table scan dominates I/O, filtered late by inv_quantity_on_hand range",
+        "evidence": "rows=8,048,979 per worker, 3 workers, time=1553ms per worker"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "join filter (inv_warehouse_sk = w_warehouse_sk) applied after scan, removing 2.3M rows per warehouse loop",
+        "evidence": "Rows Removed by Join Filter: 2,292,381, loops=10"
+      },
+      {
+        "op": "GroupAggregate",
+        "why": "aggregates 254,709 rows into 187,271 groups, then filtered by cov > 1, late reduction",
+        "evidence": "rows_in=254,709, rows_out=187,271 before cov filter, then 0 rows after"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR to UNION ALL split (no OR predicates in query)",
+      "avoid duplicating the heavy inventory scan CTE body",
+      "avoid materializing EXISTS paths (none present)",
+      "do not repeat inner_join_conversion, date_cte_explicit_join, materialize_cte, early_filter (previous failed attempts)"
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma-separated joins in CTE 'inv' to explicit JOIN syntax and pre-filter selective dimensions (date_dim, item, warehouse) into separate CTEs to create tiny hash tables before joining with inventory.",
+      "dag_target_hint": "Replace the FROM clause in CTE 'inv' with explicit INNER JOINs and add pre-filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "i_category IN ('Shoes','Sports')", "i_manager_id BETWEEN 42 AND 61", "inv_quantity_on_hand BETWEEN 791 AND 991"],
+        "output_must_preserve": ["w_warehouse_name", "w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Previous attempt with date_cte_explicit_join failed, but dimension_prefetch_star uses explicit joins and pre-filtered CTEs which may better propagate selectivity and avoid nested loop.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join, dimension scans become tiny CTE scans, inventory scan rows reduced by early join with filtered dimensions.",
+      "recommended_patch_ops": ["insert_cte_date_dim", "insert_cte_item", "insert_cte_warehouse", "replace_from_explicit_join"],
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "rank_rationale": "Targets primary hotspot (inventory scan and nested loop) by addressing comma-join weakness and enabling early filtering.",
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Split CTE 'inv' into two separate CTEs (inv5, inv6) that embed the d_moy filter (5 and 6) in their definitions, then self-join these CTEs in the outer query.",
+      "dag_target_hint": "Replace the single CTE 'inv' with two CTEs filtered by d_moy=5 and d_moy=6, and adjust final_select to join inv5 and inv6.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "i_category IN ('Shoes','Sports')", "i_manager_id BETWEEN 42 AND 61", "inv_quantity_on_hand BETWEEN 791 AND 991", "d_moy IN (5,6)"],
+        "output_must_preserve": ["w_warehouse_name", "w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "GroupAggregate computes only for months 5 and 6, reducing input rows from 254,709 to a much smaller set, and eliminates late filter on d_moy.",
+      "recommended_patch_ops": ["split_cte_by_d_moy", "replace_final_select_join"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Directly addresses secondary hotspot (late filter on d_moy) and reduces aggregation work.",
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create MATERIALIZED CTEs for filtered dimensions (date_dim, item, warehouse) and a pre-joined CTE of inventory with these dimensions, then compute aggregates from the reduced set.",
+      "dag_target_hint": "Replace CTE 'inv' with a chain of MATERIALIZED CTEs that progressively filter dimensions and join with inventory before aggregation.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "i_category IN ('Shoes','Sports')", "i_manager_id BETWEEN 42 AND 61", "inv_quantity_on_hand BETWEEN 791 AND 991"],
+        "output_must_preserve": ["w_warehouse_name", "w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:FAIL", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Transform is designed for non-equi joins but may still benefit equi-join by materializing small dimension sets and reducing fact table scan via staged joins.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Inventory scan rows reduced by early join with materialized dimension keys, nested loop eliminated, aggregation input shrinks.",
+      "recommended_patch_ops": ["insert_materialized_cte_dimensions", "insert_materialized_cte_fact_join", "replace_cte_aggregate"],
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "rank_rationale": "Exploration probe targeting primary hotspot via staged reduction, though designed for non-equi joins.",
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push d_moy filter into CTE 'inv' definition and ensure all dimension filters are applied before joining with inventory, using explicit JOIN syntax.",
+      "dag_target_hint": "Modify CTE 'inv' to include d_moy IN (5,6) in its WHERE clause and convert comma joins to explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "i_category IN ('Shoes','Sports')", "i_manager_id BETWEEN 42 AND 61", "inv_quantity_on_hand BETWEEN 791 AND 991", "d_moy IN (5,6)"],
+        "output_must_preserve": ["w_warehouse_name", "w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:FAIL", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "GroupAggregate input rows drop significantly, late d_moy filter removed, join order may improve due to explicit JOINs.",
+      "recommended_patch_ops": ["add_d_moy_filter_to_cte", "replace_comma_with_explicit_join"],
+      "recommended_examples": ["early_filter_decorrelate"],
+      "rank_rationale": "Addresses secondary hotspot (late d_moy filter) and improves join clarity with explicit syntax.",
+      "gold_example_id": "early_filter_decorrelate"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL or plan evidence."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicates in query; PostgreSQL BitmapOr handles indexed OR well."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "reason": "Previous optimization attempt failed (speedup=0.00x)."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Previous optimization attempt failed (speedup=0.00x)."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "Previous optimization attempt failed (speedup=0.00x)."
+    },
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Previous optimization attempt failed (speedup=0.00x)."
+    }
+  ]
+}

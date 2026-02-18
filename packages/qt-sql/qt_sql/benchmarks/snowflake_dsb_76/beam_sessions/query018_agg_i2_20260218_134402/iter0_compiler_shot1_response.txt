@@ -1,0 +1,71 @@
+[  {
+    "plan_id": "compile_p1",
+    "dialect": "snowflake",
+    "confidence": 0.65,
+    "based_on": "p01",
+    "strategy": "Date range pushdown via CTE to encourage micro-partition pruning on fact table.",
+    "hypothesis": "Primary hotspot is 920 GB catalog_sales scan without direct date key filter. Isolating date_dim filter into CTE may improve predicate pushdown, though p01 showed neutral results.",
+    "expected_explain_delta": "Potential reduction in catalog_sales scan partitions via earlier date filter application.",
+    "target_ir": "Add date_dim_filtered CTE and update final_select join.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "date_dim_filtered",
+          "parent_node_id": "final_select",
+          "sources": ["date_dim"],
+          "outputs": ["d_date_sk"],
+          "changed": true,
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999"
+        },
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["catalog_sales", "date_dim_filtered", "item", "customer_demographics", "customer", "customer_address"],
+          "outputs": ["i_item_id", "ca_country", "ca_state", "ca_county", "agg1", "agg2", "agg3", "agg4", "agg5", "agg6"],
+          "changed": true,
+          "sql": "WITH date_dim_filtered AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1999) SELECT i_item_id, ca_country, ca_state, ca_county, AVG(CAST(cs_quantity AS DECIMAL(12,2))) AS agg1, AVG(CAST(cs_list_price AS DECIMAL(12,2))) AS agg2, AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))) AS agg3, AVG(CAST(cs_sales_price AS DECIMAL(12,2))) AS agg4, AVG(CAST(cs_net_profit AS DECIMAL(12,2))) AS agg5, AVG(CAST(c_birth_year AS DECIMAL(12,2))) AS agg6 FROM catalog_sales INNER JOIN date_dim_filtered d ON cs_sold_date_sk = d.d_date_sk INNER JOIN item ON cs_item_sk = i_item_sk INNER JOIN customer_demographics cd ON cs_bill_cdemo_sk = cd.cd_demo_sk INNER JOIN customer c ON cs_bill_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE cd.cd_gender = 'F' AND cd.cd_education_status = '4 yr Degree' AND c.c_birth_month = 12 AND ca.ca_state IN ('AR', 'IN', 'VA') AND cs_wholesale_cost BETWEEN 5 AND 10 AND i_category = 'Music' GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county) ORDER BY ca_country, ca_state, ca_county, i_item_id LIMIT 100"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_p2",
+    "dialect": "snowflake",
+    "confidence": 0.55,
+    "based_on": "",
+    "strategy": "Early aggregation after applying date and item filters to reduce rows before remaining joins.",
+    "hypothesis": "Residual gap: no probe successfully reduced fact table rows before joins. This attempt pre-aggregates catalog_sales after filtering by date_dim and item, targeting scan and join amplification.",
+    "expected_explain_delta": "Reduced catalog_sales scan volume and fewer rows flowing into customer and customer_address joins.",
+    "target_ir": "Add filtered_catalog_sales and preagg CTEs, rewrite final_select to compute weighted averages.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "filtered_catalog_sales",
+          "parent_node_id": "preagg",
+          "sources": ["catalog_sales", "date_dim", "item"],
+          "outputs": ["i_item_id", "cs_bill_customer_sk", "cs_bill_cdemo_sk", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price", "cs_net_profit"],
+          "changed": true,
+          "sql": "SELECT cs_bill_customer_sk, cs_bill_cdemo_sk, i_item_id, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit FROM catalog_sales INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk INNER JOIN item ON cs_item_sk = i_item_sk WHERE d_year = 1999 AND i_category = 'Music' AND cs_wholesale_cost BETWEEN 5 AND 10 AND cs_bill_cdemo_sk IS NOT NULL AND cs_sold_date_sk IS NOT NULL AND cs_bill_customer_sk IS NOT NULL"
+        },
+        {
+          "node_id": "preagg",
+          "parent_node_id": "final_select",
+          "sources": ["filtered_catalog_sales"],
+          "outputs": ["i_item_id", "cs_bill_customer_sk", "cs_bill_cdemo_sk", "sum_qty", "count_qty", "sum_list_price", "count_list_price", "sum_coupon_amt", "count_coupon_amt", "sum_sales_price", "count_sales_price", "sum_net_profit", "count_net_profit"],
+          "changed": true,
+          "sql": "SELECT i_item_id, cs_bill_customer_sk, cs_bill_cdemo_sk, SUM(cs_quantity) AS sum_qty, COUNT(cs_quantity) AS count_qty, SUM(cs_list_price) AS sum_list_price, COUNT(cs_list_price) AS count_list_price, SUM(cs_coupon_amt) AS sum_coupon_amt, COUNT(cs_coupon_amt) AS count_coupon_amt, SUM(cs_sales_price) AS sum_sales_price, COUNT(cs_sales_price) AS count_sales_price, SUM(cs_net_profit) AS sum_net_profit, COUNT(cs_net_profit) AS count_net_profit FROM filtered_catalog_sales GROUP BY i_item_id, cs_bill_customer_sk, cs_bill_cdemo_sk"
+        },
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["preagg", "customer_demographics", "customer", "customer_address"],
+          "outputs": ["i_item_id", "ca_country", "ca_state", "ca_county", "agg1", "agg2", "agg3", "agg4", "agg5", "agg6"],
+          "changed": true,
+          "sql": "WITH filtered_catalog_sales AS (SELECT cs_bill_customer_sk, cs_bill_cdemo_sk, i_item_id, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit FROM catalog_sales INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk INNER JOIN item ON cs_item_sk = i_item_sk WHERE d_year = 1999 AND i_category = 'Music' AND cs_wholesale_cost BETWEEN 5 AND 10 AND cs_bill_cdemo_sk IS NOT NULL AND cs_sold_date_sk IS NOT NULL AND cs_bill_customer_sk IS NOT NULL), preagg AS (SELECT i_item_id, cs_bill_customer_sk, cs_bill_cdemo_sk, SUM(cs_quantity) AS sum_qty, COUNT(cs_quantity) AS count_qty, SUM(cs_list_price) AS sum_list_price, COUNT(cs_list_price) AS count_list_price, SUM(cs_coupon_amt) AS sum_coupon_amt, COUNT(cs_coupon_amt) AS count_coupon_amt, SUM(cs_sales_price) AS sum_sales_price, COUNT(cs_sales_price) AS count_sales_price, SUM(cs_net_profit) AS sum_net_profit, COUNT(cs_net_profit) AS count_net_profit FROM filtered_catalog_sales GROUP BY i_item_id, cs_bill_customer_sk, cs_bill_cdemo_sk) SELECT i_item_id, ca_country, ca_state, ca_county, CAST(SUM(sum_qty) AS DECIMAL(12,2)) / NULLIF(SUM(count_qty),0) AS agg1, CAST(SUM(sum_list_price) AS DECIMAL(12,2)) / NULLIF(SUM(count_list_price),0) AS agg2, CAST(SUM(sum_coupon_amt) AS DECIMAL(12,2)) / NULLIF(SUM(count_coupon_amt),0) AS agg3, CAST(SUM(sum_sales_price) AS DECIMAL(12,2)) / NULLIF(SUM(count_sales_price),0) AS agg4, CAST(SUM(sum_net_profit) AS DECIMAL(12,2)) / NULLIF(SUM(count_net_profit),0) AS agg5, AVG(CAST(c_birth_year AS DECIMAL(12,2))) AS agg6 FROM preagg INNER JOIN customer_demographics cd ON preagg.cs_bill_cdemo_sk = cd.cd_demo_sk INNER JOIN customer c ON preagg.cs_bill_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE cd.cd_gender = 'F' AND cd.cd_education_status = '4 yr Degree' AND c.c_birth_month = 12 AND ca.ca_state IN ('AR', 'IN', 'VA') GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county) ORDER BY ca_country, ca_state, ca_county, i_item_id LIMIT 100"
+        }
+      ]
+    }
+  }
+]

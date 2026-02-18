@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows nested-loop joins building a large intermediate result before aggregation (5.7s). The dominant hotspot is the Aggregate consuming rows after a series of joins; the secondary hotspot is the Hash Join building from a 163k-row Nested Loop. Non-equi join conditions (inv_quantity_on_hand < cs_quantity, d3.d_date > d1.d_date + 3 days) amplify rows early.",
+    "reasoning_trace": [
+      "Aggregate node takes 5753 ms, fed by Nested Loop chain.",
+      "Hash Join builds from Nested Loop (rows=163368, time=2696 ms) with a selective Index Scan on date_dim d1 (rows=182).",
+      "Plan includes non-equi join conditions that may block efficient join reordering or early filtering.",
+      "All date_dim scans show zero rows/zero cost in plan—likely already pruned, but multiple aliases (d1, d2, d3) may hinder predicate pushdown."
+    ],
+    "cost_spine": ["Hash Join", "Nested Loop", "Nested Loop", "Aggregate", "Sort", "Limit"],
+    "hotspots": [
+      {
+        "op": "Aggregate",
+        "why": "consumes all joined rows, dominant runtime",
+        "evidence": "time=5753 ms"
+      },
+      {
+        "op": "Hash Join",
+        "why": "builds from large Nested Loop subplan",
+        "evidence": "time=5737 ms"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "amplifies rows from catalog_sales (895 rows per d1 row)",
+        "evidence": "rows=163368 time=2696 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION splits (no OR predicate in query)",
+      "avoid materializing simple EXISTS (none present)",
+      "do not duplicate large CTE bodies",
+      "do not convert LEFT JOIN to INNER JOIN unless filter on nullable column is present"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Prefilter dimension tables (date_dim d1, d2, d3, household_demographics, customer_demographics, item) into MATERIALIZED CTEs with their selective filters, then join with fact tables (catalog_sales, inventory) after reducing both sides before the non-equi join.",
+      "dag_target_hint": "Replace final_select FROM clause with CTE chain that pre-filters dimensions and fact keys, then performs the non-equi join on reduced sets.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "inventory", "date_dim d1", "date_dim d2", "date_dim d3", "household_demographics", "customer_demographics", "item"],
+        "where_must_preserve": ["d1.d_year = 1998", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'", "inv_quantity_on_hand < cs_quantity", "hd_buy_potential = '>10000'", "cd_marital_status = 'U'", "cd_dep_count between 9 and 11", "i_category IN ('Children', 'Jewelry', 'Men')", "cs_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["i_item_desc", "w_warehouse_name", "d1.d_week_seq", "no_promo", "promo", "total_cnt", "ORDER BY total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with smaller build side; non-equi join inputs shrink; Aggregate input rows reduce.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "rank_rationale": "Directly targets the non-equi join amplification and large intermediate rows feeding the aggregate hotspot.",
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Isolate each date_dim alias (d1, d2, d3) into separate CTEs with their filters, then use explicit JOIN syntax to improve predicate propagation and join ordering.",
+      "dag_target_hint": "Change final_select FROM to use CTE aliases and explicit JOIN ON conditions, removing comma joins.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["d1.d_year = 1998", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'"],
+        "output_must_preserve": ["i_item_desc", "w_warehouse_name", "d1.d_week_seq", "no_promo", "promo", "total_cnt"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "CTE scans for date_dim with filters, explicit join order, reduced rows in join.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Addresses comma-join weakness and multiple date_dim aliases, potentially improving join cardinality estimates.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push selective dimension filters (household_demographics, customer_demographics, item) into CTEs before joining with catalog_sales, and ensure any implicit correlation (none in this query) is flattened.",
+      "dag_target_hint": "Add CTEs for filtered dimension keys, then join those keys with catalog_sales early.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "household_demographics", "customer_demographics", "item"],
+        "where_must_preserve": ["hd_buy_potential = '>10000'", "cd_marital_status = 'U'", "cd_dep_count between 9 and 11", "i_category IN ('Children', 'Jewelry', 'Men')", "cs_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["i_item_desc", "w_warehouse_name", "d_week_seq", "no_promo", "promo", "total_cnt"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:SKIP_PATHOLOGY", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Even without correlated subqueries, early filtering of multiple dimensions may reduce the fact-table scan rows before the expensive non-equi join.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension scans become tiny hash tables; catalog_sales rows filtered earlier, reducing input to nested loops.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["early_filter_decorrelate"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot (Nested Loop amplification) via early dimension filtering.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered fact–dimension join (catalog_sales with d1, household_demographics, customer_demographics, item) once in a CTE, then derive all needed aggregates and joins from that single materialized set.",
+      "dag_target_hint": "Create a CTE that joins catalog_sales with filtered dimensions, then reference that CTE for subsequent joins with inventory, warehouse, promotion, etc.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim d1", "household_demographics", "customer_demographics", "item"],
+        "where_must_preserve": ["d1.d_year = 1998", "hd_buy_potential = '>10000'", "cd_marital_status = 'U'", "cd_dep_count between 9 and 11", "i_category IN ('Children', 'Jewelry', 'Men')", "cs_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["i_item_desc", "w_warehouse_name", "d_week_seq", "no_promo", "promo", "total_cnt"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the core fact–dimension join may reduce repeated computation and allow better join ordering for the remaining tables.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single materialized CTE scanned instead of repeated dimension joins; join tree simplified.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "rank_rationale": "Exploration probe—family E underrepresented; targets potential repeated scan pattern.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; guardrail prohibits default OR-to-UNION on PostgreSQL."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries detected in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation uses CASE expressions with LEFT JOIN to promotion; pushing aggregation below joins risks multiplicity errors and loss of promo/null counts."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "LEFT JOIN to promotion and catalog_returns have no subsequent WHERE filter that would make them effectively INNER; conversion unsafe."
+    },
+    {
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "reason": "Similar to early_filter_decorrelate but portability candidate for duckdb; prefer native PostgreSQL transforms first."
+    }
+  ]
+}

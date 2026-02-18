@@ -1,0 +1,165 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Nested Loop between date_dim and store_sales (56k rows, 6.8s) dominates runtime, followed by two Hash Joins. The plan shows OR predicates on customer_demographics and customer_address are applied late via index scans after the large join, missing early filter pushdown. Comma-join syntax may limit join reordering and predicate propagation.",
+    "reasoning_trace": [
+      "Primary hotspot: Nested Loop (rows=56045, time=6789.755 ms) between date_dim and store_sales.",
+      "Secondary hotspot: Hash Join (rows=6247, time=6817.757 ms) and Hash Join (rows=6265, time=6803.517 ms) with household_demographics and store.",
+      "Late filter: customer_demographics and customer_address index scans filter to 0 rows after the large join, indicating selective OR predicates applied too late.",
+      "Comma-join syntax present; explicit JOIN may improve cardinality estimates and join order flexibility."
+    ],
+    "cost_spine": ["Nested Loop", "Hash Join", "Hash Join", "Nested Loop", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (date_dim ⋈ store_sales)",
+        "why": "largest intermediate row set (56k rows) and time (6.8s)",
+        "evidence": "rows=56045 time=6789.755 ms"
+      },
+      {
+        "op": "Hash Join (household_demographics)",
+        "why": "significant time contribution after the primary loop",
+        "evidence": "rows=6247 time=6817.757 ms"
+      },
+      {
+        "op": "Index Scan on customer_demographics",
+        "why": "highly selective OR predicate applied late, after large join",
+        "evidence": "rows=0 time=0.386 ms (filtered from 1079 upstream rows)"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union on same-column OR without plan evidence of BitmapOr failure",
+      "avoid materializing EXISTS paths (none present)",
+      "avoid duplicating large CTE bodies"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim rows (d_year=2001) into a CTE, convert comma joins to explicit INNER JOIN syntax, and join the CTE first to store_sales.",
+      "dag_target_hint": "Change final_select FROM clause to use explicit JOINs and replace date_dim reference with date_cte.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["all original output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with smaller build side (date_cte); explicit join may reorder to push date filter earlier.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Targets primary hotspot by isolating selective date dimension and enabling better join planning.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, household_demographics, store, customer_demographics, customer_address) into separate CTEs, then join them with store_sales using explicit JOIN syntax.",
+      "dag_target_hint": "Replace entire FROM clause with CTE joins, embedding OR branch filters into respective dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "household_demographics", "store", "customer_demographics", "customer_address"],
+        "where_must_preserve": ["all original OR branch predicates on cd_marital_status, cd_education_status, ss_sales_price, hd_dep_count, ca_country, ca_state, ss_net_profit"],
+        "output_must_preserve": ["all original output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Multiple Hash Joins with tiny build sides (CTEs); late index scans on customer_demographics and customer_address eliminated as filters are pushed into CTEs.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Addresses secondary hotspots and late filters by pre-filtering all dimensions, reducing rows entering the main fact join.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push selective dimension filters into CTEs before joining, focusing on customer_demographics and customer_address OR predicates, and use explicit joins.",
+      "dag_target_hint": "Create filtered_cte_cd and filtered_cte_ca CTEs that pre-apply the OR conditions, then join them with store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer_demographics", "customer_address"],
+        "where_must_preserve": ["all OR branch predicates on cd_marital_status, cd_education_status, ss_sales_price, hd_dep_count, ca_country, ca_state, ss_net_profit"],
+        "output_must_preserve": ["all original output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:SKIP_PATHOLOGY", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Even without correlated subqueries, pre-filtering dimensions with OR conditions into CTEs may allow the planner to push these filters earlier and avoid late index scans.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Index scans on customer_demographics and customer_address replaced by Hash Joins with tiny CTEs; OR branches evaluated once in CTE definition.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration targeting late-filter secondary hotspot with a family B transform, diversifying from primary join-order probes.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the three OR branches on customer_demographics/household_demographics and customer_address into separate UNION ALL subqueries, each with focused predicates, then aggregate the unioned result.",
+      "dag_target_hint": "Replace the entire SELECT with a UNION ALL of three subqueries, each containing one branch of the OR conditions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store", "household_demographics", "customer_demographics", "customer_address"],
+        "where_must_preserve": ["d_year = 2001", "s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["all original output columns and aggregates (after union)"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:REQUIRE_MANUAL_REVIEW", "G_PG_COMMA_JOIN_PRESENT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The OR conditions span multiple columns and may block index usage; splitting into UNION ALL could enable per-branch efficient plans, but risk fighting PostgreSQL BitmapOr.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Three separate query branches each with simpler filters, possibly using index scans on store_sales for each branch, followed by a Union and Aggregate.",
+      "recommended_patch_ops": ["replace_select_with_union", "rewrite_where_per_branch"],
+      "rank_rationale": "Exploration targeting OR complexity with a family D transform; low confidence due to PostgreSQL BitmapOr strength and regression risk.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar subquery present in SQL; transform not applicable."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific (Snowflake) portability candidate; runtime dialect is PostgreSQL."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join pattern in query; transform not applicable."
+    },
+    {
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "reason": "Portability candidate for duckdb; less evidence for PostgreSQL benefit compared to native transforms."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY in query; aggregation is final scalar aggregates, not intermediate grouping."
+    }
+  ]
+}

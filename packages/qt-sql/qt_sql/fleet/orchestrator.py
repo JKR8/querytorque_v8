@@ -752,6 +752,8 @@ class FleetOrchestrator:
                     qid, result = future.result()
                     speedup = getattr(result, "best_speedup", None) or getattr(result, "speedup", None)
                     status_str = getattr(result, "status", "?")
+                    n_api_calls = int(getattr(result, "n_api_calls", 0) or 0)
+                    beam_cost = float(getattr(result, "beam_cost_usd", 0.0) or 0.0)
 
                     # Save result
                     self._save_query_result(
@@ -773,14 +775,19 @@ class FleetOrchestrator:
                         "query_complete",
                         query_id=qid, status=str(status_str),
                         speedup=speedup,
+                        n_api_calls=n_api_calls,
+                        beam_cost_usd=beam_cost,
+                        beam_token_totals=getattr(result, "beam_token_totals", {}) or {},
                         completed=len(results), total=len(work_items),
                     )
                     speed_txt = f" {speedup:.2f}x" if isinstance(speedup, (int, float)) else ""
+                    calls_txt = f", calls={n_api_calls}" if n_api_calls > 0 else ""
+                    cost_txt = f", cost=${beam_cost:.4f}" if beam_cost > 0 else ""
                     self._emit(
                         EventType.EVENT_LOG,
                         scope="fleet",
                         target=qid,
-                        msg=f"Completed: {status_str}{speed_txt}",
+                        msg=f"Completed: {status_str}{speed_txt}{calls_txt}{cost_txt}",
                         level=str(status_str).lower(),
                     )
 
@@ -805,6 +812,8 @@ class FleetOrchestrator:
                         "query_complete",
                         query_id=qid, status="ERROR",
                         error=str(e)[:100],
+                        n_api_calls=0,
+                        beam_cost_usd=0.0,
                         completed=len(results), total=len(work_items),
                     )
                     self._emit(

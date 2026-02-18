@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The plan shows a large fact-table scan (STORE_RETURNS, 124 GB) after joining multiple filtered dimension tables. The join order builds hash tables from small dimensions first, but the final join with STORE_RETURNS still scans the entire table because no predicate pushdown occurs on SR_CDEMO_SK. Early materialization of filtered dimension keys may enable micro-partition pruning on STORE_RETURNS via a pushed-down semi-join or CTE pre-filter.",
+    "reasoning_trace": [
+      "STORE_RETURNS scan is the dominant I/O: parts=7070/7070 bytes=124763446272 (124 GB).",
+      "Dimension tables are fully pruned (parts=1/1) and small, but their filters are not pushed into the fact scan.",
+      "No nested loops, aggregates, or set operations present; primary bottleneck is join topology and predicate placement.",
+      "Snowflake's micro-partition pruning on join keys may be blocked by comma-join syntax and multi-way join shape."
+    ],
+    "cost_spine": ["TableScan (STORE_RETURNS)", "InnerJoin (STORE_RETURNS ⋈ CUSTOMER_DEMOGRAPHICS)", "InnerJoin (CUSTOMER ⋈ CUSTOMER_DEMOGRAPHICS)", "Filter (CUSTOMER_ADDRESS.CA_CITY)", "SortWithLimit"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_RETURNS)",
+        "why": "full scan of large fact table without predicate pushdown",
+        "evidence": "parts=7070/7070 bytes=124763446272"
+      },
+      {
+        "op": "InnerJoin (STORE_RETURNS ⋈ CUSTOMER_DEMOGRAPHICS)",
+        "why": "join occurs after dimension filters but without key pre‑filtering",
+        "evidence": "joinKey: (CUSTOMER_DEMOGRAPHICS.CD_DEMO_SK = STORE_RETURNS.SR_CDEMO_SK)"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS (no EXISTS in query)",
+      "avoid wrapping filter columns in functions (pruning critical)",
+      "do not introduce unfiltered large CTEs",
+      "do not convert comma joins to explicit JOIN if it breaks predicate pushdown"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre‑filter all selective dimension tables (CUSTOMER_ADDRESS, INCOME_BAND, HOUSEHOLD_DEMOGRAPHICS, CUSTOMER_DEMOGRAPHICS) into CTEs, then join the filtered keys with CUSTOMER, and finally join the reduced customer set with STORE_RETURNS using an explicit INNER JOIN syntax.",
+      "dag_target_hint": "Replace comma‑join chain with explicit JOINs and CTEs for each dimension.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374", "join conditions on surrogate keys"],
+        "output_must_preserve": ["c_customer_id", "customername", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_FILTER_FUNCTION_WRAP:PASS", "G_SF_JOINFILTER_PRESERVE:PASS", "G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "STORE_RETURNS scan shows reduced partitions (micro‑partition pruning on SR_CDEMO_SK) and earlier join with filtered dimension keys.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot — targets full fact‑table scan by pushing dimension‑key filters earlier.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate the most selective dimension (CUSTOMER_ADDRESS) into a CTE that returns only CA_ADDRESS_SK for 'Mount Vernon', then join with CUSTOMER, then filter other dimensions, and finally join with STORE_RETURNS.",
+      "dag_target_hint": "Create CTE filtered_ca with CA_ADDRESS_SK, CA_CITY filter; join with CUSTOMER first.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374"],
+        "output_must_preserve": ["c_customer_id", "customername", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_FILTER_FUNCTION_WRAP:PASS", "G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may propagate join keys more effectively when the most selective dimension is isolated as a tiny CTE, improving join order and fact‑table pruning.",
+      "confidence": 0.60,
+      "expected_explain_delta": "CUSTOMER_ADDRESS scan becomes a tiny CTE; join order shifts to start with filtered customer set.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Secondary hotspot — tests whether isolating a single selective dimension changes join topology.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma‑separated joins to explicit INNER JOIN syntax while preserving the original join order and filters.",
+      "dag_target_hint": "Replace FROM table1, table2, ... with explicit JOIN ... ON clauses.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374", "all original join conditions"],
+        "output_must_preserve": ["c_customer_id", "customername", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax may give the optimizer better hints for predicate pushdown and join reordering, especially for Snowflake's cost‑based join order.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Join nodes remain identical but predicate placement may shift, possibly enabling earlier filter pushdown.",
+      "recommended_patch_ops": ["replace_from"],
+      "rank_rationale": "Exploration — low‑risk syntactic change that may unlock better predicate propagation.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the filtered dimension‑key set (CUSTOMER_ADDRESS, INCOME_BAND, HOUSEHOLD_DEMOGRAPHICS, CUSTOMER_DEMOGRAPHICS) into a single CTE, then join with CUSTOMER and STORE_RETURNS.",
+      "dag_target_hint": "Create CTE filtered_dims with all dimension surrogate keys after applying filters.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Mount Vernon'", "ib_lower_bound >= 40374", "ib_upper_bound <= 90374"],
+        "output_must_preserve": ["c_customer_id", "customername", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the filtered dimension keys into a single CTE may improve cardinality estimates and allow the optimizer to push the key set into the STORE_RETURNS scan as a semi‑join filter.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Dimension scans become a single CTE; STORE_RETURNS scan may show reduced partitions.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — tests whether materializing all dimension filters together changes join planning.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "No date_dim or date_sk join in query; pattern mismatch."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "No date_dim or date_sk join in query; pattern mismatch."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subquery in query."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY or aggregate in query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operation in query."
+    }
+  ]
+}

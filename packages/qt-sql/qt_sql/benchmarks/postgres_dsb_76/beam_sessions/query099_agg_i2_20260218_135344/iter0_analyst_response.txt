@@ -1,0 +1,255 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Nested Loop between date_dim (244 rows) and catalog_sales (106 rows per outer) dominates runtime (67.2s). Dimension filters (sm_type, cc_class, w_gmt_offset) are applied late after the loop, missing early reduction. The comma-join pattern may prevent optimal join ordering and predicate pushdown.",
+    "reasoning_trace": [
+      "Nested Loop cost spine: 244 * 106 = 25,870 rows, time=67217.691 ms (91% of total).",
+      "Hash Joins with ship_mode, warehouse, call_center occur after the loop, applying selective filters too late.",
+      "Plan shows large cardinality mismatch at Sort (est=22, act=826) indicating poor row estimates from comma-join shape.",
+      "No correlated subqueries, set operations, or OR predicates present."
+    ],
+    "cost_spine": ["Nested Loop", "Hash Join (ship_mode)", "Hash Join (warehouse)", "Hash Join (call_center)", "Sort", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Nested Loop",
+        "why": "Primary bottleneck: 244 index scans on catalog_sales, each returning 106 rows.",
+        "evidence": "rows=25870 time=67217.691 ms"
+      },
+      {
+        "op": "Hash Join (ship_mode)",
+        "why": "Secondary hotspot: processes 25,870 rows after loop, but ship_mode filter (sm_type='LIBRARY') is highly selective (3 rows).",
+        "evidence": "rows=4948 time=67233.207 ms (cumulative)"
+      },
+      {
+        "op": "Sort",
+        "why": "Cardinality estimation error (est=22, act=826) may cause under-provisioned work_mem.",
+        "evidence": "q-error=37.5 (under_est), time=67249.314 ms"
+      }
+    ],
+    "do_not_do": [
+      "Avoid OR-to-UNION transforms (no OR predicates, and PostgreSQL BitmapOr is strong).",
+      "Avoid materializing EXISTS paths (none present).",
+      "Avoid duplicating heavy CTE bodies (guard G_PG_CTE_DUPLICATION_STOP).",
+      "Do not split same-column OR predicates into UNION ALL."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, ship_mode, warehouse, call_center) into MATERIALIZED CTEs, then join with catalog_sales using explicit JOIN syntax. Preserve all original predicates.",
+      "dag_target_hint": "Replace final_select FROM clause with CTE references and explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim", "ship_mode", "warehouse", "call_center"],
+        "where_must_preserve": ["d_month_seq between 1191 and 1191+23", "cs_list_price between 244 and 273", "sm_type = 'LIBRARY'", "cc_class = 'medium'", "w_gmt_offset = -5", "equi-join predicates"],
+        "output_must_preserve": ["All original output columns, grouping, ordering, limit"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop replaced by Hash Joins with small dimension CTEs as build side; date_dim filter pushed into CTE; earlier row reduction.",
+      "recommended_patch_ops": ["insert_cte_date", "insert_cte_ship_mode", "insert_cte_warehouse", "insert_cte_call_center", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: addresses comma-join weakness and late filter application via multi-dimension prefetch (gold pattern).",
+      "recommended_examples": ["pg_explicit_join_materialized", "pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_explicit_join_materialized"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate date_dim filter into a MATERIALIZED CTE, then join with catalog_sales using explicit INNER JOIN. Keep other dimensions in FROM with explicit JOINs.",
+      "dag_target_hint": "Change final_select FROM clause: CTE d AS (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN ...) JOIN catalog_sales ON cs_ship_date_sk = d.d_date_sk.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq between 1191 and 1191+23", "cs_list_price between 244 and 273", "all other original predicates"],
+        "output_must_preserve": ["All original output columns, grouping, ordering, limit"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with small date CTE as build side; earlier date filter application.",
+      "recommended_patch_ops": ["insert_cte_date", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: focuses on date_dim isolation and explicit join conversion (gold pattern).",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create MATERIALIZED CTEs for pre-filtered date_dim and catalog_sales (with cs_list_price filter), then join with other dimensions. This stages reduction before the main join cluster.",
+      "dag_target_hint": "Insert CTEs: filtered_date, filtered_sales. Then join filtered_sales with filtered_date and other dimensions.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq between 1191 and 1191+23", "cs_list_price between 244 and 273", "all other original predicates"],
+        "output_must_preserve": ["All original output columns, grouping, ordering, limit"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:FAIL", "G_PG_NONEQUI_CARDINALITY:FAIL"],
+      "exploration": true,
+      "exploration_hypothesis": "Even without non-equi joins, staging fact-table reduction via CTE may improve join order and parallelism.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Catalog_sales scan filtered early; date_dim CTE materialized; join order may shift to smaller intermediate sets.",
+      "recommended_patch_ops": ["insert_cte_date", "insert_cte_catalog_sales", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: targets fact-table scan reduction, though non-equi join gap absent; uses gold pattern.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter small dimension tables (ship_mode, warehouse, call_center) into CTEs before joining with catalog_sales and date_dim. Use explicit JOIN syntax.",
+      "dag_target_hint": "Insert CTEs for ship_mode, warehouse, call_center with their filters; then join in final SELECT.",
+      "node_contract": {
+        "from_must_include": ["ship_mode", "warehouse", "call_center"],
+        "where_must_preserve": ["sm_type = 'LIBRARY'", "cc_class = 'medium'", "w_gmt_offset = -5", "all other original predicates"],
+        "output_must_preserve": ["All original output columns, grouping, ordering, limit"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Dimension filters applied before main joins; smaller hash tables built for ship_mode, warehouse, call_center.",
+      "recommended_patch_ops": ["insert_cte_ship_mode", "insert_cte_warehouse", "insert_cte_call_center", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Secondary hotspot: applies early filtering to three selective dimensions, reducing rows before fact join.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales by cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk, cs_ship_date_sk within date range and list_price filter, then join with dimensions for final grouping.",
+      "dag_target_hint": "Insert CTE agg_sales with GROUP BY on foreign keys and conditional sums; then join with dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales"],
+        "where_must_preserve": ["d_month_seq between 1191 and 1191+23 (via cs_ship_date_sk)", "cs_list_price between 244 and 273", "all original CASE logic"],
+        "output_must_preserve": ["Same conditional sums, grouping key compatibility with final projection"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregation pushdown may reduce rows before joining multiple dimensions, though date join is on surrogate key.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Aggregate moved before joins; fewer rows flow through dimension joins.",
+      "recommended_patch_ops": ["insert_cte_agg_sales", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: family C underrepresented; targets reduction before multi-join.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered catalog_sales and date_dim join into a CTE, then join with other dimensions. Avoids recomputation of the base fact-date join.",
+      "dag_target_hint": "CTE base AS (SELECT ... FROM catalog_sales JOIN date_dim ON ... WHERE ...) then join base with ship_mode, warehouse, call_center.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq between 1191 and 1191+23", "cs_list_price between 244 and 273", "equi-join predicates"],
+        "output_must_preserve": ["All original output columns, grouping, ordering, limit"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the fact-date join may provide a stable row estimate for downstream joins and improve parallelism.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Base join materialized; subsequent joins use consistent intermediate result.",
+      "recommended_patch_ops": ["insert_cte_base", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: family E underrepresented; tests CTE materialization benefit for join re-estimation.",
+      "recommended_examples": ["profile_note_strategic_materialization"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax while preserving all predicates. No CTE changes.",
+      "dag_target_hint": "Rewrite final_select FROM clause using explicit JOIN ... ON syntax.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim", "ship_mode", "warehouse", "call_center"],
+        "where_must_preserve": ["All original join and filter predicates"],
+        "output_must_preserve": ["All original output columns, grouping, ordering, limit"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.65,
+      "expected_explain_delta": "Planner may produce better join order and hash join planning; minimal structural change.",
+      "recommended_patch_ops": ["replace_from"],
+      "rank_rationale": "Low-risk explicit join conversion; addresses comma-join weakness directly.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter date_dim, ship_mode, warehouse, call_center into separate CTEs, then join with catalog_sales using explicit JOINs. DuckDB-origin transform adapted for PostgreSQL.",
+      "dag_target_hint": "Insert four CTEs (d, sm, w, cc) with their filters; then join catalog_sales with these CTEs.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim", "ship_mode", "warehouse", "call_center"],
+        "where_must_preserve": ["All original filters and join predicates"],
+        "output_must_preserve": ["All original output columns, grouping, ordering, limit"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate: multi-dimension prefetch may work on PostgreSQL despite DuckDB origin; tests cross-CTE predicate pushdown.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Multiple small dimension CTEs built; fact table probes multiple tiny hash tables.",
+      "recommended_patch_ops": ["insert_cte_date", "insert_cte_ship_mode", "insert_cte_warehouse", "insert_cte_call_center", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: portability candidate; family A underrepresented; secondary hotspot coverage.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr handles indexed OR well."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; plan shows no correlated execution."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific (Snowflake); not applicable to PostgreSQL runtime."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "No repeated scans of same fact table with different buckets."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No UNION or repeated CTE scans with different filters."
+    }
+  ]
+}

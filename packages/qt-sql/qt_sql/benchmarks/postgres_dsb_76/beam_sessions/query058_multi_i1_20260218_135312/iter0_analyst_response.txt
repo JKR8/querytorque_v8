@@ -1,0 +1,160 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three independent channel CTEs each perform repeated full scans of date_dim (36k rows) and execute identical correlated date subqueries, causing redundant I/O and computation. Isolating shared dimension filters into a single materialized CTE and converting comma joins to explicit JOIN syntax should reduce scans and improve hash join planning.",
+    "reasoning_trace": [
+      "Plan shows three separate date_dim Seq Scans each processing 36524 rows (time ~33-58ms per scan).",
+      "Identical correlated subquery for d_month_seq executed multiple times across channels.",
+      "Comma-join syntax present in all three CTEs, blocking optimal join reordering.",
+      "Gather Merge shows severe cardinality underestimation (est=5, act=209) indicating poor selectivity propagation."
+    ],
+    "cost_spine": ["Merge Join", "Aggregate", "Nested Loop", "Hash Join", "Seq Scan on date_dim"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on date_dim",
+        "why": "repeated full table scan across three channel CTEs",
+        "evidence": "rows=36524, three occurrences, total time ~125ms"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "amplifies fact table index scans after dimension joins",
+        "evidence": "rows=1705/6909/1590 across channels, time ~178/361/373ms"
+      },
+      {
+        "op": "Gather Merge",
+        "why": "cardinality estimation error (5 vs 209) causes under-provisioning",
+        "evidence": "q-error >40x, indicates poor predicate pushdown"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION split (PostgreSQL uses BitmapOr for indexed OR)",
+      "do not materialize simple EXISTS paths (none present)",
+      "do not duplicate heavy CTE bodies across channels"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Create a MATERIALIZED CTE for date_dim filtering (d_month_seq = (SELECT d_month_seq FROM date_dim WHERE d_date = '1998-05-19')), then convert comma joins in all three channel CTEs to explicit INNER JOINs referencing this CTE.",
+      "dag_target_hint": "Replace date_dim subqueries and comma joins in ss_items, cs_items, ws_items CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item", "customer"],
+        "where_must_preserve": ["i_manager_id BETWEEN 71 and 100", "c_birth_year BETWEEN 1945 AND 1951", "ss_list_price/cs_list_price/ws_list_price BETWEEN 242 and 271"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "sum(ss_ext_sales_price/cs_ext_sales_price/ws_ext_sales_price)"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Three date_dim Seq Scans replaced by one CTE scan; comma joins become explicit hash joins with smaller build side.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot — eliminates repeated date_dim scans and addresses comma-join weakness with native PostgreSQL transform.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared date filter into a single CTE returning d_date_sk for the target month, then reference this CTE in all three channel CTEs, keeping other dimension filters (item, customer) pushed into each channel's join.",
+      "dag_target_hint": "Add date_keys CTE; modify date_dim joins in ss_items, cs_items, ws_items to use date_keys CTE via d_date_sk.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item", "customer"],
+        "where_must_preserve": ["i_manager_id BETWEEN 71 and 100", "c_birth_year BETWEEN 1945 AND 1951", "price BETWEEN 242 and 271"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "sum(ext_sales_price) per channel"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Multiple date_dim scans collapse to one; each channel CTE joins with a tiny materialized date key set.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Secondary hotspot — reduces redundant date processing while preserving channel-specific fact joins.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Precompute date range (d_date list) and item/customer filtered keysets in separate MATERIALIZED CTEs, then join with fact tables in each channel CTE using explicit JOIN syntax.",
+      "dag_target_hint": "Replace correlated date subquery with date_range CTE; add filtered_item and filtered_customer CTEs; rewrite channel CTEs with explicit joins to these CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["price BETWEEN 242 and 271"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "sum(ext_sales_price) per channel"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Correlated date subquery may block predicate pushdown; pre-materializing filtered dimensions could improve join cardinality estimates.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Correlated subquery disappears; nested loops may convert to hash joins with smaller dimension CTEs.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — targets secondary nested loop hotspot and tests decorrelation impact on PostgreSQL.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": "early_filter_decorrelate"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create separate MATERIALIZED CTEs for each selective dimension (date, item, customer) with their filters, then join all three with each fact table in a star pattern using explicit JOIN syntax.",
+      "dag_target_hint": "Build date_filtered, item_filtered, customer_filtered CTEs; rewrite each channel CTE as SELECT ... FROM fact INNER JOIN date_filtered ON ... INNER JOIN item_filtered ON ... INNER JOIN customer_filtered ON ...",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["price BETWEEN 242 and 271"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "sum(ext_sales_price) per channel"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-materializing all dimension filters may create tiny hash tables that dramatically reduce fact table probe cost and improve join order flexibility.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Multiple dimension scans replaced by CTE scans; fact table index scans may reduce rows due to better predicate pushdown.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — tests multi-dimension prefetch pattern on PostgreSQL with explicit join syntax.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation already occurs at the CTE level; no late aggregate after large join in plan."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific transform for Snowflake; not applicable to PostgreSQL runtime."
+    }
+  ]
+}

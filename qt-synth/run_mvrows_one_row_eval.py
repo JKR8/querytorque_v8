@@ -16,17 +16,24 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "packages" / "qt-shared"))
-sys.path.insert(0, str(PROJECT_ROOT / "packages" / "qt-sql"))
+for _p in (
+    str(PROJECT_ROOT / "packages" / "qt-shared"),
+    str(PROJECT_ROOT / "packages" / "qt-sql"),
+):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
+from qt_sql.validation.patch_packs import (  # noqa: E402
+    available_patch_packs,
+    load_witness_patch_pack,
+)
 from qt_sql.validation.synthetic_validator import SyntheticValidator  # noqa: E402
 from qt_sql.validation.build_dsb76_synthetic_db import (  # noqa: E402
-    _apply_mvrows_recipe,
     _build_query_context,
     _count_query_rows,
     _force_seed_for_query,
@@ -103,6 +110,7 @@ def _seed_for_witness(
     *,
     count_timeout_s: int,
     seed_attempts: int,
+    patch_pack: Optional[Any],
 ) -> Tuple[int, bool]:
     sql = qctx["sql_duckdb"]
     rows_probe = 0
@@ -149,10 +157,11 @@ def _seed_for_witness(
             if rows_probe >= 1:
                 break
 
-    if rows_probe < 1:
+    if rows_probe < 1 and patch_pack is not None:
         try:
-            _apply_mvrows_recipe(conn, qctx, global_tables)
-            rows_probe = _count_query_rows(conn, sql, count_timeout_s, probe_limit=1)
+            recipe_applied = bool(patch_pack.apply_recipe(conn, qctx, global_tables))
+            if recipe_applied:
+                rows_probe = _count_query_rows(conn, sql, count_timeout_s, probe_limit=1)
         except Exception:
             rows_probe = 0
 
@@ -170,9 +179,11 @@ def _run_eval(
     schema_mode: str,
     count_timeout_s: int,
     seed_attempts: int,
+    patch_pack_name: str,
 ) -> Dict[str, Any]:
     truth = _load_truth_map(truth_file)
     validator = SyntheticValidator(reference_db=None, dialect="postgres")
+    patch_pack = load_witness_patch_pack(patch_pack_name)
     records: List[Dict[str, Any]] = []
 
     candidate_names = [
@@ -212,7 +223,7 @@ def _run_eval(
         fallback_schema_mode = schema_mode
         try:
             validator._create_schema(global_tables)
-        except Exception as schema_exc:
+        except Exception:
             # Some optimized SQL aliases can parse into invalid synthetic column
             # names; fallback to baseline-only schema to keep eval runnable.
             fallback_schema_mode = "original_fallback"
@@ -234,6 +245,7 @@ def _run_eval(
             fk_relationships,
             count_timeout_s=count_timeout_s,
             seed_attempts=seed_attempts,
+            patch_pack=patch_pack,
         )
 
         pred = "ERR"
@@ -276,6 +288,7 @@ def _run_eval(
 
     summary = {
         "total_records": len(records),
+        "patch_pack": patch_pack.name if patch_pack else "none",
         "comparable_records": len(comparable),
         "one_row_records": len(one_row),
         "comparable_metrics": asdict(_compute_metrics(comparable)),
@@ -292,6 +305,7 @@ def _run_eval(
 
 
 def main() -> None:
+    patch_choices = ["none", *sorted(available_patch_packs().keys())]
     parser = argparse.ArgumentParser(
         description="Run MVROWS one-row synthetic EQ/NEQ detection eval vs SF100 truth."
     )
@@ -335,6 +349,12 @@ def main() -> None:
         default=6,
         help="Number of `_force_seed_for_query` attempts before recipe fallback.",
     )
+    parser.add_argument(
+        "--patch-pack",
+        choices=patch_choices,
+        default="none",
+        help="Optional benchmark patch pack (default: none).",
+    )
     args = parser.parse_args()
 
     report = _run_eval(
@@ -344,6 +364,7 @@ def main() -> None:
         schema_mode=args.schema_mode,
         count_timeout_s=args.count_timeout_s,
         seed_attempts=args.seed_attempts,
+        patch_pack_name=args.patch_pack,
     )
     report["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
     report["config"] = {
@@ -353,6 +374,7 @@ def main() -> None:
         "schema_mode": args.schema_mode,
         "count_timeout_s": args.count_timeout_s,
         "seed_attempts": args.seed_attempts,
+        "patch_pack": args.patch_pack,
     }
 
     out_path = Path(args.output_file)

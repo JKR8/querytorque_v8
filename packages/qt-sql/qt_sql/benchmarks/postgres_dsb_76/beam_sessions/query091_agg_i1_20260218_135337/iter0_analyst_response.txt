@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Sequential scan on catalog_returns (719k rows, 1.58s) dominates runtime because dimension filters (except date) are applied after the scan. Pre-filtering dimensions into CTEs and then joining with the fact table may reduce the fact table scan to only matching rows. The OR condition on customer_demographics is applied late and may be selective, warranting exploration of OR-to-UNION decomposition.",
+    "reasoning_trace": [
+      "Seq Scan on catalog_returns is the dominant cost (rows=719420, time=1579.718 ms).",
+      "Dimension filters on customer_demographics, household_demographics, and customer_address are applied after the fact table scan.",
+      "The OR condition on customer_demographics is applied via an index scan but late in the plan.",
+      "Nested loops after the fact scan add minimal time but indicate late filter application."
+    ],
+    "cost_spine": ["Seq Scan catalog_returns", "Hash Join (catalog_returns, date_dim)", "Nested Loop (customer, household_demographics, customer_address, customer_demographics)"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on catalog_returns",
+        "why": "largest I/O and time",
+        "evidence": "rows=719420, time=1579.718 ms"
+      },
+      {
+        "op": "Index Scan on customer_demographics",
+        "why": "late application of selective OR condition",
+        "evidence": "rows=0, time=0.404 ms (applied after fact table scan)"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION on same-column OR if indexed (this OR is on two columns, but caution required)",
+      "avoid duplicating heavy CTE bodies",
+      "avoid materializing simple EXISTS paths (none present)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Pre-filter all dimension tables (date_dim, customer_demographics, household_demographics, customer_address, call_center) into CTEs with their selective predicates, then join the filtered dimension keys with catalog_returns.",
+      "dag_target_hint": "Replace final_select FROM clause with CTE chain joining filtered dimension CTEs to catalog_returns.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr", "date_dim d", "customer_demographics cd", "household_demographics hd", "customer_address ca", "call_center cc", "customer c"],
+        "where_must_preserve": ["d_year = 1998", "d_moy = 2", "(cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')", "hd_buy_potential LIKE '1001-5000%'", "ca_gmt_offset = -7", "all original join conditions"],
+        "output_must_preserve": ["cc_call_center_id", "cc_name", "cc_manager", "sum(cr_net_loss)", "GROUP BY and ORDER BY semantics"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS (no correlated subquery)", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS (single fact table)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Seq Scan on catalog_returns replaced by a scan filtered by pre‑joined dimension keys; nested loops may become hash joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot — reduces fact table scan by applying all dimension filters early.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs for each selective dimension (date_dim, customer_demographics, household_demographics, customer_address, call_center) with their filters, then join them together into a single dimension keyset CTE before joining with catalog_returns.",
+      "dag_target_hint": "Replace final_select FROM clause with a single CTE that pre‑joins all filtered dimensions to produce a composite key set, then join that key set with catalog_returns.",
+      "dag_target_hint": "Replace final_select FROM clause with a single prefetch CTE that joins all filtered dimensions, then join that CTE with catalog_returns.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr", "date_dim d", "customer_demographics cd", "household_demographics hd", "customer_address ca", "call_center cc", "customer c"],
+        "where_must_preserve": ["d_year = 1998", "d_moy = 2", "(cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')", "hd_buy_potential LIKE '1001-5000%'", "ca_gmt_offset = -7", "all original join conditions"],
+        "output_must_preserve": ["cc_call_center_id", "cc_name", "cc_manager", "sum(cr_net_loss)", "GROUP BY and ORDER BY semantics"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS (single fact table)", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Multiple nested loops collapse into a single hash join between catalog_returns and a small composite dimension key set; fact scan rows drop significantly.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot with a proven PostgreSQL pattern (gold example 3.32x).",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the OR condition on customer_demographics into two UNION ALL branches, each with a focused predicate, and aggregate after the union.",
+      "dag_target_hint": "Replace the WHERE clause OR with a UNION ALL of two subqueries, each with one branch of the OR.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr", "date_dim d", "customer_demographics cd", "household_demographics hd", "customer_address ca", "call_center cc", "customer c"],
+        "where_must_preserve": ["d_year = 1998", "d_moy = 2", "hd_buy_potential LIKE '1001-5000%'", "ca_gmt_offset = -7", "all original join conditions"],
+        "output_must_preserve": ["cc_call_center_id", "cc_name", "cc_manager", "sum(cr_net_loss)", "GROUP BY and ORDER BY semantics"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:CAUTION (OR is on two columns, not same-column)", "G_PG_CROSS_COLUMN_OR_DECOMPOSITION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The OR condition may block index usage on customer_demographics; splitting may allow separate index scans and reduce rows earlier.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Index Scan on customer_demographics may become two separate index scans, each with a simpler predicate, potentially reducing rows fed to the nested loop.",
+      "recommended_patch_ops": ["replace_where_predicate", "wrap_in_union_all", "adjust_group_by"],
+      "rank_rationale": "Exploration targeting secondary hotspot (OR condition) with moderate risk due to PostgreSQL's BitmapOr strength.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate each dimension table into a separate CTE with its filters, then join the CTEs with catalog_returns.",
+      "dag_target_hint": "Replace final_select FROM clause with a series of CTEs for date_dim, customer_demographics, household_demographics, customer_address, call_center, then join them with catalog_returns.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr", "date_dim d", "customer_demographics cd", "household_demographics hd", "customer_address ca", "call_center cc", "customer c"],
+        "where_must_preserve": ["d_year = 1998", "d_moy = 2", "(cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')", "hd_buy_potential LIKE '1001-5000%'", "ca_gmt_offset = -7", "all original join conditions"],
+        "output_must_preserve": ["cc_call_center_id", "cc_name", "cc_manager", "sum(cr_net_loss)", "GROUP BY and ORDER BY semantics"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:CAUTION", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Isolating dimensions into CTEs may create small hash tables that allow the optimizer to choose a better join order and reduce fact table scan rows.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Nested loops may convert to hash joins; fact table scan rows reduced by early dimension key filtering.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration targeting primary hotspot with a different mechanism (CTE isolation) from probes 1 and 2.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "reason": "Previous optimization attempt failed (speedup=0.00x)."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated scans or subqueries in plan; CTE materialization unlikely to help."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "All joins are inner joins; no LEFT JOIN to convert."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation is after all joins; no clear fact‑table‑only aggregation pushdown opportunity without changing semantics."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Snowflake-specific transform; not applicable to PostgreSQL runtime dialect."
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query scans large fact tables STORE_SALES and WEB_SALES multiple times through CTEs and self-joins, with date filters applied late in the plan. Consolidating scans and pushing filters early can reduce I/O volume significantly. Aggregation after joins suggests pre-aggregation opportunities.",
+    "reasoning_trace": [
+      "Large I/O from STORE_SALES (bytes=1212628258304) and WEB_SALES (bytes=460956759040) scans dominates runtime.",
+      "Repeated scans for different quarters (d_qoy=1,2,3) in self-joins indicate scan consolidation potential.",
+      "Date filters on d_year=1998 and d_qoy IN (1,2,3) are applied in final WHERE, not pushed to fact table scans for micro-partition pruning."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "TableScan (WEB_SALES)", "Aggregate", "InnerJoin"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest I/O volume",
+        "evidence": "bytes=1212628258304, parts=70412/72718"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "large I/O volume",
+        "evidence": "bytes=460956759040, parts=27574/27579"
+      },
+      {
+        "op": "Repeated scans of DATE_DIM and ITEM",
+        "why": "multiple scans could be consolidated",
+        "evidence": "DATE_DIM parts=1/1 and ITEM parts=2/2 scanned multiple times in plan"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns (not present in query)",
+      "avoid wrapping partition keys in functions that hinder micro-partition pruning",
+      "avoid destructive shape rewrites that remove effective join filters without evidence"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN predicates to STORE_SALES and WEB_SALES scans based on d_year=1998 and d_qoy IN (1,2,3) to enable micro-partition pruning in CTEs ss and ws.",
+      "dag_target_hint": "Modify CTE definitions ss and ws to include date_sk range filters derived from date_dim filters.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price between 86 and 100", "ws_list_price between 86 and 100", "ca_state in ('IA','IL')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales", "web_sales", "grouping keys"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:REVIEW"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.8,
+      "expected_explain_delta": "Reduced parts scanned in STORE_SALES and WEB_SALES TableScan nodes due to early micro-partition pruning.",
+      "recommended_patch_ops": ["add_predicate_to_scan", "modify_cte_definition"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary hotspot of large fact table scans with date filters for maximum I/O reduction.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate multiple quarter scans of ss and ws CTEs into single scans using CASE WHEN expressions to compute store_sales and web_sales for d_qoy=1,2,3 in one pass per fact table.",
+      "dag_target_hint": "Rewrite CTEs ss and ws to include conditional aggregation for all quarters, eliminating self-joins in final select.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price between 86 and 100", "ws_list_price between 86 and 100", "ca_state in ('IA','IL')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales", "web_sales", "aggregate semantics"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.7,
+      "expected_explain_delta": "Fewer TableScan nodes for STORE_SALES and WEB_SALES, replaced with single scans with conditional aggregates, reducing I/O.",
+      "recommended_patch_ops": ["rewrite_cte_with_case", "consolidate_scans"],
+      "recommended_examples": [],
+      "rank_rationale": "Reduces repeated I/O by consolidating multiple scans into one, addressing scan consolidation hotspot.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate STORE_SALES and WEB_SALES by ca_address_sk and d_date_sk before joining with customer_address and date_dim in CTEs ss and ws to reduce row volume early.",
+      "dag_target_hint": "Modify CTE definitions to aggregate fact tables first on join keys, then join with filtered dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales", "date_dim", "customer_address"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price between 86 and 100", "ws_list_price between 86 and 100", "ca_state in ('IA','IL')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales", "web_sales", "join key compatibility"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.6,
+      "expected_explain_delta": "Aggregate nodes move closer to scans, reducing rows before joins and lowering compute cost.",
+      "recommended_patch_ops": ["insert_pre_aggregate_cte", "modify_join_order"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Addresses secondary hotspot by reducing row volume early in the pipeline, complementing scan reduction.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split CTEs ss and ws into separate CTEs for each d_qoy value (1,2,3) to embed filters and avoid self-joins in the final select.",
+      "dag_target_hint": "Replace ss and ws with ss_q1, ss_q2, ss_q3 and ws_q1, ws_q2, ws_q3 CTEs, each with its d_qoy filter.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price between 86 and 100", "ws_list_price between 86 and 100", "ca_state in ('IA','IL')", "d_year=1998"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales", "web_sales", "final projection columns"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS", "semantic_equivalence:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Splitting CTEs might allow better filter pushdown and reduce self-join complexity, potentially improving plan shape.",
+      "confidence": 0.5,
+      "expected_explain_delta": "Eliminates self-join nodes, with separate scans for each quarter, possibly enabling more efficient scans.",
+      "recommended_patch_ops": ["split_cte_by_filter", "create_multiple_ctes"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe targeting self-join pattern with different filters, testing family F underrepresented in primary probes.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; plan shows no nested loops."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries in query."
+    }
+  ]
+}

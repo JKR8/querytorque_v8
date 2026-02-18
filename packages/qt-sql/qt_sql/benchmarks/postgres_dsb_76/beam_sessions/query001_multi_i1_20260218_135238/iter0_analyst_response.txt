@@ -1,0 +1,336 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a correlated scalar subquery re-executing per outer row of the CTE scan (ctr1), causing a nested loop with repeated full CTE scans. The CTE itself is computed efficiently via parallel aggregation, but the main query's correlated filter forces per-row re-evaluation of an aggregate over the entire CTE, creating a quadratic blow-up.",
+    "reasoning_trace": [
+      "CTE Scan (ctr1) time=56838.289 ms is 99.9% of total runtime.",
+      "Correlated subquery (ctr2) shows Aggregate over CTE Scan with rows=2450, estimated 1 row (Q-Error 2450x).",
+      "Plan shows no hash join decorrelation; nested loop implied by correlation key ctr_store_sk.",
+      "Base CTE computation (store_returns join date_dim) is fast (2.3s) and uses indexes appropriately.",
+      "Secondary hotspot: final join chain (store, customer, demographics) is negligible (<1ms)."
+    ],
+    "cost_spine": ["CTE Scan (ctr1)", "Aggregate (subquery)", "CTE Scan (ctr2)", "Nested Loop (implied correlation)"],
+    "hotspots": [
+      {
+        "op": "CTE Scan (ctr1)",
+        "why": "correlated subquery forces per-row re-evaluation of aggregate over entire CTE",
+        "evidence": "time=56838.289 ms, rows=582, subplan shows Aggregate over CTE Scan (ctr2) rows=2450"
+      },
+      {
+        "op": "Aggregate (subquery)",
+        "why": "scalar aggregate re-computed for each outer row due to correlation",
+        "evidence": "rows=1, time=29.506 ms, but repeated per outer row (582 times)"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION split (no OR predicate in plan)",
+      "avoid materializing EXISTS path (no EXISTS in query)",
+      "avoid duplicating heavy CTE body (CTE is single-use in main query)",
+      "avoid converting comma joins to explicit JOIN unless paired with dimension isolation (already efficient)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery into three MATERIALIZED CTEs: (1) pre-filtered store_returns with date_dim join, (2) per-store_sk average threshold, (3) filtered main query joining threshold CTE.",
+      "dag_target_hint": "Replace final_select WHERE clause subquery with JOIN to threshold CTE; rewrite customer_total_return CTE as pre-filtered base CTE.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim", "store", "customer", "customer_demographics"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167", "ctr_reason_sk BETWEEN 43 AND 46", "s_state IN ('IL','KY','TX')", "cd_marital_status IN ('M','M')", "cd_education_status IN ('Advanced Degree','College')", "cd_gender='F'", "c_birth_month=2", "c_birth_year BETWEEN 1965 AND 1971"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_FACT_COUNT:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.92,
+      "expected_explain_delta": "Correlated subquery branch disappears; CTE Scan (ctr1) replaced by hash join to precomputed threshold CTE; nested loop eliminated.",
+      "recommended_patch_ops": ["insert_cte_base_filtered", "insert_cte_threshold", "replace_final_select_from", "replace_where_predicate"],
+      "rank_rationale": "Directly targets primary hotspot — decorrelation eliminates per-row re-evaluation of aggregate over CTE.",
+      "recommended_examples": ["pg_shared_scan_decorrelate", "inline_decorrelate_materialized"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push dimension filters into CTE definitions before materialization and decorrelate subquery by precomputing per-store_sk average in separate CTE, using explicit JOIN syntax.",
+      "dag_target_hint": "Rewrite customer_total_return CTE to include all dimension filters (date_dim, store, customer, customer_demographics) as early as possible; replace correlated subquery with JOIN to precomputed average CTE.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim", "store", "customer", "customer_demographics"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167", "ctr_reason_sk BETWEEN 43 AND 46", "s_state IN ('IL','KY','TX')", "cd_marital_status IN ('M','M')", "cd_education_status IN ('Advanced Degree','College')", "cd_gender='F'", "c_birth_month=2", "c_birth_year BETWEEN 1965 AND 1971"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_FACT_COUNT:PASS", "G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "CTE Scan (ctr1) time drops dramatically; correlated subquery replaced by hash join; early filters reduce base CTE row count.",
+      "recommended_patch_ops": ["insert_cte_early_filtered", "insert_cte_avg_by_store", "replace_final_select_from", "replace_where_predicate", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Combines early filtering (family A) with decorrelation (family B) for compounded reduction; strong prior success.",
+      "recommended_examples": ["early_filter_decorrelate", "pg_dimension_prefetch_star"],
+      "gold_example_id": "early_filter_decorrelate"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the base store_returns+date_dim join once as a CTE, then derive both the per-store aggregates and the filtered main query from the same materialized result.",
+      "dag_target_hint": "Create a MATERIALIZED CTE for the filtered store_returns join date_dim; compute per-store aggregates and filtered reason_sk subset in separate CTEs referencing the base CTE.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167"],
+        "output_must_preserve": ["sr_customer_sk", "sr_store_sk", "sr_reason_sk", "SR_RETURN_AMT_INC_TAX"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Base scan appears once; CTE materialization fence prevents repeated scans; per-store aggregates computed from materialized set.",
+      "recommended_patch_ops": ["insert_cte_materialized_base", "insert_cte_aggregates", "replace_final_select_from"],
+      "rank_rationale": "Addresses repeated scan of same base data; materialization fence may improve cardinality estimates.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate date_dim filter into a tiny CTE, convert comma joins to explicit JOIN syntax, and pre-join with store_returns to create a small filtered fact set before aggregation.",
+      "dag_target_hint": "Replace comma join in customer_total_return CTE with explicit INNER JOIN to a date_dim CTE; propagate explicit joins through main query.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167"],
+        "output_must_preserve": ["sr_customer_sk", "sr_store_sk", "sr_reason_sk", "SR_RETURN_AMT_INC_TAX"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax combined with dimension isolation may improve join order flexibility and cardinality estimates for the base CTE, though base CTE is already fast.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Comma join replaced by explicit JOIN; date_dim CTE creates tiny hash table; possible join order improvement.",
+      "recommended_patch_ops": ["insert_cte_date_filtered", "replace_comma_with_explicit_join", "replace_final_select_join_syntax"],
+      "rank_rationale": "Exploration — targets comma join weakness and may improve optimizer's ability to reorder joins.",
+      "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, store, customer, customer_demographics) into separate CTEs, then join them with store_returns in a star pattern using explicit JOIN syntax.",
+      "dag_target_hint": "Create CTEs for each dimension with their filters; rewrite main query as explicit joins between fact and dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim", "store", "customer", "customer_demographics"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167", "ctr_reason_sk BETWEEN 43 AND 46", "s_state IN ('IL','KY','TX')", "cd_marital_status IN ('M','M')", "cd_education_status IN ('Advanced Degree','College')", "cd_gender='F'", "c_birth_month=2", "c_birth_year BETWEEN 1965 AND 1971"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Prefetching all dimensions into tiny CTEs may improve join cardinality estimates and enable better hash join planning, though the main bottleneck is the correlated subquery.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Multiple dimension CTEs appear as tiny hash tables; explicit star join may reduce fact scan rows via combined selectivity.",
+      "recommended_patch_ops": ["insert_cte_date", "insert_cte_store", "insert_cte_customer", "insert_cte_demographics", "replace_final_select_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Exploration — secondary hotspot coverage; tests multi-dimension prefetch on PostgreSQL.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize both filtered dimension (date_dim) and pre-joined fact (store_returns) into CTEs before the main query's non-equi join (ctr_total_return > avg*1.2) to reduce search space.",
+      "dag_target_hint": "Create MATERIALIZED CTE for date_dim filtered rows, another for store_returns filtered by date and ratio, then compute per-store aggregates from that reduced set.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167"],
+        "output_must_preserve": ["sr_customer_sk", "sr_store_sk", "sr_reason_sk", "SR_RETURN_AMT_INC_TAX"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction via materialized CTEs may shrink both sides of the non-equi join (correlated filter) before the expensive comparison.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Materialized CTEs reduce rows before aggregate; non-equi join operates on smaller inputs.",
+      "recommended_patch_ops": ["insert_cte_materialized_date", "insert_cte_materialized_fact", "replace_customer_total_return_cte"],
+      "rank_rationale": "Exploration — targets non-equi join input blindness; may reduce work before correlation.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Build a CTE chain that progressively reduces data: first filter date_dim, then pre-join with store_returns, then aggregate, then filter by reason_sk, then compute per-store average, then join with remaining dimensions.",
+      "dag_target_hint": "Replace single customer_total_return CTE with a sequence of CTEs each adding one filter or join step.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim", "store", "customer", "customer_demographics"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167", "ctr_reason_sk BETWEEN 43 AND 46", "s_state IN ('IL','KY','TX')", "cd_marital_status IN ('M','M')", "cd_education_status IN ('Advanced Degree','College')", "cd_gender='F'", "c_birth_month=2", "c_birth_year BETWEEN 1965 AND 1971"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged join pipeline may allow earlier reduction and better selectivity propagation, though it adds CTE fences.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Multiple CTEs appear; each step reduces row count; final join operates on smaller sets.",
+      "recommended_patch_ops": ["insert_cte_chain_step1", "insert_cte_chain_step2", "insert_cte_chain_step3", "replace_final_select_from"],
+      "rank_rationale": "Exploration — tests progressive reduction strategy; may improve early filtering.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_returns by customer, store, reason keys before joining with date_dim, then compute per-store averages from the pre-aggregated set.",
+      "dag_target_hint": "Change customer_total_return CTE to aggregate store_returns first, then join with date_dim for filtering.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year=2002", "sr_return_amt/sr_return_quantity BETWEEN 108 AND 167"],
+        "output_must_preserve": ["sr_customer_sk", "sr_store_sk", "sr_reason_sk", "sum(SR_RETURN_AMT_INC_TAX)"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregation pushdown may reduce rows before the date join, shrinking the base CTE size and thus the correlated subquery's work.",
+      "confidence": 0.48,
+      "expected_explain_delta": "Aggregate moves below join; date_dim filter applied after aggregation via join.",
+      "recommended_patch_ops": ["replace_customer_total_return_cte", "reorder_aggregate_and_join"],
+      "rank_rationale": "Exploration — tests aggregation pushdown on PostgreSQL; may reduce base CTE rows.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in SQL or plan; guard G_PG_OR_INDEX_PROTECTED prohibits default OR-to-UNION on PostgreSQL."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No UNION or repeated CTE scans with different filters in plan."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN in query; all joins are inner."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "No self-join of CTE with different filter values."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "Transform is portability_candidate for duckdb; prefer native PostgreSQL transforms inline_decorrelate_materialized and early_filter_decorrelate."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "Transform is portability_candidate for snowflake; not native to PostgreSQL."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "Transform is portability_candidate for snowflake; not native to PostgreSQL."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "No repeated scans of same fact table with different channel buckets."
+    },
+    {
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "reason": "No multiple scalar subqueries on same table to consolidate."
+    },
+    {
+      "transform_id": "deferred_window_aggregation",
+      "family": "C",
+      "reason": "No window functions in query."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Date_dim joined only once with single filter (d_year=2002)."
+    },
+    {
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "reason": "Transform is portability_candidate for duckdb; prefer native PostgreSQL dimension_prefetch_star."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "No multiple channel CTEs with shared dimension filters."
+    },
+    {
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "reason": "Similar to date_cte_explicit_join but less specific; prefer explicit join variant."
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Similar to dimension_prefetch_star but less specific; prefer multi-dimension variant."
+    },
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Generic early filter; prefer more specific transforms like early_filter_decorrelate."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Transform is portability_candidate for snowflake; not applicable to PostgreSQL."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "Transform is portability_candidate for snowflake; not applicable to PostgreSQL."
+    },
+    {
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "reason": "No multiple correlated EXISTS subqueries to decorrelate."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "Generic materialization; prefer pg_self_join_decomposition which is native to PostgreSQL."
+    },
+    {
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "rollup_to_union_windowing",
+      "family": "D",
+      "reason": "No ROLLUP in query."
+    }
+  ]
+}

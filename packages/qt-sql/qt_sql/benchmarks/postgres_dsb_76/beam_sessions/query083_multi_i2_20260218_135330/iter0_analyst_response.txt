@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Two primary bottlenecks: (1) sequential scans on date_dim (36524 rows, 24350 rows) dominate I/O before hash joins; (2) nested loops between date subquery results and fact tables cause repeated index scans. The planner cannot push date filters across CTE boundaries, forcing full dimension scans before filtering via correlated subqueries.",
+    "reasoning_trace": [
+      "Seq Scan on date_dim (rows=36524, time=53.316 ms) is largest single I/O operator for sr_items branch.",
+      "Hash Join (rows=61, time=62.811 ms) builds hash from full date_dim scan; selectivity arrives late via nested loop.",
+      "Nested Loop (rows=42, time=1862.291 ms) shows repeated Index Scan on store_returns (rows=1, time=29.497 ms) per outer row.",
+      "Zero-row estimation on wr_items branch indicates planner cannot propagate join cardinality across CTEs."
+    ],
+    "cost_spine": ["Seq Scan on date_dim", "Hash Join", "Nested Loop", "Aggregate", "Nested Loop", "Aggregate", "Limit"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on date_dim",
+        "why": "full dimension scan before applying selective date filter via correlated subquery",
+        "evidence": "rows=36524, time=53.316 ms, largest I/O in sr_items branch"
+      },
+      {
+        "op": "Nested Loop (sr_items branch)",
+        "why": "repeated index scans on store_returns (42 loops × 29.5 ms each)",
+        "evidence": "rows=42, time=1862.291 ms, amplification factor 42"
+      },
+      {
+        "op": "Hash Join (cr_items branch)",
+        "why": "builds hash from 24350-row date_dim scan before filtering",
+        "evidence": "rows=41, time=62.431 ms, second-largest dimension scan"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union transform (PostgreSQL BitmapOr handles OR efficiently)",
+      "decorrelation of EXISTS (no EXISTS in query)",
+      "materializing large CTE without reuse",
+      "duplicate heavy CTE body across branches"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter date_dim via CTE returning only d_date_sk for the four target dates, then join fact tables using explicit INNER JOIN syntax.",
+      "dag_target_hint": "Replace date_dim scans in sr_items, cr_items, wr_items CTEs with reference to date_keys CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_date IN ('1999-01-10','1999-06-17','1999-08-04','1999-11-05')"],
+        "output_must_preserve": ["date surrogate key compatibility with fact table joins"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Seq Scan on date_dim replaced by small CTE scan; hash join input rows drop from 36524 to ~4.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot—full date_dim sequential scan—with proven family A pattern.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decorrelate the two-level date subquery by extracting a CTE with d_date_sk and d_month_seq for the four dates, then join directly with fact tables.",
+      "dag_target_hint": "Replace correlated subquery in WHERE clause with pre‑materialized date_keys CTE and explicit JOIN.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_date IN ('1999-01-10','1999-06-17','1999-08-04','1999-11-05')"],
+        "output_must_preserve": ["same set of qualifying date keys as original subquery"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Nested Loop with Index Only Scan replaced by hash join on small CTE; elimination of repeated subquery execution.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate", "replace_from"],
+      "rank_rationale": "Addresses secondary hotspot—nested loop amplification—by removing correlated subquery execution per fact row.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": "early_filter_decorrelate"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered item keys (i_item_sk) for category and manager_id range into a CTE, then join once per channel CTE.",
+      "dag_target_hint": "Replace repeated item scans in each channel CTE with reference to pre‑filtered item_keys CTE.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_category IN ('Children','Electronics')", "i_manager_id BETWEEN 15 AND 24"],
+        "output_must_preserve": ["i_item_sk for join compatibility"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Item table is scanned three times with identical filters; materializing once may reduce index scan overhead.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Three Index Scan on item nodes replaced by one CTE scan; possible reduction in index lookup overhead.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration—targets secondary dimension table with repeated identical scans; reuse may improve cache efficiency.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and push date filter into a CTE to create tiny hash table for planner.",
+      "dag_target_hint": "Change FROM clause in each channel CTE to use explicit JOIN ON syntax with date_keys CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_returns/catalog_returns/web_returns", "item"],
+        "where_must_preserve": ["date filter", "category filter", "manager_id filter", "return amount/quantity ratio", "reason_sk filter"],
+        "output_must_preserve": ["all original grouping columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_EXPLICIT_JOIN_STYLE:PASS", "G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Planner may choose better join order with explicit syntax; hash join build side shrinks due to pre‑filtered date CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Combines explicit join syntax with date pre‑filtering to arm PostgreSQL optimizer for better cardinality estimates.",
+      "recommended_examples": ["pg_explicit_join_materialized"],
+      "gold_example_id": "pg_explicit_join_materialized"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan; PostgreSQL BitmapOr handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Plan shows aggregates are already performed directly on filtered fact rows; no evidence of aggregate-after-large-join amplification."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine mismatch: transform is specific to Snowflake, not PostgreSQL."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "Query does not contain INTERSECT operations."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join in query; plan does not show non-equi join input blindness pattern."
+    }
+  ]
+}

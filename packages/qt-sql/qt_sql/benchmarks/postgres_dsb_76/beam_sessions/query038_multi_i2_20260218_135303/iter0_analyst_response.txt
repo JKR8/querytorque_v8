@@ -1,0 +1,165 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "SetOp (INTERSECT) materializes three large distinct result sets (62K, 21K, 22K rows) from separate nested-loop branches, consuming 15.7s of 16.1s total runtime. Each branch repeats identical dimension filters and nested-loop amplification. Primary hotspot is the SetOp materialization; secondary hotspots are the repeated date_dim scans and nested-loop joins.",
+    "reasoning_trace": [
+      "SetOp time=15737.22ms dominates total time=16115.048ms.",
+      "Three branches scan date_dim separately (rows=182 each) and perform nested-loop joins to fact tables.",
+      "Each branch outputs thousands of rows after distinct, which SetOp must materialize and intersect.",
+      "No correlated subqueries, aggregates, or OR predicates in plan."
+    ],
+    "cost_spine": ["SetOp", "Append", "Subquery Scan", "Unique", "Gather Merge", "Sort", "Nested Loop", "Seq Scan on date_dim", "Index Scan on fact table", "Index Scan on customer"],
+    "hotspots": [
+      {
+        "op": "SetOp",
+        "why": "materializes and intersects three large distinct sets",
+        "evidence": "time=15737.22ms, rows_in=21988, rows_out=45"
+      },
+      {
+        "op": "Nested Loop (store_sales branch)",
+        "why": "largest branch by rows and time, amplifies 182 date_dim rows into 75K fact rows before customer filter",
+        "evidence": "time=7542.535ms, rows=34904 after customer filter"
+      },
+      {
+        "op": "Seq Scan on date_dim (three times)",
+        "why": "identical filter scanned three times, each returning 182 rows",
+        "evidence": "three separate scans, each ~120ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION split (no OR predicate in plan, PostgreSQL BitmapOr is strong)",
+      "avoid materializing EXISTS paths (no EXISTS in query, protect semi-join shape)",
+      "avoid duplicating heavy CTE bodies (CTE_MATERIALIZATION_FENCE guard)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT with EXISTS correlated subqueries, using one branch as driver and others as semi-joins to avoid full materialization of distinct sets.",
+      "dag_target_hint": "Replace final_select INTERSECT structure with EXISTS in WHERE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1207 and 1207+11", "c_birth_month in (2,3,4,10)", "ss_list_price between 241 and 300", "ss_wholesale_cost between 76 and 96"],
+        "output_must_preserve": ["distinct c_last_name, c_first_name, d_date", "LIMIT 100 behavior"]
+      },
+      "gates_checked": ["G_PG_EXISTS_PROTECTED:PASS (introducing EXISTS for INTERSECT, not breaking existing semi-join)", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS (not adding CTE fence)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "SetOp replaced by semi-joins; materialization of large distinct sets eliminated.",
+      "recommended_patch_ops": ["replace_setop_with_exists", "adjust_where_clause"],
+      "rank_rationale": "Directly targets primary SetOp hotspot with strong gold example precedent (1.78x).",
+      "recommended_examples": ["pg_intersect_to_exists"],
+      "gold_example_id": "pg_intersect_to_exists"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim once as a CTE, then join explicitly with each fact table branch, converting comma joins to explicit JOIN syntax.",
+      "dag_target_hint": "Insert CTE for date_dim, change final_select FROM clauses to explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq between 1207 and 1207+11"],
+        "output_must_preserve": ["all original columns and distinctness per branch"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS (three fact tables, acceptable)", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Three date_dim Seq Scans replaced by one CTE scan; explicit joins may improve join order choices.",
+      "recommended_patch_ops": ["insert_cte", "replace_from_with_explicit_join"],
+      "rank_rationale": "Targets secondary hotspot of repeated date_dim scans and comma-join weakness, with gold example 2.28x.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Prefilter both date_dim and customer into separate CTEs, then join explicitly with each fact table branch, creating tiny hash tables for both dimensions.",
+      "dag_target_hint": "Insert two CTEs (filtered_date, filtered_customer), change final_select FROM to explicit JOINs using CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1207 and 1207+11", "c_birth_month in (2,3,4,10)"],
+        "output_must_preserve": ["all original columns and distinctness per branch"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Eliminates three date_dim scans and three customer index scans; reduces nested-loop inner side cardinality.",
+      "recommended_patch_ops": ["insert_cte", "replace_from_with_explicit_join"],
+      "rank_rationale": "Extends probe p02 by also prefetching customer, targeting nested-loop amplification, with gold example 3.32x.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Prefilter date_dim and customer into a single CTE that joins them, then join that composite dimension set with each fact table branch, reducing dimension work to one scan and join.",
+      "dag_target_hint": "Insert CTE joining filtered date_dim and customer, change final_select FROM to join with this CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1207 and 1207+11", "c_birth_month in (2,3,4,10)"],
+        "output_must_preserve": ["all original columns and distinctness per branch"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SETOP_RISK:PASS (SetOp remains, but dimension CTE is before branches)"],
+      "exploration": true,
+      "exploration_hypothesis": "Combining both dimensions into one CTE may further reduce work compared to separate CTEs, but could create a larger hash table; worth testing as exploration.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single dimension CTE scan replaces six dimension scans; may increase or decrease hash join cost.",
+      "recommended_patch_ops": ["insert_cte", "replace_from_with_explicit_join"],
+      "rank_rationale": "Exploration probe targeting underrepresented family A and secondary hotspot of repeated dimension scans.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in plan; PostgreSQL BitmapOr is strong, and guard G_PG_OR_INDEX_PROTECTED blocks."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query or plan; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY or aggregates in query; plan shows no aggregation hotspot."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated scans of same table (each fact table scanned once per branch); CTE materialization may add fence without reuse benefit."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Portability candidate for Snowflake; not native to PostgreSQL and plan shows index scans already using date_sk."
+    }
+  ]
+}

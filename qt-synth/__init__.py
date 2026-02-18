@@ -1,13 +1,26 @@
-"""
-Synthetic Data Validation Tool
+"""Synthetic Data Validation Tool — CLI wrappers.
 
-Validate SQL queries by:
-1. Extracting schema via SQLGlot AST
-2. Creating DuckDB tables
-3. Generating synthetic data  
-4. Executing queries
+Canonical implementation lives in ``packages/qt-sql/qt_sql/validation/``.
+This package re-exports classes for backward-compatible imports and provides
+CLI entrypoints for DSB benchmark tooling.
 """
 
-from .validator import SyntheticValidator, SchemaExtractor, SyntheticDataGenerator
+import sys
+from pathlib import Path
 
-__all__ = ['SyntheticValidator', 'SchemaExtractor', 'SyntheticDataGenerator']
+# Ensure production packages are importable when running from qt-synth/
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+for _p in (
+    str(_PROJECT_ROOT / "packages" / "qt-shared"),
+    str(_PROJECT_ROOT / "packages" / "qt-sql"),
+):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from qt_sql.validation.synthetic_validator import (  # noqa: E402, F401
+    SchemaExtractor,
+    SyntheticDataGenerator,
+    SyntheticValidator,
+)
+
+__all__ = ["SyntheticValidator", "SchemaExtractor", "SyntheticDataGenerator"]

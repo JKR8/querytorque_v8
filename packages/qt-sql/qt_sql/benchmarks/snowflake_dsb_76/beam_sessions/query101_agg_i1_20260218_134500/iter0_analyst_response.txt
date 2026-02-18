@@ -1,0 +1,371 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan exhibits massive I/O from three large fact table scans (store_sales: 1.25TB, store_returns: 122GB, web_sales: 461GB) without early pruning via dimension filters. Aggregates are applied after large joins, multiplying intermediate rows. Lack of predicate pushdown across the date range condition (d2.d_date between d1.d_date and d1.d_date+90) and missing direct fact table filtering by date_sk cause full scans.",
+    "reasoning_trace": [
+      "Primary I/O hotspots: STORE_SALES scan (72718 parts, 1251924090880 bytes), STORE_RETURNS scan (6909/7070 parts, 122017405952 bytes), WEB_SALES scan (27574/27579 parts, 460956759040 bytes).",
+      "Date_dim filters (d1.d_year=1998, d2.d_date between ...) apply after fact table joins, not before scans.",
+      "Multiple aggregate stages (count aggregates) after large joins amplify row flow; early aggregation could reduce join inputs.",
+      "No nested loops present; all joins are hash/merge, but join order may be suboptimal due to missing predicate propagation.",
+      "Dimension tables (date_dim, item, customer, customer_address, household_demographics) are small (parts=1 or 2) and already filtered early; further pruning is negligible."
+    ],
+    "cost_spine": ["TableScan STORE_SALES", "InnerJoin (STORE_SALES ↔ STORE_RETURNS)", "InnerJoin (↔ WEB_SALES)", "Aggregate (multiple levels)", "InnerJoin (↔ CUSTOMER)", "Aggregate (final)"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest fact table scan, no date_sk pushdown",
+        "evidence": "parts=72718/72718, bytes=1251924090880"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "second largest fact scan, no date_sk pushdown",
+        "evidence": "parts=27574/27579, bytes=460956759040"
+      },
+      {
+        "op": "TableScan (STORE_RETURNS)",
+        "why": "third large fact scan, no date_sk pushdown",
+        "evidence": "parts=6909/7070, bytes=122017405952"
+      },
+      {
+        "op": "Aggregate (multiple levels)",
+        "why": "aggregation after large joins amplifies intermediate row counts",
+        "evidence": "plan shows nested COUNT_INTERNAL aggregates after each join stage"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS/IN subqueries (none present)",
+      "avoid same-column OR to UNION ALL (no OR predicates)",
+      "avoid introducing unfiltered large CTEs that increase memory pressure",
+      "do not wrap date_sk in functions; preserve pruning eligibility"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN filters to store_returns and web_sales by pre‑computing the allowed date_sk range from filtered d1 and d2, then pushing that range into the fact table scans via join conditions.",
+      "dag_target_hint": "Replace STORE_RETURNS and WEB_SALES scans with filtered CTEs that include date_sk BETWEEN derived from date_dim.",
+      "node_contract": {
+        "from_must_include": ["store_returns sr", "date_dim d1", "web_sales ws", "date_dim d2"],
+        "where_must_preserve": ["d1.d_year = 1998", "d2.d_date between d1.d_date and (d1.d_date + interval '90 day')", "sr_returned_date_sk = d1.d_date_sk", "ws_sold_date_sk = d2.d_date_sk"],
+        "output_must_preserve": ["all original join keys and columns required for downstream joins and aggregates"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "STORE_RETURNS and WEB_SALES scans show reduced partitions scanned; date_sk filter appears directly on fact table scans.",
+      "recommended_patch_ops": ["insert_cte_date_range", "add_join_condition_between", "rewrite_fact_scan_predicate"],
+      "recommended_examples": ["sf_sk_pushdown_multi_fact"],
+      "rank_rationale": "Targets primary I/O hotspot — missing date_sk pushdown is a known Snowflake pruning gap.",
+      "gold_example_id": "sf_sk_pushdown_multi_fact"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate store_sales by ss_customer_sk, ss_item_sk, ss_ticket_number (plus count) before joining with store_returns and web_sales, reducing the rows flowing into the first join.",
+      "dag_target_hint": "Replace the base store_sales scan with a CTE that groups by the join keys and adds COUNT(*) as ss_cnt.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss"],
+        "where_must_preserve": ["i_category IN ('Children','Electronics','Music')", "ss_sales_price / ss_list_price BETWEEN 0.35 AND 0.55"],
+        "output_must_preserve": ["ss_customer_sk", "ss_item_sk", "ss_ticket_number", "count(*) as ss_cnt"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate node moves before the first join; STORE_SALES scan output rows drop significantly.",
+      "recommended_patch_ops": ["insert_cte_early_agg", "replace_from_with_cte", "adjust_downstream_aggregates"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Reduces row amplification early in the join spine; gold example shows 42.9x speedup for similar pattern.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk BETWEEN into each fact table scan via explicit join conditions, using a CTE that pre‑computes the allowed date_sk range from filtered d1 and d2.",
+      "dag_target_hint": "Add a date_range CTE with min/max d_date_sk for d1 (year=1998) and d2 (range condition), then join each fact table with an explicit date_sk BETWEEN predicate.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "store_returns sr", "web_sales ws", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d1.d_year = 1998", "d2.d_date between d1.d_date and (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["all original columns and join keys"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Fact table scans show partition pruning due to date_sk BETWEEN; join filters move earlier.",
+      "recommended_patch_ops": ["insert_cte_date_range", "add_join_condition_between", "rewrite_fact_scan_predicate"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Alternative pushdown shape that may better suit Snowflake's predicate propagation across UNION‑like fact joins.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "E",
+      "target": "Pre‑filter all dimension tables (date_dim d1, d2, item, customer, customer_address, household_demographics) into separate CTEs before joining with fact tables, creating tiny hash tables for early reduction.",
+      "dag_target_hint": "Insert CTEs for each filtered dimension, then join them sequentially to the fact tables.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2", "item i", "customer c", "customer_address ca", "household_demographics hd"],
+        "where_must_preserve": ["d1.d_year = 1998", "d2.d_date between d1.d_date and (d1.d_date + interval '90 day')", "i_category IN ('Children','Electronics','Music')", "ca_state in ('AR','CO','NC','NY','TX')", "hd_income_band_sk BETWEEN 7 AND 13", "hd_buy_potential = '0‑500'"],
+        "output_must_preserve": ["all dimension surrogate keys and required columns for downstream joins"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already push down dimension filters, but materializing them as CTEs could force a better join order and reduce fact table probe cost.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension scans become tiny CTE materializations; join order may shift to build smaller hash tables first.",
+      "recommended_patch_ops": ["insert_cte_per_dimension", "replace_from_with_cte_chain", "preserve_join_conditions"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration — addresses secondary hotspot of dimension join order; gold example shows 2.71x speedup."
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Build a staged CTE pipeline: first filter dimensions, then pre‑join them with store_sales, then with store_returns and web_sales, progressively reducing row counts before final aggregates.",
+      "dag_target_hint": "Create a CTE chain: dims → filtered store_sales → filtered store_returns → filtered web_sales → final joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "store_returns sr", "web_sales ws", "date_dim d1", "date_dim d2", "item i", "customer c", "customer_address ca", "household_demographics hd"],
+        "where_must_preserve": ["all original WHERE clause predicates"],
+        "output_must_preserve": ["all original columns and join keys"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may overcome Snowflake's join‑order heuristic and force early filtering of fact tables.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Fact table scans are replaced by filtered CTE scans; join order changes to dimension‑first.",
+      "recommended_patch_ops": ["insert_cte_chain", "replace_from_with_staged_ctes", "preserve_join_conditions"],
+      "recommended_examples": ["prefetch_fact_join"],
+      "rank_rationale": "Exploration — alternative early‑filtering shape that may reduce fact I/O more aggressively."
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate the two date_dim aliases into separate CTEs with their respective filters, then join each to its corresponding fact table (d1 with store_returns, d2 with web_sales).",
+      "dag_target_hint": "Create date1_cte and date2_cte, then join them directly to the fact tables before other joins.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d1.d_year = 1998", "d2.d_date between d1.d_date and (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["d_date_sk", "d_date for each alias"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_or_to_union:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Date_dim scans become tiny materialized CTEs; join order may shift to build smaller hash tables first.",
+      "recommended_patch_ops": ["insert_cte_date1", "insert_cte_date2", "replace_join_with_cte"],
+      "recommended_examples": ["dimension_cte_isolate"],
+      "rank_rationale": "Targets the date range join condition which currently applies after large fact scans."
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate multiple COUNT aggregates in the store_sales → store_returns → web_sales chain into a single CTE that computes all necessary counts in one pass over each fact table.",
+      "dag_target_hint": "Replace the nested COUNT_INTERNAL aggregates with a single CTE that groups by all required keys and computes counts via conditional aggregation.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "store_returns sr", "web_sales ws"],
+        "where_must_preserve": ["original filters on each fact table"],
+        "output_must_preserve": ["same aggregate results and grouping keys"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Multiple aggregate stages may be redundant; single‑pass aggregation could reduce CPU and spilling.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fewer aggregate nodes in plan; total work and memory usage may drop.",
+      "recommended_patch_ops": ["insert_cte_single_pass_agg", "replace_nested_aggregates"],
+      "recommended_examples": ["single_pass_aggregation"],
+      "rank_rationale": "Exploration — targets the aggregate amplification hotspot; may reduce compute cost."
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push the item category filter directly into the store_sales scan via an explicit JOIN with a filtered item CTE, before other joins.",
+      "dag_target_hint": "Create a filtered_item CTE and join it with store_sales as the first step in the FROM clause.",
+      "node_contract": {
+        "from_must_include": ["item i", "store_sales ss"],
+        "where_must_preserve": ["i_category IN ('Children','Electronics','Music')", "ss_item_sk = i_item_sk"],
+        "output_must_preserve": ["ss_customer_sk", "ss_item_sk", "ss_ticket_number", "ss_list_price", "ss_sales_price"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_or_to_union:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.65,
+      "expected_explain_delta": "Store_sales scan rows drop due to early item filter; join order shifts.",
+      "recommended_patch_ops": ["insert_cte_filtered_item", "rewrite_from_to_include_cte"],
+      "recommended_examples": ["early_filter"],
+      "rank_rationale": "Targets store_sales scan reduction via early dimension filter."
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the filtered date range (d1, d2) as a single CTE that pre‑computes the allowed date_sk pairs, then join it to both fact tables.",
+      "dag_target_hint": "Create a date_pairs CTE with d1_date_sk, d2_date_sk, then join store_returns to d1_date_sk and web_sales to d2_date_sk.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d1.d_year = 1998", "d2.d_date between d1.d_date and (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["d1.d_date_sk", "d2.d_date_sk"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the date pairs may allow Snowflake to propagate the range constraint more effectively to both fact tables.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date_dim scans become a single materialized CTE; join condition simplification may improve pruning.",
+      "recommended_patch_ops": ["insert_cte_date_pairs", "replace_join_with_cte"],
+      "recommended_examples": ["materialize_cte"],
+      "rank_rationale": "Exploration — focuses on the complex date range join that may hinder predicate pushdown."
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit comma joins to explicit INNER JOIN syntax and reorder joins to start with the most selective filtered dimensions.",
+      "dag_target_hint": "Rewrite FROM clause as explicit INNER JOINs, placing filtered dimensions first.",
+      "node_contract": {
+        "from_must_include": ["all original tables"],
+        "where_must_preserve": ["all original join and filter conditions"],
+        "output_must_preserve": ["same result set"]
+      },
+      "gates_checked": ["G_SF_JOINFILTER_PRESERVE:PASS", "join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may give the optimizer better hints for join ordering and predicate pushdown.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Join order changes; smaller dimension tables become build sides earlier.",
+      "recommended_patch_ops": ["replace_comma_with_inner_join", "reorder_join_clauses"],
+      "recommended_examples": ["inner_join_conversion"],
+      "rank_rationale": "Exploration — join‑topology change that may improve cost‑based join ordering."
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate the three fact table scans (store_sales, store_returns, web_sales) into a single scan per fact table using conditional aggregation for counts, then join the aggregated results.",
+      "dag_target_hint": "Replace separate fact table scans with a CTE that aggregates each fact table by its join keys and computes counts via CASE expressions.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "store_returns sr", "web_sales ws"],
+        "where_must_preserve": ["original filters on each fact table"],
+        "output_must_preserve": ["same aggregate results and grouping keys"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Multiple scans of the same fact table pattern may be consolidated into a single aggregated pass.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fewer scan nodes; aggregate work moves earlier.",
+      "recommended_patch_ops": ["insert_cte_combined_agg", "replace_multiple_scans"],
+      "recommended_examples": ["channel_bitmap_aggregation"],
+      "rank_rationale": "Exploration — targets the repeated scan pattern across three fact tables."
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date dimensions as CTEs and convert comma joins to explicit INNER JOINs, forcing a dimension‑first join order.",
+      "dag_target_hint": "Create CTEs for filtered d1 and d2, then rewrite the FROM clause as explicit joins starting with these CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d1.d_year = 1998", "d2.d_date between d1.d_date and (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["all original columns and join keys"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combining dimension CTEs with explicit join syntax may improve predicate pushdown and join ordering.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Date_dim scans become CTEs; join order shifts to build small hash tables first.",
+      "recommended_patch_ops": ["insert_cte_date1", "insert_cte_date2", "replace_comma_with_inner_join"],
+      "recommended_examples": ["date_cte_explicit_join"],
+      "rank_rationale": "Exploration — combines two families (A and F) to address date range and join topology."
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subquery pattern in query."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "No correlated subquery pattern; plan shows no nested loops."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries; plan shows no nested loops."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "rollup_to_union_windowing",
+      "family": "D",
+      "reason": "No GROUP BY ROLLUP in query."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No UNION or repeated CTE pattern."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self‑join pattern; CTEs are not scanned multiple times with different filters."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non‑equi joins; all joins are equality joins."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "No self‑join pattern; CTEs are not scanned multiple times with different filters."
+    }
+  ]
+}

@@ -1,0 +1,322 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The query scans the entire store_sales table (1.25 TB) because the selective month filter is applied after aggregation in the wss CTE, leading to high I/O cost. By pushing the month filter into the aggregation phase or splitting the CTE, the fact table scan can be pruned to only relevant dates, reducing I/O significantly.",
+    "reasoning_trace": [
+      "STORE_SALES scan shows parts=72718/72723 and bytes=1251924090880, dominating total I/O.",
+      "Month filter on date_dim (d_month_seq between ranges) is not present in wss CTE definition, applied late in main query.",
+      "wss CTE aggregates all data then filtered twice in main query, indicating late filtering opportunity."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "InnerJoin with DATE_DIM", "Aggregate in wss", "InnerJoin with STORE", "SortWithLimit"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "huge I/O volume due to lack of early month filter",
+        "evidence": "parts=72718/72723 bytes=1251924090880"
+      },
+      {
+        "op": "wss CTE aggregation",
+        "why": "computes aggregates for all weeks before month filtering",
+        "evidence": "wss defined without d_month_seq filter, used twice with different ranges"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns (none present)",
+      "avoid unfiltered large CTEs without selective predicates",
+      "do not wrap partition keys in functions that hinder micro-partition pruning"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "target": "Split wss CTE into two separate CTEs (wss_y and wss_x) each with the corresponding d_month_seq filter applied in the date_dim join, to compute aggregates only for the needed date ranges.",
+      "dag_target_hint": "Replace wss node with two CTE definitions and update references in final_select.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS", "G_SF_CTE_REUSE_RULE:REVIEW"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "STORE_SALES scan parts reduced for each CTE, and wss computations split into two smaller aggregates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "update_where_predicate"],
+      "rank_rationale": "Primary hotspot — directly reduces fact table scan I/O by applying selective month filter early.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push d_month_seq filter into wss CTE by modifying the date_dim join to include the filter, computing aggregates only for relevant months.",
+      "dag_target_hint": "Change wss node SQL to add d_month_seq filter in WHERE clause.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_SF_FILTER_FUNCTION_WRAP:PASS", "G_SF_CTE_REUSE_RULE:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; testing if manual pushdown improves pruning despite Snowflake's predicate pushdown.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced STORE_SALES scan due to early date_dim filtering.",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot with early filtering mechanism.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Create a single wss CTE that includes d_month_seq filter with a union or case to handle both ranges, then filter in main query.",
+      "dag_target_hint": "Modify wss node to embed month ranges and adjust final_select filters.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_SF_UNION_BRANCH_LIMIT:PASS", "G_SF_CTE_REUSE_RULE:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; explores alternative early filtering shape for multiple ranges.",
+      "confidence": 0.60,
+      "expected_explain_delta": "STORE_SALES scan reduced with embedded range logic.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — variant of early filtering for multiple date ranges.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Compute date_sk range from d_month_seq filter and add explicit ss_sold_date_sk BETWEEN clause in store_sales scan within wss CTE.",
+      "dag_target_hint": "Add derived date_sk range subquery or CTE and modify wss join condition.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Micro-partition pruning on ss_sold_date_sk reduces STORE_SALES scan I/O.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "rank_rationale": "Native Snowflake transform targeting primary hotspot with date_sk pushdown.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_sold_date_sk and ss_store_sk before joining with date_dim to get d_week_seq and d_day_name for CASE expressions.",
+      "dag_target_hint": "Replace wss node with a CTE that aggregates store_sales first, then joins with filtered date_dim.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Tests if pushing aggregation below join reduces row flow despite need for date_dim columns.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Reduced rows into final aggregates and joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — secondary hotspot targeting aggregation efficiency.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Change comma-separated joins in the main query to explicit JOIN syntax and pre-filter date_dim d into CTEs.",
+      "dag_target_hint": "Modify final_select FROM clause to use explicit JOINs and add CTEs for date_dim d.",
+      "node_contract": {
+        "from_must_include": ["wss", "store", "date_dim d"],
+        "where_must_preserve": ["d.d_week_seq = wss.d_week_seq", "s_state IN ('AR','CO','IA','IL','NC','NY','PA','TX')"],
+        "output_must_preserve": ["s_store_name1", "s_store_id1", "d_week_seq1", "sun_sales1/sun_sales2", "mon_sales1/mon_sales2", "tue_sales1/tue_sales2", "wed_sales1/wed_sales2", "thu_sales1/thu_sales2", "fri_sales1/fri_sales2", "sat_sales1/sat_sales2"]
+      },
+      "gates_checked": ["G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; explores if explicit joins improve plan shape on Snowflake.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Potential join order optimization or filter pushdown.",
+      "recommended_patch_ops": ["replace_from", "insert_cte"],
+      "rank_rationale": "Exploration — targets join topology in main query, secondary hotspot.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter store and date_dim d into CTEs before joining with wss in the main query, creating small hash tables.",
+      "dag_target_hint": "Add CTEs for filtered store and date_dim d, and update final_select joins.",
+      "node_contract": {
+        "from_must_include": ["wss", "store", "date_dim d"],
+        "where_must_preserve": ["d.d_week_seq = wss.d_week_seq", "s_state IN ('AR','CO','IA','IL','NC','NY','PA','TX')"],
+        "output_must_preserve": ["all original output columns and aliases"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; tests dimension prefetching for small tables in main query.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Smaller build sides for joins, though impact limited due to small dimension sizes.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — secondary hotspot focusing on dimension join efficiency.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Ensure all joins are explicit INNER JOINs and convert any implicit left joins if present, though query uses inner joins.",
+      "dag_target_hint": "Review final_select joins for left join patterns and convert to INNER JOIN if safe.",
+      "node_contract": {
+        "from_must_include": ["wss", "store", "date_dim d"],
+        "where_must_preserve": ["join conditions and filters"],
+        "output_must_preserve": ["all original output columns and aliases"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; explores join semantics optimization, though likely no change.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Minimal change, potential join order hint.",
+      "recommended_patch_ops": ["replace_from"],
+      "rank_rationale": "Exploration — low-risk probe on join topology.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Explicitly materialize wss CTE to ensure reuse, though Snowflake may already do this.",
+      "dag_target_hint": "Add MATERIALIZED hint or ensure CTE is not inlined.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Tests if explicit materialization improves performance despite Snowflake's CTE handling.",
+      "confidence": 0.35,
+      "expected_explain_delta": "Potential reduction in repeated computation, though wss is already referenced twice.",
+      "recommended_patch_ops": ["modify_cte_definition"],
+      "rank_rationale": "Exploration — low-impact probe on materialization.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate aggregate computations in wss using bitmap or conditional logic, though not directly applicable.",
+      "dag_target_hint": "Modify wss aggregate to use more efficient CASE or bitmap methods.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; explores aggregate optimization for CASE expressions.",
+      "confidence": 0.30,
+      "expected_explain_delta": "Potential compute reduction in aggregate phase.",
+      "recommended_patch_ops": ["replace_aggregate_expression"],
+      "rank_rationale": "Exploration — targets aggregate computation efficiency.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Optimize wss aggregate to compute all day sales in a single pass, though already done with CASE.",
+      "dag_target_hint": "Review wss aggregate SQL for redundant computations.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; tests if aggregate can be further optimized.",
+      "confidence": 0.25,
+      "expected_explain_delta": "Minimal change, potential slight compute improvement.",
+      "recommended_patch_ops": ["replace_aggregate_expression"],
+      "rank_rationale": "Exploration — low-confidence probe on aggregation.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Decompose the self-join on wss by embedding filters into separate CTEs, similar to union_cte_split.",
+      "dag_target_hint": "Split wss into specialized CTEs for each filter set in the self-join.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 0.57 AND 0.77"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; alternative self-join optimization.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Reduced wss computation by pre-filtering.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — variant of early filtering for self-join pattern.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in the query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in the query."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries detected."
+    }
+  ]
+}

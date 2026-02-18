@@ -1,0 +1,335 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows massive I/O from two large fact-table scans (store_sales 1.2TB, store_returns 124GB) with late aggregation and a complex join graph. The date_dim filters are selective (d2 year=2000, month=8) but the d1 range condition is a join filter applied after the store_sales scan, missing early micro-partition pruning. Multiple aggregation stages amplify row flow before final grouping.",
+    "reasoning_trace": [
+      "Primary I/O hotspot: store_sales scan (parts=70412/72718, bytes=1212628258304) dominates total bytes.",
+      "Secondary I/O hotspot: store_returns scan (parts=7070/7070, bytes=124763446272) is 10% of store_sales volume.",
+      "Date_dim scans are fully pruned (parts=1/1) but d1 range filter is a join filter (1.8) not pushed into store_sales scan.",
+      "Aggregation cascade: three aggregate stages (1.20, 1.10, 1.7) before final group by, indicating row amplification.",
+      "Join topology: five-way inner join with comma syntax may limit predicate pushdown across fact tables."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "TableScan (STORE_RETURNS)", "InnerJoin (store_sales ↔ store_returns)", "Aggregate (1.20)", "Aggregate (1.10)", "Aggregate (1.7)", "InnerJoin (store ↔ aggregated)"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest I/O volume, missing early date_sk range pruning",
+        "evidence": "parts=70412/72718 bytes=1212628258304"
+      },
+      {
+        "op": "TableScan (STORE_RETURNS)",
+        "why": "secondary large scan, date filter applied via join only",
+        "evidence": "parts=7070/7070 bytes=124763446272"
+      },
+      {
+        "op": "Aggregate (1.20)",
+        "why": "early aggregation on store_sales without date range reduction",
+        "evidence": "group by 5 keys before join to date_dim"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns (none present)",
+      "avoid wrapping date_sk in functions that block micro-partition pruning",
+      "avoid unfiltered large CTEs that increase memory pressure",
+      "do not split OR to UNION ALL without evidence of predicate blockage"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range derived from d2 filter (year=2000, month=8) and d1 range condition to store_sales and store_returns scans.",
+      "dag_target_hint": "Modify final_select WHERE clause to include ss_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_year=2000 AND d_moy=8) - 120 AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_year=2000 AND d_moy=8) and sr_returned_date_sk BETWEEN same range.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year = 2000", "d2.d_moy = 8", "d1.d_date between (d2.d_date - interval '120 day') and d2.d_date", "join equality conditions"],
+        "output_must_preserve": ["all original columns and aggregation logic"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Store_sales and store_returns scan parts reduced due to micro-partition pruning on date_sk range.",
+      "recommended_patch_ops": ["add_subquery_to_where", "replace_where_predicate"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary I/O hotspot with native Snowflake transform for predicate pushdown.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_store_sk, ss_sold_date_sk, ss_customer_sk, ss_item_sk, ss_ticket_number before joining to date_dim and store_returns.",
+      "dag_target_hint": "Replace store_sales scan with a CTE that groups by the five join keys and counts rows.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["none initially, but date_sk pushdown may be added separately"],
+        "output_must_preserve": ["grouping keys compatible with downstream joins and final aggregation"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Aggregate (1.20) removed, rows flowing into join reduced by factor of ~distinct key count.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Addresses aggregation hotspot by reducing rows before expensive joins.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter date_dim d1 and d2 into CTEs with only required columns and surrogate keys, then join to fact tables.",
+      "dag_target_hint": "Create CTEs filtered_d1 and filtered_d2, then replace original date_dim references with CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year = 2000", "d2.d_moy = 8", "d1.d_date between (d2.d_date - interval '120 day') and d2.d_date"],
+        "output_must_preserve": ["d1.d_date_sk, d1.d_date, d2.d_date_sk, d2.d_date"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Date_dim scans become tiny hash tables, join filter may push into fact scan earlier.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Reduces dimension scan overhead and may improve join filter pushdown.",
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate the two fact-table scans into a single scan with a union all and conditional aggregation, but preserve join semantics via distinct keys.",
+      "dag_target_hint": "Create a CTE that unions store_sales and store_returns with a channel marker, then aggregate by channel and join keys.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns"],
+        "where_must_preserve": ["join keys and date filters"],
+        "output_must_preserve": ["same aggregate results per store key"]
+      },
+      "gates_checked": ["G_SF_UNION_BRANCH_LIMIT:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass over both fact tables may reduce I/O overhead if data is co-located and joins can be deferred.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Two large scans replaced by one scan with union all, aggregation stages merged.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_aggregation"],
+      "recommended_examples": ["channel_bitmap_aggregation"],
+      "rank_rationale": "Exploration targeting secondary hotspot with a portability candidate transform.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and isolate date_dim filters into CTEs to force small build side.",
+      "dag_target_hint": "Rewrite FROM clause as explicit JOINs with filtered date_dim CTEs as first joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["all original join conditions and filters"],
+        "output_must_preserve": ["same result set"]
+      },
+      "gates_checked": ["G_SF_JOINFILTER_PRESERVE:PASS", "join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may improve cost-based join ordering and allow better predicate pushdown in Snowflake.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Join order may change, date_dim CTEs become build side, reducing probe side rows.",
+      "recommended_patch_ops": ["replace_from", "insert_cte"],
+      "recommended_examples": ["date_cte_explicit_join"],
+      "rank_rationale": "Exploration targeting join topology with a portability candidate.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Ensure all joins are explicit INNER JOINs (query already uses comma joins) and add filtered dimension CTEs to reduce build side.",
+      "dag_target_hint": "Replace comma joins with INNER JOIN ... ON syntax, starting with filtered date_dim CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "date_dim d1", "date_dim d2", "store"],
+        "where_must_preserve": ["all original conditions"],
+        "output_must_preserve": ["same result set"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "More deterministic join order, possible better hash join planning.",
+      "recommended_patch_ops": ["replace_from"],
+      "recommended_examples": ["inner_join_conversion"],
+      "rank_rationale": "Gold example for family F, may improve join planning.",
+      "gold_example_id": "inner_join_conversion"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the filtered store_returns aggregation (by join keys) into a CTE to avoid rescanning during multiple aggregation stages.",
+      "dag_target_hint": "Create a CTE for store_returns aggregated by sr_returned_date_sk, sr_customer_sk, sr_item_sk, sr_ticket_number.",
+      "node_contract": {
+        "from_must_include": ["store_returns"],
+        "where_must_preserve": ["none initially, but date filter may be added"],
+        "output_must_preserve": ["aggregation keys compatible with downstream joins"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.65,
+      "expected_explain_delta": "Store_returns scan aggregated once, reused in later aggregates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["materialize_cte"],
+      "rank_rationale": "Targets secondary hotspot to avoid repeated aggregation work.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate the three aggregation stages into a single CTE that computes all conditional sums in one pass over joined data.",
+      "dag_target_hint": "Create a CTE that joins store_sales, store_returns, date_dim d1, d2 and computes the five case expressions directly.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["all original filters and join conditions"],
+        "output_must_preserve": ["same aggregate results per store key"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Eliminating multiple aggregation passes may reduce compute time despite larger intermediate join.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Aggregate nodes (1.20, 1.10, 1.7) replaced by a single aggregate after join.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_aggregation"],
+      "recommended_examples": ["single_pass_aggregation"],
+      "rank_rationale": "Exploration targeting aggregation cascade with a portability candidate.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push the d1 date range filter into a subquery that pre-filters date_dim and joins to store_sales before other joins.",
+      "dag_target_hint": "Create a CTE that joins store_sales to date_dim d1 with the range condition, then join to other tables.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim d1"],
+        "where_must_preserve": ["d1.d_date between (d2.d_date - interval '120 day') and d2.d_date"],
+        "output_must_preserve": ["store_sales join keys and date_sk"]
+      },
+      "gates_checked": ["G_SF_JOINFILTER_PRESERVE:PASS", "G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Store_sales scan reduced by date range before joining store_returns.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["early_filter"],
+      "rank_rationale": "Targets primary hotspot by applying date range filter earlier.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all dimension tables (date_dim d1, d2, store) into CTEs and join to fact tables in a star-join pattern.",
+      "dag_target_hint": "Create three CTEs for filtered d1, d2, store, then join to store_sales and store_returns.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2", "store"],
+        "where_must_preserve": ["d2.d_year=2000", "d2.d_moy=8", "d1 range condition", "store columns"],
+        "output_must_preserve": ["dimension surrogate keys and required attributes"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Star-join with pre-filtered dimensions may improve cardinality estimates and join order.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension scans become tiny, fact joins may reorder to reduce intermediate rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["dimension_prefetch_star"],
+      "rank_rationale": "Exploration targeting join topology with a portability candidate.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split the query into separate CTEs for store_sales and store_returns, each with its own date_dim joins, then join the results.",
+      "dag_target_hint": "Create CTE sales_agg and returns_agg, then join them on the multiple keys.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["all original filters and join conditions"],
+        "output_must_preserve": ["same aggregate results per store key"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Decomposing the complex join may allow better parallelism and filter pushdown per branch.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Plan splits into two independent subplans that merge later, may increase total scan but reduce join complexity.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["self_join_decomposition"],
+      "rank_rationale": "Exploration targeting join complexity with a portability candidate.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "deferred_window_aggregation",
+      "family": "C",
+      "target": "Delay the final aggregation until after all joins, but pre-aggregate fact tables to reduce row flow.",
+      "dag_target_hint": "Create CTEs for pre-aggregated store_sales and store_returns, join them with dimensions, then compute final conditional sums.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "date_dim d1", "date_dim d2", "store"],
+        "where_must_preserve": ["all original filters and join conditions"],
+        "output_must_preserve": ["same aggregate results per store key"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Deferring final aggregation may reduce compute overhead if intermediate row reduction is sufficient.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Final aggregate moved later, but input rows reduced by pre-aggregation.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_aggregation"],
+      "recommended_examples": ["deferred_window_aggregation"],
+      "rank_rationale": "Exploration targeting aggregation timing with a portability candidate.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subquery pattern in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operation in query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Engine mismatch (postgresql) and no self-join pattern."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery."
+    }
+  ]
+}

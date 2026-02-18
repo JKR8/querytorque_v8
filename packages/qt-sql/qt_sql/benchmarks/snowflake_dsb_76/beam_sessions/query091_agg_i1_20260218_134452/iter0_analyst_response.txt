@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The fact table CATALOG_RETURNS (4759 parts, 82.5GB) is fully scanned without date‑pruning despite a selective date filter (d_year=1998, d_moy=2). Multiple aggregations occur before the filter is applied, inflating join work. Early filtering and aggregate pushdown should prune micro‑partitions and shrink the working set.",
+    "reasoning_trace": [
+      "Fact scan (CATALOG_RETURNS) is 82.5 GB with 4759 parts; date filter on DATE_DIM is 1 part but not pushed to fact scan.",
+      "Plan shows aggregate on full fact table (node 1.26) before join with filtered DATE_DIM, then repeated aggregations up the join tree.",
+      "No nested‑loop or set‑operation hotspots; all dimension scans are small (≤1 part) and already pruned.",
+      "OR condition on CUSTOMER_DEMOGRAPHICS is cross‑column but on a tiny table (<7 MB)."
+    ],
+    "cost_spine": ["TableScan CATALOG_RETURNS", "Aggregate (by date_sk, customer_sk, call_center_sk)", "InnerJoin with DATE_DIM", "Aggregate (by customer_sk, call_center_sk)", "Aggregate (by call_center, customer_demo columns)"],
+    "hotspots": [
+      {
+        "op": "TableScan (CATALOG_RETURNS)",
+        "why": "largest I/O volume (4759 parts, 82.5 GB) without date‑key pruning",
+        "evidence": "parts=4759/4759 bytes=82532796416"
+      },
+      {
+        "op": "Aggregate (node 1.26)",
+        "why": "aggregates full fact table before date filter is applied",
+        "evidence": "group by CR_RETURNING_CUSTOMER_SK, CR_CALL_CENTER_SK, CR_RETURNED_DATE_SK"
+      }
+    ],
+    "do_not_do": [
+      "do not materialize EXISTS/IN subqueries (Snowflake already decorrelates)",
+      "do not wrap date_sk in functions that block micro‑partition pruning",
+      "do not introduce unfiltered large CTEs",
+      "do not split OR on tiny dimension tables unless evidence shows filter slowdown"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add a date_sk BETWEEN predicate to the CATALOG_RETURNS scan by pre‑computing the min/max d_date_sk from DATE_DIM where d_year=1998 and d_moy=2, then joining on that range.",
+      "dag_target_hint": "Replace the join between DATE_DIM and CATALOG_RETURNS with a CTE that provides the date_sk range, and push the range into the fact table scan filter.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr", "date_dim d"],
+        "where_must_preserve": ["cr.cr_returned_date_sk = d.d_date_sk", "d.d_year = 1998", "d.d_moy = 2"],
+        "output_must_preserve": ["all original columns and aggregate semantics"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "CATALOG_RETURNS scan shows reduced parts (pruned by date_sk range); early aggregate input rows drop.",
+      "recommended_patch_ops": ["insert_cte", "add_join_filter", "rewrite_where_clause"],
+      "rank_rationale": "Primary hotspot — directly targets fact‑table scan I/O via date‑key pushdown, native Snowflake pattern.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate CATALOG_RETURNS by the join keys (cr_returning_customer_sk, cr_call_center_sk, cr_returned_date_sk) after applying the date‑sk range, then join the pre‑aggregated result with dimensions.",
+      "dag_target_hint": "Insert a CTE that filters CATALOG_RETURNS by the date_sk range, groups by the three join keys, and sums cr_net_loss; then join that CTE with DATE_DIM and other dimensions.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr"],
+        "where_must_preserve": ["date filter semantics (year=1998, month=2)"],
+        "output_must_preserve": ["sum(cr_net_loss) unchanged", "join‑key compatibility with dimension tables"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate node 1.26 disappears; join input rows shrink before subsequent aggregations.",
+      "recommended_patch_ops": ["insert_cte", "rewrite_from_clause", "replace_aggregate"],
+      "rank_rationale": "Secondary hotspot — reduces aggregation work before joins, complements date‑key pushdown.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Pre‑filter all dimension tables (DATE_DIM, CUSTOMER_DEMOGRAPHICS, HOUSEHOLD_DEMOGRAPHICS, CUSTOMER_ADDRESS, CUSTOMER, CALL_CENTER) into CTEs, then join them in a single CTE that reduces the fact table scan early.",
+      "dag_target_hint": "Create a chain of CTEs: filtered dimensions, then a join of those CTEs with CATALOG_RETURNS, applying all dimension filters before the fact scan.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns cr", "date_dim d", "customer c", "customer_address ca", "customer_demographics cd", "household_demographics hd", "call_center cc"],
+        "where_must_preserve": ["all original join conditions and filter predicates"],
+        "output_must_preserve": ["all original columns and aggregate semantics"]
+      },
+      "gates_checked": ["CROSS_JOIN_3_DIMS:CAUTION", "UNFILTERED_CTE:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake’s predicate pushdown may already handle dimension filters, but staging them in CTEs could improve join‑order flexibility and reduce fact‑scan rows further.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Fact scan parts drop as more predicates are pushed; dimension scans become tiny CTE materializations.",
+      "recommended_patch_ops": ["insert_cte", "rewrite_from_clause", "reorder_joins"],
+      "rank_rationale": "Exploration — tests whether explicit dimension‑first CTEs improve pruning over native join‑filter pushdown.",
+      "recommended_examples": ["prefetch_fact_join"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the cross‑column OR on CUSTOMER_DEMOGRAPHICS into two UNION ALL branches, each with a single‑column equality filter, to allow separate filter evaluation.",
+      "dag_target_hint": "Replace the OR condition with a UNION ALL of two subqueries, each filtering one of the two clause pairs, then aggregate after the UNION.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd"],
+        "where_must_preserve": ["((cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree'))"],
+        "output_must_preserve": ["same set of rows and columns", "no duplicate rows introduced"]
+      },
+      "gates_checked": ["MAX_3_BRANCHES:PASS", "SAME_COL_OR:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "The OR condition is cross‑column and may prevent efficient filter evaluation; splitting may allow simpler filter paths, though the table is small.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Filter node splits into two branches; each branch may show simpler filter evaluation.",
+      "recommended_patch_ops": ["rewrite_where_as_union", "add_union_all", "adjust_group_by"],
+      "rank_rationale": "Exploration — low‑impact due to small dimension size, but tests OR‑to‑UNION pattern for future larger tables.",
+      "recommended_examples": ["or_to_union"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in the query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in the query."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated scans or subtrees that would benefit from materialization."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "No repeated fact‑table scans with different channel filters."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN followed by WHERE filter on right table."
+    }
+  ]
+}

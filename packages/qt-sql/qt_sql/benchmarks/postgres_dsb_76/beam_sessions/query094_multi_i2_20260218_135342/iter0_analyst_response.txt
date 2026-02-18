@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows a dominant hash join (5.7s) between a pre-filtered web_sales set and a full scan of web_returns (51k rows). The NOT EXISTS anti-join is executed via hash join after scanning all returns, missing early pruning. Secondary nested loop (2.5s) between date_dim and web_sales also amplifies rows before final aggregation.",
+    "reasoning_trace": [
+      "Hash Join consumes 5695ms, largest single operator.",
+      "Seq Scan on web_returns (51578 rows, 1061ms) feeds hash join without early filter on wr_reason_sk.",
+      "Nested Loop between date_dim (20 rows) and web_sales (182 rows) produces 3710 rows before customer_address filter.",
+      "Sort node shows severe cardinality misestimate (est=14, act=1185).",
+      "EXISTS subquery uses efficient index-only scan (0.233ms), NOT EXISTS uses full scan."
+    ],
+    "cost_spine": ["Hash Join", "Nested Loop", "Seq Scan on web_returns", "Aggregate", "Sort"],
+    "hotspots": [
+      {
+        "op": "Hash Join",
+        "why": "anti-join via hash after full scan of web_returns",
+        "evidence": "time=5695.716ms, rows=2820"
+      },
+      {
+        "op": "Nested Loop (date_dim × web_sales)",
+        "why": "row amplification before customer_address filter",
+        "evidence": "time=2514.916ms, rows_in=20×182, rows_out=3710"
+      },
+      {
+        "op": "Seq Scan on web_returns",
+        "why": "full scan without early predicate push",
+        "evidence": "rows=51578, time=1061.31ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union (PostgreSQL BitmapOr already optimal)",
+      "avoid materializing EXISTS subquery (already index-only scan)",
+      "avoid duplicating heavy CTE bodies (G_PG_CTE_DUPLICATION_BLOCK)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Pre-filter web_returns by wr_reason_sk IN (8,18,20,23,41) into a CTE, then anti-join via NOT EXISTS converted to LEFT JOIN IS NULL. Also pre-filter date_dim, customer_address, web_site into CTEs for early reduction.",
+      "dag_target_hint": "Replace final_select FROM clause with CTE chain: filtered_date, filtered_ca, filtered_site, filtered_ws1, filtered_returns. Convert NOT EXISTS to LEFT JOIN ... WHERE wr_order_number IS NULL.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim", "customer_address", "web_site", "web_returns wr1"],
+        "where_must_preserve": ["d_date between '1999-10-01' and cast('1999-10-01' as date) + interval '60 day'", "ca_state in ('MO','MT','OK','SC','TX','WI')", "web_gmt_offset >= -5", "ws_list_price between 253 and 282", "EXISTS (ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)", "NOT EXISTS (wr1.wr_order_number = ws1.ws_order_number AND wr1.wr_reason_sk in (8,18,20,23,41))"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY count(distinct ws_order_number)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_EXISTS_PROTECTION:PASS (EXISTS preserved)", "G_PG_CORR_FACT_COUNT:PASS (2 fact tables)", "G_PG_CTE_DUPLICATION_BLOCK:PASS (no duplication)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Seq Scan on web_returns replaced with filtered CTE scan; Hash Join becomes anti-join earlier; Nested Loop input rows reduced by pre-filtered dimensions.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "recommended_examples": ["pg_shared_scan_decorrelate", "early_filter_decorrelate"],
+      "rank_rationale": "Targets primary hotspot (Hash Join) by pushing wr_reason_sk filter early and converting NOT EXISTS to efficient anti-join.",
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Extract date_dim filter into a CTE, convert comma joins to explicit INNER JOIN syntax, and pre-join filtered date keys with web_sales before other dimensions.",
+      "dag_target_hint": "Change final_select FROM to: WITH date_range AS (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN ...) SELECT ... FROM web_sales INNER JOIN date_range ON ws_ship_date_sk = d_date_sk INNER JOIN customer_address ON ... INNER JOIN web_site ON ...",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date between '1999-10-01' and cast('1999-10-01' as date) + interval '60 day'", "ca_state in ('MO','MT','OK','SC','TX','WI')", "web_gmt_offset >= -5", "ws_list_price between 253 and 282"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY count(distinct ws_order_number)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS (1 fact table)", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Nested Loop replaced by hash join with tiny date dimension CTE; better cardinality estimates for join ordering.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"],
+      "rank_rationale": "Targets secondary hotspot (Nested Loop) by isolating date filter and enabling better join planning.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered web_sales set (with date, customer_address, web_site filters) once in a CTE, then derive both EXISTS and NOT EXISTS checks from that single CTE to avoid repeated scans.",
+      "dag_target_hint": "Create CTE filtered_ws with all dimension joins and filters; then in main query, join filtered_ws with itself for EXISTS and with web_returns for NOT EXISTS.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date between '1999-10-01' and cast('1999-10-01' as date) + interval '60 day'", "ca_state in ('MO','MT','OK','SC','TX','WI')", "web_gmt_offset >= -5", "ws_list_price between 253 and 282"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY count(distinct ws_order_number)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS (CTE used for EXISTS and main join)", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS (no INTERSECT)"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the filtered fact set once may reduce repeated work in the EXISTS subquery and main join, though EXISTS already uses index scan.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Index Only Scan on web_sales (ws2) may be replaced by CTE scan; overall scan count reduced.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_subquery"],
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "rank_rationale": "Exploration targeting repeated web_sales scans; family E underrepresented.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all three dimension tables (date_dim, customer_address, web_site) into separate CTEs, then join them with web_sales using explicit JOIN syntax.",
+      "dag_target_hint": "Replace final_select FROM with CTEs: drange, ca_filtered, site_filtered, then JOIN web_sales ON ws_ship_date_sk = drange.d_date_sk AND ws_ship_addr_sk = ca_filtered.ca_address_sk AND ws_web_site_sk = site_filtered.web_site_sk.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date between '1999-10-01' and cast('1999-10-01' as date) + interval '60 day'", "ca_state in ('MO','MT','OK','SC','TX','WI')", "web_gmt_offset >= -5", "ws_list_price between 253 and 282"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY count(distinct ws_order_number)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Prefetching all dimensions may improve join order flexibility and cardinality estimates, though date_dim is already small.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Multiple nested loops may consolidate into hash joins with tiny dimension CTEs; better overall join ordering.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "recommended_examples": ["pg_dimension_prefetch_star", "multi_dimension_prefetch"],
+      "rank_rationale": "Exploration targeting join topology; family F underrepresented.",
+      "gold_example_id": "pg_dimension_prefetch_star"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already optimal for indexed OR."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Snowflake-specific transform; runtime dialect is PostgreSQL."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in query pattern."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY in main query; aggregation is final stage only."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join predicate in query."
+    }
+  ]
+}

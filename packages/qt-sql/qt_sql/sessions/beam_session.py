@@ -1,8 +1,8 @@
 """Beam optimization session — single mode: BEAM (probes + compiler).
 
 BEAM pipeline:
-1. Analyst (R1) → 8-16 independent transform probes
-2. Workers (qwen/reasoner, parallel) → TREE JSON per probe
+1. Analyst (R1) → 4-12 independent transform probes
+2. Workers (parallel) → TREE JSON per probe
 3. Validate (structural + equivalence + benchmark)
 4. R1 Compiler shot 1 always; shot 2 only on retryable syntax/error paths
 """
@@ -61,6 +61,7 @@ class AppliedPatch:
     worker_response: Optional[str] = None  # raw response from worker LLM
     worker_role: Optional[str] = None      # W1/W2/W3/W4
     description: Optional[str] = None      # analyst-provided probe target/intent
+    rank_rationale: Optional[str] = None   # analyst-provided rank position rationale
 
 
 @dataclass
@@ -361,6 +362,7 @@ class BeamSession(OptimizationSession):
         worker_call_fn = self._make_llm_call_fn(
             provider_spec=beam_provider_override,
             model_spec=beam_model_override,
+            enable_reasoning=self._enable_reasoning_mode(),
         )
 
         if self.on_phase_change:
@@ -830,7 +832,7 @@ class BeamSession(OptimizationSession):
             [
                 "",
                 "## Shot 2 — TREE Mode",
-                "Return one or two tree attempts as JSON (object or array).",
+                "Return one to four tree attempts as JSON (object or array of 1-4).",
                 "No changed-node-count constraints.",
                 "Preserve semantics and literals.",
             ]
@@ -1451,11 +1453,11 @@ class BeamSession(OptimizationSession):
     # ── BEAM Mode ─────────────────────────────────────────────────────────
 
     def _run_beam(self, baseline_ms: Optional[float] = None) -> SessionResult:
-        """BEAM mode: mixed worker lanes + compiler with retry-gated shot2.
+        """BEAM mode: worker probes + compiler with retry-gated shot2.
 
         Pipeline:
-        1. Analyst (R1) → 8-16 independent transform probes
-        2. Workers (reasoner lane + qwen lane, parallel) → execute probes
+        1. Analyst (R1) → 4-12 independent transform probes
+        2. Workers (parallel) → execute probes
         3. Validate + benchmark all probes
         4. R1 Compiler shot1, then shot2 only for retryable syntax/error failures
         """
@@ -1560,6 +1562,7 @@ class BeamSession(OptimizationSession):
         analyst_call_fn = self._make_llm_call_fn(
             provider_spec=beam_provider_override,
             model_spec=beam_model_override,
+            enable_reasoning=self._enable_reasoning_mode(),
         )
 
         analyst_prompt_base = build_beam_analyst_prompt(
@@ -1642,7 +1645,7 @@ class BeamSession(OptimizationSession):
         if self.on_phase_change:
             self.on_phase_change(phase="workers", iteration=0)
 
-        qwen_provider_override, qwen_model_override = self._beam_qwen_llm_override(
+        worker_provider_override, worker_model_override = self._beam_worker_llm_override(
             beam_provider_override or getattr(self.pipeline, "provider", None),
             beam_model_override or getattr(self.pipeline, "model", None),
         )
@@ -1654,12 +1657,12 @@ class BeamSession(OptimizationSession):
             int(getattr(self.pipeline.config, "wide_worker_parallelism", 8) or 8),
         )
 
-        base_qwen_slots = max(
+        base_worker_slots = max(
             0,
             int(
                 getattr(
                     self.pipeline.config,
-                    "beam_qwen_workers",
+                    "beam_workers",
                     worker_parallelism,
                 )
                 or 0
@@ -1677,53 +1680,53 @@ class BeamSession(OptimizationSession):
                 or 0
             ),
         )
-        qwen_slots = base_qwen_slots + (per_star_bonus * stars)
+        worker_slots = base_worker_slots + (per_star_bonus * stars)
 
         logger.info(
             f"[{self.query_id}] Worker budget: stars={stars}, "
-            f"qwen_base={base_qwen_slots}, star_bonus={per_star_bonus} "
-            f"-> qwen_slots={qwen_slots}"
+            f"base={base_worker_slots}, star_bonus={per_star_bonus} "
+            f"-> worker_slots={worker_slots}"
         )
-        if qwen_slots > 0 and (
-            not qwen_provider_override or not qwen_model_override
+        if worker_slots > 0 and (
+            not worker_provider_override or not worker_model_override
         ):
             raise RuntimeError(
-                f"[{self.query_id}] beam_qwen_workers={qwen_slots} "
-                "requires qwen lane provider/model (beam_qwen_* or beam_llm_*)"
+                f"[{self.query_id}] beam_workers={worker_slots} "
+                "requires worker lane provider/model (beam_worker_* or beam_llm_*)"
             )
 
-        qwen_selected = self._select_coverage_probes(
+        selected = self._select_coverage_probes(
             probes,
-            min(qwen_slots, len(probes)),
+            min(worker_slots, len(probes)),
         )
 
-        qwen_worker_call_fn: Optional[Callable[[str], str]] = None
-        if qwen_selected:
-            qwen_worker_call_fn = self._make_llm_call_fn(
-                provider_spec=qwen_provider_override,
-                model_spec=qwen_model_override,
+        worker_call_fn: Optional[Callable[[str], str]] = None
+        if selected:
+            worker_call_fn = self._make_llm_call_fn(
+                provider_spec=worker_provider_override,
+                model_spec=worker_model_override,
             )
 
         lane_assignments: List[Tuple[Any, str, Callable[[str], str], str]] = []
-        for probe in qwen_selected:
+        for probe in selected:
             lane_assignments.append(
                 (
                     probe,
                     "scout",
-                    qwen_worker_call_fn,  # type: ignore[arg-type]
-                    str(qwen_model_override or ""),
+                    worker_call_fn,  # type: ignore[arg-type]
+                    str(worker_model_override or ""),
                 )
             )
 
         if not lane_assignments:
             raise RuntimeError(
                 f"[{self.query_id}] No worker lanes scheduled. "
-                "Set beam_qwen_workers > 0."
+                "Set beam_workers > 0."
             )
 
         n_workers = min(len(lane_assignments), worker_parallelism)
         logger.info(
-            f"[{self.query_id}] Worker lanes: scout={len(qwen_selected)}, "
+            f"[{self.query_id}] Worker lanes: scout={len(selected)}, "
             f"parallelism={n_workers} "
             f"(cap={worker_parallelism}, probes={len(probes)})"
         )
@@ -1834,6 +1837,7 @@ class BeamSession(OptimizationSession):
                         worker_response=response,
                         worker_role=f"{lane}:{lane_model}",
                         description=f"[{lane}:{lane_model}] {probe.target}",
+                        rank_rationale=probe.rank_rationale,
                         raw_plan=dag_candidates[0] if dag_candidates else None,
                     )
                     if not output_sql:
@@ -1859,6 +1863,7 @@ class BeamSession(OptimizationSession):
                         status="ERROR",
                         worker_role=f"{lane}:{lane_model}",
                         description=f"[{lane}:{lane_model}] {probe.target}",
+                        rank_rationale=probe.rank_rationale,
                     ))
 
         applied = [p for p in patches if p.output_sql]
@@ -1902,7 +1907,7 @@ class BeamSession(OptimizationSession):
             shot=-1,
             mode="validate",
         )
-        retry_default_fn = qwen_worker_call_fn or reasoner_worker_call_fn
+        retry_default_fn = worker_call_fn
         retry_calls = self._retry_tier1_worker_failures(
             patches=patches,
             worker_call_fn=retry_default_fn,  # type: ignore[arg-type]
@@ -1960,9 +1965,12 @@ class BeamSession(OptimizationSession):
             p for p in patches if self._is_compiler_retry_error_patch(p)
         ]
         has_retry_errors = bool(retry_error_candidates)
-        snipe_rounds = int(getattr(self.pipeline.config, "snipe_rounds", 2) or 0)
+        compiler_rounds = int(
+            getattr(self.pipeline.config, "compiler_rounds",
+                    getattr(self.pipeline.config, "snipe_rounds", 2)) or 0
+        )
 
-        should_snipe = snipe_rounds > 0
+        should_snipe = compiler_rounds > 0
         if should_snipe:
             if self.on_phase_change:
                 self.on_phase_change(phase="snipe", iteration=0)
@@ -1983,6 +1991,8 @@ class BeamSession(OptimizationSession):
                     "status": p.status,
                     "failure_category": self._categorize_probe_failure(p),
                     "speedup": p.speedup,
+                    "original_ms": p.original_ms,
+                    "patch_ms": p.patch_ms,
                     "error": p.apply_error,
                     "explain_text": p.explain_text,
                     "sql": p.output_sql,
@@ -1995,6 +2005,7 @@ class BeamSession(OptimizationSession):
                     "description": p.description or "",
                     "failure_reason": raw.get("failure_reason", ""),
                     "partial_work": raw.get("partial_work", {}),
+                    "rank_rationale": p.rank_rationale or "",
                 })
 
             # Shot 1: BDA + intelligence → 2 PatchPlans
@@ -2077,7 +2088,7 @@ class BeamSession(OptimizationSession):
             shot1_retry_errors = [
                 p for p in shot1_compiler if self._is_compiler_retry_error_patch(p)
             ]
-            should_run_shot2 = snipe_rounds > 1 and (
+            should_run_shot2 = compiler_rounds > 1 and (
                 has_retry_errors or bool(shot1_retry_errors)
             )
             if should_run_shot2:
@@ -2583,39 +2594,52 @@ class BeamSession(OptimizationSession):
 
         return (provider or None, model or None)
 
-    def _beam_qwen_llm_override(
+    def _beam_worker_llm_override(
         self,
         default_provider: Optional[str],
         default_model: Optional[str],
     ) -> Tuple[Optional[str], Optional[str]]:
-        """Return qwen-lane provider/model overrides from config/env.
+        """Return worker-lane provider/model overrides from config/env.
 
-        Falls back to BEAM default provider/model because qwen lane is the
-        baseline worker lane in mixed execution.
+        Falls back to BEAM default provider/model.
         """
         cfg = getattr(self.pipeline, "config", None)
         provider = str(default_provider or "").strip()
         model = str(default_model or "").strip()
         if cfg is not None:
             provider_cfg = str(
-                getattr(cfg, "beam_qwen_provider", "") or ""
+                getattr(cfg, "beam_worker_provider", "") or ""
             ).strip()
             model_cfg = str(
-                getattr(cfg, "beam_qwen_model", "") or ""
+                getattr(cfg, "beam_worker_model", "") or ""
             ).strip()
             if provider_cfg:
                 provider = provider_cfg
             if model_cfg:
                 model = model_cfg
 
-        env_provider = str(os.environ.get("QT_BEAM_QWEN_PROVIDER", "") or "").strip()
-        env_model = str(os.environ.get("QT_BEAM_QWEN_MODEL", "") or "").strip()
+        env_provider = str(os.environ.get("QT_BEAM_WORKER_PROVIDER", "") or "").strip()
+        env_model = str(os.environ.get("QT_BEAM_WORKER_MODEL", "") or "").strip()
         if env_provider:
             provider = env_provider
         if env_model:
             model = env_model
 
         return (provider or None, model or None)
+
+    def _enable_reasoning_mode(self) -> Optional[bool]:
+        """Read enable_reasoning_mode from benchmark config.
+
+        Returns:
+            True/False if explicitly set in config, None otherwise (auto-detect).
+        """
+        cfg = getattr(self.pipeline, "config", None)
+        if cfg is None:
+            return None
+        val = getattr(cfg, "enable_reasoning_mode", None)
+        if val is None:
+            return None
+        return bool(val)
 
     def _beam_api_launch_interval_seconds(self) -> float:
         """Return API launch stagger interval for worker/retry calls."""
@@ -2638,49 +2662,8 @@ class BeamSession(OptimizationSession):
                 pass
         return max(0.0, interval)
 
-    @staticmethod
-    def _probe_hardness_score(probe: Any) -> Tuple[int, int, float, int]:
-        """Priority score for assigning the single reasoner probe.
-
-        Goal: give reasoner the analyst's best shot (high-confidence, primary)
-        while still preferring complex transforms.
-        """
-        family = str(getattr(probe, "family", "") or "").upper()
-        transform = str(getattr(probe, "transform_id", "") or "").lower()
-        confidence = float(getattr(probe, "confidence", 0.0) or 0.0)
-        exploration = bool(getattr(probe, "exploration", False))
-        phase = getattr(probe, "phase", None)
-
-        # Primary (non-exploration) probes represent analyst best-shot intent.
-        primary_score = 1 if not exploration else 0
-
-        # Complexity priors: decorrelation/join-topology/materialization families
-        # are typically higher reasoning burden than simple pushdown variants.
-        complexity_score = 0
-        if family in {"B", "E", "F"}:
-            complexity_score += 2
-        elif family in {"C", "D"}:
-            complexity_score += 1
-        if any(
-            k in transform
-            for k in (
-                "decorrelate",
-                "de-correlate",
-                "join",
-                "material",
-                "window",
-                "aggregate",
-            )
-        ):
-            complexity_score += 1
-
-        # Earlier phases are typically higher-impact/safer than late exploration.
-        phase_score = 1 if phase in (None, 1) else 0
-        # Keep reasoner on the strongest/highest-burden candidate first.
-        return (primary_score, complexity_score, confidence, phase_score)
-
     def _select_coverage_probes(self, probes: List[Any], slots: int) -> List[Any]:
-        """Pick qwen probes for broad coverage across rewrite angles.
+        """Pick worker probes for broad coverage across rewrite angles.
 
         Selection is diversity-first (family/transform/phase/exploration),
         with hardness as tie-breaker so quality stays high.
@@ -2757,12 +2740,14 @@ class BeamSession(OptimizationSession):
         self,
         provider_spec: Optional[str] = None,
         model_spec: Optional[str] = None,
+        enable_reasoning: bool = None,
     ) -> callable:
         """Create an LLM call function for a specific model.
 
         Args:
             provider_spec: Optional per-call provider override.
             model_spec: Optional per-call model override.
+            enable_reasoning: Explicit reasoning mode control from config.
 
         Returns:
             Callable that takes prompt string, returns response string.
@@ -2789,7 +2774,8 @@ class BeamSession(OptimizationSession):
 
         logger.info(
             f"[{self.query_id}] LLM call fn: "
-            f"provider={effective_provider}, model={effective_model}"
+            f"provider={effective_provider}, model={effective_model}, "
+            f"reasoning={enable_reasoning}"
         )
 
         def call_fn(prompt: str) -> str:
@@ -2801,6 +2787,7 @@ class BeamSession(OptimizationSession):
                 provider=effective_provider,
                 model=effective_model,
                 analyze_fn=self.pipeline.analyze_fn,
+                enable_reasoning=enable_reasoning,
             )
             logger.info(
                 f"[{self.query_id}] LLM call → {effective_model} "
@@ -3216,15 +3203,12 @@ class BeamSession(OptimizationSession):
             "llm_model": self.pipeline.model or "?",
             "beam_llm_provider": getattr(self.pipeline.config, "beam_llm_provider", "") or "",
             "beam_llm_model": getattr(self.pipeline.config, "beam_llm_model", "") or "",
-            "beam_qwen_workers": int(getattr(self.pipeline.config, "beam_qwen_workers", 8) or 0),
+            "beam_workers": int(getattr(self.pipeline.config, "beam_workers", 8) or 0),
             "beam_workers_per_star_bonus": int(
                 getattr(self.pipeline.config, "beam_workers_per_star_bonus", 0) or 0
             ),
-            "beam_reasoner_workers": int(getattr(self.pipeline.config, "beam_reasoner_workers", 0) or 0),
-            "beam_qwen_provider": getattr(self.pipeline.config, "beam_qwen_provider", "") or "",
-            "beam_qwen_model": getattr(self.pipeline.config, "beam_qwen_model", "") or "",
-            "beam_reasoner_provider": getattr(self.pipeline.config, "beam_reasoner_provider", "") or "",
-            "beam_reasoner_model": getattr(self.pipeline.config, "beam_reasoner_model", "") or "",
+            "beam_worker_provider": getattr(self.pipeline.config, "beam_worker_provider", "") or "",
+            "beam_worker_model": getattr(self.pipeline.config, "beam_worker_model", "") or "",
             "beam_edit_mode": getattr(self.pipeline.config, "beam_edit_mode", "tree"),
             "llm_timeout_seconds": LLM_TIMEOUT_SECONDS,
             "provider": self.pipeline.provider or "?",

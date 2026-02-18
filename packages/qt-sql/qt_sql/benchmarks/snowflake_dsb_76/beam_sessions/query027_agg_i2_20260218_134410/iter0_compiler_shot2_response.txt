@@ -1,0 +1,88 @@
+[
+  {
+    "plan_id": "compile_agg_pushdown",
+    "dialect": "snowflake",
+    "confidence": 0.85,
+    "based_on": "p02",
+    "strategy": "Early aggregation on fact table foreign keys before dimension joins to reduce row flow into rollup.",
+    "hypothesis": "Probe p02 (WIN, 1.17x) pre-aggregates store_sales by all join keys, reducing rows before expensive rollup. This directly addresses the repeated aggregation amplification in the original plan.",
+    "expected_explain_delta": "Store_sales scan feeds into a single aggregate before joins; multi-stage aggregate operators collapse.",
+    "target_ir": "Insert store_sales_agg CTE, update final_select to join aggregated sums/counts.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["store_sales_agg", "customer_demographics", "date_dim", "store", "item"],
+          "outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"],
+          "changed": true,
+          "sql": "WITH store_sales_agg AS (\n    SELECT\n        ss_item_sk,\n        ss_store_sk,\n        ss_cdemo_sk,\n        ss_sold_date_sk,\n        SUM(ss_quantity) AS sum_qty,\n        COUNT(ss_quantity) AS cnt_qty,\n        SUM(ss_list_price) AS sum_price,\n        COUNT(ss_list_price) AS cnt_price,\n        SUM(ss_coupon_amt) AS sum_coupon,\n        COUNT(ss_coupon_amt) AS cnt_coupon,\n        SUM(ss_sales_price) AS sum_sales,\n        COUNT(ss_sales_price) AS cnt_sales\n    FROM store_sales\n    WHERE ss_sold_date_sk IS NOT NULL\n      AND ss_cdemo_sk IS NOT NULL\n      AND ss_store_sk IS NOT NULL\n    GROUP BY ss_item_sk, ss_store_sk, ss_cdemo_sk, ss_sold_date_sk\n)\nSELECT\n    i_item_id,\n    s_state,\n    GROUPING(s_state) AS g_state,\n    SUM(sum_qty) / SUM(cnt_qty) AS agg1,\n    SUM(sum_price) / SUM(cnt_price) AS agg2,\n    SUM(sum_coupon) / SUM(cnt_coupon) AS agg3,\n    SUM(sum_sales) / SUM(cnt_sales) AS agg4\nFROM store_sales_agg\nJOIN date_dim ON ss_sold_date_sk = d_date_sk\nJOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk\nJOIN store ON ss_store_sk = s_store_sk\nJOIN item ON ss_item_sk = i_item_sk\nWHERE cd_gender = 'M'\n  AND cd_marital_status = 'W'\n  AND cd_education_status = 'Secondary'\n  AND d_year = 1999\n  AND s_state = 'OH'\n  AND i_category = 'Music'\nGROUP BY ROLLUP (i_item_id, s_state)\nORDER BY i_item_id, s_state\nLIMIT 100"
+        },
+        {
+          "node_id": "store_sales_agg",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales"],
+          "outputs": ["ss_item_sk", "ss_store_sk", "ss_cdemo_sk", "ss_sold_date_sk", "sum_qty", "cnt_qty", "sum_price", "cnt_price", "sum_coupon", "cnt_coupon", "sum_sales", "cnt_sales"],
+          "changed": true,
+          "sql": "SELECT\n    ss_item_sk,\n    ss_store_sk,\n    ss_cdemo_sk,\n    ss_sold_date_sk,\n    SUM(ss_quantity) AS sum_qty,\n    COUNT(ss_quantity) AS cnt_qty,\n    SUM(ss_list_price) AS sum_price,\n    COUNT(ss_list_price) AS cnt_price,\n    SUM(ss_coupon_amt) AS sum_coupon,\n    COUNT(ss_coupon_amt) AS cnt_coupon,\n    SUM(ss_sales_price) AS sum_sales,\n    COUNT(ss_sales_price) AS cnt_sales\nFROM store_sales\nWHERE ss_sold_date_sk IS NOT NULL\n  AND ss_cdemo_sk IS NOT NULL\n  AND ss_store_sk IS NOT NULL\nGROUP BY ss_item_sk, ss_store_sk, ss_cdemo_sk, ss_sold_date_sk"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_dimension_prefilter",
+    "dialect": "snowflake",
+    "confidence": 0.8,
+    "based_on": "p03",
+    "strategy": "Pre-filter all dimension tables into CTEs, then join with fact table, enabling combined filter pushdown.",
+    "hypothesis": "Probe p03 (WIN, 1.17x) prefilters each dimension into separate CTEs, which may allow Snowflake's join‑filter pushdown to prune the large store_sales scan. Addresses the same primary I/O hotspot via a different mechanism.",
+    "expected_explain_delta": "Dimension scans become tiny CTE scans; store_sales scan receives pushed join filters from multiple dimensions.",
+    "target_ir": "Replace dimension table references with CTE aliases in final_select, add four dimension‑filter CTEs.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["store_sales", "date_dim_filtered", "customer_demographics_filtered", "store_filtered", "item_filtered"],
+          "outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"],
+          "changed": true,
+          "sql": "WITH date_dim_filtered AS (\n    SELECT d_date_sk\n    FROM date_dim\n    WHERE d_year = 1999\n),\ncustomer_demographics_filtered AS (\n    SELECT cd_demo_sk\n    FROM customer_demographics\n    WHERE cd_gender = 'M'\n      AND cd_marital_status = 'W'\n      AND cd_education_status = 'Secondary'\n),\nstore_filtered AS (\n    SELECT s_store_sk, s_state\n    FROM store\n    WHERE s_state = 'OH'\n),\nitem_filtered AS (\n    SELECT i_item_sk, i_item_id\n    FROM item\n    WHERE i_category = 'Music'\n)\nSELECT\n    i_item_id,\n    s_state,\n    GROUPING(s_state) AS g_state,\n    AVG(ss_quantity) AS agg1,\n    AVG(ss_list_price) AS agg2,\n    AVG(ss_coupon_amt) AS agg3,\n    AVG(ss_sales_price) AS agg4\nFROM store_sales\nJOIN date_dim_filtered d ON ss_sold_date_sk = d.d_date_sk\nJOIN customer_demographics_filtered cd ON ss_cdemo_sk = cd.cd_demo_sk\nJOIN store_filtered s ON ss_store_sk = s.s_store_sk\nJOIN item_filtered i ON ss_item_sk = i.i_item_sk\nGROUP BY ROLLUP (i_item_id, s_state)\nORDER BY i_item_id, s_state\nLIMIT 100"
+        },
+        {
+          "node_id": "date_dim_filtered",
+          "parent_node_id": "final_select",
+          "sources": ["date_dim"],
+          "outputs": ["d_date_sk"],
+          "changed": true,
+          "sql": "SELECT d_date_sk\nFROM date_dim\nWHERE d_year = 1999"
+        },
+        {
+          "node_id": "customer_demographics_filtered",
+          "parent_node_id": "final_select",
+          "sources": ["customer_demographics"],
+          "outputs": ["cd_demo_sk"],
+          "changed": true,
+          "sql": "SELECT cd_demo_sk\nFROM customer_demographics\nWHERE cd_gender = 'M'\n  AND cd_marital_status = 'W'\n  AND cd_education_status = 'Secondary'"
+        },
+        {
+          "node_id": "store_filtered",
+          "parent_node_id": "final_select",
+          "sources": ["store"],
+          "outputs": ["s_store_sk", "s_state"],
+          "changed": true,
+          "sql": "SELECT s_store_sk, s_state\nFROM store\nWHERE s_state = 'OH'"
+        },
+        {
+          "node_id": "item_filtered",
+          "parent_node_id": "final_select",
+          "sources": ["item"],
+          "outputs": ["i_item_sk", "i_item_id"],
+          "changed": true,
+          "sql": "SELECT i_item_sk, i_item_id\nFROM item\nWHERE i_category = 'Music'"
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,162 @@
+```json
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows minimal operator detail, but the query structure reveals two independent CTEs scanning large fact tables (store_sales, web_sales) with identical dimension filters. Each CTE groups by county, quarter, year, but the main query filters to a single year and three quarters, suggesting early filtering of date_dim and prefetching dimension keys could prune micro-partitions earlier. Predicate transitivity across comma joins may be weak, leaving fact scans unpruned.",
+    "reasoning_trace": [
+      "Two CTEs scan large fact tables with identical dimension filters (item, customer_address, date_dim).",
+      "Main query filters CTE results to d_year=1999 and d_qoy in (1,2,3), but CTEs compute for all years/quarters.",
+      "Snowflake's predicate pushdown may not fully propagate date_dim filters into fact scans across comma joins.",
+      "No nested loops, aggregates, or set operations visible; primary bottleneck likely large fact scans."
+    ],
+    "cost_spine": ["CTE ss scan", "CTE ws scan", "Final self-join"],
+    "hotspots": [
+      {
+        "op": "store_sales scan in ss CTE",
+        "why": "large fact table scan without pushed date_sk range",
+        "evidence": "implicit join with date_dim, no explicit date_sk BETWEEN filter"
+      },
+      {
+        "op": "web_sales scan in ws CTE",
+        "why": "large fact table scan without pushed date_sk range",
+        "evidence": "implicit join with date_dim, no explicit date_sk BETWEEN filter"
+      },
+      {
+        "op": "date_dim scan in both CTEs",
+        "why": "scanned twice with same filters, could be pre‑filtered once",
+        "evidence": "identical filters on i_color, i_manager_id, ca_state, ss_list_price/ws_list_price"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns (no EXISTS in query)",
+      "avoid OR‑to‑UNION without plan evidence of OR hotspot",
+      "avoid adding unfiltered large CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN derived from date_dim filters to each fact table scan in ss and ws CTEs, using a subquery to compute min/max date_sk for d_year=1999 and d_qoy in (1,2,3).",
+      "dag_target_hint": "Modify ss and ws CTE FROM clauses to join with a subquery on date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_year=1999 AND d_qoy IN (1,2,3)) AND (SELECT MAX(d_date_sk) ...).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Fact table scans show micro‑partition pruning via date_sk BETWEEN; date_dim scan may shift to subquery.",
+      "recommended_patch_ops": ["replace_from", "add_subquery", "add_predicate"],
+      "rank_rationale": "Targets primary hotspot — explicit date_sk range may prune micro‑partitions on both fact tables.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre‑filter dimension tables (date_dim, customer_address, item) into separate CTEs with their respective filters, then join them with fact tables in ss and ws CTEs.",
+      "dag_target_hint": "Insert dimension CTEs before ss and ws; replace implicit joins with explicit joins to dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already push filters, but pre‑materializing dimension CTEs could improve join‑filter propagation and reduce repeated dimension scans.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension scans become tiny hash‑table lookups; fact scans may show reduced input rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — addresses secondary hotspot of repeated dimension scans and may improve predicate transitivity.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Isolate date_dim filter into a CTE that returns only date_sk for d_year=1999 and d_qoy in (1,2,3), then join with fact tables in ss and ws CTEs.",
+      "dag_target_hint": "Add date_dim CTE; replace date_dim table reference with CTE in ss and ws.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Isolating date_dim may enable better join‑filter pushdown into fact scans, especially if predicate transitivity across comma joins is limited.",
+      "confidence": 0.60,
+      "expected_explain_delta": "date_dim scan becomes a small CTE; fact scans may show earlier micro‑partition pruning via date_sk.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — focuses on date_dim hotspot; may complement p01 by providing explicit date_sk list.",
+      "recommended_examples": ["date_cte_explicit_join"],
+      "gold_example_id": "date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Push aggregation into a subquery per fact table before joining with dimensions, grouping by the join keys (ss_item_sk, ss_addr_sk, ss_sold_date_sk) and computing sum(ss_ext_sales_price), then join with filtered dimensions.",
+      "dag_target_hint": "Rewrite ss and ws CTEs to pre‑aggregate fact tables first, then join with date_dim, customer_address, item.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregating fact tables before joining dimensions may reduce join cardinality if many fact rows map to same county‑quarter‑year group.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fact table scan followed by early aggregate; join input rows reduced.",
+      "recommended_patch_ops": ["replace_from", "add_group_by"],
+      "rank_rationale": "Exploration — targets potential join amplification; lower confidence because Snowflake may already push aggregation.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in query; plan does not show OR‑related scan amplification."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; plan does not show nested‑loop re‑scan patterns."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set‑operation patterns in query."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "Query does not scan same fact table multiple times with different filters; two independent CTEs scan different fact tables."
+    }
+  ]
+}
+```

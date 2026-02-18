@@ -242,10 +242,10 @@ def normalize_example_record(
         if patch_plan.get("dialect"):
             patch_plan["dialect"] = normalize_dialect(patch_plan.get("dialect"))
 
-    dag_example = out.get("dag_example")
-    if isinstance(dag_example, dict):
-        if dag_example.get("dialect"):
-            dag_example["dialect"] = normalize_dialect(dag_example.get("dialect"))
+    tree_example = out.get("tree_example")
+    if isinstance(tree_example, dict):
+        if tree_example.get("dialect"):
+            tree_example["dialect"] = normalize_dialect(tree_example.get("dialect"))
 
     family = normalize_family_id(out.get("family"))
     if family:

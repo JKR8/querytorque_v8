@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The dominant hotspot is a sequential scan of store_sales (2.3M rows, 20s) inside the wss CTE, which is computed once but then joined twice with store and date_dim using comma joins and late-applied dimension filters. The plan shows comma-join weakness and cross-CTE predicate blindness, causing the large fact scan to proceed without dimension pre-filtering.",
+    "reasoning_trace": [
+      "Seq Scan on store_sales consumes 20.3s, 2.3M rows, and is the primary I/O bottleneck.",
+      "CTE wss is scanned twice (wss and wss_1) but each scan is joined with store and date_dim using comma joins (implicit joins) and filters on d_month_seq applied late.",
+      "Plan shows Hash Join cardinality misestimation (est=1, act=10K) at the final join, indicating poor selectivity propagation.",
+      "No nested loops or correlated subqueries present, ruling out family B and some family E transforms."
+    ],
+    "cost_spine": ["Seq Scan on store_sales", "Nested Loop", "Hash Join", "Hash Join", "Sort", "Limit"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_sales",
+        "why": "full table scan without dimension pre-filtering",
+        "evidence": "rows=2342989 time=20251.452ms"
+      },
+      {
+        "op": "Hash Join (y branch)",
+        "why": "large intermediate join after CTE scan",
+        "evidence": "rows=1184 time=25113.772ms"
+      },
+      {
+        "op": "Hash Join (x branch)",
+        "why": "secondary large join with similar shape",
+        "evidence": "rows=10176 time=6244.978ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION transforms (no OR predicate in plan)",
+      "avoid decorrelation transforms (no correlated subqueries)",
+      "avoid duplicating the wss CTE body (already materialized once)",
+      "avoid converting EXISTS/INTERSECT (none present)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and materialize filtered date_dim ranges into separate CTEs before joining with wss.",
+      "dag_target_hint": "Replace comma joins in final_select with explicit JOIN ON, and add date_cte_y, date_cte_x CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store"],
+        "where_must_preserve": ["ss_sales_price / ss_list_price BETWEEN 57 * 0.01 AND 77 * 0.01", "s_state in ('AR','CO','IA','IL','NC','NY','PA','TX')", "d_month_seq ranges"],
+        "output_must_preserve": ["all original columns and aggregation logic"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Explicit joins allow better cardinality estimates; date_dim filters move earlier, reducing rows fed into hash joins.",
+      "recommended_patch_ops": ["replace_from", "insert_cte", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot by addressing comma-join weakness and enabling earlier date filtering.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter store and date_dim into separate CTEs (store_filtered, date_y, date_x) and join them with wss using explicit JOIN syntax.",
+      "dag_target_hint": "Add three CTEs before final_select: store_filtered, date_y, date_x; rewrite final_select joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store"],
+        "where_must_preserve": ["s_state filter", "d_month_seq ranges", "price ratio filter"],
+        "output_must_preserve": ["grouping keys and aggregate results"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Small dimension hash tables built early; fact table join rows reduced via pre-filtered keys.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Addresses secondary hotspot by prefetching all selective dimensions, compounding selectivity.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter store and both date_dim ranges into CTEs, then join with wss in a single pass using explicit joins.",
+      "dag_target_hint": "Add store_filtered, date_range_y, date_range_x CTEs; rewrite final_select to join wss with these CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store"],
+        "where_must_preserve": ["s_state filter", "d_month_seq ranges", "price ratio filter"],
+        "output_must_preserve": ["all output columns and ratios"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate from DuckDB; may improve predicate pushdown in PostgreSQL by materializing small dimension sets.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension CTEs become tiny hash tables; join order may shift to build smaller sides first.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration probe targeting cross-CTE predicate blindness with a portability candidate.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Split the wss CTE into two specialized CTEs (wss_y, wss_x) each filtered by the respective date_dim d_month_seq range before aggregation.",
+      "dag_target_hint": "Replace wss CTE with two CTEs filtered by d_month_seq; adjust final_select to reference them.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["price ratio filter", "d_month_seq ranges"],
+        "output_must_preserve": ["d_week_seq, ss_store_sk, and all sales aggregates"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:REVIEW", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Specializing the CTE by date range may drastically reduce store_sales rows scanned in each branch, trading CTE reuse for earlier filtering.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Each CTE scans only 12 months of store_sales data; aggregate input rows drop significantly.",
+      "recommended_patch_ops": ["replace_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration probe targeting the fact scan hotspot via CTE specialization, despite losing reuse.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; plan shows no OR-related bottleneck."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL or plan."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN with subsequent NULL-filtering WHERE clause."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join predicate in query; all joins are equality-based."
+    }
+  ]
+}

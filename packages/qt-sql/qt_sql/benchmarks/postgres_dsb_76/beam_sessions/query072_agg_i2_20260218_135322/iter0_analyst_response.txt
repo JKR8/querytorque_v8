@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows a dominant Hash Join (5.4s) and Nested Loop (3.4s) driving large intermediate row flow before aggregation. The primary bottleneck is the join between filtered catalog_sales and household_demographics, amplified by subsequent nested loops with inventory and date_dim. Secondary hotspot is the late aggregate after wide-row joins.",
+    "reasoning_trace": [
+      "Hash Join (5.4s) consumes 23847 rows from Nested Loop (3.4s) which joins catalog_sales (622 rows) with household_demographics (1200 rows).",
+      "Nested Loop with inventory and date_dim d2 adds zero-time scans but may amplify row flow before final aggregate.",
+      "Aggregate appears after all joins, processing wide rows; no early aggregation or filtering pushdown visible.",
+      "Plan shows zero estimated rows for many nodes (ZERO_EST pathology), indicating poor statistics propagation across CTE/subquery boundaries."
+    ],
+    "cost_spine": ["Hash Join (5.4s)", "Nested Loop (3.4s)", "Hash Join (2.5s)", "Aggregate (5.5s)"],
+    "hotspots": [
+      {
+        "op": "Hash Join",
+        "why": "dominant time consumer, joins filtered catalog_sales with household_demographics before inventory join",
+        "evidence": "time=5488.798 ms, rows=23847"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "amplifies row flow before hash join, includes inventory and date_dim d2",
+        "evidence": "time=3442.409 ms"
+      },
+      {
+        "op": "Aggregate",
+        "why": "late aggregation after all joins, processes wide rows",
+        "evidence": "time=5508.297 ms, rows_in=large, rows_out=0"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR to UNION ALL (no OR predicates in plan)",
+      "avoid duplicating large CTE bodies (guard G_PG_CTE_DUPLICATION_BLOCK)",
+      "avoid materializing EXISTS paths (no EXISTS in query)",
+      "do not convert LEFT JOIN to INNER JOIN (promotion left join needed for CASE logic)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create MATERIALIZED CTEs for selective dimensions (date_dim d1, household_demographics, customer_demographics, item) and pre-join with catalog_sales before non-equi join with inventory. Use explicit JOIN syntax.",
+      "dag_target_hint": "Replace final_select FROM clause with CTE chain: filtered_dims -> filtered_fact -> inventory join.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "inventory", "date_dim d1", "household_demographics", "customer_demographics", "item"],
+        "where_must_preserve": ["d1.d_year = 1999", "hd_buy_potential = '>10000'", "cd_marital_status = 'S'", "cd_dep_count between 9 and 11", "i_category IN ('Men', 'Shoes', 'Sports')", "cs_wholesale_cost BETWEEN 76 AND 96", "inv_quantity_on_hand < cs_quantity", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'"],
+        "output_must_preserve": ["i_item_desc", "w_warehouse_name", "d1.d_week_seq", "no_promo", "promo", "total_cnt", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Hash Join and Nested Loop hotspots replaced by smaller hash joins on pre-filtered CTEs; inventory join input rows reduced.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot (Hash Join) and non-equi join amplification with native PostgreSQL transform.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate each date_dim instance (d1, d2, d3) into separate MATERIALIZED CTEs with their filters, then join explicitly with catalog_sales and inventory.",
+      "dag_target_hint": "Change final_select FROM to use CTEs date_d1, date_d2, date_d3 with explicit JOIN ON syntax.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "inventory", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["d1.d_year = 1999", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'", "inv_quantity_on_hand < cs_quantity"],
+        "output_must_preserve": ["all original output columns and grouping keys"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Multiple date_dim scans become tiny hash tables; explicit join syntax improves planner estimates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Addresses repeated date_dim scans and comma-join weakness; gold example shows 2.28x speedup.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales by cs_item_sk, cs_order_number, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk before joining with dimensions, preserving all needed columns for later joins and aggregates.",
+      "dag_target_hint": "Insert CTE pre_agg_cs with GROUP BY on catalog_sales keys, then join with inventory and dimensions.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["cs_item_sk", "cs_order_number", "cs_sold_date_sk", "cs_ship_date_sk", "cs_promo_sk", "cs_quantity for inventory join"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregate after all joins may be processing many wide rows; pushing aggregation earlier could reduce join fanout.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Rows into final aggregate reduce; join cardinalities drop due to earlier grouping.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting secondary aggregate hotspot; previous attempt failed but may work with different key set.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim d1, household_demographics, customer_demographics, item) into separate MATERIALIZED CTEs, then join with catalog_sales and remaining tables.",
+      "dag_target_hint": "Replace final_select FROM with CTE chain: dim_ctes -> fact join -> remaining joins.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "inventory", "date_dim d1", "household_demographics", "customer_demographics", "item"],
+        "where_must_preserve": ["d1.d_year = 1999", "hd_buy_potential = '>10000'", "cd_marital_status = 'S'", "cd_dep_count between 9 and 11", "i_category IN ('Men', 'Shoes', 'Sports')"],
+        "output_must_preserve": ["all original output columns and grouping keys"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Multi-dimension prefetch may reduce fact table scan rows more than single-dimension CTEs.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Dimension scans become tiny hash tables; catalog_sales join input rows drop significantly.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting early filtering of multiple dimensions; gold example shows 3.32x speedup.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL or plan."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "LEFT JOIN to promotion is needed for CASE logic; conversion would change semantics."
+    },
+    {
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "reason": "Previous attempt_1 failed with this transform; likely over-complex for this join graph."
+    }
+  ]
+}

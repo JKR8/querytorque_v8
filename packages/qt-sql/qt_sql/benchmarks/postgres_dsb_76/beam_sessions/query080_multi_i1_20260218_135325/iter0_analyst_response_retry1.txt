@@ -1,0 +1,154 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three independent channel CTEs each scan date_dim, item, and promotion tables redundantly via comma-separated joins, causing repeated dimension scans and blocking predicate pushdown. Converting to explicit joins and pre-filtering selective dimensions into CTEs will reduce dimension scan work and enable better join ordering.",
+    "reasoning_trace": [
+      "Plan shows three separate scans of date_dim (once index scan, twice seq scan) and promotion (three seq scans).",
+      "Comma-join syntax present in all three channel CTEs, a known PostgreSQL weakness for predicate pushdown.",
+      "Nested Loop between date_dim and fact tables is the dominant work in each branch (wsr 253ms, csr 117ms, ssr 127ms).",
+      "Item filter (i_current_price > 50, i_category IN) applied late after fact join, but is highly selective (0 rows out in plan)."
+    ],
+    "cost_spine": ["Nested Loop", "Hash Join", "Nested Loop", "Index Scan", "Seq Scan"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (date_dim_2 ⋈ web_sales)",
+        "why": "dominant fact-table join in slowest channel",
+        "evidence": "rows=2509 time=253.475ms in wsr branch"
+      },
+      {
+        "op": "Nested Loop (date_dim ⋈ store_sales)",
+        "why": "significant fact-table join in store channel",
+        "evidence": "rows=4857 time=126.828ms in ssr branch"
+      },
+      {
+        "op": "Hash Join (promotion ⋈ previous join)",
+        "why": "repeated promotion scan across all three channels",
+        "evidence": "three separate Seq Scan on promotion, each ~2-0.15ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION splits (no OR predicates in plan)",
+      "avoid materializing EXISTS paths (none present)",
+      "do not duplicate full channel CTE bodies to push filters inward",
+      "do not convert LEFT JOIN to INNER JOIN (returns may be missing)"
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter date_dim, item, and promotion into separate CTEs with MATERIALIZED, then rewrite each channel CTE (ssr, csr, wsr) using explicit JOIN syntax referencing these CTEs.",
+      "dag_target_hint": "Add three dimension CTEs before final_select; change each channel CTE's FROM clause to explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "item", "promotion"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29'::date + interval '30 day'", "i_current_price > 50", "i_category IN ('Children', 'Sports')", "p_channel_email = 'N' and p_channel_tv = 'N' and p_channel_radio = 'N' and p_channel_press = 'N' and p_channel_event = 'N'"],
+        "output_must_preserve": ["store_id, sales, returns, profit for ssr", "catalog_page_id, sales, returns, profit for csr", "web_site_id, sales, returns, profit for wsr"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_EXPLICIT_JOIN_STYLE:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Seq Scan on promotion and date_dim replaced with CTE scans; Nested Loop inputs shrink; join order may shift.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Targets primary hotspot (repeated dimension scans) and comma-join weakness with native PostgreSQL transform.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Create a MATERIALIZED CTE for filtered date_dim, then rewrite each channel CTE to join this date CTE explicitly, leaving other tables as comma joins.",
+      "dag_target_hint": "Add date_cte before final_select; modify each channel CTE's FROM to JOIN date_cte ON ss_sold_date_sk = d_date_sk (or cs_sold_date_sk, ws_sold_date_sk).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29'::date + interval '30 day'"],
+        "output_must_preserve": ["All original output columns and aggregation logic"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_EXPLICIT_JOIN_STYLE:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Date dimension scanned once; Nested Loop fact join may become Hash Join with tiny build side.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Simpler variant of p01, focusing on date_dim only, which is a known gold example win.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared dimension filters into a single CTE that returns surrogate keys (d_date_sk, i_item_sk, p_promo_sk) after applying all filters, then join this CTE with each fact table in channel CTEs.",
+      "dag_target_hint": "Add one shared_dim CTE before final_select; replace dimension joins in each channel CTE with a single join to shared_dim.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "promotion"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29'::date + interval '30 day'", "i_current_price > 50", "i_category IN ('Children', 'Sports')", "p_channel_email = 'N' and p_channel_tv = 'N' and p_channel_radio = 'N' and p_channel_press = 'N' and p_channel_event = 'N'"],
+        "output_must_preserve": ["All original output columns and aggregation logic"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:MANUAL_REVIEW", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Consolidating three dimension scans into one CTE may reduce I/O even further, but PostgreSQL's CTE materialization fence could block parallelism; worth testing.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Single CTE scan replaces three dimension scans; join graph becomes simpler but may introduce materialization fence.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot (repeated dimension scans) with a portability candidate; higher risk due to materialization fence.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create separate MATERIALIZED CTEs for each filtered dimension (date_dim, item, promotion), then rewrite channel CTEs to join all three dimension CTEs explicitly.",
+      "dag_target_hint": "Add three dimension CTEs before final_select; change each channel CTE's FROM to explicit JOINs with these CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "promotion"],
+        "where_must_preserve": ["d_date between '1998-08-29' and '1998-08-29'::date + interval '30 day'", "i_current_price > 50", "i_category IN ('Children', 'Sports')", "p_channel_email = 'N' and p_channel_tv = 'N' and p_channel_radio = 'N' and p_channel_press = 'N' and p_channel_event = 'N'"],
+        "output_must_preserve": ["All original output columns and aggregation logic"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:MANUAL_REVIEW", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Separate dimension CTEs may allow better predicate pushdown than a single shared CTE, but still risk materialization fences; test against p01.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Three CTE scans replace three dimension scans; explicit joins may allow better join ordering.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Exploration probe similar to p01 but using separate CTEs instead of inline filters; tests CTE materialization trade-off.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in plan; PostgreSQL BitmapOr already handles indexed OR well."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation already at highest logical level (per channel); pushing below joins would break LEFT JOIN semantics with returns tables."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "LEFT JOIN with returns tables must be preserved; returns may be missing, and COALESCE handles nulls."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "Engine-specific transform for Snowflake; not applicable to PostgreSQL runtime."
+    }
+  ]
+}

@@ -1,0 +1,135 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query suffers from a massive fact-table scan on STORE_RETURNS (124 GB of 127 GB total bytes) due to late application of selective filters and a correlated scalar subquery with AVG aggregation that may cause repeated work. Early predicate pushdown and decorrelation can reduce input volume and join amplification.",
+    "reasoning_trace": [
+      "STORE_RETURNS scan accounts for parts=7070/7070 bytes=124763446272, indicating it's the primary I/O bottleneck.",
+      "Correlated subquery on ctr_total_return with AVG appears in the plan as a join filter, suggesting potential for decorrelation optimization.",
+      "Filters on sr_reason_sk and computed ratio (sr_return_amt/sr_return_quantity) are applied after the scan, not pushed for micro-partition pruning."
+    ],
+    "cost_spine": ["TableScan (STORE_RETURNS)", "InnerJoin (DATE_DIM)", "Aggregate (customer_total_return)", "InnerJoin (correlated subquery)", "Filter (reason_sk)", "Join (other tables)"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_RETURNS)",
+        "why": "massive I/O volume dominating total bytes scanned",
+        "evidence": "parts=7070/7070 bytes=124763446272"
+      },
+      {
+        "op": "InnerJoin for correlated subquery",
+        "why": "scalar aggregation with correlation may not be optimally decorrelated",
+        "evidence": "joinFilter with AVG and correlation key in plan node [1.7]"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing simple EXISTS patterns (not applicable but guard rule)",
+      "avoid wrapping partition keys like sr_returned_date_sk in functions for pruning"
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose the correlated scalar subquery into three CTEs: a shared scan of customer_total_return, a per-store_sk threshold CTE computing avg(ctr_total_return)*1.2, and a filtered main query joining with the threshold.",
+      "dag_target_hint": "Change final_select WHERE clause and add threshold CTE.",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1", "store", "customer", "customer_demographics"],
+        "where_must_preserve": ["ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2 from customer_total_return ctr2 where ctr1.ctr_store_sk = ctr2.ctr_store_sk)", "ctr1.ctr_reason_sk BETWEEN 17 AND 20", "s_state IN ('IA', 'KY', 'NE')", "cd_marital_status IN ('S', 'S')", "cd_education_status IN ('4 yr Degree', '4 yr Degree')", "cd_gender = 'M'", "c_birth_month = 4", "c_birth_year BETWEEN 1987 AND 1993"],
+        "output_must_preserve": ["c_customer_id", "ORDER BY c_customer_id LIMIT 100 behavior"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:CAUTION"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "Correlated subquery replaced with pre-computed threshold join, reducing repeated aggregation and potentially shrinking join input rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate", "modify_from"],
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "rank_rationale": "Targets the correlated subquery hotspot with direct evidence from gold example and engine profile.",
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add an explicit range on sr_returned_date_sk based on d_year=2000 by pre-computing min and max d_date_sk in a CTE and using it in the store_returns scan within the customer_total_return CTE.",
+      "dag_target_hint": "Modify customer_total_return CTE to include date_sk range filter derived from date_dim.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year = 2000", "sr_return_amt / sr_return_quantity between 115 and 174"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:CAUTION"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Micro-partition pruning on sr_returned_date_sk reduces STORE_RETURNS scan bytes by applying date range early.",
+      "recommended_patch_ops": ["insert_cte", "add_filter_to_scan"],
+      "recommended_examples": ["sf_sk_pushdown_3fact"],
+      "rank_rationale": "Addresses primary fact-table scan hotspot with potential for significant I/O reduction based on engine gap evidence.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the CTE customer_total_return using Snowflake's MATERIALIZE hint or a temporary table to avoid recomputation since it is referenced multiple times (as ctr1 and ctr2).",
+      "dag_target_hint": "Add MATERIALIZE keyword to the CTE definition or rewrite as a temporary table.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year = 2000", "sr_return_amt / sr_return_quantity between 115 and 174"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"]
+      },
+      "gates_checked": ["multi_ref_cte:PASS", "no_semantic_change:PASS", "G_SF_CTE_REUSE_RULE:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the CTE could reduce computation time if Snowflake does not already cache the result for multiple references, addressing potential redundant scans.",
+      "confidence": 0.55,
+      "expected_explain_delta": "CTE computed once and reused, eliminating redundant scans or aggregates in the plan.",
+      "recommended_patch_ops": ["modify_cte_definition", "add_materialize_hint"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe targeting potential CTE recomputation overhead, using portability candidate with low risk.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push the filter ctr1.ctr_reason_sk BETWEEN 17 AND 20 into the CTE customer_total_return definition by adding sr_reason_sk BETWEEN 17 AND 20 to the WHERE clause, reducing rows early in the aggregation.",
+      "dag_target_hint": "Modify customer_total_return CTE WHERE clause to include sr_reason_sk filter.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year = 2000", "sr_return_amt / sr_return_quantity between 115 and 174", "sr_reason_sk BETWEEN 17 AND 20"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"]
+      },
+      "gates_checked": ["filter_selectivity:UNKNOWN", "no_downstream_dependency:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Applying the reason_sk filter earlier in the CTE could significantly reduce the number of rows aggregated and joined, leveraging early filtering principles.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Fewer rows processed in the CTE aggregation and subsequent joins due to early filter application.",
+      "recommended_patch_ops": ["modify_cte_where_clause"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe for early filtering to reduce data volume, using portability candidate with moderate confidence.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in the query plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in the query."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "Non-native transform for Snowflake; prefer native sf_inline_decorrelate with higher confidence."
+    }
+  ]
+}

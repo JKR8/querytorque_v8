@@ -1,0 +1,206 @@
+[
+  {
+    "plan_id": "compile_shared_dims",
+    "dialect": "snowflake",
+    "confidence": 0.65,
+    "based_on": "p03",
+    "strategy": "Extract filtered dimensions into CTEs to avoid repeated scans and push date_sk filter via join.",
+    "hypothesis": "Probe p03 showed regression but hypothesis remains valid: repeated dimension scans (date_dim, customer) are eliminated, and date_sk filter is pushed via join to prune fact micro-partitions. Regression may be due to execution error or CTE materialization; we attempt a cleaner version.",
+    "expected_explain_delta": "Three date_dim scans and three customer scans reduce to one each; fact scans show join-filter pushdown on date_sk.",
+    "target_ir": "Add filtered_date and filtered_customer CTEs, rewrite each branch to join these CTEs, preserve INTERSECT semantics.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["hot_cust"],
+          "outputs": ["count(*)"],
+          "changed": true,
+          "sql": "SELECT COUNT(*) FROM hot_cust LIMIT 100"
+        },
+        {
+          "node_id": "hot_cust",
+          "parent_node_id": "final_select",
+          "sources": ["ss_branch", "cs_branch", "ws_branch"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT * FROM ss_branch INTERSECT SELECT * FROM cs_branch INTERSECT SELECT * FROM ws_branch"
+        },
+        {
+          "node_id": "ss_branch",
+          "parent_node_id": "hot_cust",
+          "sources": ["store_sales", "filtered_date", "filtered_customer"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM store_sales ss JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk JOIN filtered_customer c ON ss.ss_customer_sk = c.c_customer_sk WHERE ss.ss_list_price BETWEEN 193 AND 252 AND ss.ss_wholesale_cost BETWEEN 35 AND 55"
+        },
+        {
+          "node_id": "cs_branch",
+          "parent_node_id": "hot_cust",
+          "sources": ["catalog_sales", "filtered_date", "filtered_customer"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM catalog_sales cs JOIN filtered_date d ON cs.cs_sold_date_sk = d.d_date_sk JOIN filtered_customer c ON cs.cs_bill_customer_sk = c.c_customer_sk WHERE cs.cs_list_price BETWEEN 193 AND 252 AND cs.cs_wholesale_cost BETWEEN 35 AND 55"
+        },
+        {
+          "node_id": "ws_branch",
+          "parent_node_id": "hot_cust",
+          "sources": ["web_sales", "filtered_date", "filtered_customer"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM web_sales ws JOIN filtered_date d ON ws.ws_sold_date_sk = d.d_date_sk JOIN filtered_customer c ON ws.ws_bill_customer_sk = c.c_customer_sk WHERE ws.ws_list_price BETWEEN 193 AND 252 AND ws.ws_wholesale_cost BETWEEN 35 AND 55"
+        },
+        {
+          "node_id": "filtered_date",
+          "parent_node_id": "ss_branch",
+          "sources": ["date_dim"],
+          "outputs": ["d_date_sk", "d_date"],
+          "changed": true,
+          "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1200 AND 1211"
+        },
+        {
+          "node_id": "filtered_customer",
+          "parent_node_id": "ss_branch",
+          "sources": ["customer"],
+          "outputs": ["c_customer_sk", "c_first_name", "c_last_name"],
+          "changed": true,
+          "sql": "SELECT c_customer_sk, c_first_name, c_last_name FROM customer WHERE c_birth_month IN (1, 2, 5, 12)"
+        },
+        {
+          "node_id": "store_sales",
+          "parent_node_id": "ss_branch",
+          "sources": [],
+          "outputs": ["ss_sold_date_sk", "ss_customer_sk", "ss_list_price", "ss_wholesale_cost"],
+          "changed": false
+        },
+        {
+          "node_id": "catalog_sales",
+          "parent_node_id": "cs_branch",
+          "sources": [],
+          "outputs": ["cs_sold_date_sk", "cs_bill_customer_sk", "cs_list_price", "cs_wholesale_cost"],
+          "changed": false
+        },
+        {
+          "node_id": "web_sales",
+          "parent_node_id": "ws_branch",
+          "sources": [],
+          "outputs": ["ws_sold_date_sk", "ws_bill_customer_sk", "ws_list_price", "ws_wholesale_cost"],
+          "changed": false
+        },
+        {
+          "node_id": "date_dim",
+          "parent_node_id": "filtered_date",
+          "sources": [],
+          "outputs": ["d_date_sk", "d_date", "d_month_seq"],
+          "changed": false
+        },
+        {
+          "node_id": "customer",
+          "parent_node_id": "filtered_customer",
+          "sources": [],
+          "outputs": ["c_customer_sk", "c_first_name", "c_last_name", "c_birth_month"],
+          "changed": false
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_fact_pushdown",
+    "dialect": "snowflake",
+    "confidence": 0.6,
+    "based_on": "p01",
+    "strategy": "Push date_sk range filter directly into fact table scans using derived min/max from date_dim.",
+    "hypothesis": "Probe p01 failed to modify SQL; we implement date_sk pushdown via a subquery that computes min/max date_sk from date_dim and adds a BETWEEN condition on each fact table's sold_date_sk. This targets the primary I/O hotspot (3 large fact scans) without changing join topology.",
+    "expected_explain_delta": "Fact table scans show micro-partition pruning on sold_date_sk range; date_dim scan count remains three but smaller.",
+    "target_ir": "Add date_sk_range CTE, modify each branch's fact scan filter to include sold_date_sk BETWEEN min_sk AND max_sk.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["hot_cust"],
+          "outputs": ["count(*)"],
+          "changed": true,
+          "sql": "SELECT COUNT(*) FROM hot_cust LIMIT 100"
+        },
+        {
+          "node_id": "hot_cust",
+          "parent_node_id": "final_select",
+          "sources": ["ss_branch", "cs_branch", "ws_branch"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT * FROM ss_branch INTERSECT SELECT * FROM cs_branch INTERSECT SELECT * FROM ws_branch"
+        },
+        {
+          "node_id": "ss_branch",
+          "parent_node_id": "hot_cust",
+          "sources": ["store_sales", "date_dim", "customer", "date_sk_range"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM store_sales ss, date_dim d, customer c, date_sk_range dsr WHERE ss.ss_sold_date_sk = d.d_date_sk AND ss.ss_customer_sk = c.c_customer_sk AND d.d_month_seq BETWEEN 1200 AND 1211 AND c.c_birth_month IN (1, 2, 5, 12) AND ss.ss_list_price BETWEEN 193 AND 252 AND ss.ss_wholesale_cost BETWEEN 35 AND 55 AND ss.ss_sold_date_sk BETWEEN dsr.min_date_sk AND dsr.max_date_sk"
+        },
+        {
+          "node_id": "cs_branch",
+          "parent_node_id": "hot_cust",
+          "sources": ["catalog_sales", "date_dim", "customer", "date_sk_range"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM catalog_sales cs, date_dim d, customer c, date_sk_range dsr WHERE cs.cs_sold_date_sk = d.d_date_sk AND cs.cs_bill_customer_sk = c.c_customer_sk AND d.d_month_seq BETWEEN 1200 AND 1211 AND c.c_birth_month IN (1, 2, 5, 12) AND cs.cs_list_price BETWEEN 193 AND 252 AND cs.cs_wholesale_cost BETWEEN 35 AND 55 AND cs.cs_sold_date_sk BETWEEN dsr.min_date_sk AND dsr.max_date_sk"
+        },
+        {
+          "node_id": "ws_branch",
+          "parent_node_id": "hot_cust",
+          "sources": ["web_sales", "date_dim", "customer", "date_sk_range"],
+          "outputs": ["c_last_name", "c_first_name", "d_date"],
+          "changed": true,
+          "sql": "SELECT DISTINCT c.c_last_name, c.c_first_name, d.d_date FROM web_sales ws, date_dim d, customer c, date_sk_range dsr WHERE ws.ws_sold_date_sk = d.d_date_sk AND ws.ws_bill_customer_sk = c.c_customer_sk AND d.d_month_seq BETWEEN 1200 AND 1211 AND c.c_birth_month IN (1, 2, 5, 12) AND ws.ws_list_price BETWEEN 193 AND 252 AND ws.ws_wholesale_cost BETWEEN 35 AND 55 AND ws.ws_sold_date_sk BETWEEN dsr.min_date_sk AND dsr.max_date_sk"
+        },
+        {
+          "node_id": "date_sk_range",
+          "parent_node_id": "ss_branch",
+          "sources": ["date_dim"],
+          "outputs": ["min_date_sk", "max_date_sk"],
+          "changed": true,
+          "sql": "SELECT MIN(d_date_sk) AS min_date_sk, MAX(d_date_sk) AS max_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1200 AND 1211"
+        },
+        {
+          "node_id": "store_sales",
+          "parent_node_id": "ss_branch",
+          "sources": [],
+          "outputs": ["ss_sold_date_sk", "ss_customer_sk", "ss_list_price", "ss_wholesale_cost"],
+          "changed": false
+        },
+        {
+          "node_id": "catalog_sales",
+          "parent_node_id": "cs_branch",
+          "sources": [],
+          "outputs": ["cs_sold_date_sk", "cs_bill_customer_sk", "cs_list_price", "cs_wholesale_cost"],
+          "changed": false
+        },
+        {
+          "node_id": "web_sales",
+          "parent_node_id": "ws_branch",
+          "sources": [],
+          "outputs": ["ws_sold_date_sk", "ws_bill_customer_sk", "ws_list_price", "ws_wholesale_cost"],
+          "changed": false
+        },
+        {
+          "node_id": "date_dim",
+          "parent_node_id": "ss_branch",
+          "sources": [],
+          "outputs": ["d_date_sk", "d_date", "d_month_seq"],
+          "changed": false
+        },
+        {
+          "node_id": "customer",
+          "parent_node_id": "ss_branch",
+          "sources": [],
+          "outputs": ["c_customer_sk", "c_first_name", "c_last_name", "c_birth_month"],
+          "changed": false
+        }
+      ]
+    }
+  }
+]

@@ -42,7 +42,13 @@ def refresh_explains(
 
     bench_dir = resolve_benchmark(benchmark)
     cfg = load_benchmark_config(bench_dir)
-    db_path = cfg.get("db_path") or cfg.get("db_path_or_dsn", "")
+    db_path = (
+        cfg.get("db_path")
+        or cfg.get("db_path_or_dsn")
+        or cfg.get("benchmark_dsn")
+        or cfg.get("dsn")
+        or ""
+    )
     query_ids = parse_query_filter(query, bench_dir)
 
     if not query_ids:

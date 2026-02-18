@@ -1,108 +1,61 @@
 # qt-synth
 
-AST-first synthetic SQL evaluation and witness generation.
+DSB benchmark tooling and CLI wrappers for the synthetic SQL validation engine.
 
-## Canonical Eval Representation
+**Canonical implementation**: `packages/qt-sql/qt_sql/validation/`
 
-This is the canonical structure for SQL eval in `qt-synth`:
-
-```text
-├── [CTE] ss_items
-│   ├── SCAN store_sales
-│   ├── FILTER (ss_list_price BETWEEN 242 AND 271)  [>>> SET: 250.00]
-│   ├── AGG (GROUP BY item_id)                      [>>> RESULT: Rev must be > 0]
-│   └── OUTPUT (item_id, ss_item_rev)               [>>> OUT: {1, 250.00}]
-├── [CTE] cs_items
-│   ├── SCAN catalog_sales
-│   ├── FILTER (cs_list_price BETWEEN 242 AND 271)  [>>> SET: 250.00]
-│   ├── AGG (GROUP BY item_id)                      [>>> RESULT: Rev must match SS +/- 10%]
-│   └── OUTPUT (item_id, cs_item_rev)               [>>> OUT: {1, 250.00}]
-└── [MAIN] main_query
-    ├── JOIN (ss_items.item_id = cs_items.item_id)  [>>> CHECK: 1 == 1 (OK)]
-    ├── FILTER (ss_rev BETWEEN 0.9 * cs_rev ...)    [>>> CHECK: 250 vs 250 (OK)]
-```
-
-## AST-Only Contract
-
-All representation and witness decisions must be derivable from the SQL AST:
-
-- relation and alias nodes define `SCAN` and graph edges
-- boolean expressions (`WHERE`, `ON`, `HAVING`) define `FILTER` and `CHECK`
-- aggregate expressions and group keys define `AGG` result constraints
-- projection expressions define `OUTPUT`
-- no raw SQL string heuristics as a source of truth
-
-## Sidecar Extensions (Window + Correlation)
-
-The base tree can lose critical semantics for window functions and correlated
-subqueries. In those cases, keep the same tree and attach an AST-derived
-`ATTACHMENT` sidecar that carries the missing constraints.
-
-Window-function sidecar method:
-
-```text
-QUERY: (Window Function "Sidecar" Method)
-├── [CTE] store_sales_ranked
-│   ├── SCAN store_sales  [=]  Constraint: Must generate CLUSTER
-│   │   │
-│   │   ├── [ATTACHMENT: WINDOW DEFINITION]
-│   │   │   ├── PARTITION BY: s_store_sk (The "Bucket")
-│   │   │   ├── ORDER BY:     ss_sales_price DESC (The "Sort")
-│   │   │   └── TARGET:       RANK() = 3
-│   │   │
-│   │   └── [REQUIRED CLUSTER MANIFEST]
-│   │       ├── Row 1: {Store: 1, Price: 100}  (Filler)
-│   │       ├── Row 2: {Store: 1, Price: 90}   (Filler)
-│   │       └── Row 3: {Store: 1, Price: 80}   (The "Witness")
-│   │
-│   ├── AGG (None)
-│   └── OUTPUT (store_id, item_id, revenue, rnk)
-└── [MAIN] ...
-```
-
-Correlated subqueries follow the same rule:
-
-- represent the outer and inner scopes in the base tree
-- attach a `CORRELATION` sidecar with binding keys, predicate direction, and
-  required witness pair(s)
-
-## Row Growth Strategy
-
-Row growth starts at one witness row and expands with deterministic AST-driven cases:
-
-1. Golden witness partition that must satisfy all constraints and produce one row.
-2. Clone partition (shifted IDs, equivalent math) that stress-tests structural invariance.
-3. Boundary-fail partition that violates exactly one AST predicate by epsilon.
-4. Booster rows only where needed to preserve aggregate context for the target witness.
-
-Reference pattern:
-
-```sql
--- 1. THE GOLDEN WITNESS (Store 1) - Must return 1 row
-INSERT INTO store_sales VALUES (1, 1, 1, 40.00, 100.00);   -- Target (Pass)
-INSERT INTO store_sales VALUES (1, 2, 1, 800.00, 2000.00); -- Booster
-
--- 2. THE CLONE (Store 2) - Stress test, Must return 1 row
-INSERT INTO store VALUES (2, 'Store2', 'IA');
-INSERT INTO item VALUES (3, 'CloneItem', 10.00, 5.00, 'BrandX', 80);
-INSERT INTO store_sales VALUES (2, 3, 1, 40.00, 100.00);   -- Clone Target (Pass)
-INSERT INTO store_sales VALUES (2, 4, 1, 800.00, 2000.00); -- Clone Booster
-
--- 3. THE BOUNDARY FAIL (Store 3) - Negative Test, Must return 0 rows
-INSERT INTO store VALUES (3, 'Store3', 'IA');
-INSERT INTO item VALUES (5, 'FailItem', 10.00, 5.00, 'BrandX', 80);
-INSERT INTO store_sales VALUES (3, 5, 1, 43.00, 100.00);   -- Target (Fail: 43 > 42)
-INSERT INTO store_sales VALUES (3, 6, 1, 797.00, 2000.00); -- Booster
-```
+All files in this directory are thin re-exports that delegate to the canonical
+location. Use these as CLI entry points or import from `qt_sql.validation.*`
+directly.
 
 ## Quick Start
 
 ```bash
-python3 qt-synth/validator.py your_query.sql
-python3 qt-synth/validator.py your_query.sql --target-rows 1000 --min-rows 800 --max-rows 5000
-python3 qt-synth/validator.py your_query.sql --target-rows 1000 --output results.json
+# Single-query validation (file-based)
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. \
+  python3 qt-synth/synthetic_validator.py your_query.sql --target-rows 1000
+
+# SQL pair equivalence check (from code)
+from qt_sql.validation.synthetic_validator import SyntheticValidator
+v = SyntheticValidator(dialect="postgres")
+result = v.validate_sql_pair(original_sql, optimized_sql, witness_mode="multi")
+
+# DSB-76 batch synthetic DB build
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. \
+  python3 qt-synth/build_dsb76_synthetic_db.py \
+    --out-db /tmp/dsb76_mvrows.duckdb --force-seed-attempts 16
+
+# MVROWS one-row equivalence eval
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. \
+  python3 qt-synth/run_mvrows_one_row_eval.py --schema-mode merged
 ```
 
-## MVROWS One-Row Eval
+## Files
 
-See `qt-synth/README_MVROWS_ONE_ROW.md`.
+| File | Role |
+|------|------|
+| `synthetic_validator.py` | Re-export + CLI for `qt_sql.validation.synthetic_validator` |
+| `build_dsb76_synthetic_db.py` | Re-export + CLI for DSB-76 batch builder |
+| `build_minimal_synthetic_db.py` | Re-export + CLI for minimal witness DB |
+| `repair_dsb76_synthetic_db.py` | Re-export + CLI for in-place DB repair |
+| `patch_packs.py` | Re-export for benchmark patch-pack system |
+| `validator.py` / `validator_v2.py` | Legacy compatibility aliases |
+| `run_mvrows_one_row_eval.py` | Eval script for MVROWS one-row detection |
+| `patches/` | DSB-specific witness recipes (behind patch-pack boundary) |
+
+## Architecture
+
+The engine is AST-first: all schema extraction, type inference, constraint
+solving, and witness generation derive from the SQL parse tree (SQLGlot). No
+raw SQL string heuristics.
+
+Key features:
+- **Predicate-context type inference**: BETWEEN/comparison with date expressions
+  overrides name-based heuristics
+- **Generic temporal dimension detection**: Works on any calendar/date table,
+  not just TPC-DS `date_dim`
+- **Multi-row witness generation**: Clone + boundary-fail witnesses for higher
+  semantic recall (`witness_mode="multi"`)
+- **Deterministic**: Same SQL + same config = identical synthetic data
+
+See `packages/qt-sql/qt_sql/validation/README_MVROWS.md` for the MVROWS design.

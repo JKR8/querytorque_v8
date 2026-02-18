@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three large sequential scans on returns tables (store_returns, catalog_returns, web_returns) dominate runtime at 5-6 seconds each, with repeated full scans of the item table (three times) adding 1.2 seconds each. The self‑join on the CTE `all_sales` forces materialization of all years before filtering to 1999 and 1998, losing early pruning.",
+    "reasoning_trace": [
+      "Sequential scans on returns tables each scan millions of rows (store_returns 260k rows/5.8s, catalog_returns 119k rows/3.9s, web_returns 154k rows/6.3s).",
+      "Item table scanned three times (13k rows each) with same filter i_category='Children'—no sharing across UNION branches.",
+      "CTE `all_sales` materializes full‑year aggregation; final self‑join filters to two years after full computation, missing pushdown opportunity.",
+      "Gather operator shows large cardinality mismatch (est=3, act=20k) indicating poor selectivity estimation across UNION branches."
+    ],
+    "cost_spine": ["Seq Scan store_returns", "Hash Join", "Nested Loop", "Append", "Aggregate", "Nested Loop self‑join"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_returns",
+        "why": "largest single‑table I/O volume (260k rows, 5.8s)",
+        "evidence": "rows=260757 time=5859ms"
+      },
+      {
+        "op": "Seq Scan on web_returns",
+        "why": "second‑largest I/O (154k rows, 6.3s)",
+        "evidence": "rows=154733 time=6388ms"
+      },
+      {
+        "op": "Repeated Seq Scan on item",
+        "why": "same dimension scanned three times with identical filter",
+        "evidence": "three scans each ~1200ms, total 3600ms"
+      },
+      {
+        "op": "CTE Scan (curr_yr)",
+        "why": "materializes all years before filtering to 1999",
+        "evidence": "CTE scan time=26362ms, no year filter inside CTE"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR‑to‑UNION split (no OR predicates in plan)",
+      "avoid duplicating large CTE bodies (prev failed attempts show regression risk)",
+      "do not break EXISTS semi‑join (query has no EXISTS)",
+      "do not convert LEFT JOIN to INNER if nullable returns rows are needed (but WHERE cr_reason_sk IN (...) already eliminates NULLs)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split CTE all_sales into two separate CTEs (curr_year_sales, prev_year_sales) that embed the year filters (d_year=1999, d_year=1998) in their definitions, then self‑join them. This pushes year filtering into the CTE materialization, pruning rows before aggregation.",
+      "dag_target_hint": "Replace all_sales CTE with two CTEs filtered by year, then rewrite final SELECT to join curr_year_sales and prev_year_sales.",
+      "node_contract": {
+        "from_must_include": ["item", "date_dim", "catalog_sales", "store_sales", "web_sales", "catalog_returns", "store_returns", "web_returns"],
+        "where_must_preserve": ["i_category='Children'", "price‑ratio BETWEEN filters", "reason_sk IN (8,18,20,23,41)"],
+        "output_must_preserve": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "sales_cnt", "sales_amt"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:FAIL (no comma join)", "G_PG_CTE_DUPLICATION_BLOCK:PASS (CTEs differ by filter, not body duplication)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "CTE scans show year filter applied early, reducing rows materialized by ~98% (all years → two years).",
+      "recommended_patch_ops": ["split_cte_by_filter", "rewrite_final_from", "preserve_union_structure"],
+      "rank_rationale": "Targets primary hotspot — CTE materialization of all years dominates total runtime.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract filtered item dimension (i_category='Children') into a single CTE and reference it in all three UNION branches, eliminating three separate sequential scans.",
+      "dag_target_hint": "Insert CTE filtered_items before UNION; replace each branch's item scan with a join to filtered_items.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_category='Children'"],
+        "output_must_preserve": ["i_item_sk", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:FAIL (no comma join)", "G_PG_CTE_REUSE_REQUIRED:PASS (CTE reused three times)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Three Seq Scan on item nodes replaced by one CTE scan; hash‑join build side becomes tiny materialized result.",
+      "recommended_patch_ops": ["insert_cte_filtered_items", "rewrite_union_branches_to_join_cte"],
+      "rank_rationale": "Addresses clear secondary hotspot — repeated dimension scans waste 3.6 seconds.",
+      "recommended_examples": ["shared_dimension_multi_channel"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Push aggregation into each UNION branch: pre‑aggregate sales‑returns data by (d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id) before the UNION, then only combine partial aggregates in the outer CTE.",
+      "dag_target_hint": "Modify each UNION subquery to include GROUP BY on the five dimension columns, aggregating sales_cnt and sales_amt; adjust outer CTE to sum the pre‑aggregated results.",
+      "node_contract": {
+        "from_must_include": ["item", "date_dim", "sales_table", "returns_table"],
+        "where_must_preserve": ["i_category='Children'", "price‑ratio BETWEEN", "reason_sk IN list"],
+        "output_must_preserve": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "SUM(sales_cnt)", "SUM(sales_amt)"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS (keys match final group by)", "duplication_sensitive_metrics:none (only SUM)"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre‑aggregating each channel reduces rows flowing into UNION and outer aggregation, cutting memory and hash‑join work.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Each UNION branch outputs aggregated rows (thousands instead of millions); outer Aggregate becomes a simple sum of sums.",
+      "recommended_patch_ops": ["rewrite_union_subqueries_with_group_by", "adjust_outer_cte_aggregation"],
+      "rank_rationale": "Exploration — targets secondary hotspot (large row flow into UNION) with plausible impact.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize date‑dimension rows for years 1999 and 1998 into a CTE, convert comma‑style joins to explicit JOIN syntax, and push date‑sk filters into each fact‑table join for better pruning.",
+      "dag_target_hint": "Add CTE filtered_dates (SELECT d_date_sk FROM date_dim WHERE d_year IN (1999,1998)); rewrite each fact‑join to explicit JOIN filtered_dates ON d_date_sk = cs_sold_date_sk etc.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year IN (1999,1998)"],
+        "output_must_preserve": ["d_date_sk", "d_year"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:FAIL (no comma join in original)", "G_PG_EXPLICIT_JOIN_STYLE:PASS (explicit join conversion is safe)"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax plus pre‑filtered date CTE may improve join‑order flexibility and enable partition pruning on fact tables via date‑sk pushdown.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date‑dim scans become tiny CTE scans; fact‑table joins may switch to index‑based nested loops with pushed date‑sk filter.",
+      "recommended_patch_ops": ["insert_cte_filtered_dates", "convert_to_explicit_join", "push_date_sk_to_fact_join"],
+      "rank_rationale": "Exploration — underrepresented family F, targets secondary date‑dim scan and join topology.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in plan; PostgreSQL BitmapOr already handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "LEFT JOIN already behaves as INNER due to WHERE filter on returns reason_sk; plan already shows hash join, no further benefit."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL; decorrelation not applicable."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "Transform targeted at Snowflake micro‑partition pruning; not native to PostgreSQL."
+    }
+  ]
+}

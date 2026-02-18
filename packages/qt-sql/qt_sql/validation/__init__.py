@@ -63,6 +63,9 @@ from .synthetic_validator import (
 from .sql_differ import (
     SQLDiffer,
 )
+from .witness_generator import (
+    MultiRowWitnessGenerator,
+)
 
 __all__ = [
     # Main validator
@@ -92,4 +95,5 @@ __all__ = [
     "MiniValidator",
     "SyntheticValidator",
     "SQLDiffer",
+    "MultiRowWitnessGenerator",
 ]

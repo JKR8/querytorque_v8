@@ -1,0 +1,72 @@
+[
+  {
+    "plan_id": "compile_p1",
+    "dialect": "snowflake",
+    "confidence": 0.85,
+    "based_on": "p01",
+    "strategy": "Decorrelation via shared scan and per-item threshold CTE to eliminate repeated fact table scans.",
+    "hypothesis": "Primary hotspot is correlated subquery causing repeated catalog_sales scans. Probe p01 (1.06x) successfully decorrelates using shared scan CTE, addressing the main I/O bottleneck. Residual gap: OR condition on ITEM may still limit pruning.",
+    "expected_explain_delta": "Elimination of repeated catalog_sales scans and correlated subquery operators, replaced by a single scan and hash join with threshold CTE.",
+    "target_ir": "Introduce shared_scan_cs and threshold_per_item CTEs, update final_select to join them.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["shared_scan_cs", "threshold_per_item"],
+          "outputs": ["excess discount amount"],
+          "changed": true,
+          "sql": "SELECT SUM(cs.cs_ext_discount_amt) AS \"excess discount amount\" FROM shared_scan_cs cs JOIN threshold_per_item t ON cs.cs_item_sk = t.cs_item_sk WHERE cs.cs_ext_discount_amt > t.threshold ORDER BY SUM(cs.cs_ext_discount_amt) LIMIT 100"
+        },
+        {
+          "node_id": "shared_scan_cs",
+          "parent_node_id": "final_select",
+          "sources": ["catalog_sales", "date_dim", "item"],
+          "outputs": ["cs_item_sk", "cs_sold_date_sk", "cs_ext_discount_amt", "cs_list_price", "cs_sales_price"],
+          "changed": true,
+          "sql": "SELECT cs.cs_item_sk, cs.cs_sold_date_sk, cs.cs_ext_discount_amt, cs.cs_list_price, cs.cs_sales_price FROM catalog_sales cs JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk JOIN item i ON cs.cs_item_sk = i.i_item_sk WHERE d.d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 day' AND (i.i_manufact_id IN (47, 226, 612, 676, 818) OR i.i_manager_id BETWEEN 71 AND 100)"
+        },
+        {
+          "node_id": "threshold_per_item",
+          "parent_node_id": "final_select",
+          "sources": ["shared_scan_cs"],
+          "outputs": ["cs_item_sk", "threshold"],
+          "changed": true,
+          "sql": "SELECT cs_item_sk, 1.3 * AVG(cs_ext_discount_amt) AS threshold FROM shared_scan_cs WHERE cs_list_price BETWEEN 108 AND 137 AND cs_sales_price / cs_list_price BETWEEN 0.23 AND 0.43 GROUP BY cs_item_sk"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_p2",
+    "dialect": "snowflake",
+    "confidence": 0.70,
+    "based_on": "p04",
+    "strategy": "Single-pass aggregation using window function to compute threshold in the same scan, avoiding repeated scans and extra join.",
+    "hypothesis": "Alternative pathway computes threshold per item using window function in a single pass over catalog_sales, reducing I/O and avoiding separate aggregation step. Probe p04 showed neutral performance (0.97x) but offers distinct mechanism.",
+    "expected_explain_delta": "Single scan of catalog_sales with window aggregation, followed by filter, eliminating correlated subquery and extra join.",
+    "target_ir": "Introduce single_pass_agg CTE with window function, update final_select to filter by threshold.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["single_pass_agg"],
+          "outputs": ["excess discount amount"],
+          "changed": true,
+          "sql": "SELECT SUM(cs_ext_discount_amt) AS \"excess discount amount\" FROM single_pass_agg WHERE cs_ext_discount_amt > threshold ORDER BY SUM(cs_ext_discount_amt) LIMIT 100"
+        },
+        {
+          "node_id": "single_pass_agg",
+          "parent_node_id": "final_select",
+          "sources": ["catalog_sales", "item", "date_dim"],
+          "outputs": ["cs_ext_discount_amt", "threshold"],
+          "changed": true,
+          "sql": "SELECT cs_ext_discount_amt, 1.3 * AVG(CASE WHEN cs_list_price BETWEEN 108 AND 137 AND cs_sales_price / cs_list_price BETWEEN 0.23 AND 0.43 THEN cs_ext_discount_amt END) OVER (PARTITION BY cs_item_sk) AS threshold FROM catalog_sales cs JOIN item i ON cs.cs_item_sk = i.i_item_sk JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk WHERE (i.i_manufact_id IN (47, 226, 612, 676, 818) OR i.i_manager_id BETWEEN 71 AND 100) AND d.d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 day'"
+        }
+      ]
+    }
+  }
+]

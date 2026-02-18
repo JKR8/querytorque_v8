@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -28,8 +29,6 @@ import click
               help="Stop early when this speedup is reached.")
 @click.option("--single-iteration", is_flag=True,
               help="Run one analyst/worker/snipe round only.")
-@click.option("--fan-out-only", "fan_out_only_legacy", is_flag=True, hidden=True,
-              help="Deprecated alias for --single-iteration.")
 @click.option("--resume", is_flag=True,
               help="Resume from last checkpoint in the run directory.")
 @click.option("-o", "--output-dir", type=click.Path(), default=None,
@@ -55,14 +54,17 @@ import click
               help="Engine version override (e.g., '17' for PG, '1.2' for DuckDB).")
 @click.option("--output-contract", is_flag=True,
               help="Emit structured QueryOutputContract JSON alongside results.")
-@click.option("--patch", "patch_mode", is_flag=True, hidden=True,
-              help="Deprecated. Beam always runs tiered patch flow.")
-@click.option("--fleet", "fleet_legacy", is_flag=True, hidden=True,
-              help="Deprecated alias for --mode fleet.")
 @click.option("--dry-run", "dry_run", is_flag=True,
               help="With --mode fleet: run survey + triage only, no LLM calls.")
 @click.option("--live", "live_dashboard", is_flag=True,
               help="With --mode fleet: launch Fleet C2 browser dashboard with live WebSocket updates.")
+@click.option(
+    "--live-port",
+    type=int,
+    default=8765,
+    show_default=True,
+    help="With --mode fleet --live: WebSocket/dashboard port. Set different ports to run multiple engines concurrently.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -72,7 +74,6 @@ def run(
     max_iterations: int,
     target_speedup: float,
     single_iteration: bool,
-    fan_out_only_legacy: bool,
     resume: bool,
     output_dir: str | None,
     concurrency: int | None,
@@ -83,10 +84,9 @@ def run(
     scenario: str,
     engine_version: str,
     output_contract: bool,
-    patch_mode: bool,
-    fleet_legacy: bool,
     dry_run: bool,
     live_dashboard: bool,
+    live_port: int,
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 
@@ -103,19 +103,17 @@ def run(
         print_success,
     )
 
-    if fleet_legacy:
-        mode = "fleet"
-
     if dry_run and mode != "fleet":
         print_error("--dry-run is only valid with --mode fleet.")
         raise SystemExit(2)
     if launch_interval_seconds < 0:
         print_error("--launch-interval-seconds must be >= 0.")
         raise SystemExit(2)
+    if live_port < 1 or live_port > 65535:
+        print_error("--live-port must be between 1 and 65535.")
+        raise SystemExit(2)
 
     # Beam is the canonical tiered analyst/worker/snipe flow.
-    patch_mode = True
-    single_iteration = single_iteration or fan_out_only_legacy
 
     bench_dir = resolve_benchmark(benchmark)
     cfg = load_benchmark_config(bench_dir)
@@ -273,7 +271,29 @@ def run(
             # Locate HTML file
             html_path = Path(__file__).resolve().parent.parent / "dashboard" / "fleet_c2.html"
 
-            port = 8765
+            port = _resolve_available_port(live_port)
+            if port != live_port:
+                console.print(
+                    f"  [yellow]Requested --live-port {live_port} is busy; using {port}.[/yellow]"
+                )
+            run_context = {
+                "run_id": out.name,
+                "benchmark_name": bench_dir.name,
+                "benchmark_dir": str(bench_dir),
+                "engine": str(cfg.get("engine", "") or ""),
+                "query_count": len(query_ids),
+                "fleet_concurrency": concurrency or 4,
+                "benchmark_slots": benchmark_concurrency,
+                "beam_edit_mode": str(cfg.get("beam_edit_mode", "tree") or "tree"),
+                "wide_max_probes": int(cfg.get("wide_max_probes", 16) or 16),
+                "beam_workers": int(cfg.get("beam_workers", cfg.get("beam_qwen_workers", 8)) or 8),
+                "compiler_rounds": int(cfg.get("compiler_rounds", cfg.get("snipe_rounds", 2)) or 2),
+                "mode_summary": (
+                    f"beam:{str(cfg.get('beam_edit_mode', 'tree') or 'tree')}"
+                    f" w{int(cfg.get('beam_workers', cfg.get('beam_qwen_workers', 8)) or 8)}"
+                    f" p{int(cfg.get('wide_max_probes', 16) or 16)}"
+                ),
+            }
             console.print(f"\n[bold]Fleet C2 Dashboard[/bold]")
             run_server_in_thread(
                 event_bus=event_bus,
@@ -283,6 +303,7 @@ def run(
                 pause_event=pause_event,
                 port=port,
                 benchmark_dir=bench_dir,
+                run_context=run_context,
             )
             url = f"http://127.0.0.1:{port}"
             console.print(f"  Dashboard: [link={url}]{url}[/link]")
@@ -392,7 +413,7 @@ def run(
     t0 = time.time()
 
     # Parallel tiered beam: LLM concurrent, benchmark with bounded concurrency
-    if concurrency > 0 and patch_mode:
+    if concurrency > 0:
         _run_patch_parallel(
             pipeline=pipeline,
             query_ids=query_ids,
@@ -427,7 +448,7 @@ def run(
             errors=errors,
             console=console,
             orchestrator=orchestrator,
-            patch_mode=patch_mode,
+            patch_mode=True,
         )
 
     elapsed = time.time() - t0
@@ -852,3 +873,18 @@ def _write_progress_snapshot(
         "errors": [{"query_id": qid, "error": msg} for qid, msg in errors[-100:]],
     }
     _write_json_atomic(out / "progress.json", payload)
+
+
+def _resolve_available_port(preferred_port: int, host: str = "127.0.0.1") -> int:
+    """Use preferred port when free; otherwise pick the next available."""
+    for port in range(preferred_port, min(65536, preferred_port + 100)):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(
+        f"No available live dashboard port in range {preferred_port}-{min(65535, preferred_port + 99)}."
+    )

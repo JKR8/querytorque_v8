@@ -365,11 +365,18 @@ def _run_explain_analyze_duckdb(database_path: str, sql: str) -> Optional[dict]:
         return None
 
 
-def _run_explain_analyze_postgres(database_path: str, sql: str) -> Optional[dict]:
-    """Run EXPLAIN ANALYZE on PostgreSQL."""
+def _run_explain_analyze_postgres(
+    database_path: str,
+    sql: str,
+    timeout_ms: int = 300_000,
+) -> Optional[dict]:
+    """Run EXPLAIN ANALYZE on PostgreSQL.
+
+    If ANALYZE times out (statement_timeout=300s default), falls back to
+    plain EXPLAIN (no execution) so we still get the plan structure.
+    """
     try:
         from .factory import PostgresConfig
-        import json as json_mod
 
         config = PostgresConfig.from_dsn(database_path)
         db = config.get_executor()
@@ -382,30 +389,46 @@ def _run_explain_analyze_postgres(database_path: str, sql: str) -> Optional[dict
                 "actual_rows": None,
             }
 
-            # Get JSON plan with ANALYZE
-            try:
-                explain_result = db.explain(sql, analyze=True)
+            analyzed = False
 
-                if explain_result:
+            # Try EXPLAIN ANALYZE first (with timeout)
+            try:
+                explain_result = db.explain(sql, analyze=True, timeout_ms=timeout_ms)
+
+                if explain_result and not explain_result.get("error"):
                     result["plan_json"] = explain_result.get("Plan")
                     result["execution_time_ms"] = explain_result.get("Execution Time", 0)
                     result["actual_rows"] = explain_result.get("rows_returned", 0)
-
-                    # Build text representation
                     plan = explain_result.get("Plan", {})
                     result["plan_text"] = _plan_to_text(plan)
+                    analyzed = True
+                elif explain_result and explain_result.get("error"):
+                    err = explain_result["error"]
+                    logger.warning(f"EXPLAIN ANALYZE returned error: {err}")
 
             except Exception as e:
-                logger.warning(f"Failed to get PostgreSQL JSON plan: {e}")
+                logger.warning(f"EXPLAIN ANALYZE failed (will try estimate-only): {e}")
 
-                # Fallback to text-only EXPLAIN
+            # Fallback: plain EXPLAIN (no execution, instant)
+            if not analyzed:
                 try:
-                    text_rows = db.execute(f"EXPLAIN {sql}")
-                    result["plan_text"] = "\n".join(
-                        row.get("QUERY PLAN", str(row)) for row in text_rows
-                    )
+                    explain_result = db.explain(sql, analyze=False, timeout_ms=30_000)
+                    if explain_result and not explain_result.get("error"):
+                        result["plan_json"] = explain_result.get("Plan")
+                        plan = explain_result.get("Plan", {})
+                        result["plan_text"] = _plan_to_text(plan)
+                        est_cost = plan.get("Total Cost", 0)
+                        result["execution_time_ms"] = est_cost
+                        result["note"] = (
+                            "estimate-only (ANALYZE timed out at "
+                            f"{timeout_ms / 1000:.0f}s) — plan structure "
+                            "available but no actual timing/row counts"
+                        )
+                        logger.info(
+                            f"Using estimate-only EXPLAIN (cost={est_cost:.0f})"
+                        )
                 except Exception as text_e:
-                    logger.warning(f"Text EXPLAIN also failed: {text_e}")
+                    logger.warning(f"Estimate-only EXPLAIN also failed: {text_e}")
 
             return result
 

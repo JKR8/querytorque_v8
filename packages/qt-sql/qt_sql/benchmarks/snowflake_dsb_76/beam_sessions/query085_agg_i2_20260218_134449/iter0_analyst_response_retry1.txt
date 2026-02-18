@@ -1,0 +1,301 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows two large fact-table scans (WEB_SALES 460GB, WEB_RETURNS 39GB) without pushed date_sk filter from date_dim (d_year=2002), causing full partition scans. OR conditions on customer_demographics and customer_address are applied as late join filters, preventing efficient join planning and predicate pushdown.",
+    "reasoning_trace": [
+      "WEB_SALES scan reads 27574 parts (460GB) without date_sk filter; WEB_RETURNS scan reads 2289 parts (39GB) without date_sk filter.",
+      "Date_dim filter (d_year=2002) applied at node 1.14 but not pushed into fact scans, indicating predicate transitivity failure.",
+      "OR conditions on customer_demographics/ws_sales_price and customer_address/ws_net_profit appear as join filters (nodes 1.17, 1.11), applied after join materialization.",
+      "Aggregation occurs in multiple stages; final group by r_reason_desc suggests early aggregation pushdown may reduce join volume."
+    ],
+    "cost_spine": [
+      "TableScan(WEB_SALES)",
+      "TableScan(WEB_RETURNS)",
+      "InnerJoin (WEB_RETURNS ↔ WEB_SALES) with OR joinFilter",
+      "Aggregate (multiple levels)"
+    ],
+    "hotspots": [
+      {
+        "op": "TableScan(WEB_SALES)",
+        "why": "largest I/O volume, no pushed predicate from date_dim",
+        "evidence": "parts=27574/27579, bytes=460956759040"
+      },
+      {
+        "op": "TableScan(WEB_RETURNS)",
+        "why": "second largest I/O volume, no pushed predicate from date_dim",
+        "evidence": "parts=2289/2289, bytes=39149218304"
+      },
+      {
+        "op": "InnerJoin (node 1.17)",
+        "why": "complex OR join filter on customer_demographics and ws_sales_price",
+        "evidence": "joinFilter with three OR branches"
+      },
+      {
+        "op": "Aggregate (node 1.16)",
+        "why": "aggregation before joining with dimensions, potential for further pushdown",
+        "evidence": "group by includes join keys (ws_web_page_sk, wr_reason_sk, wr_refunded_addr_sk, ws_sold_date_sk)"
+      }
+    ],
+    "do_not_do": [
+      "do not wrap date_sk or filter columns in functions that break micro‑partition pruning",
+      "do not materialize EXISTS/NOT EXISTS patterns (none present)",
+      "do not introduce unfiltered large CTEs",
+      "avoid same‑column OR to UNION ALL unless evidence shows OR blocks pruning"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk range from date_dim filter (d_year=2002) into WEB_SALES and WEB_RETURNS scans via explicit BETWEEN or IN subquery to enable micro‑partition pruning.",
+      "dag_target_hint": "Add WHERE ws_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_year = 2002) to WEB_SALES and wr_returned_date_sk equivalent to WEB_RETURNS if applicable, else derive from ws_sold_date_sk.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "web_sales ws", "web_returns wr"],
+        "where_must_preserve": ["d.d_year = 2002", "ws.ws_sold_date_sk = d.d_date_sk", "wr.wr_returned_date_sk? or infer from ws_sold_date_sk"],
+        "output_must_preserve": ["All original columns and join relationships"]
+      },
+      "gates_checked": [
+        "G_SF_SK_DATE_FILTER_REQUIRED:PASS",
+        "G_SF_SK_SCAN_PRESSURE:PASS",
+        "G_SF_SK_COMPUTE_BOUND_SKIP:PASS",
+        "G_SF_SK_RANGE_SEMANTICS:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "WEB_SALES and WEB_RETURNS scans show reduced partitions read due to date_sk range pushdown.",
+      "recommended_patch_ops": ["add_subquery_filter", "rewrite_where_clause"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Primary hotspot — largest scan volume; direct evidence of missing date_sk pushdown.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR condition on customer_demographics and ws_sales_price into three UNION ALL branches, each with a single marital‑status/education and corresponding price range, preserving join semantics.",
+      "dag_target_hint": "Replace the OR joinFilter (node 1.17) with a UNION ALL over three subqueries, each with fixed cd1.cd_marital_status, cd1.cd_education_status, and ws_sales_price range.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2", "web_sales ws", "web_returns wr"],
+        "where_must_preserve": ["cd1.cd_marital_status = cd2.cd_marital_status", "cd1.cd_education_status = cd2.cd_education_status"],
+        "output_must_preserve": ["All rows from original OR condition; no duplication or loss"]
+      },
+      "gates_checked": [
+        "G_SF_UNION_BRANCH_LIMIT:PASS (3 branches acceptable)",
+        "multiplicity_guard_required:PASS (UNION ALL preserves row count)"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "JoinFilter replaced by separate join branches; each branch may enable better predicate pushdown and join planning.",
+      "recommended_patch_ops": ["split_or_to_union", "rewrite_from_clause"],
+      "recommended_examples": [],
+      "rank_rationale": "Targets secondary hotspot — complex OR join filter likely blocking efficient join planning.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate web_sales and web_returns by join keys (ws_item_sk, ws_order_number, ws_web_page_sk, ws_sold_date_sk, wr_reason_sk, wr_refunded_addr_sk) before joining with dimensions, preserving AVG aggregates via SUM/COUNT.",
+      "dag_target_hint": "Create CTEs for web_sales and web_returns aggregated by their join keys, then join with dimensions and reason.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws", "web_returns wr"],
+        "where_must_preserve": ["All original join predicates"],
+        "output_must_preserve": ["AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee) via SUM/COUNT"]
+      },
+      "gates_checked": [
+        "agg_key_compatibility:PASS",
+        "duplication_sensitive_metrics:none (AVG handled via SUM/COUNT)"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Early aggregation reduces rows flowing into joins; fewer rows at node 1.16 and above.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_group_by"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Targets aggregation hotspot — current plan aggregates late after joins; early reduction likely beneficial.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR condition on customer_address and ws_net_profit into three UNION ALL branches, each with a single state list and profit range.",
+      "dag_target_hint": "Replace the OR joinFilter (node 1.11) with a UNION ALL over three subqueries, each with fixed ca_state list and ws_net_profit range.",
+      "node_contract": {
+        "from_must_include": ["customer_address ca", "web_sales ws", "web_returns wr"],
+        "where_must_preserve": ["ca.ca_country = 'United States'"],
+        "output_must_preserve": ["All rows from original OR condition; no duplication"]
+      },
+      "gates_checked": [
+        "G_SF_UNION_BRANCH_LIMIT:PASS (3 branches acceptable)",
+        "multiplicity_guard_required:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Secondary OR condition may also block join optimization; splitting may improve join filter pushdown.",
+      "confidence": 0.65,
+      "expected_explain_delta": "JoinFilter replaced by separate join branches; each branch may enable better predicate pushdown.",
+      "recommended_patch_ops": ["split_or_to_union", "rewrite_from_clause"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — addresses second OR filter; lower confidence due to unknown Snowflake UNION ALL branch cost.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre‑filter selective dimension tables (date_dim, customer_demographics, customer_address, reason) into separate CTEs, then join with fact tables.",
+      "dag_target_hint": "Create CTEs for date_dim (d_year=2002), customer_demographics (filtered by marital/education status), customer_address (filtered by state), reason (no filter) before joining with web_sales/web_returns.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "customer_demographics cd1", "customer_demographics cd2", "customer_address ca", "reason r"],
+        "where_must_preserve": ["d.d_year = 2002", "cd1.cd_marital_status IN ('S','M','U')", "cd1.cd_education_status IN ('Primary','Secondary','2 yr Degree')", "ca.ca_country = 'United States'", "ca.ca_state IN (...)"],
+        "output_must_preserve": ["All original join keys and relationships"]
+      },
+      "gates_checked": [
+        "no_unfiltered_large_cte:PASS (dimension CTEs are tiny)",
+        "cross_cte_predicate_blindness:CAUTION (portability candidate)"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Pre‑filtering dimensions may create smaller hash tables and improve join performance, though Snowflake may already push filters.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension scans become CTE scans; join operators may show smaller build sides.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration — underrepresented family A; targets dimension joins.",
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Build staged CTE chain: filter dimensions first, join with fact tables progressively, reducing fact rows before later joins.",
+      "dag_target_hint": "Create CTE1 = filtered dimensions; CTE2 = join CTE1 with web_sales/web_returns on date_sk; CTE3 = join CTE2 with remaining dimensions.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "customer_demographics cd1", "customer_demographics cd2", "customer_address ca", "web_sales ws", "web_returns wr"],
+        "where_must_preserve": ["All original filter and join predicates"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": [
+        "no_unfiltered_large_cte:PASS (CTEs are filtered)",
+        "cross_cte_predicate_blindness:CAUTION (portability candidate)"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may improve join order and reduce intermediate row counts.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fewer rows in intermediate joins; earlier aggregation opportunities.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — family A; tests CTE‑based join reordering.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate each dimension table into its own CTE with filters applied, then join with fact tables.",
+      "dag_target_hint": "Create separate CTEs for date_dim, customer_demographics (cd1 and cd2), customer_address, reason, each with its filters, then join with web_sales and web_returns.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "customer_demographics cd1", "customer_demographics cd2", "customer_address ca", "reason r"],
+        "where_must_preserve": ["d.d_year = 2002", "cd1.cd_marital_status IN ('S','M','U')", "cd1.cd_education_status IN ('Primary','Secondary','2 yr Degree')", "ca.ca_country = 'United States'", "ca.ca_state IN (...)"],
+        "output_must_preserve": ["All join keys and relationships"]
+      },
+      "gates_checked": [
+        "no_unfiltered_large_cte:PASS",
+        "cross_cte_predicate_blindness:CAUTION (portability candidate)"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "CTE isolation may help Snowflake materialize small dimension results and improve join planning.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Dimension scans become CTE scans; join operators may show smaller build sides.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["dimension_cte_isolate"],
+      "rank_rationale": "Exploration — similar to p05 but more granular; tests CTE materialization benefit.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Isolate date_dim filter into a CTE and join with fact tables, potentially improving date_sk pushdown.",
+      "dag_target_hint": "Create CTE date_range AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2002), then join with web_sales and web_returns.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "web_sales ws", "web_returns wr"],
+        "where_must_preserve": ["d.d_year = 2002", "ws.ws_sold_date_sk = d.d_date_sk", "wr.wr_returned_date_sk? or infer from ws_sold_date_sk"],
+        "output_must_preserve": ["All original columns and join relationships"]
+      },
+      "gates_checked": [
+        "no_unfiltered_large_cte:PASS",
+        "cross_cte_predicate_blindness:CAUTION (portability candidate)"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "CTE isolation may help Snowflake push date_sk predicate into fact scans more effectively.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date_dim scan becomes CTE scan; fact scans may show reduced partitions.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — family A; focuses on date predicate pushdown via CTE.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Plan already uses explicit InnerJoin; no comma joins to convert."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "No correlated subquery requiring shared scan."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "No repeated scans of same fact table with different channel filters."
+    },
+    {
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "reason": "No multiple scalar subqueries on same table."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated subquery patterns in plan."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "No self‑join with different filter values."
+    }
+  ]
+}

@@ -1,0 +1,178 @@
+```json
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows two full WEB_SALES table scans (27579/27579 parts each) without partition pruning from date_dim filters, causing 900+ GB of I/O. EXISTS and NOT EXISTS are already decorrelated as semi/anti joins but still scan entire fact table. The primary bottleneck is missing predicate pushdown from date dimension to fact table scans.",
+    "reasoning_trace": [
+      "WEB_SALES scanned twice at full size (27579/27579 parts, 461GB each scan) despite date range filter on date_dim",
+      "SemiJoin and AntiJoin already implemented efficiently as hash joins, not nested loops",
+      "Dimension tables already pruned (date_dim 1/1 parts, customer_address 256/256 parts)",
+      "No aggregation pushdown opportunity before joins",
+      "No OR predicates or set operations requiring decomposition"
+    ],
+    "cost_spine": ["TableScan (WEB_SALES)", "TableScan (WEB_SALES)", "TableScan (WEB_RETURNS)", "SemiJoin", "AntiJoin", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "TableScan (WEB_SALES) [1.16]",
+        "why": "full scan without date filter pushdown",
+        "evidence": "parts=27579/27579 bytes=461041485824"
+      },
+      {
+        "op": "TableScan (WEB_SALES) [1.22]",
+        "why": "second full scan for EXISTS without date filter pushdown",
+        "evidence": "parts=27579/27579 bytes=461041485824"
+      },
+      {
+        "op": "TableScan (WEB_RETURNS)",
+        "why": "full scan without date filter pushdown",
+        "evidence": "parts=2289/2289 bytes=39149218304"
+      }
+    ],
+    "do_not_do": [
+      "do not materialize EXISTS/NOT EXISTS into broad CTE branches (violates G_SF_EXISTS_PROTECTED)",
+      "do not wrap date_sk column in functions that block pruning",
+      "do not introduce unfiltered large CTEs",
+      "do not convert comma joins if join-filter behavior is already effective"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit ws_ship_date_sk BETWEEN range derived from date_dim filter to main WEB_SALES scan and EXISTS branch WEB_SALES scan.",
+      "dag_target_hint": "Add predicate to TableScan nodes [1.16] and [1.22]",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim d"],
+        "where_must_preserve": ["d.d_date between '2002-9-01' and cast('2002-9-01' as date) + interval '60 day'", "ws1.ws_ship_date_sk = d.d_date_sk", "ws1.ws_list_price between 237 and 266"],
+        "output_must_preserve": ["all original output columns and aggregate semantics"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "WEB_SALES scan parts reduced from 27579/27579 to pruned partitions, bytes scanned drops substantially",
+      "recommended_patch_ops": ["add_predicate_to_scan", "derive_date_sk_range", "apply_to_both_fact_scans"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Primary hotspot - targets both full WEB_SALES scans with native Snowflake micro-partition pruning",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk range into EXISTS subquery by converting EXISTS to UNION ALL branches with explicit date range filter, then aggregate to remove duplicates.",
+      "dag_target_hint": "Modify SemiJoin branch [1.21-1.22] to include date range filter",
+      "node_contract": {
+        "from_must_include": ["web_sales ws2", "date_dim d"],
+        "where_must_preserve": ["ws1.ws_order_number = ws2.ws_order_number", "ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk"],
+        "output_must_preserve": ["EXISTS semantics (any matching row)"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_UNION_BRANCH_LIMIT:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "EXISTS subquery currently scans full WEB_SALES without date filter; pushing date range via UNION ALL may enable partition pruning",
+      "confidence": 0.65,
+      "expected_explain_delta": "Second WEB_SALES scan shows reduced partitions, SemiJoin input rows drop",
+      "recommended_patch_ops": ["convert_exists_to_union", "add_date_range_to_branch", "add_distinct_aggregation"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Secondary hotspot - targets second WEB_SALES scan via alternative pushdown method",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate WEB_SALES by ws_order_number before joining with dimensions, reducing join cardinality.",
+      "dag_target_hint": "Insert CTE before joins that groups ws_order_number with needed aggregates",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["ws_list_price between 237 and 266"],
+        "output_must_preserve": ["COUNT(DISTINCT ws_order_number) = COUNT(ws_order_number) after pushdown", "SUM(ws_ext_ship_cost) unchanged", "SUM(ws_net_profit) unchanged"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none", "G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Join input rows reduce dramatically, Aggregate operator moves earlier in plan",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "verify_distinct_count"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Targets join amplification - pre-aggregation reduces rows entering multi-way joins",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate two WEB_SALES scans into single scan with CASE labeling for main vs EXISTS branch, enabling single-pass fact table read.",
+      "dag_target_hint": "Replace both WEB_SALES scans [1.16] and [1.22] with single consolidated scan",
+      "node_contract": {
+        "from_must_include": ["web_sales"],
+        "where_must_preserve": ["date range filter from probe p01", "ws_list_price between 237 and 266"],
+        "output_must_preserve": ["All columns needed for both main query and EXISTS check"]
+      },
+      "gates_checked": ["G_SF_EXISTS_PROTECTED:PASS", "G_SF_CTE_REUSE_RULE:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Two full WEB_SALES scans might be consolidated into one with conditional logic, reducing I/O by ~50%",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single WEB_SALES scan appears instead of two, total bytes scanned reduces by ~50%",
+      "recommended_patch_ops": ["consolidate_scans", "add_case_labels", "rewrite_exists_logic"],
+      "recommended_examples": ["channel_bitmap_aggregation"],
+      "rank_rationale": "Exploration - attempts to eliminate redundant fact table scan via single-pass aggregation"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in plan - EXISTS/NOT EXISTS already optimized as semi/anti joins"
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in plan - simple EXISTS already decorrelated"
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence"
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query"
+    },
+    {
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "reason": "Dimension tables already fully pruned (date_dim 1/1, customer_address 256/256) - negligible I/O reduction"
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Dimension tables already fully pruned - adding CTEs would not reduce I/O and might inline"
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "All joins are already inner joins - no LEFT JOIN to convert"
+    }
+  ]
+}
+```

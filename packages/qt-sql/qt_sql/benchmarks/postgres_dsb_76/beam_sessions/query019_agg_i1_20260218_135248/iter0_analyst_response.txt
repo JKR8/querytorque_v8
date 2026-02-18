@@ -1,0 +1,175 @@
+{  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary bottleneck is nested-loop amplification from fact table (store_sales) joining with selective dimensions after large intermediate result. The plan shows a Hash Join producing 18255 rows feeding nested loops with 1000x amplification, and cardinality underestimation (est=4, act=103) at customer join indicates poor selectivity propagation.",
+    "reasoning_trace": [
+      "Hash Join (rows=18255, time=155ms) is largest I/O volume before nested-loop amplification.",
+      "Nested Loop with customer shows severe cardinality underestimation (est=4, act=103) indicating poor filter propagation.",
+      "Final aggregate reduces 2 rows to 1 row, but upstream join work dominates runtime.",
+      "Plan uses comma joins (implicit joins) which may limit optimizer's join reordering."
+    ],
+    "cost_spine": ["Hash Join", "Nested Loop", "Nested Loop", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Hash Join",
+        "why": "largest intermediate result before nested-loop amplification",
+        "evidence": "rows=18255 time=155ms"
+      },
+      {
+        "op": "Nested Loop (customer)",
+        "why": "severe cardinality underestimation causing poor join planning",
+        "evidence": "est=4 act=103 q-error=25.75"
+      },
+      {
+        "op": "Nested Loop (store_sales-date_dim)",
+        "why": "fact table scan with selective date filter but joined before other filters",
+        "evidence": "rows=1848 time=13.7ms per scan"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION transforms (PostgreSQL BitmapOr handles indexed OR)",
+      "avoid materializing EXISTS paths (PostgreSQL semi-join optimization)",
+      "avoid duplicating large CTE bodies",
+      "do not split same-column OR predicates"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma joins to explicit JOIN syntax and pre-filter all selective dimensions (date_dim, item, customer, customer_address, store) into MATERIALIZED CTEs before joining with store_sales.",
+      "dag_target_hint": "Replace final_select FROM clause with CTE chain and explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales", "item", "customer", "customer_address", "store"],
+        "where_must_preserve": ["i_category = 'Jewelry'", "d_year=2002", "d_moy=4", "ca_state='IL'", "c_birth_month=1", "ss_wholesale_cost BETWEEN 35 AND 55", "substring(ca_zip,1,5) <> substring(s_zip,1,5)"],
+        "output_must_preserve": ["i_brand_id", "i_brand", "i_manufact_id", "i_manufact", "sum(ss_ext_sales_price)", "GROUP BY and ORDER BY columns"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Hash Join replaced by multiple small hash tables from CTEs; nested loops eliminated; better cardinality estimates.",
+      "recommended_patch_ops": ["insert_cte_date_dim", "insert_cte_item", "insert_cte_customer", "insert_cte_customer_address", "insert_cte_store", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Targets primary hotspot (Hash Join) and comma-join weakness with native PostgreSQL transform.",
+      "recommended_examples": ["pg_explicit_join_materialized", "pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_explicit_join_materialized"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Isolate date_dim filter into MATERIALIZED CTE and convert comma joins to explicit JOIN syntax, enabling better join order optimization.",
+      "dag_target_hint": "Change final_select FROM clause to start with date_cte and explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales"],
+        "where_must_preserve": ["d_year=2002", "d_moy=4"],
+        "output_must_preserve": ["all original output columns and aggregation"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Small date CTE hash table built first; fact table scan reduced via early join; nested loops may remain but with better driver.",
+      "recommended_patch_ops": ["insert_cte_date_dim", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Addresses comma-join weakness and provides early filtering for date dimension.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_materialized_dimension_fact_prefilter",
+      "family": "C",
+      "target": "Create MATERIALIZED CTEs for selective dimensions (item, customer, customer_address, store) and pre-join them with store_sales before final aggregation.",
+      "dag_target_hint": "Insert CTEs before final_select and modify FROM to join pre-filtered fact set.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "customer", "customer_address", "store"],
+        "where_must_preserve": ["i_category = 'Jewelry'", "ca_state='IL'", "c_birth_month=1", "ss_wholesale_cost BETWEEN 35 AND 55", "substring(ca_zip,1,5) <> substring(s_zip,1,5)"],
+        "output_must_preserve": ["grouping keys and aggregate sum"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Non-equi join condition (zip substring inequality) may benefit from staged reduction of both dimension and fact tables before final join.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced rows entering final join; better cardinality estimates for customer join.",
+      "recommended_patch_ops": ["insert_cte_item_filtered", "insert_cte_customer_filtered", "insert_cte_customer_address_filtered", "insert_cte_store_filtered", "insert_cte_fact_prejoined"],
+      "rank_rationale": "Exploration targeting secondary hotspot (cardinality underestimation) and non-equi join condition.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Pre-filter all dimensions into CTEs and use explicit joins, focusing on early reduction of customer and customer_address to address cardinality underestimation.",
+      "dag_target_hint": "Add CTEs for each dimension with filters and rewrite final_select with explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address"],
+        "where_must_preserve": ["c_birth_month=1", "ca_state='IL'", "substring(ca_zip,1,5) <> substring(s_zip,1,5)"],
+        "output_must_preserve": ["all original joins and aggregates"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:SKIP_PATHOLOGY", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering of customer and customer_address may improve cardinality estimates and reduce nested-loop amplification.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Customer join cardinality estimate improves; nested-loop rows reduced.",
+      "recommended_patch_ops": ["insert_cte_customer_filtered", "insert_cte_customer_address_filtered", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Exploration targeting cardinality underestimation hotspot with early filtering.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; transform not applicable."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation is already on fact table; pre-aggregation would lose dimension filters needed for joins."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join pattern in query; single scan of each table."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Snowflake-specific transform; not native to PostgreSQL."
+    },
+    {
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "reason": "Portability candidate with caution note (MAX_2_CHAINS); query has 6 tables, risk of over-complication."
+    }
+  ]
+}

@@ -1,0 +1,326 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query performs multiple full scans of large fact tables across different CTEs and subqueries, leading to high I/O volume. INTERSECT operations may materialize intermediate sets, and aggregation occurs after large joins, suggesting opportunities for early filtering, scan consolidation, and aggregation pushdown.",
+    "reasoning_trace": [
+      "Fact table scans account for terabytes of I/O: STORE_SALES 1.25TB, CATALOG_SALES 0.92TB, WEB_SALES 0.46TB.",
+      "Repeated scans of the same fact tables in cross_items, avg_sales, and main query indicate redundant I/O.",
+      "INTERSECT operations in cross_items CTE could be optimized to semi-joins to avoid full materialization.",
+      "Aggregates are computed after joining with dimension tables, allowing for pre-aggregation to reduce row flow."
+    ],
+    "cost_spine": ["SortWithLimit", "InnerJoin", "Aggregate", "TableScan (STORE_SALES)"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest I/O volume and repeated scans",
+        "evidence": "bytes=1251924090880, scanned in multiple plan nodes"
+      },
+      {
+        "op": "INTERSECT operations in cross_items",
+        "why": "potential materialization of large sets",
+        "evidence": "present in SQL and plan as semi-joins and aggregates"
+      },
+      {
+        "op": "Aggregate after join in main query",
+        "why": "late aggregation increases row flow",
+        "evidence": "group by after joining store_sales with item"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns unnecessarily",
+      "ensure date_sk pushdown semantics preserve original date filters"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk range derived from date_dim filters (d_year between 1999 and 2001) into each branch of the UNION ALL in avg_sales CTE, adding sold_date_sk BETWEEN clauses to store_sales, catalog_sales, and web_sales scans.",
+      "dag_target_hint": "Modify avg_sales CTE SQL to include date_sk range in fact table joins.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales ss", "catalog_sales cs", "web_sales ws"],
+        "where_must_preserve": ["d.d_year between 1999 and 2001", "ss_wholesale_cost between 35 and 55", "cs_wholesale_cost between 35 and 55", "ws_wholesale_cost between 35 and 55"],
+        "output_must_preserve": ["average_sales calculation"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Fact table scans show date_sk range filters, reducing micro-partition reads.",
+      "recommended_patch_ops": ["add_date_sk_range_to_fact_scans", "modify_union_branches"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary I/O hotspot with native Snowflake transform for partition pruning.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Consolidate repeated scans of fact tables into shared CTEs, e.g., create a CTE that scans store_sales once with common filters and reuse it in cross_items and main query.",
+      "dag_target_hint": "Introduce new CTEs for shared fact scans and update references in cross_items and final_select.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "date_dim d"],
+        "where_must_preserve": ["ss_wholesale_cost between 35 and 55", "d.d_year between 1999 and 2001"],
+        "output_must_preserve": ["ss_item_sk and other necessary columns for downstream joins"]
+      },
+      "gates_checked": ["no_orphaned_scans:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Sharing scans across CTEs could reduce I/O by avoiding redundant reads of the same data.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduced number of TableScan operators for fact tables.",
+      "recommended_patch_ops": ["create_shared_cte", "replace_scan_references"],
+      "recommended_examples": [],
+      "rank_rationale": "Addresses repeated scan hotspot with potential I/O reduction.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_item_sk before joining with item table in the main query, computing sum(ss_quantity*ss_list_price) and count(*) at the item level.",
+      "dag_target_hint": "Modify final_select SQL to include a CTE for pre-aggregated store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss"],
+        "where_must_preserve": ["ss_wholesale_cost between 35 and 55", "ss_sold_date_sk join conditions"],
+        "output_must_preserve": ["grouping keys compatible with item attributes", "aggregate values for sales and count"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Aggregate pushed down before join, reducing rows flowing into the join.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Targets late aggregation hotspot with known effective transform.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT operations in cross_items CTE with EXISTS subqueries to avoid materializing full result sets, using semi-joins.",
+      "dag_target_hint": "Rewrite cross_items CTE SQL to use EXISTS instead of INTERSECT.",
+      "node_contract": {
+        "from_must_include": ["item i", "store_sales ss", "catalog_sales cs", "web_sales ws", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["i_category in ('Electronics', 'Jewelry', 'Men')", "i_manager_id between 91 and 100", "date filters", "wholesale_cost filters"],
+        "output_must_preserve": ["ss_item_sk output"]
+      },
+      "gates_checked": ["no_materialization_of_exists:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Converting INTERSECT to EXISTS might enable semi-join optimizations and reduce intermediate materialization.",
+      "confidence": 0.60,
+      "expected_explain_delta": "INTERSECT operators replaced with SemiJoin operators, potentially with early stop.",
+      "recommended_patch_ops": ["replace_intersect_with_exists", "adjust_join_conditions"],
+      "recommended_examples": ["intersect_to_exists"],
+      "rank_rationale": "Addresses set operation hotspot with potential for reduced computation.",
+      "gold_example_id": "intersect_to_exists"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk range into individual fact table joins in cross_items and main query, adding sold_date_sk BETWEEN clauses where date_dim is joined.",
+      "dag_target_hint": "Modify join conditions in cross_items and final_select to include date_sk range.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales ss", "catalog_sales cs", "web_sales ws"],
+        "where_must_preserve": ["d.d_year between 1999 and 2001", "wholesale_cost filters"],
+        "output_must_preserve": ["join semantics and output columns"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Fact table scans show date_sk range filters, improving partition pruning.",
+      "recommended_patch_ops": ["add_date_sk_range_to_joins", "update_filter_predicates"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Extends date pushdown to all fact joins for comprehensive I/O reduction.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate multiple aggregate computations in avg_sales CTE into a single scan with CASE expressions, reducing passes over fact tables.",
+      "dag_target_hint": "Rewrite avg_sales CTE SQL to compute all aggregates in one pass using conditional aggregation.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "catalog_sales cs", "web_sales ws", "date_dim d"],
+        "where_must_preserve": ["d.d_year between 1999 and 2001", "wholesale_cost filters"],
+        "output_must_preserve": ["average_sales calculation"]
+      },
+      "gates_checked": ["no_duplicate_scans:PASS", "aggregate_semantics_preserved:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass aggregation could reduce compute overhead by minimizing fact table scans.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Fewer TableScan and Aggregate operators in avg_sales path.",
+      "recommended_patch_ops": ["consolidate_aggregates", "use_case_expressions"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration for compute reduction in avg_sales CTE.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "target": "Convert cascading INTERSECT operations in cross_items into correlated EXISTS subqueries with pre-materialized date and channel CTEs for finer control.",
+      "dag_target_hint": "Restructure cross_items CTE with separate CTEs for each channel and date filter, then use EXISTS joins.",
+      "node_contract": {
+        "from_must_include": ["item i", "store_sales ss", "catalog_sales cs", "web_sales ws", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["i_category filters", "i_manager_id range", "date filters", "wholesale_cost filters"],
+        "output_must_preserve": ["ss_item_sk output"]
+      },
+      "gates_checked": ["no_materialization_of_exists:PASS", "semantic_equivalence:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Alternative INTERSECT decomposition might better leverage Snowflake's semi-join optimizations.",
+      "confidence": 0.50,
+      "expected_explain_delta": "More granular SemiJoin operators with pre-filtered CTEs.",
+      "recommended_patch_ops": ["create_channel_ctes", "replace_intersect_with_exists_cte"],
+      "recommended_examples": ["intersect_to_exists"],
+      "rank_rationale": "Secondary exploration for set operation optimization.",
+      "gold_example_id": "intersect_to_exists"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize shared fact-dimension scans into CTEs to avoid recomputation in self-join patterns, adapted for Snowflake semantics.",
+      "dag_target_hint": "Introduce MATERIALIZED CTEs for repeated scan patterns in cross_items and main query.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "catalog_sales cs", "web_sales ws", "date_dim d"],
+        "where_must_preserve": ["date filters", "wholesale_cost filters"],
+        "output_must_preserve": ["necessary keys and aggregates for downstream use"]
+      },
+      "gates_checked": ["no_orphaned_scans:PASS", "cte_reuse_justified:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materialization might reduce repeated compute despite Snowflake's inline tendencies for single-ref CTEs.",
+      "confidence": 0.45,
+      "expected_explain_delta": "CTE materialization nodes appear, reducing subtree rescans.",
+      "recommended_patch_ops": ["add_materialized_cte", "update_references"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration for materialization benefits in repeated scan contexts.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose any residual correlated scalar subqueries into CTEs for shared scan and threshold computation, though evidence is weak.",
+      "dag_target_hint": "Identify and rewrite scalar subqueries in HAVING or WHERE into standalone CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "date_dim d"],
+        "where_must_preserve": ["original filter predicates"],
+        "output_must_preserve": ["scalar subquery results"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:FAIL", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Potential decorrelation opportunity if scalar subqueries are not already optimized.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Correlated branches replaced with CTE joins, reducing per-row execution.",
+      "recommended_patch_ops": ["create_threshold_cte", "replace_subquery"],
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "rank_rationale": "Low-confidence exploration for family B due to weak evidence.",
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize selective date filters into CTEs and convert comma joins to explicit JOIN syntax for better join planning.",
+      "dag_target_hint": "Modify join patterns in cross_items and main query to use explicit JOINs with pre-filtered date CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales ss", "catalog_sales cs", "web_sales ws"],
+        "where_must_preserve": ["date filters", "join conditions"],
+        "output_must_preserve": ["join semantics and output columns"]
+      },
+      "gates_checked": ["join_semantics_preserved:PASS", "explicit_join_benefit:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit joins with materialized dimension CTEs might improve join order and cardinality estimates.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Join operators show smaller build sides and improved filter pushdown.",
+      "recommended_patch_ops": ["create_date_cte", "convert_to_explicit_join"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration for join topology optimization with dimension isolation.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate channel-specific aggregates (store, catalog, web) into a single scan with conditional aggregation for avg_sales or main query.",
+      "dag_target_hint": "Rewrite aggregate computations to use CASE expressions per channel in a unified CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "catalog_sales cs", "web_sales ws", "date_dim d"],
+        "where_must_preserve": ["date filters", "wholesale_cost filters"],
+        "output_must_preserve": ["channel-specific aggregates and totals"]
+      },
+      "gates_checked": ["no_duplicate_scans:PASS", "aggregate_semantics_preserved:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Channel consolidation could reduce fact table scans and aggregate overhead.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Reduced number of scan and aggregate operators across channels.",
+      "recommended_patch_ops": ["unify_channel_aggregates", "use_conditional_aggregation"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration for aggregation efficiency across multiple sales channels.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit joins in WHERE clauses to explicit INNER JOIN syntax where applicable, though Snowflake may already optimize this.",
+      "dag_target_hint": "Adjust SQL in final_select and cross_items to use explicit JOIN keywords.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss", "item i", "date_dim d"],
+        "where_must_preserve": ["join conditions", "filter predicates"],
+        "output_must_preserve": ["output columns and join semantics"]
+      },
+      "gates_checked": ["join_semantics_preserved:PASS", "explicit_join_benefit:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax might provide marginal planning benefits or clarity.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Join operators remain similar but with explicit syntax.",
+      "recommended_patch_ops": ["convert_to_explicit_join"],
+      "recommended_examples": ["inner_join_conversion"],
+      "rank_rationale": "Low-priority exploration for join syntax optimization.",
+      "gold_example_id": "inner_join_conversion"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery detected; already decorrelated or not applicable based on plan evidence."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "Engine-specific for PostgreSQL, not native to Snowflake and evidence does not support portability."
+    },
+    {
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "reason": "Portability candidate with low baseline caution; native Snowflake transforms preferred for date pushdown."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Portability candidate; native sf_sk_pushdown transforms provide similar benefits with better Snowflake integration."
+    }
+  ]
+}

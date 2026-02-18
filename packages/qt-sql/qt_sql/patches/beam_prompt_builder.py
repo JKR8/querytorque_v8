@@ -693,12 +693,19 @@ def build_beam_compiler_prompt(
     # BDA table for all probes (primary evidence surface).
     bda_lines = [
         "## BDA Table (all probes)\n",
-        "| Probe | Transform | Family | Status | Failure Category | Speedup | Top EXPLAIN Nodes | Model Description | SQL Patch | Failure Reason | Partial Work | Error/Notes |",
-        "|-------|-----------|--------|--------|------------------|---------|-------------------|-------------------|-----------|----------------|--------------|-------------|",
+        "| Probe | Transform | Family | Status | Failure Category | Speedup | Rank Rationale | Top EXPLAIN Nodes | Model Description | SQL Patch | Failure Reason | Partial Work | Error/Notes |",
+        "|-------|-----------|--------|--------|------------------|---------|----------------|-------------------|-------------------|-----------|----------------|--------------|-------------|",
     ]
     for s in strike_results:
         speedup = s.get("speedup")
-        speedup_str = f"{speedup:.2f}x" if speedup else "-"
+        orig_ms = s.get("original_ms")
+        ptch_ms = s.get("patch_ms")
+        if speedup and orig_ms and ptch_ms:
+            speedup_str = f"{speedup:.2f}x ({orig_ms:.0f}→{ptch_ms:.0f}ms)"
+        elif speedup:
+            speedup_str = f"{speedup:.2f}x"
+        else:
+            speedup_str = "-"
         error_str = _safe_md_cell(s.get("error") or "")
         failure_category = _safe_md_cell(s.get("failure_category") or "-")
         top_nodes = _safe_md_cell(
@@ -714,12 +721,13 @@ def build_beam_compiler_prompt(
             )
         else:
             partial_work_str = "-"
+        rank_rationale = _safe_md_cell(s.get("rank_rationale") or "-")
         bda_lines.append(
             f"| {_safe_md_cell(s.get('probe_id', '?'))} | "
                 f"{_safe_md_cell(s.get('transform_id', '?'))} | "
                 f"{_safe_md_cell(s.get('family', '?'))} | "
                 f"{_safe_md_cell(s.get('status', '?'))} | "
-                f"{failure_category} | {speedup_str} | {top_nodes} | {description} | {sql_ref} | {failure_reason} | {partial_work_str} | {error_str} |"
+                f"{failure_category} | {speedup_str} | {rank_rationale} | {top_nodes} | {description} | {sql_ref} | {failure_reason} | {partial_work_str} | {error_str} |"
         )
     dynamic.append("\n".join(bda_lines))
 
@@ -729,7 +737,14 @@ def build_beam_compiler_prompt(
         sql_sections = ["## Worker SQL Patches\n"]
         for s in sql_entries:
             speedup = s.get("speedup")
-            speedup_str = f"{speedup:.2f}x" if speedup else "n/a"
+            orig_ms = s.get("original_ms")
+            ptch_ms = s.get("patch_ms")
+            if speedup and orig_ms and ptch_ms:
+                speedup_str = f"{speedup:.2f}x ({orig_ms:.0f}ms→{ptch_ms:.0f}ms)"
+            elif speedup:
+                speedup_str = f"{speedup:.2f}x"
+            else:
+                speedup_str = "n/a"
             sql_sections.append(
                 f"### {s.get('probe_id', '?')}: {s.get('transform_id', '?')} "
                 f"({s.get('status', '?')}, {speedup_str})\n"
@@ -746,7 +761,7 @@ def build_beam_compiler_prompt(
     return "\n\n".join(
         [
             "## Role",
-            "You are a Principal SQL Optimization Reviewer. Output one tree object or a JSON array with exactly two tree objects.",
+            "You are a Principal SQL Optimization Reviewer. Output one tree object or a JSON array of one to four tree objects.",
             "## Cache Boundary",
             "Everything below is query-specific input.",
         ]

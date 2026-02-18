@@ -275,11 +275,11 @@ def test_analyst_template_has_strict_schema_and_invalid_boundary_examples() -> N
     assert "## Terminology (normative)" in text
     assert "## Input Contract" in text
     assert "## Decision Priority Ladder" in text
-    assert "## Probe-count Policy (deterministic)" in text
+    assert "## Probe-count Policy" in text
     assert "## Gold Example Routing Policy" in text
     assert "set `gold_example_id` to the best-fit gold id" in text
     assert "Diversity rule for non-gold probes" in text
-    assert "### Complexity evidence score (CES)" in text
+    assert "stars=2" in text  # probe-count policy references star levels
     assert "Top-level schema:" in text
     assert "Dispatch schema:" in text
     assert "Probe item schema:" in text

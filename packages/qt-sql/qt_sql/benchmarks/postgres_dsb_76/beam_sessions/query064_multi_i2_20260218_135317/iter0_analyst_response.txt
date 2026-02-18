@@ -1,0 +1,322 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query suffers from a massive nested-loop explosion starting with a Merge Join producing 604 rows that then drives 157,863 rows through a nested loop with store_returns and store_sales, ultimately creating ~24K rows where 1 was expected. This indicates severe cardinality misestimation at the fact-table join boundary, causing PostgreSQL to choose nested loops when hash joins might be more appropriate. The primary bottleneck is the Merge Join and subsequent nested loop chain, consuming ~95% of total runtime.",
+    "reasoning_trace": [
+      "Merge Join (rows=604, time=25859ms) joins item scan with cs_ui aggregate, then nested loop with store_returns (rows=261) explodes to 157,863 rows.",
+      "Cardinality estimation error: Nested Loop estimated 1 row, actual ~24K rows (24,000x under-estimate).",
+      "Plan shows no correlated subqueries or OR predicates; all joins are explicit but use comma-syntax.",
+      "Large fact-table scans (catalog_sales 573K rows, catalog_returns 719K rows) dominate early I/O.",
+      "Final self-join of cross_sales CTE shows zero rows, suggesting early pruning possible."
+    ],
+    "cost_spine": [
+      "Merge Join (item ↔ cs_ui aggregate)",
+      "Nested Loop (Merge Join result ↔ store_returns)",
+      "Nested Loop (result ↔ store_sales)",
+      "Chain of dimension table nested loops (hd1, ad1, d1, cd1, store, customer, d3, hd2, d2, ib2, cd2, promotion, ad2, ib1)"
+    ],
+    "hotspots": [
+      {
+        "op": "Merge Join",
+        "why": "Drives entire nested-loop chain; misestimation causes catastrophic join strategy",
+        "evidence": "rows=604 time=25859ms"
+      },
+      {
+        "op": "Nested Loop (after Merge Join)",
+        "why": "Amplifies 604 rows to 157,863 rows due to store_returns/store_sales loops",
+        "evidence": "rows=157863 time=57364ms"
+      },
+      {
+        "op": "cs_ui Aggregate",
+        "why": "Scans two large fact tables (catalog_sales 573K, catalog_returns 719K) before filtering",
+        "evidence": "rows=58699 time=23982ms"
+      }
+    ],
+    "do_not_do": [
+      "Avoid OR-to-UNION transforms (no OR predicates present)",
+      "Avoid decorrelation transforms (no correlated subqueries)",
+      "Avoid duplicating the 13-table cross_sales CTE body",
+      "Avoid materializing EXISTS paths (none exist)",
+      "Do not split indexed OR predicates"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit JOIN syntax and pre-filter date_dim tables d1, d2, d3 into separate CTEs with their respective filters, then join these CTEs explicitly with store_sales and customer.",
+      "dag_target_hint": "Replace cross_sales node FROM clause with explicit JOINs and add date_cte_d1, date_cte_d2, date_cte_d3 CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "cs_ui", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["ss_sold_date_sk = d1.d_date_sk", "c_first_sales_date_sk = d2.d_date_sk", "c_first_shipto_date_sk = d3.d_date_sk"],
+        "output_must_preserve": ["d1.d_year as syear", "d2.d_year as fsyear", "d3.d_year as s2year"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_EXPLICIT_JOIN_STYLE:PASS", "G_PG_COMMA_FACT_FANOUT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Merge Join replaced by Hash Join with smaller build side; nested loops on dimension tables reduced or eliminated.",
+      "recommended_patch_ops": ["insert_cte date_cte_d1", "insert_cte date_cte_d2", "insert_cte date_cte_d3", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot: comma-join weakness and date-dimension filtering blindness.",
+      "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter all selective dimension tables (customer_demographics cd1, cd2, promotion, customer_address ad1, ad2, household_demographics hd1, hd2, income_band ib1, ib2) into CTEs before joining with fact tables, ensuring filters are applied before large scans.",
+      "dag_target_hint": "Create CTEs for each dimension with their selective predicates, then rewrite cross_sales FROM to reference these CTEs.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2", "promotion", "customer_address ad1", "customer_address ad2"],
+        "where_must_preserve": ["cd1.cd_marital_status in ('S','S','S')", "cd2.cd_marital_status in ('S','S','S')", "p_channel_email='Y'", "ad2.ca_state in ('KS','OH','VA')"],
+        "output_must_preserve": ["cd1.cd_demo_sk", "cd2.cd_demo_sk", "p_promo_sk", "ad1.ca_address_sk", "ad2.ca_address_sk"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:MANUAL_REVIEW", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Dimension tables become tiny hash tables; nested loops replaced by hash joins; fact table scan rows reduced.",
+      "recommended_patch_ops": ["insert_cte cd1_filtered", "insert_cte cd2_filtered", "insert_cte promotion_filtered", "insert_cte ad1_filtered", "insert_cte ad2_filtered", "replace_from"],
+      "rank_rationale": "Addresses secondary hotspot: dimension filters applied late; prefetch reduces fact scan volume.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "multi_dimension_prefetch"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales and catalog_returns by cs_item_sk with the wholesale_cost filter before the join, reducing the cs_ui CTE output from 58K rows to a smaller keyset.",
+      "dag_target_hint": "Rewrite cs_ui CTE to pre-filter and aggregate catalog_sales and catalog_returns separately before joining.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 76 AND 96", "cs_item_sk = cr_item_sk", "cs_order_number = cr_order_number"],
+        "output_must_preserve": ["cs_item_sk", "sum(cs_ext_list_price) as sale", "sum(cr_refunded_cash+cr_reversed_charge+cr_store_credit) as refund"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "cs_ui aggregate rows drop significantly; Merge Join input size reduced; nested loop chain shrinks.",
+      "recommended_patch_ops": ["replace_cte cs_ui"],
+      "rank_rationale": "Targets cs_ui aggregate hotspot: pre-aggregation reduces rows before expensive Merge Join.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the cross_sales CTE once, then create two derived CTEs (cs1, cs2) that filter on syear=2000 and syear=2001 respectively, replacing the final self-join with joins between these materialized CTEs.",
+      "dag_target_hint": "Add MATERIALIZED keyword to cross_sales CTE, create cs1_filtered and cs2_filtered CTEs, rewrite final_select to join them.",
+      "node_contract": {
+        "from_must_include": ["cross_sales cs1", "cross_sales cs2"],
+        "where_must_preserve": ["cs1.syear = 2000", "cs2.syear = 2000 + 1", "cs1.item_sk = cs2.item_sk"],
+        "output_must_preserve": ["cs1.product_name", "cs1.store_name", "cs2.cnt", "cs1.s1", "cs2.s1"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing cross_sales may allow PostgreSQL to better estimate join cardinalities and avoid nested loops in the final self-join, which currently yields zero rows.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Final self-join nested loop replaced by hash join; zero-row result detected earlier.",
+      "recommended_patch_ops": ["modify_cte cross_sales add_materialized", "insert_cte cs1_filtered", "insert_cte cs2_filtered", "replace_final_select"],
+      "rank_rationale": "Exploration targeting final self-join inefficiency; materialization may improve planner estimates.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create a MATERIALIZED CTE that pre-joins store_sales with filtered store_returns and filtered cs_ui, applying all selective dimension filters early, then join this reduced fact set with remaining dimensions.",
+      "dag_target_hint": "Create a new CTE 'filtered_facts' that joins store_sales, store_returns, cs_ui with selective predicates, then rewrite cross_sales to use this CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "cs_ui"],
+        "where_must_preserve": ["ss_item_sk = sr_item_sk", "ss_ticket_number = sr_ticket_number", "ss_item_sk = cs_ui.cs_item_sk", "ss_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["ss_item_sk", "ss_customer_sk", "ss_store_sk", "ss_promo_sk", "ss_cdemo_sk", "ss_hdemo_sk", "ss_addr_sk"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:SKIP", "G_PG_NONEQUI_CARDINALITY:SKIP", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staging the fact-table joins with early filters into a materialized CTE may reduce the nested-loop explosion by providing accurate cardinality estimates to the planner.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Nested loop chain on store_sales/store_returns replaced by a single hash join in CTE; downstream dimension joins become hash joins.",
+      "recommended_patch_ops": ["insert_cte filtered_facts", "replace_from"],
+      "rank_rationale": "Exploration targeting the store_sales/returns nested loop amplification; materialized prefilter may break misestimation chain.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN predicates to catalog_sales and catalog_returns scans by inferring date range from date_dim joins (though not directly joined). This is speculative and requires deriving date bounds from other parts of query.",
+      "dag_target_hint": "Modify cs_ui CTE to add cs_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_year=2001) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_year=2001) based on outer query's d1.d_year=2001 filter.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["cs_item_sk", "sale", "refund"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_SCALE_GUARD:MANUAL_REVIEW", "portability_candidate:EXPLORATION"],
+      "exploration": true,
+      "exploration_hypothesis": "The cs_ui CTE lacks date filters, but the outer query filters on d1.d_year=2001; pushing derived date_sk bounds into cs_ui may prune catalog fact scans dramatically.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Catalog fact table scans reduce rows via date_sk pruning; cs_ui aggregate output shrinks.",
+      "recommended_patch_ops": ["replace_cte cs_ui add_date_predicate"],
+      "rank_rationale": "Exploration targeting catalog fact scan volume; portability candidate with uncertain PostgreSQL efficacy.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate the multiple aggregate columns (s1, s2, s3) in cross_sales CTE into a single CASE-based aggregation pass over store_sales to reduce expression evaluation overhead.",
+      "dag_target_hint": "Rewrite cross_sales CTE's SELECT list to compute sum(CASE WHEN ... THEN ss_wholesale_cost END) as s1, etc., in a single scan.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["sum(ss_wholesale_cost) s1", "sum(ss_list_price) s2", "sum(ss_coupon_amt) s3"]
+      },
+      "gates_checked": ["portability_candidate:EXPLORATION"],
+      "exploration": true,
+      "exploration_hypothesis": "The cross_sales CTE aggregates three separate columns; consolidating into a single-pass conditional aggregation may reduce CPU overhead.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Aggregate node may show reduced CPU cost; same row count.",
+      "recommended_patch_ops": ["replace_select_list cross_sales"],
+      "rank_rationale": "Exploration targeting aggregate CPU; minor impact but safe.",
+      "recommended_examples": ["single_pass_aggregation"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Combine the separate promotion channel predicates (p_channel_email='Y', p_channel_tv='Y', p_channel_radio='Y') into a single bitmap OR condition and aggregate with conditional sums if needed.",
+      "dag_target_hint": "Modify cross_sales WHERE clause to use promotion.p_channel_email='Y' AND p_channel_tv='Y' AND p_channel_radio='Y' (already present). No change needed, but ensure index usage.",
+      "node_contract": {
+        "from_must_include": ["promotion"],
+        "where_must_preserve": ["p_channel_email = 'Y'", "p_channel_tv = 'Y'", "p_channel_radio = 'Y'"],
+        "output_must_preserve": []
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.40,
+      "expected_explain_delta": "No plan change; ensures promotion filter uses bitmap index scan.",
+      "recommended_patch_ops": ["ensure_index_hint promotion"],
+      "rank_rationale": "Low-impact safety probe; ensures promotion filter uses optimal index path.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL bitmap index scan already optimal for OR."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subqueries; transform mismatch."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar subqueries; also previous attempt failed."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries; Snowflake-specific."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No UNION in query; cross_sales CTE is not scanned multiple times with different filters."
+    },
+    {
+      "transform_id": "rollup_to_union_windowing",
+      "family": "D",
+      "reason": "No ROLLUP in query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOINs in query."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "No self-join of same CTE with different filter values; cross_sales self-join is on different years but same CTE."
+    },
+    {
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "reason": "No correlated EXISTS subqueries."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries; Snowflake-specific."
+    },
+    {
+      "transform_id": "deferred_window_aggregation",
+      "family": "C",
+      "reason": "No window functions in query."
+    },
+    {
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "reason": "No INTERSECT operations."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "Query uses only store and catalog channels, but dimension filters are not identical across channels."
+    },
+    {
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "reason": "Too many dimension tables (13) for staged chain; risk of CTE duplication."
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Similar to multi_dimension_prefetch but less comprehensive; prefer prefetch."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "No UNION ALL branches; Snowflake-specific."
+    }
+  ]
+}

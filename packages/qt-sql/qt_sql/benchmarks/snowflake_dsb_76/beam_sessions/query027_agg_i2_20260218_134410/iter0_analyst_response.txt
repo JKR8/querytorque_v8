@@ -1,0 +1,155 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The dominant cost is a full scan of the store_sales fact table (1.2TB) without partition pruning from dimension filters. Aggregation occurs after joins, missing early reduction. Secondary hotspot is multi-stage aggregation amplifying row flow.",
+    "reasoning_trace": [
+      "store_sales scan reads 70412 parts, 1.2TB, with no predicate pushdown from date_dim or other dimensions.",
+      "Aggregate nodes [1.13], [1.9], [1.4] show repeated aggregation before final rollup, indicating late reduction.",
+      "Dimension tables are fully pruned (parts=1/1) with selective filters, but filters are not pushed into fact scan.",
+      "No nested loops or repeated scans; joins are hash/merge but fact scan is the primary I/O bottleneck."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "InnerJoin (DATE_DIM)", "Aggregate (by ss_item_sk, s_state)", "Aggregate (by i_item_id, s_state)", "GroupingSets"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest I/O volume, no partition pruning from dimension filters",
+        "evidence": "parts=70412/72718, bytes=1212628258304"
+      },
+      {
+        "op": "Aggregate [1.13]",
+        "why": "early aggregation by (s_state, ss_item_sk, ss_sold_date_sk) but after joins, could be pushed earlier",
+        "evidence": "aggregate before date_dim join, input rows likely large"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS (no correlated subqueries present)",
+      "avoid unfiltered large CTEs",
+      "do not convert inner joins to left joins"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk range filter to store_sales scan derived from date_dim.d_year = 1999, using a CTE to precompute min/max date_sk.",
+      "dag_target_hint": "Insert CTE before final_select, modify store_sales scan predicate.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 1999", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "store_sales scan shows reduced partitions scanned due to date_sk range pushdown.",
+      "recommended_patch_ops": ["insert_cte", "add_predicate_to_scan"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Primary hotspot: targets fact table scan I/O reduction via partition pruning.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by all dimension foreign keys (ss_item_sk, ss_store_sk, ss_cdemo_sk, ss_sold_date_sk) before joining to dimensions, preserving sums and counts for final AVG.",
+      "dag_target_hint": "Replace store_sales scan and early aggregates with a single CTE that groups by foreign keys.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_sold_date_sk IS NOT NULL", "ss_cdemo_sk IS NOT NULL", "ss_store_sk IS NOT NULL"],
+        "output_must_preserve": ["sums and counts for ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregation after joins may process more rows than necessary; pushing aggregation earlier reduces join input.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Aggregate node moves below joins, reducing rows flowing into join operators.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_group_by"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Secondary hotspot: targets aggregation amplification, may reduce join cost.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter all dimension tables (date_dim, customer_demographics, store, item) into separate CTEs, then join them with store_sales in a single CTE to apply combined filters early.",
+      "dag_target_hint": "Create CTEs for each dimension with filters, then join with store_sales in a staging CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_demographics", "store", "item"],
+        "where_must_preserve": ["cd_gender = 'M'", "cd_marital_status = 'W'", "cd_education_status = 'Secondary'", "d_year = 1999", "s_state = 'OH'", "i_category = 'Music'"],
+        "output_must_preserve": ["all join keys and columns needed for final aggregation"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension selectivity may enable better join ordering and fact scan reduction.",
+      "confidence": 0.55,
+      "expected_explain_delta": "store_sales scan shows reduced rows due to early join with filtered dimension CTEs.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_where"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration: targets fact scan via multi-dimension prefetch, underrepresented family A.",
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate date_dim filter into a CTE returning only d_date_sk, then join with store_sales early to push date_sk range.",
+      "dag_target_hint": "Insert date_dim CTE before store_sales join, modify join condition.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 1999", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Isolating date_dim may enable better predicate pushdown and join ordering.",
+      "confidence": 0.50,
+      "expected_explain_delta": "store_sales scan shows reduced partitions due to date_sk filter pushdown.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["dimension_cte_isolate"],
+      "rank_rationale": "Exploration: secondary dimension isolation, low risk but may improve pruning.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subquery pattern in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "All joins are already inner joins; no LEFT JOIN to convert."
+    }
+  ]
+}

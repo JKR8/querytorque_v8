@@ -24,7 +24,7 @@ Success criterion per query:
 - aggregate thresholds: solve minimal cardinality/value
 - arithmetic join offsets: satisfy with paired keys (example: `week2 = week1 + 52`)
 4. Insert rows in FK-safe order.
-5. Execute query probe; if zero rows, run deterministic fallback recipes for known hard templates.
+5. Execute query probe; if zero rows, optional deterministic patch-pack fallback can be enabled.
 
 ## Implemented
 - AST schema/column normalization and type promotion from filters.
@@ -32,7 +32,7 @@ Success criterion per query:
 - Aggregate super-value solver for SUM/AVG/MAX/MIN thresholds.
 - Temporal anchor detection for date-heavy predicates.
 - Anti-pattern table skip logic (`NOT EXISTS`, `NOT IN`, `EXCEPT`).
-- Deterministic MVROWS fallback entrypoint (`_apply_mvrows_recipe`) with template handlers for known holdout families.
+- Patch-pack boundary for benchmark-specific fallback recipes (`--patch-pack dsb_mvrows`).
 - Simple UNSAT detector for obvious contradictions (for example `x <> x` under single-literal domain constraints).
 
 ## Determinism Rules
@@ -41,24 +41,35 @@ Success criterion per query:
 - Fixed recipe key spaces per query family.
 - Same SQL + same seed config => same inserted rows.
 
-## Known Current Gaps
-- Some query shapes still need pure-graph solving instead of family-specific recipe logic.
-- Ambiguous query variants that are semantically contradictory should be marked UNSAT deterministically.
-- Need wider arithmetic-constraint solver coverage (beyond current hardcoded patterns).
-- Example contradictory variant in current DSB76 set:
-  - `query064_multi_i2`: `cd1.cd_marital_status <> cd2.cd_marital_status` while both sides are constrained to `'S'` only.
-  - This is now detected as `unsat_expected` in validation output.
+## Predicate-Context Type Inference
 
-## Next Work (In Order)
-1. Replace family recipes with generic DAG/constraint solver passes:
-- branch solving for OR predicates
-- correlated aggregate constraints as symbolic inequalities
-- arithmetic equalities/offset relations across aliases
-2. Add UNSAT classification and reporting.
-3. Add tests:
-- every DSB76 query should be `ROWS>=1` or explicit `UNSAT`.
-- invariant test: rerun produces same witness rows for same query.
-4. Remove recipe-specific logic after generic solver reaches equivalent or better coverage.
+Column types inferred from name heuristics can be overridden when predicate
+context proves a different type:
+
+- `BETWEEN CAST('...' AS DATE) AND CAST('...' AS DATE)` → column is DATE
+- `col + INTERVAL '30' DAY > ...` → column is DATE
+- `col = CAST('...' AS DATE)` → column is DATE
+
+This fixes columns like `d_date` or `cal_date` being mistyped as DECIMAL.
+
+## Generic Temporal Dimension Detection
+
+The engine detects temporal dimension tables generically using
+`_is_temporal_dimension(table_name, columns)` which checks for:
+- Table name matches (date_dim, calendar, dim_date, etc.)
+- OR: has a DATE column + 2 temporal integer columns (year, month, quarter, etc.)
+
+No TPC-DS naming is required.
+
+## Multi-Row Witness Generation
+
+`MultiRowWitnessGenerator` (in `witness_generator.py`) generates additional
+data sets to increase semantic recall:
+
+1. **Clone witness**: Shifted surrogate keys (+10000), same values
+2. **Boundary-fail witness**: Perturbs one BETWEEN boundary by epsilon
+
+Usage: `validate_sql_pair(..., witness_mode="multi")`
 
 ## How To Run
 ```bash
@@ -69,8 +80,13 @@ python3 -m qt_sql.validation.build_dsb76_synthetic_db \
   --force-seed-attempts 16 \
   --force-seed-rows 1 \
   --min-query-rows 1 \
-  --preferred-query-rows 1
+  --preferred-query-rows 1 \
+  --patch-pack none
 ```
+
+Patch-pack options:
+- `none` (default): core AST/general flow only.
+- `dsb_mvrows`: enable DSB-specific witness recipes.
 
 ## Key File
 - `packages/qt-sql/qt_sql/validation/build_dsb76_synthetic_db.py`

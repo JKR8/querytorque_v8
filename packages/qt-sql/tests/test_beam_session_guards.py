@@ -395,7 +395,7 @@ def test_editor_strike_uses_single_worker_call(
         },
     )
 
-    def fake_make_llm_call_fn(provider_spec=None, model_spec=None):
+    def fake_make_llm_call_fn(provider_spec=None, model_spec=None, enable_reasoning=None):
         def _call(prompt: str) -> str:
             calls["llm"] += 1
             calls["prompt"] = prompt
@@ -496,10 +496,11 @@ def test_make_llm_call_fn_accepts_beam_override_model_and_provider(
     captured = {}
 
     class StubGenerator:
-        def __init__(self, provider=None, model=None, analyze_fn=None):
+        def __init__(self, provider=None, model=None, analyze_fn=None, enable_reasoning=None):
             captured["provider"] = provider
             captured["model"] = model
             captured["analyze_fn"] = analyze_fn
+            captured["enable_reasoning"] = enable_reasoning
             self._llm_client = SimpleNamespace(last_usage={})
 
     monkeypatch.setattr(generate_mod, "CandidateGenerator", StubGenerator)
@@ -741,7 +742,7 @@ def test_run_beam_tree_mode_executes_without_api_calls(
     session.pipeline.config.beam_edit_mode = "tree"
     session.pipeline.config.wide_max_probes = 1
     session.pipeline.config.wide_worker_parallelism = 1
-    session.pipeline.config.snipe_rounds = 0
+    session.pipeline.config.compiler_rounds = 0
     session.pipeline.config.dispatcher_max_attempts = 1
     session.pipeline.config.semantic_validation_enabled = False
     session.pipeline.config.target_speedup = 2.0
@@ -818,7 +819,7 @@ def test_run_beam_tree_mode_executes_without_api_calls(
     responses = [dispatcher_response, worker_response]
     prompts_seen = []
 
-    def fake_make_llm_call_fn(provider_spec=None, model_spec=None):
+    def fake_make_llm_call_fn(provider_spec=None, model_spec=None, enable_reasoning=None):
         def _call(_prompt: str) -> str:
             assert responses, "Unexpected extra LLM call in test"
             prompts_seen.append(_prompt)

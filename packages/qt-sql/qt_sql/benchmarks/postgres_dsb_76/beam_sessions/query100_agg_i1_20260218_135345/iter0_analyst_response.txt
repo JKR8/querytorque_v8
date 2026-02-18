@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a large Merge Join (77,900 rows) between a filtered date_dim+store_sales scan and item1, followed by a chain of nested loops. The comma-join syntax may prevent optimal join ordering and predicate pushdown. The non-equi join condition (item1.i_item_sk < item2.i_item_sk) is applied late via nested loop, amplifying work.",
+    "reasoning_trace": [
+      "Merge Join output rows=77,900, time=7,574ms is the primary I/O hotspot.",
+      "Nested Loop (rows=3,468, time=19,364ms) shows significant under-estimation (est=49, act=3,468) driving repeated inner index scans.",
+      "SQL uses comma-join syntax with predicates in WHERE, matching the COMMA_JOIN_WEAKNESS gap.",
+      "No correlated subqueries, set operations, or OR predicates present in the SQL."
+    ],
+    "cost_spine": ["Merge Join", "Nested Loop", "Nested Loop", "Nested Loop", "Aggregate", "Sort"],
+    "hotspots": [
+      {
+        "op": "Merge Join",
+        "why": "largest row flow (77,900 rows) and time (7,574ms) before nested loop amplification",
+        "evidence": "rows=77900 time=7574ms"
+      },
+      {
+        "op": "Nested Loop (rows=3468)",
+        "why": "severe cardinality misestimation (est=49, act=3,468) driving repeated inner index scans on store_sales (s2) and item2",
+        "evidence": "rows=3468 time=19364ms, est=49, q-error=70.8"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION transforms (no OR predicate in plan)",
+      "avoid decorrelating EXISTS (no EXISTS subqueries)",
+      "do not duplicate large CTE bodies (respect G_PG_CTE_DUPLICATION_BLOCK)",
+      "do not convert to explicit JOIN without also pushing filters (risk of 0.55x regression)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and isolate selective date_dim filter into a MATERIALIZED CTE to create a tiny hash table for the optimizer.",
+      "dag_target_hint": "Replace final_select FROM clause with explicit JOINs and wrap date_dim filter in a CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales s1", "item item1"],
+        "where_must_preserve": ["d.d_year between 1998 and 1998 + 1", "item1.i_category in ('Electronics', 'Jewelry')", "s1.ss_list_price between 108 and 122"],
+        "output_must_preserve": ["All original columns and GROUP BY/ORDER BY semantics"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Merge Join replaced by Hash Join with small date CTE as build side; nested loop count may reduce.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot (Merge Join) and addresses COMMA_JOIN_WEAKNESS with a gold-pattern transform.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimension tables (date_dim, customer_demographics, customer, customer_address) into separate MATERIALIZED CTEs, then join them explicitly with fact tables.",
+      "dag_target_hint": "Wrap each dimension filter in a CTE and rewrite final_select FROM with explicit JOINs on CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "customer_demographics cd", "customer c", "customer_address ca"],
+        "where_must_preserve": ["d.d_year between 1998 and 1998 + 1", "cd.cd_marital_status = 'S'", "cd.cd_education_status = 'College'", "c_current_addr_sk = ca_address_sk", "c_current_cdemo_sk = cd_demo_sk"],
+        "output_must_preserve": ["All original columns and join multiplicities"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Multiple nested loops replaced by hash joins with tiny build sides; cardinality estimates improve.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Addresses secondary hotspot (nested loop misestimation) by prefetching all dimensions, a gold pattern for PostgreSQL.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize the filtered fact table (store_sales s1) joined with date_dim and item1 into a CTE, then join with remaining dimensions and the second fact table (s2) with non-equi condition.",
+      "dag_target_hint": "Create a CTE for s1+date+item1, then join with customer, demographics, address, and s2+item2 in final_select.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "date_dim d", "item item1"],
+        "where_must_preserve": ["d.d_year between 1998 and 1998 + 1", "item1.i_category in ('Electronics', 'Jewelry')", "s1.ss_list_price between 108 and 122"],
+        "output_must_preserve": ["All original columns and the non-equi join condition (item1.i_item_sk < item2.i_item_sk)"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staging the fact table join may reduce rows before the expensive nested loop with s2 and item2, improving non-equi join performance.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Nested loop on s2 and item2 receives a smaller outer set; may switch to hash join or reduce loop iterations.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting the non-equi join amplification; gold example shows 12.07x but previous attempt failed, so confidence moderated.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered store_sales join with date_dim and item1 into a CTE, then self-join on ss_ticket_number with item2 filter and non-equi condition.",
+      "dag_target_hint": "Create a base CTE for s1+date+item1, then self-join it with item2 in final_select.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "date_dim d", "item item1"],
+        "where_must_preserve": ["d.d_year between 1998 and 1998 + 1", "item1.i_category in ('Electronics', 'Jewelry')", "s1.ss_list_price between 108 and 122"],
+        "output_must_preserve": ["All original columns and the join condition s1.ss_ticket_number = s2.ss_ticket_number"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Repeated store_sales scans (s1 and s2) may benefit from shared materialization of the filtered s1 path, reducing redundant work.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Eliminates one store_sales scan; may change join topology and reduce nested loop depth.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting repeated fact table scan pattern; uses native PostgreSQL CTE materialization.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in SQL; plan shows no OR-related bottleneck."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL; transform not applicable."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregate is final operation after all joins; no intermediate aggregation hotspot."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOINs in query; all joins are inner joins."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific transform for Snowflake; not portable to PostgreSQL runtime."
+    }
+  ]
+}

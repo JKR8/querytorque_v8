@@ -201,6 +201,7 @@ def prepare(
         _load_engine_intelligence,
     )
     from ..patches.beam_prompts import (
+        build_base_tree_prompt,
         build_beam_analyst_prompt,
         build_beam_worker_prompt,
     )
@@ -212,7 +213,7 @@ def prepare(
         os.environ["QT_ALLOW_INTELLIGENCE_BOOTSTRAP"] = "1"
 
     pipeline = Pipeline(bench_dir)
-    # Prepare is a pre-flight mode; allow EXPLAIN collection for missing cache entries.
+    # Prepare is the offline prep step — collect EXPLAINs for missing cache entries.
     pipeline.config.explain_policy = "explain"
 
     # Load scenario card if specified
@@ -259,6 +260,7 @@ def prepare(
             ir_dialect = dialect_map.get(dialect, Dialect.DUCKDB)
             script_ir = build_script_ir(sql, ir_dialect)
             ir_node_map_text = render_ir_node_map(script_ir)
+            base_tree_prompt = build_base_tree_prompt(sql, dialect=dialect)
 
             # Keep prepare aligned with beam runtime templates.
             gold_examples = load_gold_examples(dialect)
@@ -287,6 +289,7 @@ def prepare(
                 original_sql=sql,
                 explain_text=explain_text,
                 ir_node_map=ir_node_map_text,
+                current_tree_map=base_tree_prompt,
                 gold_examples=gold_examples,
                 dialect=dialect,
                 intelligence_brief=intelligence_brief,
@@ -310,20 +313,17 @@ def prepare(
                 "do not alter grouping cardinality",
                 "do not introduce unfiltered wide CTE materialization",
             ]
-            sample_gold_dag = None
+            sample_gold_tree = None
             if isinstance(sample_gold_example, dict):
-                sample_gold_dag = (
-                    sample_gold_example.get("dag_example")
-                    or sample_gold_example.get("dag")
-                )
+                sample_gold_tree = sample_gold_example.get("tree_example")
 
             worker_qwen_prompt = build_beam_worker_prompt(
                 original_sql=sql,
                 ir_node_map=ir_node_map_text,
-                current_dag_map="",
+                current_tree_map=base_tree_prompt,
                 hypothesis=sample_hypothesis,
                 probe=sample_probe,
-                gold_dag_example=sample_gold_dag,
+                gold_tree_example=sample_gold_tree,
                 dialect=dialect,
                 schema_context="",
                 equivalence_tier="exact",
@@ -336,10 +336,10 @@ def prepare(
             worker_reasoner_prompt = build_beam_worker_prompt(
                 original_sql=sql,
                 ir_node_map=ir_node_map_text,
-                current_dag_map="",
+                current_tree_map=base_tree_prompt,
                 hypothesis=sample_hypothesis,
                 probe=sample_probe,
-                gold_dag_example=sample_gold_dag,
+                gold_tree_example=sample_gold_tree,
                 dialect=dialect,
                 schema_context="",
                 equivalence_tier="exact",
@@ -382,6 +382,7 @@ def prepare(
                 strike_results=sample_strike_results,
                 intelligence_brief=intelligence_brief,
                 importance_stars=2,
+                current_tree_map=base_tree_prompt,
                 schema_context="",
                 engine_knowledge=engine_knowledge,
                 dispatch_hypothesis=sample_hypothesis,

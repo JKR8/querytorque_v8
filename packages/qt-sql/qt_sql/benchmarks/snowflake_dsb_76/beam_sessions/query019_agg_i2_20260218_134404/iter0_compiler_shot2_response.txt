@@ -1,0 +1,87 @@
+[
+  {
+    "plan_id": "compile_p1",
+    "dialect": "snowflake",
+    "confidence": 0.82,
+    "based_on": "p01,p02",
+    "strategy": "Combine date filter pushdown with pre-aggregation to reduce both I/O and intermediate rows.",
+    "hypothesis": "p01 (date filter pushdown) achieved 1.72x speedup by pruning fact table partitions; p02 (pre‑aggregation) achieved 1.51x by reducing rows before joins. Combining both techniques should yield multiplicative benefit while preserving semantics.",
+    "expected_explain_delta": "Store_sales scan filtered by date_sk range via subquery, then aggregated before joins; fewer rows flow through join spine, reducing aggregation stages.",
+    "target_ir": "Add ss_preagg CTE that pushes date filter and aggregates; rewrite final_select to join with CTE and remove redundant date_dim table.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["ss_preagg", "item", "customer", "customer_address", "store"],
+          "outputs": ["brand_id", "brand", "i_manufact_id", "i_manufact", "ext_price"],
+          "changed": true,
+          "sql": "WITH ss_preagg AS (\n  SELECT ss_sold_date_sk,\n         ss_item_sk,\n         ss_customer_sk,\n         ss_store_sk,\n         SUM(ss_ext_sales_price) AS ss_ext_sales_price\n  FROM store_sales\n  WHERE ss_wholesale_cost BETWEEN 76 AND 96\n    AND ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 2)\n  GROUP BY ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk\n)\nSELECT i.i_brand_id AS brand_id,\n       i.i_brand AS brand,\n       i.i_manufact_id,\n       i.i_manufact,\n       SUM(ss_preagg.ss_ext_sales_price) AS ext_price\nFROM ss_preagg\nJOIN item i ON ss_preagg.ss_item_sk = i.i_item_sk\nJOIN customer c ON ss_preagg.ss_customer_sk = c.c_customer_sk\nJOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nJOIN store s ON ss_preagg.ss_store_sk = s.s_store_sk\nWHERE i.i_category = 'Shoes'\n  AND c.c_birth_month = 2\n  AND ca.ca_state = 'KS'\n  AND SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5)\nGROUP BY i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nORDER BY ext_price DESC, i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nLIMIT 100"
+        },
+        {
+          "node_id": "ss_preagg",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales", "date_dim"],
+          "outputs": ["ss_sold_date_sk", "ss_item_sk", "ss_customer_sk", "ss_store_sk", "ss_ext_sales_price"],
+          "changed": true,
+          "sql": "SELECT ss_sold_date_sk,\n       ss_item_sk,\n       ss_customer_sk,\n       ss_store_sk,\n       SUM(ss_ext_sales_price) AS ss_ext_sales_price\nFROM store_sales\nWHERE ss_wholesale_cost BETWEEN 76 AND 96\n  AND ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 2)\nGROUP BY ss_sold_date_sk, ss_item_sk, ss_customer_sk, ss_store_sk"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_p2",
+    "dialect": "snowflake",
+    "confidence": 0.75,
+    "based_on": "p01",
+    "strategy": "Date filter pushdown via subquery to prune fact partitions, retain explicit join order.",
+    "hypothesis": "Probe p01 alone achieved 1.72x speedup by pushing date filter into store_sales scan via IN subquery, enabling micro‑partition pruning. Keep original join topology and aggregation stages to minimize semantic risk.",
+    "expected_explain_delta": "Store_sales scan filtered by date_sk range; subsequent joins and aggregations process fewer rows.",
+    "target_ir": "Add ss_scan_with_pushdown CTE; final_select unchanged except referencing CTE.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["ss_scan_with_pushdown", "date_dim", "item", "customer", "customer_address", "store"],
+          "outputs": ["brand_id", "brand", "i_manufact_id", "i_manufact", "ext_price"],
+          "changed": true,
+          "sql": "WITH ss_scan_with_pushdown AS (\n  SELECT ss_sold_date_sk,\n         ss_item_sk,\n         ss_customer_sk,\n         ss_store_sk,\n         ss_wholesale_cost,\n         ss_ext_sales_price\n  FROM store_sales\n  WHERE ss_wholesale_cost BETWEEN 76 AND 96\n    AND ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 2)\n)\nSELECT i.i_brand_id AS brand_id,\n       i.i_brand AS brand,\n       i.i_manufact_id,\n       i.i_manufact,\n       SUM(ss_scan_with_pushdown.ss_ext_sales_price) AS ext_price\nFROM ss_scan_with_pushdown\nJOIN date_dim d ON d.d_date_sk = ss_scan_with_pushdown.ss_sold_date_sk\nJOIN item i ON ss_scan_with_pushdown.ss_item_sk = i.i_item_sk\nJOIN customer c ON ss_scan_with_pushdown.ss_customer_sk = c.c_customer_sk\nJOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nJOIN store s ON ss_scan_with_pushdown.ss_store_sk = s.s_store_sk\nWHERE i.i_category = 'Shoes'\n  AND d.d_year = 1999\n  AND d.d_moy = 2\n  AND c.c_birth_month = 2\n  AND ca.ca_state = 'KS'\n  AND SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5)\nGROUP BY i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nORDER BY ext_price DESC, i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nLIMIT 100"
+        },
+        {
+          "node_id": "ss_scan_with_pushdown",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales", "date_dim"],
+          "outputs": ["ss_sold_date_sk", "ss_item_sk", "ss_customer_sk", "ss_store_sk", "ss_wholesale_cost", "ss_ext_sales_price"],
+          "changed": true,
+          "sql": "SELECT ss_sold_date_sk,\n       ss_item_sk,\n       ss_customer_sk,\n       ss_store_sk,\n       ss_wholesale_cost,\n       ss_ext_sales_price\nFROM store_sales\nWHERE ss_wholesale_cost BETWEEN 76 AND 96\n  AND ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 2)"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_p3",
+    "dialect": "snowflake",
+    "confidence": 0.70,
+    "based_on": "p04",
+    "strategy": "Explicit join syntax with join order re‑evaluation, no CTE changes.",
+    "hypothesis": "Probe p04 achieved 1.66x speedup by converting comma joins to explicit INNER JOIN and reordering joins. This may allow cost‑based optimizer to choose a better join sequence while preserving original scan and aggregation pattern.",
+    "expected_explain_delta": "Join order may change; fact scan and aggregation stages remain unchanged.",
+    "target_ir": "Rewrite final_select with explicit joins and selective join order (date_dim → store_sales → item → customer → customer_address → store).",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["date_dim", "store_sales", "item", "customer", "customer_address", "store"],
+          "outputs": ["brand_id", "brand", "i_manufact_id", "i_manufact", "ext_price"],
+          "changed": true,
+          "sql": "SELECT i.i_brand_id AS brand_id,\n       i.i_brand AS brand,\n       i.i_manufact_id,\n       i.i_manufact,\n       SUM(ss.ss_ext_sales_price) AS ext_price\nFROM date_dim d\nINNER JOIN store_sales ss ON d.d_date_sk = ss.ss_sold_date_sk\nINNER JOIN item i ON ss.ss_item_sk = i.i_item_sk\nINNER JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk\nINNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\nINNER JOIN store s ON ss.ss_store_sk = s.s_store_sk\nWHERE i.i_category = 'Shoes'\n  AND d.d_year = 1999\n  AND d.d_moy = 2\n  AND ss.ss_wholesale_cost BETWEEN 76 AND 96\n  AND ca.ca_state = 'KS'\n  AND c.c_birth_month = 2\n  AND SUBSTRING(ca.ca_zip, 1, 5) <> SUBSTRING(s.s_zip, 1, 5)\nGROUP BY i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nORDER BY ext_price DESC, i.i_brand, i.i_brand_id, i.i_manufact_id, i.i_manufact\nLIMIT 100"
+        }
+      ]
+    }
+  }
+]

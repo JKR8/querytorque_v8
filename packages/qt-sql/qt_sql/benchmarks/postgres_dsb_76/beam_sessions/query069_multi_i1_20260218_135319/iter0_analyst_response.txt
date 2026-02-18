@@ -1,0 +1,257 @@
+```json
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary bottleneck is repeated nested-loop anti-joins against materialized large fact sets (web_sales 83K rows, catalog_sales 310K rows) for each qualifying customer row (~1K rows), causing ~300M row processed amplification. Secondary hotspot is the store_sales nested loop (150K rows) feeding the initial customer filter. Transform must replace correlated NOT EXISTS with pre-materialized anti-join keysets.",
+    "reasoning_trace": [
+      "Top-level Nested Loop (rows=964) processes right-side Materialize nodes (web_sales 83K rows, catalog_sales 310K rows) per outer row, ~300M total processed rows.",
+      "Store_sales nested loop produces 150K rows before customer join, showing large intermediate volume.",
+      "All three date_dim scans are index-only and fast (31 rows each), not primary bottlenecks.",
+      "Plan shows repeated materialization of large fact sets for anti-join checks—classic correlated subquery paralysis."
+    ],
+    "cost_spine": ["Nested Loop (top)", "Materialize (catalog_sales)", "Gather (web_sales)", "Nested Loop (store_sales)", "Hash Join (customer+address)"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (top)",
+        "why": "Amplifies materialized fact sets 964 times",
+        "evidence": "outer rows=964, inner rows=310392, estimated ~300M processed rows"
+      },
+      {
+        "op": "Materialize (catalog_sales)",
+        "why": "Large materialized set (310K rows) rescanned repeatedly",
+        "evidence": "rows=310392, time=53ms but rescanned 964 times"
+      },
+      {
+        "op": "Gather (web_sales)",
+        "why": "Large parallel scan (84K rows) materialized for rescans",
+        "evidence": "rows=84341, time=2033ms, rescanned 1105 times"
+      },
+      {
+        "op": "Nested Loop (store_sales)",
+        "why": "Produces 150K rows before customer join",
+        "evidence": "rows=150624, time=1817ms"
+      }
+    ],
+    "do_not_do": [
+      "Do not split same-column OR predicates into UNION ALL (protects BitmapOr)",
+      "Do not materialize EXISTS paths already optimized as semi-joins",
+      "Do not duplicate large CTE bodies multiple times",
+      "Do not convert explicit JOINs to comma joins"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Replace correlated NOT EXISTS checks with pre-materialized anti-join keysets. Create CTE for store_sales customers (EXISTS), then CTEs for web_sales and catalog_sales customers, then anti-join all. Push date_dim filters into each CTE.",
+      "dag_target_hint": "Replace final_select FROM clause with CTE chain and explicit anti-joins.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics"],
+        "where_must_preserve": ["ca_state IN ('CO','NC','TX')", "cd_marital_status IN ('S','M','U')", "cd_education_status IN ('Primary','College')"],
+        "output_must_preserve": ["All original grouping columns and aggregate counts"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.88,
+      "expected_explain_delta": "Materialize nodes disappear; Nested Loop replaced by Hash Anti Join; date_dim scans remain index-only but not repeated.",
+      "recommended_patch_ops": ["insert_cte_store_customers", "insert_cte_web_customers", "insert_cte_catalog_customers", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: eliminates repeated rescans of large materialized fact sets via decorrelation.",
+      "recommended_examples": ["pg_shared_scan_decorrelate", "early_filter_decorrelate"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Consolidate three channel checks into single CTE computing customer presence bitmap via UNION ALL, then filter for store-only customers in main query.",
+      "dag_target_hint": "Replace EXISTS/NOT EXISTS with single channel_presence CTE joined via CASE flags.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics"],
+        "where_must_preserve": ["Same state and demographic filters"],
+        "output_must_preserve": ["Same grouping columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass over fact tables with conditional aggregation may reduce total I/O versus separate CTEs.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Three separate nested loops merge into single scan per fact table with UNION ALL; top-level filter on bitmap.",
+      "recommended_patch_ops": ["insert_cte_channel_presence", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: tests single-pass consolidation of three channel checks, secondary hotspot coverage.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered fact-date joins once per channel, then reference in main query. Use MATERIALIZED hint to prevent re-inlining.",
+      "dag_target_hint": "Create three MATERIALIZED CTEs: store_fact, web_fact, catalog_fact, each with date_dim join and price filter.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics"],
+        "where_must_preserve": ["Same state and demographic filters"],
+        "output_must_preserve": ["Same grouping and aggregates"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Materialized CTEs scanned once; outer query uses anti-joins against CTEs; eliminates repeated index scans on fact tables.",
+      "recommended_patch_ops": ["insert_materialized_cte_store", "insert_materialized_cte_web", "insert_materialized_cte_catalog", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets secondary hotspot: reduces repeated fact table scans via shared materialization.",
+      "recommended_examples": ["profile_note_strategic_materialization"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit JOIN syntax and isolate date_dim filters into CTEs to create tiny hash tables.",
+      "dag_target_hint": "Change final_select FROM to explicit JOINs with CTE-wrapped date_dim filters.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics"],
+        "where_must_preserve": ["Same state and demographic filters"],
+        "output_must_preserve": ["Same grouping and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_EXPLICIT_JOIN_STYLE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Comma joins become explicit INNER JOINs; date_dim CTEs become small hash tables; may improve join order flexibility.",
+      "recommended_patch_ops": ["insert_cte_dates", "replace_from_comma_to_join", "replace_where_predicate"],
+      "rank_rationale": "Addresses comma-join weakness and may improve cardinality estimates for fact joins.",
+      "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (customer_address, customer_demographics, date_dim) into MATERIALIZED CTEs before joining to fact tables.",
+      "dag_target_hint": "Create CTEs for filtered dimensions, then join to fact tables in channel subqueries.",
+      "node_contract": {
+        "from_must_include": ["customer c"],
+        "where_must_preserve": ["Same state and demographic filters"],
+        "output_must_preserve": ["Same grouping and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Multi-dimension prefetch may reduce fact table scan rows by pushing filters earlier.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension CTEs materialized as tiny hash tables; fact table scans reduce via early key restriction.",
+      "recommended_patch_ops": ["insert_cte_filtered_address", "insert_cte_filtered_demographics", "insert_cte_filtered_dates", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: tests multi-dimension prefetch for reducing fact scan volume.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate three channel scans into single pass per fact table with CASE flags, compute customer presence via conditional aggregation in CTE.",
+      "dag_target_hint": "Replace separate EXISTS/NOT EXISTS with single CTE per fact table that aggregates by customer with channel flags.",
+      "node_contract": {
+        "from_must_include": ["customer c"],
+        "where_must_preserve": ["Same state and demographic filters"],
+        "output_must_preserve": ["Same grouping and aggregates"]
+      },
+      "gates_checked": ["G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass aggregation per fact table may reduce I/O and improve parallelism.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Multiple nested loops per channel merge into single aggregate scan per fact table.",
+      "recommended_patch_ops": ["insert_cte_store_agg", "insert_cte_web_agg", "insert_cte_catalog_agg", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: tests aggregation pushdown and scan consolidation for fact tables.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk BETWEEN predicate directly into each fact table join condition to enable partition pruning (portability candidate).",
+      "dag_target_hint": "Add explicit d_date_sk BETWEEN condition to each fact table join.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics"],
+        "where_must_preserve": ["Same state and demographic filters"],
+        "output_must_preserve": ["Same grouping and aggregates"]
+      },
+      "gates_checked": ["G_PG_CORR_EXISTS_PROTECTION:PASS", "portability_candidate:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit date_sk range may improve predicate transitivity and index usage on fact tables.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fact table index scans may use additional date_sk filter, reducing rows scanned.",
+      "recommended_patch_ops": ["replace_where_predicate", "add_date_sk_between"],
+      "rank_rationale": "Exploration: portability candidate testing predicate pushdown for fact tables.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit comma joins to explicit INNER JOIN syntax and ensure all join predicates are in ON clauses.",
+      "dag_target_hint": "Rewrite final_select FROM clause with explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics"],
+        "where_must_preserve": ["Same state and demographic filters"],
+        "output_must_preserve": ["Same grouping and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_EXPLICIT_JOIN_STYLE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.68,
+      "expected_explain_delta": "Explicit JOIN syntax may enable better join reordering and hash join planning.",
+      "recommended_patch_ops": ["replace_from_comma_to_join"],
+      "rank_rationale": "Low-risk syntax improvement that may unlock other optimizations.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot; PostgreSQL BitmapOr already optimal."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregate before join hotspot; aggregates are final COUNT(*)."
+    },
+    {
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "reason": "Previous attempt FAIL status; prefer other dimension prefetch variants."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "Previous attempt FAIL status; avoid repeated failed strategy."
+    }
+  ]
+}
+```

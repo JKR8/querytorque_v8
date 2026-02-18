@@ -9,7 +9,9 @@ Beam mode: analyst → 4 workers → validate → snipe.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -325,6 +327,121 @@ def format_pg_explain_tree(plan_json: Any) -> str:
                          f"calls={t.get('Calls', 0)} time={t.get('Time', 0):.1f}ms")
 
     return "\n".join(lines)
+
+
+def _fmt_bytes(n: Any) -> str:
+    """Format byte counts compactly."""
+    try:
+        value = float(n or 0)
+    except Exception:
+        return str(n)
+    if value >= 1024 ** 4:
+        return f"{value / (1024 ** 4):.1f}TB"
+    if value >= 1024 ** 3:
+        return f"{value / (1024 ** 3):.1f}GB"
+    if value >= 1024 ** 2:
+        return f"{value / (1024 ** 2):.1f}MB"
+    if value >= 1024:
+        return f"{value / 1024:.1f}KB"
+    return f"{int(value)}B"
+
+
+_IN_CHAIN_RE = re.compile(
+    r"(?P<lhs>[A-Za-z_][A-Za-z0-9_.]*)\s+IN\s+'(?P<v1>[^']+)'(?P<tail>(?:\s+IN\s+'[^']+')+)"
+)
+
+
+def _normalize_snowflake_expression(expr: str) -> str:
+    """Normalize some Snowflake plan-expression render artifacts for readability."""
+    if not expr:
+        return ""
+    out = " ".join(str(expr).split())
+    # Example artifact: "col IN 'A' IN 'B'" -> "col IN ('A', 'B')"
+    for _ in range(8):
+        m = _IN_CHAIN_RE.search(out)
+        if not m:
+            break
+        lhs = m.group("lhs")
+        vals = [m.group("v1")]
+        vals.extend(re.findall(r"IN\s+'([^']+)'", m.group("tail")))
+        repl = f"{lhs} IN ({', '.join(repr(v) for v in vals)})"
+        out = out[: m.start()] + repl + out[m.end() :]
+    return out
+
+
+def format_snowflake_explain_tree(plan_json: Any) -> str:
+    """Render Snowflake profile JSON into compact readable text."""
+    if not plan_json:
+        return ""
+    raw = plan_json
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return raw
+    if not isinstance(raw, dict):
+        try:
+            return json.dumps(raw, indent=2)
+        except Exception:
+            return str(raw)
+
+    lines: list[str] = []
+    stats = raw.get("GlobalStats") or {}
+    if isinstance(stats, dict) and stats:
+        p_assigned = stats.get("partitionsAssigned")
+        p_total = stats.get("partitionsTotal")
+        b_assigned = stats.get("bytesAssigned")
+        lines.append(
+            "Global Stats: "
+            f"partitions={p_assigned}/{p_total}, "
+            f"bytes={_fmt_bytes(b_assigned)}"
+        )
+        lines.append("")
+
+    ops: list[dict] = []
+    for block in raw.get("Operations") or []:
+        if isinstance(block, list):
+            for op in block:
+                if isinstance(op, dict):
+                    ops.append(op)
+        elif isinstance(block, dict):
+            ops.append(block)
+
+    if not ops:
+        try:
+            return json.dumps(raw, indent=2)
+        except Exception:
+            return str(raw)
+
+    ops.sort(key=lambda op: int(op.get("id", 10**9)))
+    for op in ops:
+        op_id = op.get("id", "?")
+        op_name = op.get("operation", "Unknown")
+        parents = op.get("parentOperators") or []
+        parent_txt = f" parents={parents}" if parents else ""
+        lines.append(f"[{op_id}] {op_name}{parent_txt}")
+
+        objects = op.get("objects") or []
+        if objects:
+            lines.append(f"  objects: {', '.join(str(o) for o in objects)}")
+
+        exprs = op.get("expressions") or []
+        if exprs:
+            for e in exprs:
+                lines.append(f"  expr: {_normalize_snowflake_expression(str(e))}")
+
+        p_assigned = op.get("partitionsAssigned")
+        p_total = op.get("partitionsTotal")
+        b_assigned = op.get("bytesAssigned")
+        if p_assigned is not None or p_total is not None or b_assigned is not None:
+            lines.append(
+                "  io: "
+                f"partitions={p_assigned}/{p_total}, "
+                f"bytes={_fmt_bytes(b_assigned)}"
+            )
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 def _format_regression_for_analyst(reg: Dict[str, Any]) -> str:

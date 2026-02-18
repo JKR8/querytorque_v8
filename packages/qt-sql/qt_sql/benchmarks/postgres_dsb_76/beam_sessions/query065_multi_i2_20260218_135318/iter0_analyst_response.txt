@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "Plan shows two identical large fact-table scans (store_sales + date_dim) with identical filters and grouping, causing redundant 2.4s work. Consolidating these into a single scan should cut runtime nearly in half. Secondary cost from comma-join syntax may block optimal join ordering.",
+    "reasoning_trace": [
+      "Two identical Nested Loop + Index Only Scan patterns on store_sales and date_dim (rows=36,809 each) dominate runtime.",
+      "Aggregates (HashAggregate) repeat same computation: one at store-item level (sc), another at store level (sb).",
+      "Comma-join syntax in derived tables may prevent predicate pushdown and optimal join reordering.",
+      "Store and item dimension scans are tiny (7 and 0 rows) and already indexed; not primary bottlenecks."
+    ],
+    "cost_spine": [
+      "Index Only Scan on store_sales (2x)",
+      "Aggregate (2x)",
+      "Merge Join",
+      "Nested Loop"
+    ],
+    "hotspots": [
+      {
+        "op": "Index Only Scan on store_sales (two instances)",
+        "why": "identical fact-table scan repeated with same filters and join",
+        "evidence": "rows=36809, time=2380ms and 1249ms, total ~3.6s"
+      },
+      {
+        "op": "Aggregate (two instances)",
+        "why": "redundant aggregation on same base data",
+        "evidence": "time=4371ms and 2384ms, total ~6.7s"
+      },
+      {
+        "op": "Merge Join",
+        "why": "joining two large aggregated results from repeated scans",
+        "evidence": "rows=53, time=6756ms"
+      }
+    ],
+    "do_not_do": [
+      "Avoid materialize_cte and pg_self_join_decomposition (previous attempts failed, speedup=0.00x)",
+      "Do not split OR predicates (no OR in query, guard G_PG_OR_INDEX_PROTECTED)",
+      "Do not duplicate large CTE bodies (guard G_PG_CTE_DUPLICATION_STOP)",
+      "Do not apply EXISTS decorrelation (no correlated subqueries present)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate the two identical store_sales+date_dim scans into one CTE that computes store-item revenue, then derive store-level average from same CTE to eliminate redundant scan and aggregation.",
+      "dag_target_hint": "Replace derived tables sa and sc with a single CTE computing ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue, then compute store-level avg in outer query.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq between 1215 and 1226", "ss_sales_price / ss_list_price BETWEEN 0.79 AND 0.89"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue", "ave per store"]
+      },
+      "gates_checked": ["no_correlated_subquery:PASS", "redundant_scan_elimination:REQUIRED", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "One store_sales+date_dim scan instead of two, one aggregate instead of two, Merge Join input rows reduced.",
+      "recommended_patch_ops": ["insert_cte", "replace_derived_table_sa", "replace_derived_table_sc"],
+      "rank_rationale": "Targets primary hotspot — eliminates duplicate 3.6s scan and 6.7s aggregation.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and isolate date_dim filter into a CTE to create a tiny hash table for better join planning.",
+      "dag_target_hint": "Change comma joins in derived tables to explicit JOIN ON syntax and materialize filtered date_dim keys as a CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales"],
+        "where_must_preserve": ["d_month_seq between 1215 and 1226", "ss_sales_price / ss_list_price BETWEEN 0.79 AND 0.89"],
+        "output_must_preserve": ["all original columns and join semantics"]
+      },
+      "gates_checked": ["comma_join_present:PASS", "fact_fanout_safe:PASS", "explicit_join_semantic_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may enable better join order choices and predicate pushdown; date_dim CTE may reduce repeated index scans.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Comma joins replaced with explicit JOIN; date_dim scan may become a CTE scan.",
+      "recommended_patch_ops": ["insert_cte_date_dim", "replace_comma_with_join"],
+      "rank_rationale": "Secondary hotspot — addresses comma-join weakness and may improve join ordering.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter store and item dimensions into CTEs and convert all joins to explicit INNER JOIN syntax, creating tiny hash tables for early cardinality reduction.",
+      "dag_target_hint": "Create CTEs for filtered store and item, then join them explicitly with the fact-derived CTEs.",
+      "node_contract": {
+        "from_must_include": ["store", "item"],
+        "where_must_preserve": ["i_manager_id BETWEEN 10 and 14", "s_state in ('KS','OH','SD')"],
+        "output_must_preserve": ["all original columns and join semantics"]
+      },
+      "gates_checked": ["comma_join_present:PASS", "dimension_selectivity_high:PASS", "explicit_join_semantic_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering tiny dimensions may improve join order estimates and enable earlier filter application.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Store and item scans become CTE scans; joins become explicit INNER JOIN.",
+      "recommended_patch_ops": ["insert_cte_store", "insert_cte_item", "replace_comma_with_join"],
+      "rank_rationale": "Exploration — dimension tables already tiny, but explicit join may help planner.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize the two derived tables (sb and sc) into separate CTEs before the non‑equi join (sc.revenue <= 0.1 * sb.ave) to reduce join input sizes and enable better join strategy.",
+      "dag_target_hint": "Move sb and sc into MATERIALIZED CTEs, then join them with store and item.",
+      "node_contract": {
+        "from_must_include": ["sb", "sc"],
+        "where_must_preserve": ["sc.revenue <= 0.1 * sb.ave"],
+        "output_must_preserve": ["all original columns and non-equi join semantics"]
+      },
+      "gates_checked": ["non_equi_join_present:PASS", "cte_reuse_benefit:PASS", "no_setop_risk:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the aggregated results may allow the planner to choose a more efficient join algorithm for the non‑equi condition.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Merge Join may become Hash Join or Nested Loop with materialized inputs.",
+      "recommended_patch_ops": ["insert_cte_sb", "insert_cte_sc", "replace_derived_tables_with_cte_refs"],
+      "rank_rationale": "Exploration — targets non‑equi join between aggregated results, though inputs are already small.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Previous attempt failed (speedup=0.00x); pattern not strongly evidenced in current plan."
+    },
+    {
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "reason": "Previous attempt failed (speedup=0.00x); engine profile suggests risk of over‑decomposition."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; guard G_PG_OR_INDEX_PROTECTED contraindicates."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar subquery present in SQL or plan."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subquery present in SQL or plan."
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows a single date_dim scan for the month_seq subquery, but the three fact-table CTEs (store_sales, catalog_sales, web_sales) are not detailed in the explain. The dominant I/O likely comes from scanning these three large fact tables, each joined with the same date_dim, item, and customer filters. Precomputing the date key set and pushing filters earlier could prune fact micro-partitions more effectively.",
+    "reasoning_trace": [
+      "GlobalStats shows 2.1 MB scanned from date_dim, but fact tables (store_sales, catalog_sales, web_sales) are absent from the explain, indicating they are the primary I/O hotspots.",
+      "Each CTE repeats the same date_dim subquery; materializing it once could avoid recomputation.",
+      "Filters on item.manager_id and customer.birth_year are applied in each CTE but may not be pushed down optimally across the comma-join shape."
+    ],
+    "cost_spine": ["TableScan (DATE_DIM)", "Result (final)"],
+    "hotspots": [
+      {
+        "op": "store_sales scan",
+        "why": "largest fact table, repeated date+item+customer filters",
+        "evidence": "absent from explain but known large volume; each CTE scans same date range"
+      },
+      {
+        "op": "catalog_sales scan",
+        "why": "second large fact table, same filter pattern",
+        "evidence": "absent from explain, similar scale to store_sales"
+      },
+      {
+        "op": "web_sales scan",
+        "why": "third large fact table, same filter pattern",
+        "evidence": "absent from explain, similar scale to store_sales"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS paths (no EXISTS in query)",
+      "avoid OR-to-UNION (no OR predicates)",
+      "avoid unfiltered large CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Precompute date_sk keys for the month_seq in a CTE, then add explicit date_sk BETWEEN or IN list to each fact table join condition to enable micro-partition pruning.",
+      "dag_target_hint": "Replace date_dim subquery in each CTE with a CTE containing date_sk list, and add sold_date_sk IN (SELECT date_sk FROM date_keys_cte) to each fact table.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["i_manager_id BETWEEN 71 and 100", "c_birth_year BETWEEN 1945 AND 1951", "ss_list_price between 242 and 271", "cs_list_price between 242 and 271", "ws_list_price between 242 and 271"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "sum(ss_ext_sales_price)", "sum(cs_ext_sales_price)", "sum(ws_ext_sales_price)"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Fact table scans show reduced partitions scanned due to date_sk pushdown; date_dim scan appears once.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate", "replace_join_condition"],
+      "rank_rationale": "Targets primary I/O hotspot across all three fact tables with native Snowflake transform.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter item and customer tables into separate CTEs returning only surrogate keys (i_item_sk, c_customer_sk) that meet the manager_id and birth_year filters, then join these CTEs to each fact table.",
+      "dag_target_hint": "Replace inline dimension tables in each CTE with references to pre-filtered CTEs.",
+      "node_contract": {
+        "from_must_include": ["item", "customer"],
+        "where_must_preserve": ["i_manager_id BETWEEN 71 and 100", "c_birth_year BETWEEN 1945 AND 1951"],
+        "output_must_preserve": ["i_item_sk", "c_customer_sk"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_LOW_BASELINE_SKIP_HEAVY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already push these filters, but materializing them as CTEs could improve join planning and reduce repeated filter evaluation.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension scans become tiny CTE scans; fact table joins probe smaller hash tables.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting secondary hotspot (dimension filters) with portability candidate transform.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate the three CTEs into a single scan per fact table with conditional aggregation, then union and group by item_id, birth_year, and channel indicator.",
+      "dag_target_hint": "Replace ss_items, cs_items, ws_items CTEs with a single CTE that unions all three fact tables and uses CASE to compute revenue per channel.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["date filter", "item manager filter", "customer birth year filter", "list price range"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "ss_item_rev", "cs_item_rev", "ws_item_rev"]
+      },
+      "gates_checked": ["G_SF_UNION_BRANCH_LIMIT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Reducing three separate aggregation passes to one unioned pass may lower I/O and compute overhead if the same micro-partitions are scanned multiple times.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fewer aggregate nodes; union branches appear with conditional aggregation.",
+      "recommended_patch_ops": ["replace_cte", "insert_union", "replace_group_by"],
+      "rank_rationale": "Exploration targeting aggregation redundancy across three fact tables.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the date_dim subquery result (list of date_sk) into a CTE to avoid recomputing it three times.",
+      "dag_target_hint": "Replace the correlated date_dim subquery in each CTE with a reference to a single date_keys CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq = (select d_month_seq from date_dim where d_date = '1998-05-19')"],
+        "output_must_preserve": ["d_date_sk"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Date_dim scan appears once; each fact table join references the materialized CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_subquery"],
+      "rank_rationale": "Targets repeated subquery execution; low risk and complementary to probe p01.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in the query; the date subquery is not correlated."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in the query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicates in the query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN patterns in the query; all joins are comma joins."
+    }
+  ]
+}

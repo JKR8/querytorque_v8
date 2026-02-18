@@ -1,0 +1,165 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three large fact-table scans (store_sales, catalog_sales, web_sales) dominate I/O (2.6TB total) with late application of date and item filters. The OR of two EXISTS is implemented via LeftOuterJoin+Filter, which may block early pruning. Date_dim and item filters are selective but applied after large scans.",
+    "reasoning_trace": [
+      "Fact scans: store_sales 1.25TB (72718 parts), catalog_sales 923GB (54922 parts), web_sales 461GB (27579 parts).",
+      "Date_dim filters (d_year=1999, d_moy 5-8) are applied in SemiJoin after fact scan, not pushed into fact scan predicate.",
+      "OR condition implemented as LeftOuterJoin+Filter, not as UNION ALL, which may inhibit branch-level pruning.",
+      "Dimension tables (date_dim, item) are small and fully pruned (parts=1/1, 2/2); not primary I/O targets."
+    ],
+    "cost_spine": ["TableScan store_sales", "TableScan catalog_sales", "TableScan web_sales", "SemiJoin date_dim", "LeftOuterJoin OR-branch", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "TableScan store_sales",
+        "why": "largest fact scan, 1.25TB, no date_sk range predicate",
+        "evidence": "parts=72718/72718 bytes=1251924090880"
+      },
+      {
+        "op": "TableScan catalog_sales",
+        "why": "second largest fact scan, 923GB, no date_sk range predicate",
+        "evidence": "parts=54922/54922 bytes=923617475584"
+      },
+      {
+        "op": "TableScan web_sales",
+        "why": "third largest fact scan, 461GB, no date_sk range predicate",
+        "evidence": "parts=27579/27579 bytes=461041485824"
+      },
+      {
+        "op": "LeftOuterJoin OR-branch",
+        "why": "OR of two EXISTS implemented as LeftOuterJoin+Filter, may block early pruning",
+        "evidence": "nodes [1.28] LeftOuterJoin catalog_sales, [1.44] LeftOuterJoin web_sales, [1.27] Filter OR condition"
+      }
+    ],
+    "do_not_do": [
+      "do not materialize EXISTS subqueries into broad CTEs (violates G_SF_EXISTS_PROTECTED)",
+      "do not wrap date_sk or item_sk in functions (protects MICRO_PARTITION_PRUNING)",
+      "avoid same-column OR to UNION ALL on Snowflake unless evidence shows OR blocks pruning"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range derived from date_dim filter (d_year=1999 AND d_moy BETWEEN 5 AND 8) to each fact table scan (store_sales, catalog_sales, web_sales) in the WHERE clause, preserving existing join conditions.",
+      "dag_target_hint": "Modify final_select WHERE clause to add ss_sold_date_sk BETWEEN ... AND ..., cs_sold_date_sk BETWEEN ... AND ..., ws_sold_date_sk BETWEEN ... AND ...",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 1999", "d_moy BETWEEN 5 AND 8", "all existing join predicates"],
+        "output_must_preserve": ["all original output columns and grouping"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "TableScan nodes for store_sales, catalog_sales, web_sales show reduced parts scanned due to micro-partition pruning from date_sk BETWEEN predicate.",
+      "recommended_patch_ops": ["add_where_predicate", "derive_date_sk_range"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary I/O hotspot — largest fact scans lack date_sk range predicate, direct evidence from plan.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Replace OR of two EXISTS with UNION ALL of two branches, each with one EXISTS, then aggregate after union. Preserve same grouping and counts.",
+      "dag_target_hint": "Replace final_select WHERE clause OR condition with UNION ALL of two subqueries, then outer aggregate.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year = 1999", "d_moy BETWEEN 5 AND 8", "i_category IN ('Children','Home','Women')", "i_manager_id BETWEEN 91 AND 100", "price ratio filters"],
+        "output_must_preserve": ["same grouping keys and aggregate counts"]
+      },
+      "gates_checked": ["G_SF_EXISTS_PROTECTED:CAUTION", "G_SF_UNION_BRANCH_LIMIT:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "OR implemented as LeftOuterJoin+Filter may prevent branch-specific pruning; UNION ALL may allow each branch to be optimized independently and push date_sk predicates earlier.",
+      "confidence": 0.55,
+      "expected_explain_delta": "LeftOuterJoin nodes replaced by UNION ALL; each branch may show reduced scan parts due to independent predicate pushdown.",
+      "recommended_patch_ops": ["replace_where_or_with_union_all", "wrap_union_in_outer_aggregate"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — targets secondary hotspot (OR shape) with plausible pruning benefit, but Snowflake may already optimize; confidence moderate.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate each fact table (store_sales, catalog_sales, web_sales) by customer key (ss_customer_sk, cs_ship_customer_sk, ws_bill_customer_sk) and date_sk before joining to date_dim and item, reducing rows early.",
+      "dag_target_hint": "Insert CTEs for pre-aggregated fact data, then join to date_dim and item in EXISTS subqueries.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year = 1999", "d_moy BETWEEN 5 AND 8", "i_category IN ('Children','Home','Women')", "i_manager_id BETWEEN 91 AND 100", "price ratio filters"],
+        "output_must_preserve": ["customer key for EXISTS correlation", "no duplication of rows"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none", "G_SF_EXISTS_PROTECTED:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-aggregating fact tables before joining dimensions may reduce rows flowing into SemiJoin and subsequent aggregates, especially for catalog_sales and web_sales in OR branch.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Aggregate nodes appear earlier in plan; SemiJoin input rows reduced; fact scan may still be large but downstream work shrinks.",
+      "recommended_patch_ops": ["insert_cte", "replace_subquery_from"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Exploration — targets secondary hotspot (aggregate placement) with potential to reduce join amplification; family C underrepresented.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared dimension filters (date_dim and item) into a single CTE each, then reference them in all three channel subqueries (store, catalog, web) to avoid repeated dimension scans.",
+      "dag_target_hint": "Insert CTEs for filtered date_dim and item, then replace original dimension table references in EXISTS subqueries with CTE joins.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item"],
+        "where_must_preserve": ["d_year = 1999", "d_moy BETWEEN 5 AND 8", "i_category IN ('Children','Home','Women')", "i_manager_id BETWEEN 91 AND 100"],
+        "output_must_preserve": ["date_sk, item_sk keys for joins", "no change to fact table filters"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "dimension_already_pruned:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Dimension tables are small and already pruned, but materializing them once may improve join planning and reduce repeated subtree overhead.",
+      "confidence": 0.45,
+      "expected_explain_delta": "TableScan date_dim and item appear once each in CTE materialization; subsequent joins reference CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_dimension_reference"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration — low confidence due to small dimension size, but family A underrepresented and may improve join planning.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in query; only EXISTS and OR of EXISTS, which Snowflake already decorrelates to SemiJoin."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN followed by WHERE filter eliminating NULLs; OR branch uses LeftOuterJoin but Filter is on OR condition, not right-table NULL elimination."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "Correlated EXISTS already decorrelated to SemiJoin in plan; manual decorrelation unlikely to help and risks violating G_SF_EXISTS_PROTECTED."
+    }
+  ]
+}

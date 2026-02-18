@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a large merge join (85k rows) feeding nested loops that amplify to a smaller set (6540 rows). The comma-style joins and late application of the item inequality filter cause poor join order and large intermediate results. Prefiltering dimensions and restructuring the self-join can reduce the fact-table scan volume and improve join order.",
+    "reasoning_trace": [
+      "Merge Join (rows=85310, time=5807ms) is the largest intermediate result, driven by a full scan of store_sales (s1) after a selective date_dim filter.",
+      "Nested Loop (rows=6540, time=18608ms) is the second largest hotspot, joining the large intermediate result with customer and customer_demographics before the inequality filter on item keys.",
+      "The inequality condition `item1.i_item_sk < item2.i_item_sk` is applied late, after joining with customer and customer_demographics, missing early pruning opportunity.",
+      "Comma-style joins may prevent the optimizer from reordering joins effectively, leading to suboptimal join order."
+    ],
+    "cost_spine": ["Merge Join", "Nested Loop", "Nested Loop", "Aggregate", "Sort"],
+    "hotspots": [
+      {
+        "op": "Merge Join",
+        "why": "large intermediate result from store_sales (s1) and item1 before other filters",
+        "evidence": "rows=85310 time=5807ms"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "amplifies merge join result with customer and customer_demographics before inequality filter",
+        "evidence": "rows=6540 time=18608ms"
+      },
+      {
+        "op": "Nested Loop (item2)",
+        "why": "late inequality filter applied after joining with customer and customer_demographics",
+        "evidence": "rows=279 time=18921ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION transforms (no OR predicate in plan)",
+      "avoid decorrelating EXISTS (no correlated subqueries present)",
+      "do not duplicate large CTE bodies (respect G_PG_CTE_DUPLICATION_STOP)",
+      "avoid aggressive join-order forcing; prefer cardinality reduction"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create two MATERIALIZED CTEs: one for s1 with date_dim and item1 filters, another for s2 with date_dim and item2 filters. Join these CTEs on ss_ticket_number, then join remaining dimensions. Convert comma joins to explicit JOIN syntax.",
+      "dag_target_hint": "Replace final_select FROM clause with explicit JOINs and CTE references.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "store_sales s2", "item item1", "item item2", "date_dim", "customer", "customer_address", "customer_demographics"],
+        "where_must_preserve": ["item1.i_item_sk < item2.i_item_sk", "s1.ss_ticket_number = s2.ss_ticket_number", "d_year between 1999 and 1999 + 1", "item1.i_category in ('Electronics', 'Men')", "item2.i_manager_id between 44 and 63", "cd_marital_status = 'D'", "cd_education_status = 'College'", "s1.ss_list_price between 115 and 129", "s2.ss_list_price between 115 and 129"],
+        "output_must_preserve": ["item1.i_item_sk", "item2.i_item_sk", "count(*) as cnt", "GROUP BY item1.i_item_sk, item2.i_item_sk", "ORDER BY cnt"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS", "G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Merge Join replaced by hash joins on prefiltered CTEs; nested loops eliminated; inequality filter applied earlier.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Targets primary hotspot (merge join) and secondary hotspot (nested loop) by prefetching fact tables with dimension filters and addressing comma-join weakness.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered store_sales for s1 and s2 separately into CTEs, each with its own item and date filters, then join CTEs on ticket number and remaining dimensions.",
+      "dag_target_hint": "Replace final_select FROM clause with CTEs for s1 and s2, then explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "store_sales s2", "item item1", "item item2", "date_dim", "customer", "customer_address", "customer_demographics"],
+        "where_must_preserve": ["item1.i_item_sk < item2.i_item_sk", "s1.ss_ticket_number = s2.ss_ticket_number", "d_year between 1999 and 1999 + 1", "item1.i_category in ('Electronics', 'Men')", "item2.i_manager_id between 44 and 63", "cd_marital_status = 'D'", "cd_education_status = 'College'", "s1.ss_list_price between 115 and 129", "s2.ss_list_price between 115 and 129"],
+        "output_must_preserve": ["item1.i_item_sk", "item2.i_item_sk", "count(*) as cnt", "GROUP BY item1.i_item_sk, item2.i_item_sk", "ORDER BY cnt"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the two store_sales scans separately may allow the planner to choose better join orders and apply inequality filter earlier.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Two CTE scans replace single store_sales scans; nested loops may become hash joins; inequality filter pushed into CTE definitions.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Exploration targeting self-join decomposition to reduce scan volume and improve join order.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Isolate date_dim into a MATERIALIZED CTE with the year filter, then join with store_sales and other tables using explicit JOIN syntax.",
+      "dag_target_hint": "Replace final_select FROM clause with explicit JOINs and a date_cte.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "store_sales s2", "item item1", "item item2", "date_dim", "customer", "customer_address", "customer_demographics"],
+        "where_must_preserve": ["item1.i_item_sk < item2.i_item_sk", "s1.ss_ticket_number = s2.ss_ticket_number", "d_year between 1999 and 1999 + 1", "item1.i_category in ('Electronics', 'Men')", "item2.i_manager_id between 44 and 63", "cd_marital_status = 'D'", "cd_education_status = 'College'", "s1.ss_list_price between 115 and 129", "s2.ss_list_price between 115 and 129"],
+        "output_must_preserve": ["item1.i_item_sk", "item2.i_item_sk", "count(*) as cnt", "GROUP BY item1.i_item_sk, item2.i_item_sk", "ORDER BY cnt"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Merge Join replaced by hash join with tiny date CTE; nested loops may be reordered.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Targets comma-join weakness and reduces date_dim scan to a tiny hash table, addressing early filtering.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "A",
+      "target": "Prefilter all dimension tables (date_dim, customer, customer_address, customer_demographics, item1, item2) into separate CTEs, then join with store_sales using explicit JOIN syntax.",
+      "dag_target_hint": "Replace final_select FROM clause with explicit JOINs and multiple dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales s1", "store_sales s2", "item item1", "item item2", "date_dim", "customer", "customer_address", "customer_demographics"],
+        "where_must_preserve": ["item1.i_item_sk < item2.i_item_sk", "s1.ss_ticket_number = s2.ss_ticket_number", "d_year between 1999 and 1999 + 1", "item1.i_category in ('Electronics', 'Men')", "item2.i_manager_id between 44 and 63", "cd_marital_status = 'D'", "cd_education_status = 'College'", "s1.ss_list_price between 115 and 129", "s2.ss_list_price between 115 and 129"],
+        "output_must_preserve": ["item1.i_item_sk", "item2.i_item_sk", "count(*) as cnt", "GROUP BY item1.i_item_sk, item2.i_item_sk", "ORDER BY cnt"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Prefetching all dimensions may allow the planner to reorder joins more effectively and reduce intermediate row counts.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Multiple CTE scans replace dimension table scans; join order may shift to smaller build sides.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Exploration targeting secondary hotspot (nested loop) by prefetching all dimensions to improve join order.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; plan does not show OR-related hotspot."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; plan does not show correlated execution."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation is final step after joins; no early aggregation opportunity evident in plan."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No set operations (INTERSECT/EXCEPT) in query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "All joins are inner joins; no LEFT JOIN with WHERE filter pattern."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Transform is specific to Snowflake and not native to PostgreSQL runtime."
+    }
+  ]
+}

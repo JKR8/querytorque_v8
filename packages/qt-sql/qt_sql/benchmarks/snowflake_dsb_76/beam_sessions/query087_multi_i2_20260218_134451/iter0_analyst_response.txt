@@ -1,0 +1,174 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 2,
+    "probe_count": 4,
+    "early_stop": true,
+    "equivalence_tier": "exact",
+    "hypothesis": "The plan is already efficient with early filters applied to dimension tables and predicates pushed into fact scans. The primary cost is scanning three large fact tables (store_sales, catalog_sales, web_sales) for distinct keys, but each scan is already pruned by list_price and wholesale_cost filters. The main opportunity is to test if predicate pushdown across the EXCEPT set operations can further prune fact micro-partitions, and to explore consolidation of repeated dimension scans.",
+    "reasoning_trace": [
+      "GlobalStats shows 155799/156005 parts scanned, indicating high but not full table scans.",
+      "DATE_DIM scans show parts=1/1, proving d_month_seq filter prunes partitions effectively.",
+      "CUSTOMER scans show parts=261/261 (full table), but filter on c_birth_year is applied early (Filter node).",
+      "Three large fact table scans (STORE_SALES, CATALOG_SALES, WEB_SALES) dominate I/O bytes.",
+      "Each fact scan has its price/wholesale_cost filter applied directly (Filter node before TableScan).",
+      "Plan shows no nested loops, late filters, or correlated subqueries; shape is already set-based.",
+      "AST pre-screening shows 100% match for `sf_sk_pushdown_multi_fact` transform."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "TableScan (CATALOG_SALES)", "TableScan (WEB_SALES)", "Aggregate (groupKeys)", "AntiJoin"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "Largest I/O volume scan among the three fact tables.",
+        "evidence": "parts=72718/72718 bytes=1251924090880"
+      },
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "Second largest I/O volume fact scan.",
+        "evidence": "parts=54721/54922 bytes=920184101376"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "Third large I/O volume fact scan.",
+        "evidence": "parts=27574/27579 bytes=460956759040"
+      }
+    ],
+    "do_not_do": [
+      "Avoid materializing EXISTS patterns (query uses EXCEPT, not EXISTS).",
+      "Avoid wrapping date_sk or filter columns in functions that block micro-partition pruning.",
+      "Avoid introducing large, unfiltered CTEs that increase total scan volume.",
+      "Do not convert EXCEPT to NOT EXISTS if it materializes full result sets prematurely."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range predicate derived from `d_month_seq between 1213 and 1213+11` to each fact table's WHERE clause (store_sales.ss_sold_date_sk, catalog_sales.cs_sold_date_sk, web_sales.ws_sold_date_sk).",
+      "dag_target_hint": "Modify the WHERE clause in each of the three main subqueries (store_sales, catalog_sales, web_sales branches).",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales", "catalog_sales", "web_sales", "customer"],
+        "where_must_preserve": ["d_month_seq between 1213 and 1224", "list_price between 168 and 197", "wholesale_cost between 76 and 86", "c_birth_year BETWEEN 1968 AND 1974"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date from each subquery", "EXCEPT semantics and order"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Potential reduction in parts scanned for CATALOG_SALES and WEB_SALES (currently not 1/1). DATE_DIM scan remains parts=1/1.",
+      "recommended_patch_ops": ["replace_where_predicate"],
+      "rank_rationale": "Targets the primary I/O hotspot with a native Snowflake transform strongly matched by AST screening.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate the three separate fact+dimension scans into a single CTE that labels the sales channel, then aggregate once to produce the distinct sets needed for the EXCEPT operation.",
+      "dag_target_hint": "Replace the three main subqueries with a UNION ALL inside a single CTE, adding a channel column, then aggregate and pivot in outer logic.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer", "store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["All original filters on date, price, cost, and birth year"],
+        "output_must_preserve": ["Final set of distinct (c_last_name, c_first_name, d_date) tuples after EXCEPT logic"]
+      },
+      "gates_checked": ["DG_BLOCKER_POLICY:PASS", "G_SF_UNION_BRANCH_LIMIT:PASS", "G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The plan shows three repeated scan+aggregate patterns. A single pass may reduce total scan cost if the union can be pruned or if compute overhead is less than scanning three times, but it risks losing per-branch filter pushdown.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Three separate TableScan and Aggregate chains replaced by one larger scan with a UNION ALL and a single aggregation stage. I/O may increase or decrease depending on union pruning.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_set_operation"],
+      "rank_rationale": "Exploration targeting the redundant scan pattern (Family C), which is underrepresented. High match score from AST screening.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Pre-filter the date_dim table for the required month range into a tiny CTE and join it to each fact table subquery.",
+      "dag_target_hint": "Insert a CTE `filtered_dates` at the top, and replace each join to `date_dim` with a join to `filtered_dates`.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_month_seq between 1213 and 1224"],
+        "output_must_preserve": ["d_date_sk and d_date columns for joining", "All original join and filter logic in the three main subqueries"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_FILTER_FUNCTION_WRAP:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "DATE_DIM is already fully pruned (parts=1/1). This transform tests if materializing it as a CTE provides any planning benefit or reduces repeated work, though the benefit is likely minimal.",
+      "confidence": 0.45,
+      "expected_explain_delta": "The three separate `TableScan (DATE_DIM)` nodes may be replaced by `CTESCAN` referencing the single materialized date CTE. I/O on date_dim should remain constant.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting secondary dimension scan pattern. Low confidence due to already optimal pruning, but uses an underrepresented Family A variant.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create a single CTE for the filtered customer data (birth_year) and a single CTE for the filtered date data (month_seq). Join these once to each sales fact table in the respective subqueries.",
+      "dag_target_hint": "Insert CTEs `filtered_customers` and `filtered_dates`. Replace the customer and date_dim tables in each of the three subqueries with joins to these CTEs.",
+      "node_contract": {
+        "from_must_include": ["customer", "date_dim"],
+        "where_must_preserve": ["c_birth_year BETWEEN 1968 AND 1974", "d_month_seq between 1213 and 1224"],
+        "output_must_preserve": ["All join keys (c_customer_sk, d_date_sk) and output columns (c_last_name, c_first_name, d_date)"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_UNION_BRANCH_LIMIT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The customer table is scanned three times (parts=261/261 each). Materializing the filtered customer set once may reduce redundant work, though the filter is already applied early in each branch.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Three `TableScan (CUSTOMER)` nodes replaced by references to a shared `CTESCAN`. Potential reduction in scan overhead if the CTE is materialized and reused.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting the repeated customer dimension scan. Uses Family A and addresses a secondary hotspot.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence; all filters are simple BETWEEN ranges."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "Query uses EXCEPT, not INTERSECT. Converting EXCEPT to NOT EXISTS may materialize larger intermediate sets."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in the SQL or plan evidence."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery pattern (G_SF_CORR_SCALAR_REQUIRED gate fails)."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation is already performed on the join result (distinct per subquery). Pre-aggregating fact tables before joining customer may change semantics if customer filters affect distinctness."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "While it consolidates scans, it is a portability_candidate for duckdb. Snowflake-native single_pass_aggregation is preferred for exploration."
+    }
+  ]
+}

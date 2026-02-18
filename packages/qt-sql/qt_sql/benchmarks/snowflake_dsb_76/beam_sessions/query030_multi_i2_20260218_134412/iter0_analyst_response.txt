@@ -1,0 +1,159 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The correlated scalar subquery on customer_total_return causes redundant aggregation per state, leading to potential repeated computation, and repeated scans of customer_address increase I/O volume. Decorrelating the subquery and pre-filtering dimension tables could reduce computation and scan overhead.",
+    "reasoning_trace": [
+      "TableScan (WEB_RETURNS) scans 39GB, indicating high I/O cost.",
+      "Correlated subquery in final SELECT involves aggregation per state, which may not be fully optimized by Snowflake's decorrelation for scalar aggregates.",
+      "CUSTOMER_ADDRESS is scanned twice in the plan: once in the CTE and once in the final SELECT, with different filters."
+    ],
+    "cost_spine": ["TableScan (WEB_RETURNS)", "Aggregate", "InnerJoin with joinFilter for correlated subquery", "TableScan (CUSTOMER_ADDRESS)"],
+    "hotspots": [
+      {
+        "op": "InnerJoin with joinFilter for correlated subquery",
+        "why": "Correlated scalar aggregate may cause redundant computation per state",
+        "evidence": "Plan shows joinFilter with aggregation in [1.4]; AST pre-screening indicates CORRELATED_SUBQUERY_PARALYSIS gap"
+      },
+      {
+        "op": "TableScan (CUSTOMER_ADDRESS)",
+        "why": "Repeated scan increases I/O volume",
+        "evidence": "Scanned twice in plan: parts=256/256 bytes=776454656 each at [1.26] and [1.35]"
+      },
+      {
+        "op": "TableScan (WEB_RETURNS)",
+        "why": "Large fact table scan dominates I/O",
+        "evidence": "parts=2289/2289 bytes=39149218304"
+      }
+    ],
+    "do_not_do": [
+      "Avoid materializing EXISTS patterns as they are optimized by Snowflake's semi-join",
+      "Avoid introducing unfiltered large CTEs",
+      "Do not wrap partition keys in functions to preserve micro-partition pruning"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose the correlated scalar subquery into CTEs: create a shared CTE for customer_total_return data, a threshold CTE computing avg(ctr_total_return)*1.2 per ctr_state, and modify final_select to join with the threshold CTE instead of the subquery.",
+      "dag_target_hint": "Change final_select node to reference new CTEs and replace the correlated subquery with a join to the threshold CTE.",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1", "customer_address", "customer"],
+        "where_must_preserve": ["ctr1.ctr_total_return > threshold", "ca_state in ('OK', 'SC', 'TX', 'WI')", "c_birth_year BETWEEN 1985 AND 1991", "ctr1.ctr_reason_sk in (20, 36)"],
+        "output_must_preserve": ["All original output columns and ORDER BY/LIMIT behavior"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "Correlated joinFilter replaced with pre-computed threshold join, reducing aggregation redundancy.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot with direct evidence from gold example and high expected impact.",
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter customer_address on ca_state in ('OK', 'SC', 'TX', 'WI') into a CTE before joining in the final_select, to reduce scan volume for that part.",
+      "dag_target_hint": "Modify final_select node to reference a pre-filtered customer_address CTE instead of the base table.",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1", "customer"],
+        "where_must_preserve": ["ca_state in ('OK', 'SC', 'TX', 'WI')", "c_birth_year BETWEEN 1985 AND 1991", "ctr1.ctr_reason_sk in (20, 36)", "ctr1.ctr_total_return > subquery condition"],
+        "output_must_preserve": ["All original output columns and join semantics"]
+      },
+      "gates_checked": ["G_SF_FILTER_FUNCTION_WRAP:PASS", "anti_padding_guard:PASS for significant scan reduction"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "TableScan (CUSTOMER_ADDRESS) in final_select path replaced with scan of pre-filtered CTE, reducing I/O.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Addresses secondary hotspot of repeated customer_address scan with plausible I/O savings.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the customer_address scan into a CTE to avoid repeated base table scans, especially if filters differ between CTE and final_select contexts.",
+      "dag_target_hint": "Introduce a CTE for customer_address and reference it in both customer_total_return and final_select nodes.",
+      "node_contract": {
+        "from_must_include": ["customer_address base or filtered"],
+        "where_must_preserve": ["Join conditions and any filters applied in respective contexts"],
+        "output_must_preserve": ["All required columns for downstream joins and projections"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS for multi-ref CTE", "semantic_equivalence:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Reduced number of TableScan (CUSTOMER_ADDRESS) nodes, potentially lowering I/O and scan overhead.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Targets repeated scan hotspot with materialization to avoid redundant work.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "E",
+      "target": "Pre-filter all selective dimension tables (date_dim with d_year=2002, item with i_manager_id BETWEEN 68 and 77) into CTEs before the web_returns scan in customer_total_return, to reduce fact table scan rows through early join reduction.",
+      "dag_target_hint": "Modify customer_total_return node to reference pre-filtered dimension CTEs instead of base tables.",
+      "node_contract": {
+        "from_must_include": ["web_returns", "pre-filtered date_dim", "pre-filtered item", "customer_address"],
+        "where_must_preserve": ["d_year=2002", "i_manager_id BETWEEN 68 and 77", "wr_return_amt/wr_return_quantity between 242 and 271", "join conditions"],
+        "output_must_preserve": ["Grouping keys and aggregate results"]
+      },
+      "gates_checked": ["G_SF_LOW_BASELINE_SKIP_HEAVY:PASS as baseline has high I/O", "anti_padding_guard:CAUTION for small dimensions but exploration justified"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering selective dimensions may reduce web_returns scan volume through better join planning, despite small dimension sizes.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Earlier application of dimension filters could reduce rows flowing into web_returns joins, lowering I/O or compute.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot with underrepresented family E, testing early reduction impact.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "Query does not contain UNION ALL or multiple fact tables with date_dim join to justify sk pushdown."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Group by keys in customer_total_return span multiple tables (web_returns and customer_address), making direct pushdown complex and evidence weak."
+    }
+  ]
+}

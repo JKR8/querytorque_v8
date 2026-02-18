@@ -14,6 +14,7 @@ def create_llm_client(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     api_key: Optional[str] = None,
+    enable_reasoning: bool = None,
 ) -> Optional[LLMClient]:
     """Create an LLM client based on configuration.
 
@@ -24,6 +25,8 @@ def create_llm_client(
             (deepseek, gemini-api, gemini-cli, groq, openai, openrouter)
         model: Model name (required; no implicit provider defaults)
         api_key: API key (optional, uses environment if not specified)
+        enable_reasoning: Explicit reasoning mode control (forwarded to OpenAIClient).
+            None = auto-detect, True = force on, False = force off.
 
     Returns:
         An LLM client instance, or None if no provider is configured.
@@ -86,6 +89,7 @@ def create_llm_client(
         return OpenAIClient(
             api_key=api_key,
             model=model,
+            enable_reasoning=enable_reasoning,
         )
     elif provider == "openrouter":
         if not api_key:
@@ -94,6 +98,7 @@ def create_llm_client(
             api_key=api_key,
             model=model,
             base_url="https://openrouter.ai/api/v1",
+            enable_reasoning=enable_reasoning,
         )
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")

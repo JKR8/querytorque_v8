@@ -1,0 +1,160 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Correlated scalar subquery forces a separate full fact-table scan and aggregation, doubling I/O and compute. Primary bottleneck is the repeated 461GB web_sales scan (twice) for outer and inner branches. Decorrelation should compute per-item average once, then filter outer rows against precomputed thresholds.",
+    "reasoning_trace": [
+      "Plan shows two full web_sales scans (27579 parts each, 461GB each) with identical date and wholesale_cost filters.",
+      "Correlated subquery aggregates per-item average discount, re-scanning fact table per outer row via separate branch.",
+      "Outer OR filter on item table is selective but small; fact-table scan reduction is the dominant opportunity.",
+      "No nested loops, so family B decorrelation is primary path; family A early filtering may reduce dimension join rows."
+    ],
+    "cost_spine": ["TableScan(WEB_SALES) ×2", "Aggregate(SUM, COUNT)", "InnerJoin(ITEM, WEB_SALES)", "Filter(correlated scalar subquery)"],
+    "hotspots": [
+      {
+        "op": "TableScan(WEB_SALES) inner branch",
+        "why": "repeated full fact scan for correlated subquery",
+        "evidence": "parts=27579/27579 bytes=461041485824"
+      },
+      {
+        "op": "TableScan(WEB_SALES) outer branch",
+        "why": "outer fact scan with same date/wholesale filters",
+        "evidence": "parts=27579/27579 bytes=461041485824"
+      },
+      {
+        "op": "Filter(correlated scalar subquery)",
+        "why": "per-row re-evaluation of aggregate threshold",
+        "evidence": "plan shows separate aggregation branch with same filters"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS (no EXISTS in query)",
+      "avoid unfiltered large CTE introduction",
+      "do not wrap date_sk in functions (micro-partition pruning key)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery into three CTEs: (1) filtered date_dim keys, (2) filtered web_sales with date join and ws_sales_price/ws_list_price filter, (3) per-item average threshold CTE grouping by ws_item_sk. Then join threshold CTE in main FROM and replace subquery with direct column comparison.",
+      "dag_target_hint": "Replace final_select FROM and WHERE clause; add three CTEs before main SELECT.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item", "date_dim", "threshold_cte"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men')", "d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day'", "ws_wholesale_cost BETWEEN 16 AND 36", "ws_ext_discount_amt > 1.3 * threshold_cte.avg_discount"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY sum(ws_ext_discount_amt)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "Eliminate second web_sales scan; single aggregated threshold CTE; filter becomes simple join condition.",
+      "recommended_patch_ops": ["insert_cte:filtered_dates", "insert_cte:filtered_sales", "insert_cte:thresholds", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot — eliminates repeated fact scan for correlated subquery, direct gold match.",
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Create shared CTE scanning web_sales with date join and wholesale_cost filter, then compute outer filtered set and inner aggregate thresholds from same CTE to avoid duplicate scans.",
+      "dag_target_hint": "Replace final_select FROM with shared CTE and derived CTEs; keep outer item join and inner threshold logic separate.",
+      "node_contract": {
+        "from_must_include": ["shared_sales_cte", "item", "threshold_cte"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men')", "ws_ext_discount_amt > 1.3 * threshold_cte.avg_discount"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY sum(ws_ext_discount_amt)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Single web_sales scan in shared CTE; outer and inner branches become filtered projections from same CTE.",
+      "recommended_patch_ops": ["insert_cte:shared_scan", "insert_cte:outer_filtered", "insert_cte:thresholds", "replace_from"],
+      "rank_rationale": "Secondary decorrelation variant — shares scan but inner filter on ws_sales_price/ws_list_price differs.",
+      "recommended_examples": ["sf_shared_scan_decorrelate"],
+      "gold_example_id": "sf_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR condition on item into two UNION ALL branches: one for i_manufact_id range, one for i_category IN list, each joined to filtered web_sales and date_dim.",
+      "dag_target_hint": "Replace final_select with UNION ALL of two branches, each with dedicated item filter.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item", "date_dim", "threshold_cte"],
+        "where_must_preserve": ["d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day'", "ws_wholesale_cost BETWEEN 16 AND 36", "ws_ext_discount_amt > 1.3 * threshold_cte.avg_discount"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\" across UNION", "ORDER BY sum(ws_ext_discount_amt)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_UNION_BRANCH_LIMIT:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "OR on different columns may prevent optimal filter pushdown; UNION may enable separate micro‑partition pruning on each column.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Two separate table scans on item with focused predicates; UNION ALL merges results before final aggregation.",
+      "recommended_patch_ops": ["replace_from_with_union", "split_or_predicate"],
+      "rank_rationale": "Exploration — secondary hotspot item scan may benefit from predicate separation.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre‑filter item and date_dim into CTEs returning only surrogate keys, then join with web_sales and threshold CTE.",
+      "dag_target_hint": "Insert CTEs for filtered_item and filtered_date before main FROM.",
+      "node_contract": {
+        "from_must_include": ["filtered_item", "filtered_date", "web_sales", "threshold_cte"],
+        "where_must_preserve": ["ws_wholesale_cost BETWEEN 16 AND 36", "ws_ext_discount_amt > 1.3 * threshold_cte.avg_discount"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY sum(ws_ext_discount_amt)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension CTEs may improve join order choices and reduce fact‑scan rows via early key reduction.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Dimension scans become tiny CTE materializations; join order may shift to fact‑last.",
+      "recommended_patch_ops": ["insert_cte:filtered_item", "insert_cte:filtered_date", "replace_from"],
+      "rank_rationale": "Exploration — family A underrepresented; may complement decorrelation by reducing join input.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY in outer query; aggregation is a single SUM across all rows, not per‑group."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "No UNION ALL or multiple fact tables; date_sk join already present with date filter."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated subquery pattern; only one correlated subquery."
+    }
+  ]
+}

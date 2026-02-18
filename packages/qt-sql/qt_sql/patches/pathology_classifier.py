@@ -210,6 +210,7 @@ def build_intelligence_brief(
     top_ast = [m for m in detected_transforms if m.overlap_ratio >= 0.30][:5]
     if top_ast:
         lines.append("### AST Feature Detection")
+        lines.append("AST pre-screening results for this query; use to validate transform applicability against runtime gates.")
         lines.append("")
         for m in top_ast:
             gap_str = f" (gap: {m.gap})" if m.gap else ""

@@ -1,0 +1,159 @@
+{  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query uses comma-separated joins and complex OR conditions, leading to poor cardinality estimates (UNDER_EST at JOIN) and nested loops dominating runtime. Converting to explicit joins and pre-filtering dimensions may improve join order and reduce row amplification before aggregation.",
+    "reasoning_trace": [
+      "Nested Loop operator consumes 2707 ms with rows=22, indicating join inefficiency.",
+      "Hash Join operator consumes 2310 ms with rows=6247, showing significant join work.",
+      "Estimation error: JOIN under-estimated (est=1,928, act=56K), suggesting planner misjudgment due to comma joins or OR predicates.",
+      "Index Only Scans on date_dim and store_sales are fast, but joins amplify rows late in the plan."
+    ],
+    "cost_spine": ["Aggregate", "Gather", "Aggregate", "Nested Loop", "Nested Loop", "Hash Join", "Hash Join", "Nested Loop", "Index Only Scan on date_dim", "Index Only Scan on store_sales"],
+    "hotspots": [
+      {
+        "op": "Nested Loop",
+        "why": "dominant time consumption with row amplification after joins",
+        "evidence": "time=2707.328 ms, rows=22"
+      },
+      {
+        "op": "Hash Join",
+        "why": "significant join work before nested loop",
+        "evidence": "time=2310.635 ms, rows=6247"
+      }
+    ],
+    "do_not_do": [
+      "avoid splitting same-column indexed OR predicates into UNION ALL (BitMapOr strength in PostgreSQL)",
+      "avoid duplicating heavy CTE bodies without reuse benefit",
+      "avoid materializing EXISTS paths already optimized as semi-joins"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit JOIN syntax and isolate date_dim filter (d_year=2001) into a CTE to create a small hash table, enabling better join planning and cardinality estimates.",
+      "dag_target_hint": "Change final_select FROM clause to use explicit JOINs and add date_cte as a materialized CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk", "d_year = 2001", "cd_marital_status IN ('M','S','W')", "cd_education_status IN ('2 yr Degree','Primary')", "ss_sales_price BETWEEN clauses", "hd_dep_count IN (3,1)", "ca_country = 'United States'", "ca_state IN lists", "ss_net_profit BETWEEN clauses"],
+        "output_must_preserve": ["MIN(ss_quantity)", "MIN(ss_ext_sales_price)", "MIN(ss_ext_wholesale_cost) (duplicate corrected)"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop replaced with more efficient Hash Joins, reduced time in join operators due to better cardinality estimates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "add_explicit_joins"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Targets primary hotspot of comma join weakness with strong gold example support (2.28x speedup).",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, household_demographics, customer_demographics, customer_address) into separate CTEs before joining with store_sales to reduce input size and improve join order.",
+      "dag_target_hint": "Add multiple CTEs for filtered dimensions and modify final_select to join from these CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk", "d_year = 2001", "cd_marital_status IN ('M','S','W')", "cd_education_status IN ('2 yr Degree','Primary')", "ss_sales_price BETWEEN clauses", "hd_dep_count IN (3,1)", "ca_country = 'United States'", "ca_state IN lists", "ss_net_profit BETWEEN clauses"],
+        "output_must_preserve": ["MIN(ss_quantity)", "MIN(ss_ext_sales_price)", "MIN(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Testing if pre-filtering all dimensions simultaneously provides better row reduction than isolating only date_dim, potentially compounding selectivity.",
+      "confidence": 0.70,
+      "expected_explain_delta": "Reduced rows in early joins, potentially changing join order and lowering nested loop cost.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "rank_rationale": "Secondary approach to comma join weakness, exploring multi-dimension prefetch with gold example support (3.32x speedup).",
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR conditions on ss_sales_price and ss_net_profit into separate UNION ALL branches, each with focused predicates, to allow different access paths and potentially bypass BitmapOr limitations.",
+      "dag_target_hint": "Modify final_select WHERE clause to use UNION ALL over three branches corresponding to OR groups, preserving all joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk", "d_year = 2001", "join conditions for demographics and address"],
+        "output_must_preserve": ["MIN(ss_quantity)", "MIN(ss_ext_sales_price)", "MIN(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:CAUTION", "G_PG_CROSS_COLUMN_OR_DECOMPOSITION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "OR conditions might block optimal index usage or cause poor estimates; splitting could enable better scans and reduce filter overhead.",
+      "confidence": 0.50,
+      "expected_explain_delta": "BitmapOr replaced with multiple Index Scans or Seq Scans, potentially reducing filter time and improving join input.",
+      "recommended_patch_ops": ["replace_where_with_union"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe targeting OR condition bottleneck with low confidence due to PostgreSQL BitmapOr strength and regression risks.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered dimension and fact data into CTEs before final join to reduce input size for range filters (BETWEEN on ss_sales_price and ss_net_profit), treating them as non-equi join-like bottlenecks.",
+      "dag_target_hint": "Add CTEs for filtered store_sales and dimensions, then join in final_select.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk", "d_year = 2001", "cd_marital_status IN ('M','S','W')", "cd_education_status IN ('2 yr Degree','Primary')", "ss_sales_price BETWEEN clauses", "hd_dep_count IN (3,1)", "ca_country = 'United States'", "ca_state IN lists", "ss_net_profit BETWEEN clauses"],
+        "output_must_preserve": ["MIN(ss_quantity)", "MIN(ss_ext_sales_price)", "MIN(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:CAUTION", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staging filtered data might improve join efficiency even without explicit non-equi joins, by reducing input early.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Reduced input size to joins, potentially lowering nested loop cost and improving aggregate performance.",
+      "recommended_patch_ops": ["insert_cte", "materialize_filtered_data"],
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "rank_rationale": "Exploration probe testing materialization benefit for range filters with gold example support (12.07x speedup in similar contexts).",
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Previous optimization attempt failed (speedup=0.00x), and plan shows filters already applied early in Index Only Scans."
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Previous optimization attempt failed (speedup=0.00x), and transform is portability_candidate with caution for unfiltered CTE risks."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Not applicable; query has no GROUP BY, only scalar aggregates, so pushdown not feasible without row multiplication risks."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join patterns in the query; transform irrelevant to current plan structure."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in the query; decorrelation not needed, and previous attempt failed."
+    }
+  ]
+}

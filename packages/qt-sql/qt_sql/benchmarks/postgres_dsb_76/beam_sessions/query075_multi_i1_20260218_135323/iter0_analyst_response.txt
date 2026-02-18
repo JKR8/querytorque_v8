@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The primary bottleneck is the repeated full sequential scans of large returns tables (store_returns, catalog_returns, web_returns) without partition pruning, consuming ~75% of total runtime. Secondary hotspot is the nested-loop self-join of the all_sales CTE that processes all years before filtering to 1999/1998.",
+    "reasoning_trace": [
+      "Sequential scans on store_returns (172k rows, 7472ms), catalog_returns (78k rows, 3140ms), web_returns (101k rows, 4850ms) dominate I/O volume.",
+      "No date_sk predicate pushdown into returns tables despite date_dim join; returns tables scanned fully then filtered late.",
+      "all_sales CTE aggregates all years before outer self-join filters to 1999/1998, materializing unnecessary rows.",
+      "Gather node shows 3x underestimation (est=3, act=9798) indicating poor cardinality estimates on UNION branches."
+    ],
+    "cost_spine": ["Seq Scan store_returns", "Seq Scan catalog_returns", "Seq Scan web_returns", "Hash Join", "Nested Loop self-join"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_returns",
+        "why": "full table scan without date pruning",
+        "evidence": "rows=172653 time=7472ms"
+      },
+      {
+        "op": "Seq Scan on web_returns",
+        "why": "full table scan without date pruning",
+        "evidence": "rows=101985 time=4850ms"
+      },
+      {
+        "op": "Nested Loop self-join",
+        "why": "processes all years before filtering to two years",
+        "evidence": "rows=50 time=19815ms"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union transform (PostgreSQL uses BitmapOr for indexed OR)",
+      "duplicate heavy CTE bodies (G_PG_CTE_DUPLICATION_BLOCK)",
+      "materialize EXISTS paths already optimized as semi-joins"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk BETWEEN predicate into each UNION branch's returns table join condition to enable partition pruning.",
+      "dag_target_hint": "Modify all_sales CTE's three UNION subqueries to add returns.date_sk BETWEEN date_dim.d_date_sk AND date_dim.d_date_sk.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_returns", "catalog_returns", "web_returns"],
+        "where_must_preserve": ["i_category='Home'", "sales_price/list_price BETWEEN 0.34 AND 0.54", "reason_sk in (7,25,26,52,69)"],
+        "output_must_preserve": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "sales_cnt", "sales_amt"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Seq Scan on returns tables replaced with Index Scan using date_sk range, reducing rows scanned by 90%+.",
+      "recommended_patch_ops": ["add_predicate_to_join", "replace_where_clause"],
+      "rank_rationale": "Targets primary hotspot — eliminates full sequential scans of largest tables.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter date_dim to years 1998-1999 before joining with returns tables, and push filter into returns via date_sk.",
+      "dag_target_hint": "Wrap each UNION branch in a CTE that first filters date_dim, then joins filtered date_sk to returns tables.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_returns", "catalog_returns", "web_returns"],
+        "where_must_preserve": ["d_year IN (1998,1999)", "i_category='Home'", "sales_price/list_price BETWEEN 0.34 AND 0.54", "reason_sk in (7,25,26,52,69)"],
+        "output_must_preserve": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "all_sales CTE output rows."],
+        "output_must_preserve": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "sales_cnt", "sales_amt"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:PASS", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Returns table scans reduce to only rows matching 1998-1999 date range; all_sales CTE rows drop from ~10k to ~2k.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "add_predicate_to_join"],
+      "rank_rationale": "Addresses secondary hotspot — reduces all_sales CTE size before self-join.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize all_sales CTE once, then create two filtered CTEs (curr_yr_1999, prev_yr_1998) from it before joining.",
+      "dag_target_hint": "Replace final self-join with materialized CTE scan filtered by year.",
+      "node_contract": {
+        "from_must_include": ["all_sales"],
+        "where_must_preserve": ["curr_yr.d_year=1999", "prev_yr.d_year=1998", "prev_yr.sales_cnt>0", "curr_yr.sales_cnt/prev_yr.sales_cnt<0.9"],
+        "output_must_preserve": ["prev_year", "year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "prev_yr_cnt", "curr_yr_cnt", "sales_cnt_diff", "sales_amt_diff"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may choose better join algorithm (hash join) when CTE is materialized and filtered separately.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Nested Loop replaced with Hash Join between two small materialized CTEs.",
+      "recommended_patch_ops": ["materialize_cte", "split_cte_by_filter"],
+      "rank_rationale": "Exploration — tests if materialization and decomposition improve self-join performance.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert LEFT JOIN between sales and returns to INNER JOIN because WHERE clause filters on returns.reason_sk, eliminating NULL rows.",
+      "dag_target_hint": "Change LEFT JOIN to INNER JOIN in all three UNION branches.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales", "catalog_returns", "web_sales", "web_returns"],
+        "where_must_preserve": ["reason_sk in (7,25,26,52,69)"],
+        "output_must_preserve": ["sales_cnt", "sales_amt calculation semantics"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may reorder joins more freely with INNER JOIN, potentially reducing intermediate row counts.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Left Join replaced with Inner Join; possible join order change and reduced work.",
+      "recommended_patch_ops": ["replace_join_type"],
+      "rank_rationale": "Exploration — low-risk semantic change that may unlock better join planning.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "PostgreSQL uses BitmapOr for indexed OR; transform contraindicated by engine guard G_PG_OR_INDEX_PROTECTED."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in plan evidence."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation already occurs at earliest point (after UNION); no clear pushdown opportunity."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    }
+  ]
+}

@@ -1,0 +1,175 @@
+```json
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The STORE_SALES fact table scan (1.2TB) dominates I/O, with selective date dimension filters not pushed into the scan. Multiple aggregation stages roll up join results, but join topology may keep fact scan rows high. Two secondary hotspots: late aggregation stages and a join filter on zip substring applied after aggregation.",
+    "reasoning_trace": [
+      "Primary hotspot: STORE_SALES table scan shows parts=70412/72718 (97% of total partitions) and bytes=1212628258304 (99% of total bytes).",
+      "Secondary hotspot 1: Three aggregation stages (1.24→1.20→1.15) indicate repeated rolling aggregation after each join, not before joins.",
+      "Secondary hotspot 2: Join filter (SUBSTRING(ca_zip) != SUBSTRING(s_zip)) appears at node 1.4, applied after aggregations and joins, potentially filtering late.",
+      "Date dimension filter (d_year=1999, d_moy=2) is selective (parts=1/1) but not pushed into fact scan predicate; sold_date_sk join exists."
+    ],
+    "cost_spine": [
+      "TableScan (STORE_SALES)",
+      "Filter (SS_WHOLESALE_COST BETWEEN)",
+      "Aggregate (group by SS_CUSTOMER_SK, SS_STORE_SK, SS_ITEM_SK, SS_SOLD_DATE_SK)",
+      "InnerJoin (DATE_DIM)",
+      "Aggregate (rollup)",
+      "InnerJoin (ITEM)",
+      "Aggregate (rollup)",
+      "InnerJoin (STORE)",
+      "Aggregate (rollup)",
+      "InnerJoin (CUSTOMER)",
+      "Aggregate (rollup)",
+      "InnerJoin (CUSTOMER_ADDRESS) with zip filter"
+    ],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "fact table scan dominates I/O (1.2TB) and is not pruned by date dimension filter",
+        "evidence": "parts=70412/73239 total, bytes=1212628258304, scan filter only on SS_WHOLESALE_COST"
+      },
+      {
+        "op": "Aggregate stages (1.24→1.20→1.15)",
+        "why": "multiple aggregation rollups after each join increase intermediate row volume",
+        "evidence": "three aggregation nodes before final group by, each with different grouping keys"
+      },
+      {
+        "op": "JoinFilter (zip substring inequality)",
+        "why": "complex filter applied late after aggregation and joins, missing early reduction",
+        "evidence": "appears at node 1.4 after aggregations and joins to CUSTOMER_ADDRESS and STORE"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS/NOT EXISTS into broad CTE branches (G_SF_EXISTS_PROTECTED)",
+      "do not wrap partition keys in functions when pruning matters",
+      "do not create unfiltered large CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN predicate derived from date_dim filters directly to STORE_SALES scan to enable micro‑partition pruning.",
+      "dag_target_hint": "Modify final_select FROM clause to push date_sk range into STORE_SALES join condition.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales ss"],
+        "where_must_preserve": ["d.d_year=1999", "d.d_moy=2", "ss.ss_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "STORE_SALES scan shows reduced partitions read (micro‑partition pruning) and earlier filter pushdown.",
+      "recommended_patch_ops": ["add_predicate_to_scan", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot — date filter pushdown may prune fact table partitions significantly.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate STORE_SALES by date_sk, item_sk, customer_sk, store_sk before joining dimensions, reducing rows entering the join pipeline.",
+      "dag_target_hint": "Insert CTE that aggregates STORE_SALES before joining with date_dim, item, customer, store, customer_address.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss"],
+        "where_must_preserve": ["ss.ss_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["grouping keys compatible with downstream joins (surrogate keys)"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Earlier aggregation node appears directly after STORE_SALES scan; subsequent join and aggregate stages have fewer rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Targets secondary aggregation hotspot — reduces intermediate row volume before joins.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre‑filter all dimension tables (date_dim, item, customer, customer_address, store) into CTEs to create tiny hash tables before joining with fact table.",
+      "dag_target_hint": "Replace comma‑separated FROM with explicit JOINs on pre‑filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "item i", "customer c", "customer_address ca", "store s"],
+        "where_must_preserve": ["d.d_year=1999", "d.d_moy=2", "i.i_category='Shoes'", "ca.ca_state='KS'", "c.c_birth_month=2"],
+        "output_must_preserve": ["all original join keys and output columns"]
+      },
+      "gates_checked": ["no_unfiltered_large_cte:PASS", "join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already push dimension filters, but explicit CTEs could improve join cardinality estimates and reduce repeated scans.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension scans become tiny CTE scans; join order may shift to build smaller hash tables first.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — addresses secondary hotspot (late zip filter) by reducing dimension rows early.",
+      "recommended_examples": ["dimension_cte_isolate"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert implicit comma joins to explicit INNER JOIN syntax and reorder join sequence to place most selective dimensions first.",
+      "dag_target_hint": "Rewrite final_select FROM clause to explicit JOIN order: date_dim → store_sales → item → customer → store → customer_address.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales ss", "item i", "customer c", "store s", "customer_address ca"],
+        "where_must_preserve": ["all original join conditions and filters"],
+        "output_must_preserve": ["all original output columns and aggregates"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may give Snowflake’s cost‑based optimizer better freedom to reorder joins, especially after date_sk pushdown.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Join order changes; fact table scan moves later in plan after selective dimension filters are applied.",
+      "recommended_patch_ops": ["replace_from"],
+      "rank_rationale": "Exploration — tests join‑order sensitivity after primary pushdown and aggregation probes.",
+      "recommended_examples": ["inner_join_conversion"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subquery pattern in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self‑join pattern; all tables appear only once."
+    }
+  ]
+}
+```

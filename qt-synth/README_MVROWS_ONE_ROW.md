@@ -34,20 +34,23 @@ must be derivable from AST operators/predicates/aggregates.
 From repo root:
 
 ```bash
-PYTHONPATH=packages/qt-shared:packages/qt-sql \
 python3 qt-synth/run_mvrows_one_row_eval.py
 ```
 
 Optional flags:
 
 ```bash
-PYTHONPATH=packages/qt-shared:packages/qt-sql \
 python3 qt-synth/run_mvrows_one_row_eval.py \
   --schema-mode merged \
   --count-timeout-s 4 \
   --seed-attempts 6 \
+  --patch-pack dsb_mvrows \
   --output-file qt-synth/mvrows_one_row_equiv_eval.latest.json
 ```
+
+Patch-pack behavior:
+- `--patch-pack none` (default): no benchmark-specific witness recipes.
+- `--patch-pack dsb_mvrows`: enable DSB-specific fallback recipes.
 
 ## Metric Definition
 

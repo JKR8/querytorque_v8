@@ -1,0 +1,155 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows a dominant nested-loop join between item and store_sales (8.35s) driving the entire runtime, with late application of selective dimension filters (date_dim, customer_address). The CTE materialization fence blocks predicate pushdown, causing full fact-table scans per item row. Early filtering and explicit join syntax should reduce the nested-loop amplification.",
+    "reasoning_trace": [
+      "Nested Loop (item -> store_sales) consumes 8350ms, 96% of total runtime.",
+      "Index Scan on item returns 89 rows, each triggering a Bitmap Heap Scan on store_sales.",
+      "CTE materialization boundary prevents date_dim and customer_address filters from pushing into the fact scan.",
+      "Zero rows from web_sales branch indicates high selectivity, but store_sales path is the bottleneck."
+    ],
+    "cost_spine": ["Nested Loop (item, store_sales)", "Bitmap Heap Scan on store_sales", "Index Scan on item", "Index Scan on date_dim", "CTE Scan (ss1, ss2, ss3)"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (item → store_sales)",
+        "why": "Repeated bitmap heap scans for each matching item row",
+        "evidence": "time=8350.374 ms, rows=1048"
+      },
+      {
+        "op": "CTE materialization fence",
+        "why": "Prevents date_dim and customer_address filters from pushing into fact scan",
+        "evidence": "CTE Scan nodes appear after full fact-table join"
+      }
+    ],
+    "do_not_do": [
+      "Do not split OR predicates into UNION ALL (no OR in plan)",
+      "Do not materialize EXISTS paths (none present)",
+      "Do not duplicate the 5-table CTE body to push filters inward"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Extract selective date_dim filter (d_year=1998) into a MATERIALIZED CTE, convert comma joins to explicit INNER JOIN syntax, and push the filtered date keys into the fact-table scan.",
+      "dag_target_hint": "Replace ss and ws CTE definitions with explicit JOINs on pre-filtered date_cte.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price BETWEEN 86 and 100", "ca_state IN ('IA','IL')", "d_year = 1998"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales aggregate"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join with tiny date dimension; Bitmap Heap Scan reduces rows due to early date filter.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Targets primary hotspot — reduces nested-loop amplification by pushing date filter early and enabling better join planning.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all three selective dimensions (date_dim, customer_address, item) into separate MATERIALIZED CTEs, then join them with store_sales using explicit JOIN syntax to create a tiny probe side.",
+      "dag_target_hint": "Replace ss and ws CTE definitions with a chain of dimension CTEs joined to store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price BETWEEN 86 and 100", "ca_state IN ('IA','IL')", "d_year = 1998"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales aggregate"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Multiple small dimension CTEs hash-joined to store_sales, eliminating nested loops and reducing fact-scan rows via composite key pushdown.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Addresses CTE fence blindness by materializing all selective dimensions early, compounding selectivity.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Create a single shared dimension CTE filtering item, date_dim, and customer_address, then join it separately with store_sales and web_sales to avoid redundant dimension scans.",
+      "dag_target_hint": "Insert a shared_dim CTE; modify ss and ws CTEs to join with it.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price BETWEEN 86 and 100", "ca_state IN ('IA','IL')", "d_year = 1998"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales and web_sales aggregates"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The web_sales branch currently returns zero rows, but a shared dimension CTE may improve planning symmetry and reduce work if web_sales had rows.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension scans appear once; store_sales and web_sales join to the same small dimension set.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — targets secondary hotspot of repeated dimension scans, though web_sales is currently empty.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered fact+dimension join once as a CTE, then derive ss1, ss2, ss3 aggregates via filtering on d_qoy within the same CTE to avoid recomputation.",
+      "dag_target_hint": "Replace ss CTE with a materialized base CTE; compute quarter aggregates via CASE or FILTER.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('navajo', 'orchid')", "i_manager_id BETWEEN 8 and 27", "ss_list_price BETWEEN 86 and 100", "ca_state IN ('IA','IL')", "d_year = 1998"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales aggregate per quarter"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL's CTE materialization may allow single-pass computation of all quarters, reducing repeated work in the final self-join.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single materialized CTE scanned three times with different d_qoy filters, replacing three separate aggregations.",
+      "recommended_patch_ops": ["insert_cte", "replace_group_by"],
+      "rank_rationale": "Exploration — tests whether materializing the filtered join once improves over three separate aggregations.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in plan; PostgreSQL BitmapOr already optimal."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation keys include dimension columns (ca_county, d_qoy, d_year), cannot push below joins."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join in query; transform mismatch."
+    }
+  ]
+}

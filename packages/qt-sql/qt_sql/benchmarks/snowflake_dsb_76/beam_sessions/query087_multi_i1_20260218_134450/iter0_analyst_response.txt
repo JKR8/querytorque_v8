@@ -1,0 +1,153 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query performs three large fact table scans with similar filters, potentially missing predicate pushdown for date range pruning, and EXCEPT operations may materialize large intermediate distinct sets, increasing I/O and compute.",
+    "reasoning_trace": [
+      "SQL structure shows multiple fact table scans (store_sales, catalog_sales, web_sales) joined to date_dim with a range filter on d_month_seq.",
+      "EXCEPT operations involve computing distinct sets from each subquery, which could lead to materialization and comparison of large datasets.",
+      "Snowflake's micro-partition pruning might not fully push date_sk predicates into fact scans due to multi-table join shape."
+    ],
+    "cost_spine": ["fact table scan", "join with date_dim and customer", "distinct", "EXCEPT", "count aggregate"],
+    "hotspots": [
+      {
+        "op": "fact table scan",
+        "why": "large I/O volume from scanning store_sales, catalog_sales, web_sales",
+        "evidence": "inferred from SQL structure with multiple fact tables and filters"
+      },
+      {
+        "op": "EXCEPT operation",
+        "why": "potential materialization and comparison of large distinct sets",
+        "evidence": "query uses EXCEPT between three subqueries with distinct selects"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS into broad CTE branches if rewriting EXCEPT",
+      "avoid introducing unfiltered large CTEs",
+      "do not wrap partition keys in functions that hinder micro-partition pruning"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN predicate derived from d_month_seq range to each fact table scan in the subqueries to enable micro-partition pruning.",
+      "dag_target_hint": "Modify WHERE clause in each subquery to include ss_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN 1214 AND 1214+11) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN 1214 AND 1214+11), and similarly for cs_sold_date_sk and ws_sold_date_sk.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["d_month_seq between 1214 and 1214+11", "ss_list_price between 242 and 271", "c_birth_year BETWEEN 1955 AND 1961", "ss_wholesale_cost BETWEEN 35 AND 45", "cs_list_price between 242 and 271", "cs_wholesale_cost BETWEEN 35 AND 45", "ws_list_price between 242 and 271", "ws_wholesale_cost BETWEEN 35 AND 45"],
+        "output_must_preserve": ["distinct sets of c_last_name, c_first_name, d_date from each subquery", "final count(*)"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:ASSUMED_PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:ASSUMED_PASS", "G_SF_SK_RANGE_SEMANTICS:REVIEW_REQUIRED"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "fact table scans show reduced micro-partition reads due to pushed date_sk range.",
+      "recommended_patch_ops": ["add_where_predicate_to_fact_scans"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary hotspot of large fact table scans with potential missing predicate pushdown.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit INNER JOIN syntax and pre-filter date_dim into a CTE to improve join planning and reduce dimension scan redundancy.",
+      "dag_target_hint": "Replace comma joins with explicit JOIN clauses and add a CTE for filtered date_dim keys.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["d_month_seq between 1214 and 1214+11", "all price and birth year filters"],
+        "output_must_preserve": ["distinct sets and final count"]
+      },
+      "gates_checked": ["G_SF_JOINFILTER_PRESERVE:REVIEW_REQUIRED", "G_SF_CTE_REUSE_RULE:ASSUMED_PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax and dimension isolation may enhance Snowflake's cost-based join order and reduce repeated dimension scans.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Join operators may show improved cardinality estimates and reduced dimension table scans.",
+      "recommended_patch_ops": ["insert_cte_for_date_dim", "replace_comma_joins_with_explicit_join"],
+      "recommended_examples": ["date_cte_explicit_join"],
+      "rank_rationale": "Exploration targeting join topology and dimension scan reduction as a secondary hotspot.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Rewrite EXCEPT operations using NOT EXISTS with joins to avoid full materialization and leverage semi-join optimizations.",
+      "dag_target_hint": "Replace EXCEPT with LEFT JOIN and IS NULL checks or NOT EXISTS subqueries.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["all original filters"],
+        "output_must_preserve": ["final count of distinct combinations not in other subqueries"]
+      },
+      "gates_checked": ["G_SF_EXISTS_PROTECTED:REVIEW_REQUIRED", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Converting EXCEPT to NOT EXISTS may reduce intermediate materialization and enable early-stop semi-join behavior.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Set operation nodes replaced with join or anti-join operators, potentially reducing memory usage.",
+      "recommended_patch_ops": ["rewrite_except_to_not_exists"],
+      "recommended_examples": ["intersect_to_exists"],
+      "rank_rationale": "Exploration targeting EXCEPT operation hotspot with set operation family.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the distinct sets from each subquery into CTEs to avoid recomputation and share results if needed, though subqueries are independent.",
+      "dag_target_hint": "Add CTEs for each subquery's distinct result and reference them in the EXCEPT operation.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["all original filters"],
+        "output_must_preserve": ["final count"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:ASSUMED_PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing distinct sets may reduce repeated computation in EXCEPT, but effectiveness depends on Snowflake's CTE inlining.",
+      "confidence": 0.45,
+      "expected_explain_delta": "CTE materialization nodes appear, potentially caching intermediate results.",
+      "recommended_patch_ops": ["insert_cte_for_each_subquery"],
+      "recommended_examples": ["materialize_cte"],
+      "rank_rationale": "Exploration targeting materialization reuse for secondary hotspot with low confidence.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries in the query."
+    },
+    {
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "reason": "Query lacks multiple scalar aggregates; only final COUNT(*)."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicates in the query to decompose."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation is final COUNT(*) after set operations, not pushable below joins."
+    }
+  ]
+}

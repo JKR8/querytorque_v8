@@ -1,0 +1,198 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan scans all 4759 micro-partitions of CATALOG_RETURNS (82.5 GB) without date_sk pruning, despite a highly selective date_dim filter (d_year=2001, d_moy=12). This fact-table scan dominates I/O. Secondary amplification occurs through repeated nested aggregation stages, but the primary bottleneck is predicate pushdown failure across the fact‑table join.",
+    "reasoning_trace": [
+      "CATALOG_RETURNS scan reads 82.5 GB (4759/4759 parts) with no date_sk range filter.",
+      "DATE_DIM filter is applied after the join, not pushed into fact scan, indicating PREDICATE_TRANSITIVITY_FAILURE gap.",
+      "Multiple aggregation stages (1.26, 1.22, 1.18, etc.) reduce rows gradually but start from full fact scan.",
+      "Dimension tables are fully pruned (parts=1/1) and filters applied early; their scans are negligible relative to fact scan."
+    ],
+    "cost_spine": [
+      "TableScan(CATALOG_RETURNS)",
+      "InnerJoin(DATE_DIM)",
+      "Aggregate(CR_RETURNING_CUSTOMER_SK, CR_CALL_CENTER_SK, CR_RETURNED_DATE_SK)",
+      "InnerJoin(CALL_CENTER)",
+      "Aggregate(CC_CALL_CENTER_ID, CC_NAME, CC_MANAGER, CR_RETURNING_CUSTOMER_SK)",
+      "InnerJoin(CUSTOMER)",
+      "Aggregate(CC_CALL_CENTER_ID, CC_NAME, CC_MANAGER, C_CURRENT_CDEMO_SK, C_CURRENT_HDEMO_SK, C_CURRENT_ADDR_SK)"
+    ],
+    "hotspots": [
+      {
+        "op": "TableScan(CATALOG_RETURNS)",
+        "why": "full scan of 82.5 GB without date_sk pruning",
+        "evidence": "parts=4759/4759 bytes=82532796416"
+      },
+      {
+        "op": "InnerJoin(DATE_DIM)",
+        "why": "filter applied after join, preventing fact scan pruning",
+        "evidence": "date filter (d_year=2001, d_moy=12) appears at node 1.24, after join at 1.23"
+      }
+    ],
+    "do_not_do": [
+      "avoid converting simple EXISTS/IN to CTE materialization (Snowflake already decorrelates)",
+      "do not wrap date_sk column in functions that block micro‑partition pruning",
+      "do not introduce unfiltered large CTEs that increase scan volume"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk range filter from DATE_DIM into CATALOG_RETURNS scan by extracting min/max date_sk from filtered date_dim and adding `cr_returned_date_sk BETWEEN min_sk AND max_sk` to the fact‑table WHERE clause.",
+      "dag_target_hint": "Modify final_select WHERE clause to include derived date_sk range predicate on catalog_returns.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "d_moy = 12", "cr_returned_date_sk = d_date_sk"],
+        "output_must_preserve": ["cc_call_center_id", "cc_name", "cc_manager", "sum(cr_net_loss)", "GROUP BY and ORDER BY semantics"]
+      },
+      "gates_checked": [
+        "G_SF_SK_DATE_FILTER_REQUIRED:PASS",
+        "G_SF_SK_SCAN_PRESSURE:PASS",
+        "G_SF_SK_COMPUTE_BOUND_SKIP:PASS",
+        "G_SF_SK_RANGE_SEMANTICS:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "CATALOG_RETURNS TableScan shows reduced partitions (<<4759) due to date_sk range pruning; join with DATE_DIM remains but filter pushed into scan.",
+      "recommended_patch_ops": [
+        "insert_cte_date_range",
+        "add_where_predicate_to_fact_scan"
+      ],
+      "rank_rationale": "Directly targets the primary hotspot (82.5 GB scan) with a native Snowflake transform proven for predicate‑transitivity gaps.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre‑filter all dimension tables (date_dim, customer, customer_address, customer_demographics, household_demographics, call_center) into separate CTEs containing only surrogate keys and required columns, then join those CTEs with catalog_returns in a single FROM clause.",
+      "dag_target_hint": "Replace comma‑separated joins with explicit INNER JOINs on pre‑filtered CTEs, preserving original join order.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim", "customer", "customer_address", "customer_demographics", "household_demographics", "call_center"],
+        "where_must_preserve": [
+          "d_year = 2001",
+          "d_moy = 12",
+          "ca_gmt_offset = -6",
+          "hd_buy_potential LIKE '>10000%'",
+          "(cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')"
+        ],
+        "output_must_preserve": ["All output columns, grouping keys, and aggregate semantics"]
+      },
+      "gates_checked": [
+        "CROSS_JOIN_3_DIMS:PASS",
+        "UNFILTERED_CTE:BLOCKER_MITIGATED"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.65,
+      "expected_explain_delta": "Dimension scans remain small (parts=1/1) but join order may shift to start with filtered dimension CTEs, enabling earlier fact‑table pruning if optimizer pushes predicates.",
+      "recommended_patch_ops": [
+        "create_cte_for_each_dimension",
+        "replace_from_with_cte_joins"
+      ],
+      "rank_rationale": "Secondary hotspot coverage — attempts to force predicate pushdown by isolating dimension filters before the fact join.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate catalog_returns by the join keys (cr_returning_customer_sk, cr_call_center_sk, cr_returned_date_sk) before joining with dimensions, keeping only the sum(cr_net_loss) and counts needed for later aggregation stages.",
+      "dag_target_hint": "Wrap the fact‑table scan and its immediate aggregation (node 1.26) into a CTE, then join that CTE with dimensions in the main FROM.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns"],
+        "where_must_preserve": ["cr_call_center_sk IS NOT NULL", "cr_returning_customer_sk IS NOT NULL"],
+        "output_must_preserve": ["Grouping keys compatible with downstream joins (customer_sk, call_center_sk, date_sk)", "SUM(cr_net_loss) and COUNT(*)"]
+      },
+      "gates_checked": [
+        "agg_key_compatibility:PASS",
+        "duplication_sensitive_metrics:none"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "The plan already aggregates in stages, but pushing the initial aggregation earlier may reduce rows flowing through the first join (date_dim) and subsequent aggregates.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Initial aggregate node moves below the date_dim join; row count into join and later aggregates reduced.",
+      "recommended_patch_ops": [
+        "insert_cte_fact_agg",
+        "replace_from_with_cte"
+      ],
+      "rank_rationale": "Exploration — targets the secondary amplification pattern of nested aggregates; low risk because aggregation keys are join keys.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the OR condition on customer_demographics into two UNION ALL branches, each with a conjunctive filter, and aggregate the union result before joining with other tables.",
+      "dag_target_hint": "Replace the OR in the WHERE clause with a UNION ALL of two subqueries, each filtering one branch of the OR, then aggregate the union.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics"],
+        "where_must_preserve": [
+          "cd_marital_status = 'M' AND cd_education_status = 'Unknown'",
+          "cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree'"
+        ],
+        "output_must_preserve": ["All columns needed for downstream joins (cd_demo_sk, cd_marital_status, cd_education_status)", "Row‑set equivalence without duplication"]
+      },
+      "gates_checked": [
+        "SAME_COL_OR:PASS (cross‑column OR)",
+        "MAX_3_BRANCHES:PASS (only 2 branches)"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "The OR condition may prevent efficient filter evaluation; splitting into UNION ALL may allow separate filter paths and better pruning, though the table is small.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Filter on customer_demographics replaced by a UNION ALL of two scans, each with a simple conjunctive filter; downstream joins unchanged.",
+      "recommended_patch_ops": [
+        "replace_or_with_union_all",
+        "wrap_union_in_cte"
+      ],
+      "rank_rationale": "Exploration — targets a secondary pattern (cross‑column OR) with low risk because dimension is tiny (parts=1/1).",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subquery present in query."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "No correlated subquery pattern requiring decorrelation."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Query uses only INNER JOINs (implicit comma joins); no LEFT JOIN to convert."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated subquery patterns or shared scans requiring materialization."
+    }
+  ]
+}

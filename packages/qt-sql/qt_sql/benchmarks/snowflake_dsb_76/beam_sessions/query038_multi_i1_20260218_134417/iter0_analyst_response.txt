@@ -1,0 +1,170 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three large fact-table scans (store_sales, catalog_sales, web_sales) dominate I/O (1251GB, 923GB, 461GB) without date_sk pruning; the date_dim filter on d_month_seq does not propagate to fact scans. Intersect operations (SemiJoins) materialize distinct per-branch aggregates before intersecting, potentially redundant work. Selective customer filter (c_birth_month IN) applies late after joining large aggregates.",
+    "reasoning_trace": [
+      "Fact scans are largest I/O hotspots: store_sales (1251GB), catalog_sales (923GB), web_sales (461GB) with no predicate on sold_date_sk.",
+      "Date_dim filters (d_month_seq BETWEEN) apply to dimension scan but not pushed to fact joins; plan shows Aggregate on date_sk before join.",
+      "Three identical dimension scans (date_dim, customer) repeated per branch; each branch aggregates to distinct (c_last_name, c_first_name, d_date) before intersect.",
+      "Customer filter applied after join with large aggregate, not before reducing rows."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "TableScan (CATALOG_SALES)", "TableScan (WEB_SALES)", "Aggregate (groupKeys)", "SemiJoin (INTERSECT)"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest fact scan without date_sk pruning",
+        "evidence": "parts=72718/72718 bytes=1251924090880"
+      },
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "second largest fact scan without date_sk pruning",
+        "evidence": "parts=54922/54922 bytes=923617475584"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "third fact scan without date_sk pruning",
+        "evidence": "parts=27579/27579 bytes=461041485824"
+      },
+      {
+        "op": "Aggregate (groupKeys) before intersect",
+        "why": "materializes full distinct per-branch before intersect",
+        "evidence": "three separate aggregates per branch on (c_last_name, c_first_name, d_date)"
+      }
+    ],
+    "do_not_do": [
+      "do not materialize EXISTS paths (Snowflake already optimizes semi-join)",
+      "do not wrap date_sk or sold_date_sk in functions (would break pruning)",
+      "avoid same-column OR to UNION ALL (no OR predicate in plan)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk BETWEEN filter derived from d_month_seq range into each fact table scan (store_sales, catalog_sales, web_sales) to prune micro-partitions. Compute min/max date_sk from date_dim WHERE d_month_seq BETWEEN 1200 AND 1211.",
+      "dag_target_hint": "Add sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN 1200 AND 1211) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN 1200 AND 1211) to each fact table WHERE clause.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1200 AND 1211", "c_birth_month IN (1,2,5,12)", "list_price/wholesale_cost range filters"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date per branch", "INTERSECT semantics"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Fact table scans show reduced partitions read due to sold_date_sk pruning; Filter operator appears before scan.",
+      "recommended_patch_ops": ["add_where_predicate", "inline_scalar_subquery"],
+      "rank_rationale": "Targets primary I/O hotspot across all three fact tables with native Snowflake pruning.",
+      "recommended_examples": ["sf_sk_pushdown_multi_fact"],
+      "gold_example_id": "sf_sk_pushdown_multi_fact"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT with EXISTS to avoid materializing full distinct per-branch; rewrite as WHERE EXISTS (SELECT 1 FROM branch2 WHERE ...) AND EXISTS (SELECT 1 FROM branch3 WHERE ...) on first branch.",
+      "dag_target_hint": "Replace INTERSECT set operators with correlated EXISTS subqueries on (c_last_name, c_first_name, d_date).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1200 AND 1211", "c_birth_month IN (1,2,5,12)", "list_price/wholesale_cost range filters"],
+        "output_must_preserve": ["DISTINCT semantics", "same result rows as INTERSECT"]
+      },
+      "gates_checked": ["G_SF_EXISTS_PROTECTED:PASS", "no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may optimize EXISTS better than materialized INTERSECT; could reduce aggregation and SemiJoin work.",
+      "confidence": 0.65,
+      "expected_explain_delta": "SemiJoin operators replaced by correlated subquery joins; aggregate counts may change.",
+      "recommended_patch_ops": ["replace_set_operator", "add_correlated_subquery"],
+      "rank_rationale": "Exploration targeting set-operation materialization hotspot; secondary to scan pruning.",
+      "recommended_examples": ["intersect_to_exists"],
+      "gold_example_id": "intersect_to_exists"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract filtered date_dim and customer into CTEs and reuse across three branches to avoid repeated dimension scans and early filtering.",
+      "dag_target_hint": "Add CTEs filtered_date and filtered_customer before main query; reference them in each branch.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1200 AND 1211", "c_birth_month IN (1,2,5,12)"],
+        "output_must_preserve": ["All dimension columns needed for joins and projections"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "no_unfiltered_large_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension tables may benefit from single materialization; Snowflake may inline CTEs but could enable better filter pushdown.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date_dim and customer scans appear once; join filters propagate earlier.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting repeated dimension scans; low risk.",
+      "recommended_examples": ["shared_dimension_multi_channel"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate each fact table by (sold_date_sk, customer_sk) before joining dimensions to reduce rows early.",
+      "dag_target_hint": "Replace each branch's fact scan with a CTE aggregating by (sold_date_sk, customer_sk) and joining to filtered date_dim and customer after.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["list_price/wholesale_cost range filters"],
+        "output_must_preserve": ["Join key columns for downstream joins"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate nodes appear earlier in plan; join input rows reduced.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Targets early aggregation hotspot; each branch aggregates before join, but may push aggregation even earlier.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in plan; not applicable."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in original SQL."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries; pattern mismatch."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN with WHERE filter on right table."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Redundant with shared_dimension_multi_channel; less direct evidence."
+    }
+  ]
+}

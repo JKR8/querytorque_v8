@@ -7,9 +7,12 @@ Consolidated prompt history by version.
 - `<version>/examples/` — concrete sample prompts
 - `<version>/docs/` — version-specific docs/specs
 
-## Versions
-- `V3`: current BEAM + REASONING prompt system
-- `V2`: BEAM transition variants
-- `V1_20260213`: legacy pack with SWARM-era artifacts
-- `V0`: initial prompt sample pack
-- `SWARM_LEGACY`: explicit archive mirror of old SWARM prompt artifacts
+## IN USE
+- `V3`: current runtime prompt system
+
+## ARCHIVED (NOT IN USE)
+Archived version histories were moved to:
+- `prompts/archive/versions/V2`
+- `prompts/archive/versions/V1_20260213`
+- `prompts/archive/versions/V0`
+- `prompts/archive/versions/SWARM_LEGACY`

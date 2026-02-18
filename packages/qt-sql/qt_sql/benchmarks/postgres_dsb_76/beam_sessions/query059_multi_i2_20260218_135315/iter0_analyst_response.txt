@@ -1,0 +1,160 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query suffers from a large fact-table scan on store_sales due to late application of selective date filters, compounded by comma joins that hinder optimizer planning. Materialization of the CTE wss adds overhead, and poor cardinality estimates lead to inefficient nested loops.",
+    "reasoning_trace": [
+      "Seq Scan on store_sales dominates runtime with 23035.219 ms, scanning 1.33M rows.",
+      "CTE wss is materialized and scanned twice, taking 26157.399 ms, indicating reuse but high materialization cost.",
+      "Nested Loop shows poor cardinality estimates (est=1, act=20K), leading to amplification and inefficiency.",
+      "Comma joins in FROM clauses may prevent optimal join order and predicate pushdown."
+    ],
+    "cost_spine": ["Seq Scan on store_sales", "CTE Scan on wss", "Nested Loop", "Hash Join"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_sales",
+        "why": "large fact table scan with filter applied late",
+        "evidence": "time=23035.219 ms, rows=1333491"
+      },
+      {
+        "op": "CTE Scan on wss",
+        "why": "materialization of aggregated data, scanned multiple times",
+        "evidence": "time=26157.399 ms"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "poor cardinality estimates leading to amplification",
+        "evidence": "est=1, act=20K"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union splits as no OR predicate present",
+      "avoid duplicating heavy CTE bodies without filter reduction",
+      "keep EXISTS paths protected (none in this query)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Convert comma-separated joins in the main query to explicit JOIN syntax and pre-filter date_dim into separate CTEs for the two month ranges (1183-1194 and 1195-1206) to enable better optimizer planning and reduce fact table scan.",
+      "dag_target_hint": "Change final_select FROM clause to use explicit JOINs and add date_cte_y, date_cte_x CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store"],
+        "where_must_preserve": ["ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 85 * 0.01", "d_month_seq between 1183 and 1183 + 11 for y, between 1183 + 12 and 1183 + 23 for x", "s_state in ('AR','GA','IN','KS','KY','OH','SD','VA')"],
+        "output_must_preserve": ["all output columns", "ORDER BY s_store_name1,s_store_id1,d_week_seq1", "LIMIT 100 behavior"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Comma joins replaced with explicit joins, date_dim scans reduced via CTE pre-filtering, leading to smaller hash tables and better join order.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_joins_explicit"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Targets primary hotspot by addressing comma join weakness and enabling early date filtering.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter both date_dim and store tables into CTEs before joining with the wss CTE to reduce the size of dimension tables and improve join efficiency.",
+      "dag_target_hint": "Add date_filtered_cte and store_filtered_cte, and modify final_select joins to use these CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store"],
+        "where_must_preserve": ["ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 85 * 0.01", "d_month_seq between ranges", "s_state in list"],
+        "output_must_preserve": ["all output columns", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Dimension scans become tiny CTE scans, reducing build side of hash joins and improving cardinality estimates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "rank_rationale": "Addresses primary hotspot by pre-filtering all selective dimensions, potentially more effective than probe 1.",
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Split the wss CTE into two separate CTEs, wss_y and wss_x, each with the corresponding date month range filter embedded, to avoid materializing the full aggregated set.",
+      "dag_target_hint": "Replace wss CTE with wss_y and wss_x CTEs defined with filters on d_month_seq.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 85 * 0.01", "d_date_sk = ss_sold_date_sk"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.60,
+      "expected_explain_delta": "CTE materialization size reduced for each scan, leading to lower memory and I/O for CTE scans.",
+      "recommended_patch_ops": ["replace_cte", "split_cte"],
+      "recommended_examples": [],
+      "rank_rationale": "Targets secondary hotspot of CTE materialization by specializing CTEs for each usage.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter date_dim table based on the month ranges and push this filter into the wss CTE definition to reduce the store_sales scan early.",
+      "dag_target_hint": "Modify wss CTE to include a join with pre-filtered date_dim CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sales_price / ss_list_price BETWEEN 65 * 0.01 AND 85 * 0.01", "d_date_sk = ss_sold_date_sk"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pushing date filters earlier into the CTE may reduce the fact table scan significantly, but requires careful handling of the two ranges.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Store_sales scan rows reduced due to early join with filtered date_dim.",
+      "recommended_patch_ops": ["insert_cte", "modify_cte_definition"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe testing early filtering hypothesis on the primary hotspot.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in the SQL; guard G_PG_OR_INDEX_PROTECTED contraindicates unnecessary splits."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in the SQL or plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in the query."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join predicates identified; gap NON_EQUI_JOIN_INPUT_BLINDNESS not applicable."
+    }
+  ]
+}

@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The execution plan shows a correlated scalar subquery (SubPlan) that re-executes per outer row, dominating runtime with repeated scans. Secondary, the Seq Scan on item with an OR condition may not leverage indexes efficiently, contributing to scan cost.",
+    "reasoning_trace": [
+      "SubPlan is correlated on i_item_sk and executes for each row from the Hash Join (rows=136), causing repeated nested loop scans.",
+      "Seq Scan on item filters 46599 rows with an OR condition but uses no index, potentially missing BitmapOr optimization.",
+      "Hash Join cost is high (10465.42..39424.83), and the Join Filter includes the correlated SubPlan, indicating late predicate application."
+    ],
+    "cost_spine": ["Hash Join", "SubPlan (correlated aggregate)", "Seq Scan on item", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "SubPlan",
+        "why": "correlated scalar aggregate re-executes per outer row",
+        "evidence": "SubPlan appears in Join Filter, correlated on i_item_sk, with Nested Loop in subplan"
+      },
+      {
+        "op": "Seq Scan on item",
+        "why": "OR condition uses Seq Scan without index, scanning 46599 rows",
+        "evidence": "Filter: (((i_manufact_id >= 797) AND (i_manufact_id <= 996)) OR (i_category = ANY ('{Men,Shoes,Sports}'::bpchar[])))"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union on indexed OR predicates due to PostgreSQL BitmapOr strength",
+      "avoid materializing EXISTS paths already optimized as semi-joins",
+      "avoid duplicating heavy CTE bodies without reuse benefit"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Decompose the correlated scalar subquery into MATERIALIZED CTEs: pre-filter date_dim and web_sales, compute per-item average threshold (1.3 * avg(ws_ext_discount_amt)), then join threshold in main query replacing the SubPlan.",
+      "dag_target_hint": "Change final_select to include CTEs (e.g., filtered_date, filtered_web_sales, item_threshold) and modify WHERE clause to use threshold CTE.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 or i_category IN ('Men', 'Shoes', 'Sports')", "d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "SubPlan disappears, replaced by CTE scans and hash joins, eliminating per-row correlated execution.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot — correlated subquery drives repeated scans and is the dominant bottleneck.",
+      "recommended_examples": ["pg_shared_scan_decorrelate"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the OR condition on item into UNION ALL branches: one for i_manufact_id BETWEEN 797 and 996, another for i_category IN ('Men', 'Shoes', 'Sports'), ensuring distinct rows with UNION ALL.",
+      "dag_target_hint": "Modify the FROM clause for item scan in final_select to use a derived table with UNION ALL.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_item_sk output for join compatibility"],
+        "output_must_preserve": ["i_item_sk without duplicates affecting join multiplicity"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:CAUTION (Seq Scan used, but guardrail advises against split)", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "OR condition currently uses Seq Scan; splitting may enable index usage or better filter pushdown, though PostgreSQL's BitmapOr might be fighting.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Seq Scan on item replaced by UNION ALL with potential index scans or bitmap heap scans.",
+      "recommended_patch_ops": ["replace_from_subquery", "add_union_branches"],
+      "rank_rationale": "Exploration for secondary hotspot — item OR condition scan may benefit from access path specialization.",
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the filtered item result into a CTE to create a small hash table for the join, potentially improving join planning.",
+      "dag_target_hint": "Add a CTE for filtered item (e.g., filtered_item) and reference it in final_select instead of direct item scan.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 or i_category IN ('Men', 'Shoes', 'Sports')"],
+        "output_must_preserve": ["i_item_sk for join"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:CAUTION (single-use, low benefit)", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the dimension filter might reduce scan cost or improve hash join efficiency, though reuse is minimal.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Seq Scan on item replaced by CTE scan, with possible materialization fence.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — testing materialization impact on dimension scan and join performance.",
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Extract date_dim filter into a CTE and convert comma joins to explicit INNER JOIN syntax to arm the optimizer for better join ordering.",
+      "dag_target_hint": "Change final_select FROM clause to use CTE for date_dim (e.g., filtered_date) and explicit JOINs (e.g., INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk).",
+      "node_contract": {
+        "from_must_include": ["date_dim", "web_sales", "item"],
+        "where_must_preserve": ["d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "join conditions preserved"],
+        "output_must_preserve": ["all original columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may improve cardinality estimates and join order despite previous failure, testing in current context.",
+      "confidence": 0.30,
+      "expected_explain_delta": "Comma joins replaced with explicit INNER JOINs, possible better join order or hash join planning.",
+      "recommended_patch_ops": ["insert_cte", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Exploration — testing join syntax change and dimension isolation, though previous attempt failed.",
+      "recommended_examples": ["pg_date_cte_explicit_join"]
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Previous optimization attempt failed with speedup=0.00x."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "Previous optimization attempt failed with speedup=0.00x."
+    },
+    {
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "reason": "Previous optimization attempt failed with speedup=0.00x."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "inline_decorrelate_materialized is preferred native transform for PostgreSQL with higher confidence."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No group by in main query before joins; aggregate is final sum after filtering, not suitable for pushdown."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "Portability candidate for Snowflake, not native for PostgreSQL; inline_decorrelate_materialized is preferred."
+    }
+  ]
+}

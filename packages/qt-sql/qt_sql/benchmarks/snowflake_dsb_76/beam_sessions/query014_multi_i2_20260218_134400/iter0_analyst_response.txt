@@ -1,0 +1,347 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Query executes three major fact-table scans (store_sales, catalog_sales, web_sales) multiple times across UNION ALL and INTERSECT branches, scanning 4.53TB total. The cross_items CTE materializes large intersection results, then those results are rescanned in both this_year and last_year branches, causing repeated work. No correlated scalar subqueries require decorrelation, but date_dim filters are not pushed into all fact scans for micro-partition pruning.",
+    "reasoning_trace": [
+      "GlobalStats shows 4.53TB scanned across 453k partitions, dominated by three fact tables.",
+      "cross_items CTE uses INTERSECT of three large channel aggregations, materializing intermediate results.",
+      "Plan shows cross_items referenced twice (nodes 4.14 and 4.88), indicating duplicate computation.",
+      "DATE_DIM filters exist but date_sk range predicates may not push into all UNION ALL branches.",
+      "No nested loops or correlated scalar aggregates in plan evidence."
+    ],
+    "cost_spine": [
+      "TableScan STORE_SALES (72718 parts, 1.2TB)",
+      "TableScan CATALOG_SALES (54922 parts, 923GB)",
+      "TableScan WEB_SALES (27579 parts, 461GB)",
+      "SemiJoin (cross_items filter)",
+      "Aggregate (channel aggregations)",
+      "InnerJoin (item to sales)"
+    ],
+    "hotspots": [
+      {
+        "op": "TableScan STORE_SALES",
+        "why": "largest fact table scanned multiple times in cross_items, avg_sales, and main query branches",
+        "evidence": "parts=72718, bytes=1251924090880, appears at nodes 2.8, 4.52, 4.75, 4.96"
+      },
+      {
+        "op": "TableScan CATALOG_SALES",
+        "why": "second largest fact table scanned in multiple contexts",
+        "evidence": "parts=54922, bytes=923617475584, appears at nodes 2.14, 4.37"
+      },
+      {
+        "op": "TableScan WEB_SALES",
+        "why": "third fact table scanned repeatedly",
+        "evidence": "parts=27579, bytes=461041485824, appears at nodes 2.20, 4.67"
+      },
+      {
+        "op": "cross_items CTE materialization",
+        "why": "INTERSECT of three large aggregations computed twice",
+        "evidence": "WithReference nodes 4.14 and 4.88 indicate two materializations"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns (Snowflake already optimizes semi-joins)",
+      "do not wrap date_sk in functions that block micro-partition pruning",
+      "avoid same-column OR to UNION ALL splits without index evidence",
+      "do not introduce unfiltered large CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk BETWEEN derived from date_dim filters into each UNION ALL branch of avg_sales CTE to enable micro-partition pruning on fact tables.",
+      "dag_target_hint": "Modify avg_sales CTE definition branches to include explicit date_sk range predicates.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_year between 1999 AND 1999 + 2", "wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["average_sales scalar value"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "TableScan nodes for store_sales, catalog_sales, web_sales in avg_sales branches show reduced partitions scanned due to date_sk range pushdown.",
+      "recommended_patch_ops": ["rewrite_cte", "add_predicate_to_branch"],
+      "rank_rationale": "Primary hotspot mitigation — addresses largest I/O source with native Snowflake transform.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN predicates to store_sales, catalog_sales, web_sales joins with date_dim in cross_items CTE subqueries.",
+      "dag_target_hint": "Modify cross_items CTE subquery joins to include explicit date_sk range derived from d_year filter.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_year between 1999 AND 1999 + 2", "i_category IN ('Electronics','Shoes','Sports')", "i_manager_id BETWEEN 42 and 51", "wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["i_brand_id, i_class_id, i_category_id intersection semantics"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Fact table scans in cross_items subqueries show reduced partition counts and bytes scanned.",
+      "recommended_patch_ops": ["rewrite_cte", "add_predicate_to_join"],
+      "rank_rationale": "Targets second-largest I/O source with native pushdown transform.",
+      "recommended_examples": ["sf_sk_pushdown_3fact"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT in cross_items with EXISTS semi-joins to avoid materializing full channel aggregations before intersection.",
+      "dag_target_hint": "Rewrite cross_items CTE as filtered item keys where EXISTS in all three channel aggregations.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_category IN ('Electronics','Shoes','Sports')", "i_manager_id BETWEEN 42 and 51"],
+        "output_must_preserve": ["ss_item_sk list identical to original INTERSECT result"]
+      },
+      "gates_checked": ["G_SF_EXISTS_PROTECTED:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already optimize INTERSECT efficiently, but EXISTS could reduce intermediate materialization and enable better join planning.",
+      "confidence": 0.55,
+      "expected_explain_delta": "INTERSECT operator replaced by SemiJoin nodes; aggregate materialization reduced.",
+      "recommended_patch_ops": ["rewrite_cte", "replace_intersect_with_exists"],
+      "rank_rationale": "Exploration — targets set operation materialization hotspot with portability candidate.",
+      "recommended_examples": ["intersect_to_exists"],
+      "gold_example_id": "intersect_to_exists"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize cross_items CTE with Snowflake's MATERIALIZED hint to compute once and reuse across both this_year and last_year references.",
+      "dag_target_hint": "Add MATERIALIZED keyword to cross_items CTE definition.",
+      "node_contract": {
+        "from_must_include": ["item", "store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["all original filters and intersection logic"],
+        "output_must_preserve": ["ss_item_sk list identical to original"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may inline CTEs; explicit MATERIALIZED could force single computation and reduce duplicate work.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Duplicate WithReference nodes collapse to single materialized CTE scan.",
+      "recommended_patch_ops": ["add_materialized_keyword"],
+      "rank_rationale": "Exploration — addresses duplicate computation of cross_items CTE.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate three channel aggregations in cross_items into single scan with conditional aggregation, then filter for items present in all three.",
+      "dag_target_hint": "Rewrite cross_items as single aggregation over union of all sales with CASE expressions per channel.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item", "date_dim"],
+        "where_must_preserve": ["date filters, category, manager_id, wholesale_cost ranges"],
+        "output_must_preserve": ["ss_item_sk list identical to original INTERSECT"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass aggregation could reduce three separate fact scans to one, but may increase per-row compute.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Three separate fact scans replaced by one larger scan with conditional aggregates.",
+      "recommended_patch_ops": ["rewrite_cte", "consolidate_scans", "add_case_aggregation"],
+      "rank_rationale": "Exploration — attempts to reduce total scan I/O via consolidation.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "E",
+      "target": "Pre-filter date_dim for 1999-2001 range into a CTE and reuse across all channel subqueries in cross_items and avg_sales.",
+      "dag_target_hint": "Add date_range CTE containing d_date_sk for filtered years, join all fact tables to this CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year between 1999 AND 1999 + 2"],
+        "output_must_preserve": ["d_date_sk list"]
+      },
+      "gates_checked": ["no_unfiltered_large_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Small dimension CTE could be reused across many joins, reducing repeated date_dim scans and improving join planning.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Multiple date_dim TableScan nodes replaced by single CTE scan.",
+      "recommended_patch_ops": ["insert_cte", "replace_joins"],
+      "rank_rationale": "Exploration — targets repeated dimension scans across subqueries.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by ss_item_sk before joining with item and date_dim in main query branches, reducing rows before large joins.",
+      "dag_target_hint": "Modify this_year and last_year subqueries to join with pre-aggregated store_sales CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 76 AND 96", "date filters via d_week_seq subqueries"],
+        "output_must_preserve": ["aggregate sums and counts per item key"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate moves below join with item, reducing input rows to final aggregate.",
+      "recommended_patch_ops": ["insert_cte", "rewrite_subquery"],
+      "rank_rationale": "Targets aggregation-after-join pattern in main query branches.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "target": "Split avg_sales CTE into three separate CTEs (store_avg, catalog_avg, web_avg) to allow per-channel optimization and predicate pushdown.",
+      "dag_target_hint": "Replace avg_sales UNION ALL with three CTEs combined via outer aggregation.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["date range, wholesale_cost filters"],
+        "output_must_preserve": ["final average_sales value identical to original"]
+      },
+      "gates_checked": ["G_SF_UNION_BRANCH_LIMIT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Separate CTEs may enable better per-branch predicate pushdown and pruning.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single UnionAll replaced by three separate aggregations merged later.",
+      "recommended_patch_ops": ["split_cte", "rewrite_union"],
+      "rank_rationale": "Exploration — tests UNION ALL decomposition for better pruning.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Pre-compute d_week_seq values for 1999-12-12 and 2000-12-12 into tiny CTEs to avoid repeated scalar subquery execution.",
+      "dag_target_hint": "Replace scalar subqueries for d_week_seq with CTE references.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year, d_moy, d_dom filters"],
+        "output_must_preserve": ["d_week_seq scalar values"]
+      },
+      "gates_checked": ["no_unfiltered_large_cte:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Scalar subquery nodes replaced by CTE scans.",
+      "recommended_patch_ops": ["insert_cte", "replace_subquery"],
+      "rank_rationale": "Addresses repeated scalar subquery execution, though impact may be small.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared item and date filters into a single CTE used by all three channel subqueries in cross_items.",
+      "dag_target_hint": "Create filtered_items CTE and filtered_dates CTE, join once per channel.",
+      "node_contract": {
+        "from_must_include": ["item", "date_dim"],
+        "where_must_preserve": ["i_category, i_manager_id filters", "d_year range"],
+        "output_must_preserve": ["keys needed for channel joins"]
+      },
+      "gates_checked": ["no_unfiltered_large_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared dimension CTEs may reduce repeated dimension filtering work across channels.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Multiple dimension filter nodes collapse to CTE scans.",
+      "recommended_patch_ops": ["insert_cte", "consolidate_filters"],
+      "rank_rationale": "Exploration — targets repeated dimension filtering across channels.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Decompose cross_items self-join pattern by creating separate CTEs per channel with embedded filters, then intersect via join.",
+      "dag_target_hint": "Replace INTERSECT with three independent channel CTEs joined on item attributes.",
+      "node_contract": {
+        "from_must_include": ["item", "store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["all original per-channel filters"],
+        "output_must_preserve": ["item keys present in all three channels"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit per-channel CTEs may allow better join ordering and filter pushdown.",
+      "confidence": 0.55,
+      "expected_explain_delta": "INTERSECT replaced by three-way inner join on item attributes.",
+      "recommended_patch_ops": ["rewrite_cte", "decompose_intersect"],
+      "rank_rationale": "Exploration — alternative to EXISTS transform for set operation.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate avg_sales and cross_items aggregations into a single pass over fact tables with conditional expressions for each metric.",
+      "dag_target_hint": "Create combined CTE that computes both average sales and channel presence indicators in one scan.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "item"],
+        "where_must_preserve": ["all original filters"],
+        "output_must_preserve": ["average_sales and cross_items keys"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass consolidation could dramatically reduce total fact scans but may increase memory/compute per row.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Multiple fact scans merge into one larger scan with multiple conditional aggregates.",
+      "recommended_patch_ops": ["consolidate_ctes", "add_case_aggregation"],
+      "rank_rationale": "Exploration — high-risk, high-reward consolidation of all fact table accesses.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries in plan evidence; simple EXISTS/IN already optimized by Snowflake."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspots in plan evidence; Snowflake does not benefit from OR-to-UNION without index usage evidence."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN patterns in query; all joins are inner or semi-joins."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries requiring decorrelation; gates indicate skip."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregates; plan shows no decorrelation opportunity."
+    }
+  ]
+}

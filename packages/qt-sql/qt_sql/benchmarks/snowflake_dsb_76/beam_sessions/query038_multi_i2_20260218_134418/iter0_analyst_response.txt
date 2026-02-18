@@ -1,0 +1,164 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The INTERSECT operation likely materializes three distinct result sets from large fact-table scans before intersecting; the dominant cost is scanning three fact tables with identical dimension joins and filters. Early pruning via date_sk pushdown and dimension prefetch can reduce scan volume, while converting INTERSECT to EXISTS may short-circuit evaluation.",
+    "reasoning_trace": [
+      "Plan shows INTERSECT over three large fact-table scans (store_sales, catalog_sales, web_sales) each joined to date_dim and customer with identical filters.",
+      "No nested-loop or aggregation hotspots visible in minimal EXPLAIN; structural routing suggests scan reduction and set-operation transformation are primary levers.",
+      "AST pre-screening shows strong match for PREDICATE_TRANSITIVITY_FAILURE and multi-channel dimension reuse."
+    ],
+    "cost_spine": ["Scan store_sales", "Scan catalog_sales", "Scan web_sales", "Join date_dim", "Join customer", "Distinct", "Intersect"],
+    "hotspots": [
+      {
+        "op": "Scan store_sales",
+        "why": "Large fact-table scan with date_dim filter; potential for partition pruning via date_sk pushdown",
+        "evidence": "AST match for sf_sk_pushdown_multi_fact (100%); filter on d_month_seq may not propagate to fact-table date_sk"
+      },
+      {
+        "op": "Scan catalog_sales",
+        "why": "Second large fact-table scan with identical dimension joins",
+        "evidence": "Identical join and filter pattern as store_sales"
+      },
+      {
+        "op": "Scan web_sales",
+        "why": "Third large fact-table scan with identical dimension joins",
+        "evidence": "Identical join and filter pattern as store_sales"
+      },
+      {
+        "op": "Intersect",
+        "why": "Set operation may materialize three distinct intermediate results before intersecting",
+        "evidence": "Three branches with DISTINCT; INTERSECT must compute full sets"
+      }
+    ],
+    "do_not_do": [
+      "Do not wrap date_sk in functions that block micro-partition pruning",
+      "Avoid materializing large CTEs without filters",
+      "Do not convert INTERSECT to EXISTS if it breaks semantics (must preserve distinctness and three-way intersection)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN predicate to each fact-table join condition by precomputing date_sk range from date_dim filter (d_month_seq BETWEEN 1207 AND 1218).",
+      "dag_target_hint": "Modify each fact-table scan node (store_sales, catalog_sales, web_sales) to include ss_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1218) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN 1207 AND 1218).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1207 AND 1218", "c_birth_month IN (2,3,4,10)", "list_price and wholesale_cost range filters"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date from each branch"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Fact-table scans show reduced partitions scanned due to date_sk range pushdown.",
+      "recommended_patch_ops": ["add_predicate_to_scan", "inline_subquery_range"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Primary hotspot — targets all three fact-table scans with native Snowflake transform for partition pruning.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Pre-filter date_dim and customer into a single CTE and reuse it across all three channel subqueries to avoid repeated dimension scans.",
+      "dag_target_hint": "Insert CTE for filtered dimensions before the INTERSECT; replace each branch's dimension tables with CTE references.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1207 AND 1218", "c_birth_month IN (2,3,4,10)"],
+        "output_must_preserve": ["All original columns needed for joins and projection"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_LOW_BASELINE_SKIP_HEAVY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already share dimension scans across branches, but materializing into a CTE could ensure single scan and reuse.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension scans appear once instead of three times; join work unchanged.",
+      "recommended_patch_ops": ["insert_cte", "replace_dimension_references"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration — targets secondary hotspot of repeated dimension scans; family A underrepresented.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT with EXISTS subqueries to avoid materializing full distinct sets; use first branch as base and add EXISTS clauses for other channels.",
+      "dag_target_hint": "Rewrite final_select to use store_sales branch as base and add EXISTS conditions for catalog_sales and web_sales matching on (c_last_name, c_first_name, d_date).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["All original filters from each branch"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "LIMIT 100 semantics"]
+      },
+      "gates_checked": ["G_SF_EXISTS_PROTECTED:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "INTERSECT operator replaced by semi-joins; materialization of full distinct sets may be avoided.",
+      "recommended_patch_ops": ["replace_intersect_with_exists", "preserve_distinct_through_semijoin"],
+      "recommended_examples": ["intersect_to_exists"],
+      "rank_rationale": "Targets set-operation hotspot with potential short-circuit; family D not yet covered.",
+      "gold_example_id": "intersect_to_exists"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk range into each branch by converting INTERSECT branches to UNION ALL with precomputed date_sk range, then deduplicate after union.",
+      "dag_target_hint": "Replace INTERSECT with UNION ALL, add date_sk BETWEEN to each branch's fact-table scan, and wrap entire union in a deduplicating DISTINCT.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_month_seq BETWEEN 1207 AND 1218", "c_birth_month IN (2,3,4,10)", "list_price and wholesale_cost range filters"],
+        "output_must_preserve": ["Same distinct rows as original INTERSECT"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_UNION_BRANCH_LIMIT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Union-all with pushdown may enable partition pruning per branch while preserving semantics via outer distinct.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Each branch scan shows date_sk range filter; UNION ALL replaces INTERSECT; extra distinct aggregation added.",
+      "recommended_patch_ops": ["replace_intersect_with_union_all", "add_date_sk_predicate_per_branch", "wrap_union_in_distinct"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Exploration — alternative pushdown shape using union; tests if union branches prune better than intersect.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; plan shows no nested loops."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregation hotspot; only DISTINCT per branch which is a set operation."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicates in plan; not applicable."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated subquery pattern; each branch scans different fact tables."
+    }
+  ]
+}

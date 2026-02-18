@@ -1,0 +1,295 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 2,
+    "probe_count": 6,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows repeated scans of large fact tables (catalog_sales, web_sales, store_sales) without early filtering, leading to excessive data movement. Multiple UNION ALL branches and wide scans suggest predicate pushdown opportunities. A secondary hotspot involves repeated CTE evaluations due to multi-table joins without decorrelation.",
+    "reasoning_trace": [
+      "Multiple scans of large fact tables (catalog_sales, web_sales, store_sales) with no early filtering.",
+      "UNION ALL branches are present without date_sk predicate pushdown, suggesting pruning opportunity.",
+      "Repeated CTE evaluations indicate lack of decorrelation for multi-table joins."
+    ],
+    "cost_spine": [
+      "UnionAll",
+      "TableScan (CATALOG_SALES)",
+      "TableScan (WEB_SALES)",
+      "InnerJoin",
+      "TableScan (DATE_DIM)",
+      "TableScan (ITEM)",
+      "TableScan (CUSTOMER)"
+    ],
+    "hotspots": [
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "wide scan without early filtering",
+        "evidence": "parts=54721/54922 bytes=920184101376"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "wide scan without early filtering",
+        "evidence": "parts=27574/27579 bytes=460956759040"
+      },
+      {
+        "op": "UnionAll",
+        "why": "UNION ALL without predicate pushdown",
+        "evidence": "branches scan full tables without date_sk filtering"
+      }
+    ],
+    "do_not_do": [
+      "avoid unfiltered large CTE introduction",
+      "avoid materializing simple EXISTS path already optimized as semi-join",
+      "do not wrap partition keys in functions when pruning matters"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk BETWEEN predicates into each UNION ALL branch to enable micro-partition pruning on fact tables.",
+      "dag_target_hint": "Modify the cs_or_ws_sales CTE to include date_sk range filters in each branch.",
+      "node_contract": {
+        "from_must_include": [
+          "catalog_sales",
+          "web_sales",
+          "date_dim"
+        ],
+        "where_must_preserve": [
+          "d_moy = 1",
+          "d_year = 1998"
+        ],
+        "output_must_preserve": [
+          "sold_date_sk",
+          "customer_sk",
+          "item_sk",
+          "wholesale_cost"
+        ]
+      },
+      "gates_checked": [
+        "G_SF_SK_DATE_FILTER_REQUIRED:PASS",
+        "G_SF_SK_SCAN_PRESSURE:PASS",
+        "G_SF_SK_RANGE_SEMANTICS:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.92,
+      "expected_explain_delta": "Each UNION ALL branch will scan fewer partitions due to date_sk range pushdown, reducing I/O.",
+      "recommended_patch_ops": [
+        "insert_cte",
+        "replace_from",
+        "replace_where_predicate"
+      ],
+      "recommended_examples": [
+        "sf_sk_pushdown_union_all"
+      ],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by customer key before joining customer_address and store dimensions.",
+      "dag_target_hint": "Modify my_revenue CTE to aggregate store_sales early.",
+      "node_contract": {
+        "from_must_include": [
+          "store_sales"
+        ],
+        "where_must_preserve": [
+          "ss_wholesale_cost BETWEEN 35 AND 65"
+        ],
+        "output_must_preserve": [
+          "c_customer_sk",
+          "revenue"
+        ]
+      },
+      "gates_checked": [
+        "agg_key_compatibility:PASS",
+        "duplication_sensitive_metrics:none"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Rows into final aggregate and join reduce due to earlier grouping.",
+      "recommended_patch_ops": [
+        "insert_cte",
+        "replace_from"
+      ],
+      "recommended_examples": [
+        "aggregate_pushdown"
+      ],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery with aggregation into 3 CTEs: shared scan, per-key threshold, filtered main query.",
+      "dag_target_hint": "Modify final_select to decorrelate any correlated scalar subqueries.",
+      "node_contract": {
+        "from_must_include": [
+          "store_sales",
+          "date_dim"
+        ],
+        "where_must_preserve": [
+          "d_month_seq between (select distinct d_month_seq+1 ...) and (select distinct d_month_seq+3 ...)"
+        ],
+        "output_must_preserve": [
+          "segment",
+          "num_customers",
+          "segment_base"
+        ]
+      },
+      "gates_checked": [
+        "G_SF_CORR_SCALAR_REQUIRED:PASS",
+        "G_SF_CORR_SEMANTIC_KEYS:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Correlated branch disappears and join input rows drop before aggregate.",
+      "recommended_patch_ops": [
+        "insert_cte",
+        "replace_from",
+        "replace_where_predicate"
+      ],
+      "recommended_examples": [
+        "sf_inline_decorrelate"
+      ],
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter dimension tables (item, date_dim, customer) into CTEs returning only surrogate keys before joining with fact tables.",
+      "dag_target_hint": "Modify my_customers CTE to isolate dimension filters.",
+      "node_contract": {
+        "from_must_include": [
+          "item",
+          "date_dim",
+          "customer"
+        ],
+        "where_must_preserve": [
+          "i_category = 'Electronics'",
+          "i_class = 'personal'",
+          "d_moy = 1",
+          "d_year = 1998",
+          "c_birth_year BETWEEN 1928 AND 1941"
+        ],
+        "output_must_preserve": [
+          "c_customer_sk",
+          "c_current_addr_sk"
+        ]
+      },
+      "gates_checked": [
+        "no_or_to_union:PASS",
+        "multiplicity_guard_required:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Secondary hotspot suggests driver-order sensitivity on current join shape.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Planner chooses smaller build side and lowers join work on fact path.",
+      "recommended_patch_ops": [
+        "insert_cte",
+        "replace_from"
+      ],
+      "recommended_examples": [
+        "dimension_cte_isolate"
+      ]
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "When multiple dimension tables have selective filters, pre-filter ALL of them into CTEs before the fact table join.",
+      "dag_target_hint": "Modify my_revenue CTE to prefetch dimensions.",
+      "node_contract": {
+        "from_must_include": [
+          "customer_address",
+          "store",
+          "date_dim"
+        ],
+        "where_must_preserve": [
+          "s_state in ('AR','CO','IA','IL','KY','NC','NM','NY','PA','TX')",
+          "d_month_seq between (select distinct d_month_seq+1 ...) and (select distinct d_month_seq+3 ...)"
+        ],
+        "output_must_preserve": [
+          "c_customer_sk",
+          "revenue"
+        ]
+      },
+      "gates_checked": [
+        "no_or_to_union:PASS",
+        "multiplicity_guard_required:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Secondary hotspot suggests driver-order sensitivity on current join shape.",
+      "confidence": 0.62,
+      "expected_explain_delta": "Planner chooses smaller build side and lowers join work on fact path.",
+      "recommended_patch_ops": [
+        "insert_cte",
+        "replace_from"
+      ],
+      "recommended_examples": [
+        "multi_dimension_prefetch"
+      ]
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Extract repeated subquery patterns into CTEs to avoid recomputation.",
+      "dag_target_hint": "Modify segments CTE to materialize intermediate results.",
+      "node_contract": {
+        "from_must_include": [
+          "my_revenue"
+        ],
+        "where_must_preserve": [],
+        "output_must_preserve": [
+          "segment"
+        ]
+      },
+      "gates_checked": [
+        "agg_key_compatibility:PASS",
+        "duplication_sensitive_metrics:none"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Repeated CTE evaluations indicate lack of decorrelation for multi-table joins.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Repeated subtree rescans are reduced by materializing intermediate results.",
+      "recommended_patch_ops": [
+        "insert_cte",
+        "replace_from"
+      ],
+      "recommended_examples": [
+        "materialize_cte"
+      ]
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in plan evidence."
+    }
+  ]
+}

@@ -163,6 +163,10 @@ def _table_name_variants(table_name: str) -> Set[str]:
     for tok in tokens:
         variants.add(tok)
         variants.add(_singularize(tok))
+        if len(tok) >= 3:
+            variants.add(tok[:3])
+        if len(tok) >= 4:
+            variants.add(tok[:4])
 
     if tokens:
         compact = ''.join(tokens)
@@ -347,12 +351,19 @@ class SchemaExtractor:
                 continue
             
             alias = table.alias
-            
-            tables[table_name] = {
-                'alias': alias,
-                'columns': {},
-                'key': f"{table_name}_sk"  # assume surrogate key pattern
-            }
+
+            if table_name not in tables:
+                tables[table_name] = {
+                    'alias': alias,
+                    'aliases': set([alias]) if alias else set(),
+                    'columns': {},
+                    'key': f"{table_name}_sk"  # assume surrogate key pattern
+                }
+            else:
+                if alias:
+                    tables[table_name].setdefault('aliases', set()).add(alias)
+                    if not tables[table_name].get('alias'):
+                        tables[table_name]['alias'] = alias
         
         # Extract columns using explicit qualifiers + generic name heuristics
         self._extract_columns_from_expression(self.parsed, tables, cte_names)
@@ -368,6 +379,9 @@ class SchemaExtractor:
         for t_name, t_info in tables.items():
             if t_info.get('alias'):
                 alias_map[t_info['alias']] = t_name
+            for alias in t_info.get('aliases', set()):
+                if alias:
+                    alias_map[alias] = t_name
             alias_map[t_name] = t_name
 
         # Collect all derived table/CTE aliases in the expression
@@ -395,6 +409,69 @@ class SchemaExtractor:
                     if hasattr(sel_col, 'alias') and sel_col.alias:
                         derived_col_aliases.add(sel_col.alias)
 
+        def _strict_prefix_table_match(col_name: str, candidate_tables: Set[str]) -> Optional[str]:
+            col_lower = col_name.lower()
+            parts = [p for p in col_lower.split('_') if p]
+            if not parts:
+                return None
+            prefix = parts[0]
+            matched: List[str] = []
+            for table_name in candidate_tables:
+                table_lower = table_name.lower()
+                table_tokens = [t for t in table_lower.split('_') if t]
+                variants = _table_name_variants(table_name)
+                abbrev = _table_abbreviation(table_name)
+                is_match = False
+                if prefix in variants:
+                    is_match = True
+                elif abbrev and prefix == abbrev:
+                    is_match = True
+                elif (
+                    len(prefix) == 1
+                    and table_tokens
+                    and table_lower.endswith('_dim')
+                    and prefix == table_tokens[0][0]
+                ):
+                    is_match = True
+                if is_match:
+                    matched.append(table_name)
+            if len(matched) == 1:
+                return matched[0]
+            return None
+
+        def _direct_scope_sources(select_node: Optional[exp.Select]) -> Tuple[Set[str], bool]:
+            """Return (base_tables, has_non_base_source) for a SELECT scope."""
+            if select_node is None:
+                return set(), False
+            base_tables: Set[str] = set()
+            has_non_base = False
+
+            source_nodes: List[exp.Expression] = []
+            from_expr = select_node.args.get('from')
+            if from_expr is not None and getattr(from_expr, 'this', None) is not None:
+                source_nodes.append(from_expr.this)
+            for join_expr in select_node.args.get('joins') or []:
+                if getattr(join_expr, 'this', None) is not None:
+                    source_nodes.append(join_expr.this)
+
+            for src in source_nodes:
+                if isinstance(src, exp.Table):
+                    src_name = src.name
+                    if src_name in cte_names:
+                        has_non_base = True
+                    elif src_name in tables:
+                        base_tables.add(src_name)
+                    else:
+                        # Unknown table reference: treat conservatively as non-base.
+                        has_non_base = True
+                else:
+                    # Subquery / derived source at this scope.
+                    has_non_base = True
+
+            return base_tables, has_non_base
+
+        unresolved_unqualified: List[Tuple[str, str, Set[str], bool]] = []
+
         # Find all columns in the expression
         for col in expr.find_all(exp.Column):
             table_name = col.table
@@ -413,12 +490,38 @@ class SchemaExtractor:
                         'nullable': True
                     }
             else:
-                # Try generic naming convention against available tables
-                matched_table = get_table_from_column(col_name, set(tables.keys()))
-                # If this token is a derived alias and cannot be mapped to a
-                # concrete base table, treat it as derived and skip.
-                if not matched_table and col_name in derived_col_aliases:
+                select_scope = col.find_ancestor(exp.Select)
+                scope_base_tables, scope_has_non_base = _direct_scope_sources(select_scope)
+                if not scope_base_tables:
                     continue
+
+                # Prefer strict prefix/abbrev matching within the current SELECT scope.
+                matched_table = _strict_prefix_table_match(col_name, scope_base_tables)
+                if not matched_table:
+                    # In mixed base+derived scopes, avoid heuristic remapping of
+                    # unqualified columns; they frequently belong to derived sources.
+                    if scope_has_non_base:
+                        continue
+                    # If this token is a derived alias, do not force it onto a base table.
+                    if col_name in derived_col_aliases:
+                        continue
+                    if len(scope_base_tables) == 1:
+                        matched_table = next(iter(scope_base_tables))
+                    else:
+                        matched_table = get_table_from_column(col_name, scope_base_tables)
+                    if not matched_table:
+                        parts = [p for p in col_lower.split('_') if p]
+                        prefix = parts[0] if parts else ''
+                        if prefix:
+                            family_tables: List[str] = []
+                            marker = f"{prefix}_"
+                            for candidate_table in scope_base_tables:
+                                existing_cols = tables.get(candidate_table, {}).get('columns', {})
+                                if any(str(ec).lower().startswith(marker) for ec in existing_cols.keys()):
+                                    family_tables.append(candidate_table)
+                            if len(family_tables) == 1:
+                                matched_table = family_tables[0]
+
                 if matched_table and matched_table in tables:
                     if col_name not in tables[matched_table]['columns']:
                         col_type = self._infer_column_type(col_name)
@@ -426,6 +529,44 @@ class SchemaExtractor:
                             'type': col_type,
                             'nullable': True
                         }
+                else:
+                    unresolved_unqualified.append(
+                        (col_name, col_lower, set(scope_base_tables), scope_has_non_base)
+                    )
+
+        # Second pass: resolve previously ambiguous unqualified columns after
+        # first-pass strong matches have seeded prefix families.
+        for col_name, col_lower, scope_base_tables, scope_has_non_base in unresolved_unqualified:
+            if not scope_base_tables or scope_has_non_base:
+                continue
+            if col_name in derived_col_aliases:
+                continue
+
+            matched_table = _strict_prefix_table_match(col_name, scope_base_tables)
+            if not matched_table:
+                if len(scope_base_tables) == 1:
+                    matched_table = next(iter(scope_base_tables))
+                else:
+                    matched_table = get_table_from_column(col_name, scope_base_tables)
+            if not matched_table:
+                parts = [p for p in col_lower.split('_') if p]
+                prefix = parts[0] if parts else ''
+                if prefix:
+                    marker = f"{prefix}_"
+                    family_tables: List[str] = []
+                    for candidate_table in scope_base_tables:
+                        existing_cols = tables.get(candidate_table, {}).get('columns', {})
+                        if any(str(ec).lower().startswith(marker) for ec in existing_cols.keys()):
+                            family_tables.append(candidate_table)
+                    if len(family_tables) == 1:
+                        matched_table = family_tables[0]
+
+            if matched_table and matched_table in tables and col_name not in tables[matched_table]['columns']:
+                col_type = self._infer_column_type(col_name)
+                tables[matched_table]['columns'][col_name] = {
+                    'type': col_type,
+                    'nullable': True,
+                }
     
     def _infer_column_type(self, col_name: str) -> str:
         """Infer column type from column name."""
@@ -435,6 +576,19 @@ class SchemaExtractor:
         if col_lower.endswith('_sk') or col_lower.endswith('_id') or col_lower == 'id':
             return 'INTEGER'
         elif col_lower.endswith('_key'):
+            return 'INTEGER'
+
+        # Time-of-day attributes are commonly numeric in benchmark schemas
+        # (e.g., time_dim.t_time), even when the token contains "time".
+        if col_lower in {'t_time', 'time', 'hour', 'minute', 'second'}:
+            return 'INTEGER'
+        if (
+            col_lower.endswith('_time')
+            and 'timestamp' not in col_lower
+            and 'date' not in col_lower
+        ):
+            return 'INTEGER'
+        if 'sq_ft' in col_lower or 'square_feet' in col_lower:
             return 'INTEGER'
         
         # Date-related columns - check BEFORE numeric patterns
@@ -452,7 +606,14 @@ class SchemaExtractor:
             return 'INTEGER'
         elif col_lower in ['year', 'month', 'moy', 'qoy', 'dom']:
             return 'INTEGER'
-        
+
+        # Name/description columns should remain textual even when they include
+        # date-like tokens (e.g., d_day_name).
+        if any(str_col in col_lower for str_col in ['name', 'desc', 'description', 'type', 'category', 'state', 'city', 'email', 'address', 'phone']):
+            return 'VARCHAR(100)'
+        if 'country' in col_lower or 'county' in col_lower:
+            return 'VARCHAR(100)'
+
         # Numeric columns - be careful not to match date-related columns
         if any(num_col in col_lower for num_col in ['qty', 'quantity', 'number', 'count', 'seq', 'year', 'month', 'day', 'week']):
             return 'INTEGER'
@@ -472,9 +633,7 @@ class SchemaExtractor:
             return 'INTEGER'
         
         # String columns
-        elif any(str_col in col_lower for str_col in ['name', 'desc', 'description', 'type', 'category', 'state', 'city', 'email', 'address', 'phone']):
-            return 'VARCHAR(100)'
-        elif col_lower.endswith('_id') and not col_lower.endswith('_sk'):
+        if col_lower.endswith('_id') and not col_lower.endswith('_sk'):
             return 'VARCHAR(50)'
 
         # Fallback: lexical vector similarity over column-name tokens.
@@ -483,6 +642,57 @@ class SchemaExtractor:
             return sim_type
 
         return 'VARCHAR(50)'
+
+
+def _is_date_expression(node: Optional[exp.Expression]) -> bool:
+    """Return True if *node* is a date-typed expression (CAST to DATE, INTERVAL, date arithmetic)."""
+    if node is None:
+        return False
+    if isinstance(node, exp.Paren):
+        return _is_date_expression(node.this)
+    if isinstance(node, exp.Interval):
+        return True
+    if isinstance(node, exp.Cast):
+        target = node.args.get("to")
+        if target is not None and "DATE" in target.sql().upper():
+            return True
+    if isinstance(node, (exp.Add, exp.Sub)):
+        if _is_date_expression(node.left) or _is_date_expression(node.right):
+            return True
+    return False
+
+
+_TEMPORAL_TOKENS = frozenset({
+    'year', 'month', 'quarter', 'week', 'day', 'moy', 'qoy', 'dom', 'dow',
+})
+
+
+def _is_temporal_dimension(table_name: str, columns: Dict[str, Any]) -> bool:
+    """Detect a temporal dimension table generically (not just ``date_dim``).
+
+    Returns True when the table has at least one DATE column AND two or more
+    integer columns whose names contain temporal tokens (year, month, quarter,
+    week, day, etc.).  This covers ``date_dim``, ``calendar``, ``dim_date``,
+    or any custom temporal dimension.
+    """
+    has_date_col = False
+    temporal_int_count = 0
+    for col_name, col_info in columns.items():
+        col_type = (col_info.get('type', '') if isinstance(col_info, dict) else str(col_info)).upper()
+        if 'DATE' in col_type and 'UPDATE' not in col_name.upper():
+            has_date_col = True
+        if 'INT' in col_type:
+            col_lower = col_name.lower()
+            if any(tok in col_lower for tok in _TEMPORAL_TOKENS):
+                temporal_int_count += 1
+    # Also match by table name heuristic (date_dim, time_dim, calendar, dim_date)
+    tl = table_name.lower()
+    name_match = (
+        tl in {'date_dim', 'time_dim', 'calendar', 'dim_date', 'dim_time'}
+        or ('date' in tl and tl.endswith('_dim'))
+        or ('time' in tl and tl.endswith('_dim'))
+    )
+    return name_match or (has_date_col and temporal_int_count >= 2)
 
 
 class SyntheticDataGenerator:
@@ -517,17 +727,15 @@ class SyntheticDataGenerator:
         if not row_context:
             return None
         for _child_col, (parent_table, _parent_col) in foreign_keys.items():
-            parent_lower = str(parent_table).lower()
-            is_date_parent = (
-                parent_lower == "date_dim"
-                or (parent_lower.endswith("_dim") and "date" in parent_lower)
-            )
-            if not is_date_parent:
+            parent_cols = self.all_schemas.get(parent_table, {}).get('columns', {})
+            if not _is_temporal_dimension(parent_table, parent_cols):
                 continue
             parent_idx = row_context.get(f"__parent_row_idx__:{parent_table}")
             if parent_idx is None:
                 continue
-            years = self.table_column_values.get(parent_table, {}).get("d_year")
+            # Find the year column dynamically
+            year_col = next((c for c in self.table_column_values.get(parent_table, {}) if 'year' in c.lower()), None)
+            years = self.table_column_values.get(parent_table, {}).get(year_col) if year_col else None
             if years and 0 <= int(parent_idx) < len(years):
                 try:
                     return int(years[int(parent_idx)])
@@ -664,15 +872,57 @@ class SyntheticDataGenerator:
 
         decimal_info = self._parse_decimal_type(col_type)
 
+        def _remember_date_dim_value(value: Any) -> None:
+            """Remember year/month values from any temporal dimension for consistency."""
+            if row_context is None or not table_name:
+                return
+            _tbl_cols = self.all_schemas.get(table_name, {}).get('columns', {}) if table_name else {}
+            if not _is_temporal_dimension(table_name, _tbl_cols):
+                return
+            try:
+                if 'year' in col_name_lower:
+                    row_context['__date_dim_year'] = int(float(value))
+                elif 'month' in col_name_lower or col_name_lower.endswith('_moy'):
+                    month_i = int(float(value))
+                    if month_i < 1:
+                        month_i = 1
+                    elif month_i > 12:
+                        month_i = 12
+                    row_context['__date_dim_month'] = month_i
+            except (TypeError, ValueError):
+                return
+
         # Check if filter_literal_values has a value for this table+column
         # Inject matching values ~70% of the time so WHERE filters produce results
         filter_vals = getattr(self, 'filter_literal_values', {})
         if table_name and table_name in filter_vals and col_name in filter_vals[table_name]:
             vals = filter_vals[table_name][col_name]
             if vals:
+                plain_literals = [
+                    v for v in vals
+                    if not (isinstance(v, str) and (v.startswith('BETWEEN:') or (':' in v and v and v[0] in '><')))
+                ]
+                is_numeric_col = any(t in col_type_upper for t in ('INT', 'DECIMAL', 'BIGINT', 'SMALLINT', 'FLOAT', 'DOUBLE'))
+                is_measure_col = any(
+                    tok in col_name_lower
+                    for tok in ('fee', 'amount', 'amt', 'sales', 'price', 'cost', 'tax', 'revenue', 'profit', 'loss', 'total')
+                )
+                if is_numeric_col and is_measure_col and len(plain_literals) > 1:
+                    # Keep value choice stable per FK parent bucket so grouped
+                    # aggregates see meaningful low/high variance.
+                    bucket_seed = 0
+                    if row_context:
+                        parent_idxs = [
+                            int(v) for k, v in row_context.items()
+                            if k.startswith('__parent_row_idx__:') and isinstance(v, (int, float))
+                        ]
+                        if parent_idxs:
+                            bucket_seed = sum(parent_idxs)
+                    chosen = plain_literals[bucket_seed % len(plain_literals)]
+                else:
+                    chosen = vals[row_idx % len(vals)]
                 # Deterministic cycling ensures every filtered column gets
                 # satisfying values even under highly selective workloads.
-                chosen = vals[row_idx % len(vals)]
                 # Handle BETWEEN ranges
                 if isinstance(chosen, str) and chosen.startswith('BETWEEN:'):
                     _, low, high = chosen.split(':', 2)
@@ -737,15 +987,20 @@ class SyntheticDataGenerator:
                     # Direct equality / IN value
                     if 'INTEGER' in col_type:
                         try:
-                            return int(chosen)
+                            out = int(chosen)
+                            _remember_date_dim_value(out)
+                            return out
                         except (ValueError, TypeError):
                             pass
                     elif 'DECIMAL' in col_type:
                         try:
-                            return float(chosen)
+                            out = float(chosen)
+                            _remember_date_dim_value(out)
+                            return out
                         except (ValueError, TypeError):
                             pass
                     else:
+                        _remember_date_dim_value(chosen)
                         return str(chosen)
         
         # Check if this is a foreign key column
@@ -755,11 +1010,8 @@ class SyntheticDataGenerator:
             target_col_lower = str(target_col).lower()
             parent_row_key = f"__parent_row_idx__:{target_table}"
             target_lower = target_table.lower()
-            is_temporal_dim = (
-                target_lower in {'date_dim', 'time_dim'}
-                or ('date' in target_lower and target_lower.endswith('_dim'))
-                or ('time' in target_lower and target_lower.endswith('_dim'))
-            )
+            target_columns = self.all_schemas.get(target_table, {}).get('columns', {})
+            is_temporal_dim = _is_temporal_dimension(target_table, target_columns)
 
             # Composite-key correlation: for multiple child columns pointing to
             # one parent table, pin all to the same parent row in this output row.
@@ -847,28 +1099,98 @@ class SyntheticDataGenerator:
                 val = row_idx + 1
             return val
 
-        # Keep date_dim attributes internally consistent so self-joins on week/
-        # month/quarter sequences have realistic hit rates.
-        if table_name and table_name.lower() == 'date_dim':
+        # Keep temporal dimension attributes internally consistent so self-joins
+        # on week/month/quarter sequences have realistic hit rates.
+        # Generic: works for date_dim, calendar, dim_date, or any custom temporal dim.
+        _table_cols = self.all_schemas.get(table_name, {}).get('columns', {}) if table_name else {}
+        if table_name and _is_temporal_dimension(table_name, _table_cols):
+            def _fixed_filter_int(*candidates: str) -> Optional[int]:
+                table_filters = filter_vals.get(table_name, {})
+                for candidate in candidates:
+                    vals = table_filters.get(candidate)
+                    if not vals:
+                        continue
+                    for raw_val in vals:
+                        txt = str(raw_val).strip()
+                        if not txt:
+                            continue
+                        if txt.startswith('BETWEEN:'):
+                            continue
+                        if ':' in txt and txt[0] in {'>', '<'}:
+                            continue
+                        try:
+                            return int(float(txt.strip("'\"")))
+                        except (TypeError, ValueError):
+                            continue
+                return None
+
+            # Find year/month columns by token matching (not hardcoded names)
+            year_cols = [c for c in _table_cols if 'year' in c.lower()]
+            month_cols = [c for c in _table_cols if any(t in c.lower() for t in ('month', 'moy'))]
+
             base_date = datetime(1990, 1, 1) + timedelta(days=(row_idx % (365 * 40)))
-            if col_name_lower in {'d_date'} or col_name_lower.endswith('_date'):
-                return base_date.strftime('%Y-%m-%d')
-            if col_name_lower in {'d_year', 'd_fy_year'}:
-                return base_date.year
-            if col_name_lower in {'d_month', 'd_moy'}:
-                return base_date.month
-            if col_name_lower in {'d_day', 'd_dom'}:
-                return base_date.day
-            if col_name_lower in {'d_quarter', 'd_qoy'}:
-                return ((base_date.month - 1) // 3) + 1
-            if col_name_lower in {'d_week_seq', 'd_fy_week_seq'}:
+            year_for_seq = None
+            month_for_seq = None
+            if row_context is not None:
+                year_for_seq = row_context.get('__date_dim_year')
+                month_for_seq = row_context.get('__date_dim_month')
+            if year_for_seq is None:
+                year_for_seq = _fixed_filter_int(*year_cols) if year_cols else None
+            if month_for_seq is None:
+                month_for_seq = _fixed_filter_int(*month_cols) if month_cols else None
+            if year_for_seq is None:
+                year_for_seq = base_date.year
+            if month_for_seq is None:
+                month_for_seq = base_date.month
+            try:
+                year_for_seq = int(year_for_seq)
+            except (TypeError, ValueError):
+                year_for_seq = base_date.year
+            try:
+                month_for_seq = int(month_for_seq)
+            except (TypeError, ValueError):
+                month_for_seq = base_date.month
+            if month_for_seq < 1:
+                month_for_seq = 1
+            elif month_for_seq > 12:
+                month_for_seq = 12
+
+            day_for_date = 1 + (row_idx % 28)
+            try:
+                current_date = datetime(year_for_seq, month_for_seq, day_for_date)
+            except ValueError:
+                current_date = datetime(max(1900, min(2100, year_for_seq)), month_for_seq, 1)
+
+            # Token-based column matching for temporal attributes
+            if col_name_lower.endswith('_sk') or col_name_lower.endswith('_id'):
+                return row_idx + 1
+            if 'date' in col_name_lower and not any(t in col_name_lower for t in ('update', 'name', 'sk', 'id')):
+                return current_date.strftime('%Y-%m-%d')
+            if 'year' in col_name_lower:
+                _remember_date_dim_value(year_for_seq)
+                return year_for_seq
+            if 'month' in col_name_lower or col_name_lower.endswith('_moy'):
+                _remember_date_dim_value(month_for_seq)
+                return month_for_seq
+            if 'day' in col_name_lower and 'name' not in col_name_lower:
+                if col_name_lower.endswith('_dom') or 'day' == col_name_lower or col_name_lower.endswith('_day'):
+                    return current_date.day
+            if 'day_name' in col_name_lower:
+                day_names = [
+                    'Monday', 'Tuesday', 'Wednesday', 'Thursday',
+                    'Friday', 'Saturday', 'Sunday',
+                ]
+                return day_names[current_date.weekday()]
+            if 'quarter' in col_name_lower or col_name_lower.endswith('_qoy'):
+                if 'seq' in col_name_lower:
+                    return 1 + (year_for_seq - 1990) * 4 + ((month_for_seq - 1) // 3)
+                return ((month_for_seq - 1) // 3) + 1
+            if 'week' in col_name_lower and 'seq' in col_name_lower:
                 return 1 + (row_idx // 7)
-            if col_name_lower == 'd_month_seq':
-                return 1 + (base_date.year - 1990) * 12 + (base_date.month - 1)
-            if col_name_lower in {'d_quarter_seq', 'd_fy_quarter_seq'}:
-                return 1 + (base_date.year - 1990) * 4 + ((base_date.month - 1) // 3)
-            if col_name_lower == 'd_dow':
-                return ((base_date.weekday() + 1) % 7) + 1
+            if col_name_lower.endswith('_month_seq') or col_name_lower == 'month_seq':
+                return 1 + (year_for_seq - 1990) * 12 + (month_for_seq - 1)
+            if 'dow' in col_name_lower:
+                return ((current_date.weekday() + 1) % 7) + 1
 
         # Date/time-like columns
         if col_name_lower in {'d_date', 'date'}:
@@ -926,7 +1248,10 @@ class SyntheticDataGenerator:
                     key_domain = max(20, min(200, max(10, total_rows // 20)))
                     return self.random.randint(1, min(key_domain, max_val))
                 else:
-                    return self.random.randint(1, max(10, max_val // 10))
+                    # Keep generic decimal measures in a safe practical range
+                    # to avoid downstream cast overflow (e.g. DECIMAL(12,2)).
+                    val = self.random.uniform(1, min(10000, max_val))
+                    return round(val, scale)
             
             # Regular INTEGER/BIGINT
             if 'return_quantity' in col_name_lower:
@@ -1210,9 +1535,9 @@ class SyntheticValidator:
         self.conn = duckdb.connect(':memory:')
         self.reference_db = reference_db
         self.dialect = dialect.lower()
+        self.llm_max_retries = max(0, int(llm_max_retries))
         self.llm_provider = llm_provider
         self.llm_model = llm_model
-        self.llm_max_retries = max(0, int(llm_max_retries))
         self._repair_analyze_fn = repair_analyze_fn
         mode = str(repair_mode or "add_only").strip().lower()
         self.repair_mode = mode if mode in {"add_only", "hybrid"} else "add_only"
@@ -1231,6 +1556,7 @@ class SyntheticValidator:
         self.adversarial_log_path = str(adversarial_log_path)
         self._repair_llm_client = None
         self._repair_llm_initialized = False
+        self._predicate_type_hints: Dict[Tuple[str, str], str] = {}
         # Only create SchemaFromDB for supported DSN schemes
         if reference_db and SchemaFromDB.supports_dsn(reference_db):
             self.schema_extractor = SchemaFromDB(reference_db)
@@ -1258,30 +1584,8 @@ class SyntheticValidator:
             logger.debug("Failed to append adversarial effort log %s: %s", path, e)
 
     def _get_repair_llm_client(self):
-        """Lazy-init optional repair LLM client."""
-        if self._repair_analyze_fn is not None:
-            return None
-        if self._repair_llm_initialized:
-            return self._repair_llm_client
-
-        self._repair_llm_initialized = True
-        try:
-            from qt_shared.llm import create_llm_client
-        except Exception as e:
-            logger.debug("Repair LLM unavailable (import): %s", e)
-            self._repair_llm_client = None
-            return None
-
-        try:
-            self._repair_llm_client = create_llm_client(
-                provider=self.llm_provider,
-                model=self.llm_model,
-            )
-        except Exception as e:
-            logger.debug("Repair LLM unavailable (factory): %s", e)
-            self._repair_llm_client = None
-
-        return self._repair_llm_client
+        """LLM repair removed; retained as a no-op compatibility hook."""
+        return None
 
     def _analyze_repair_prompt(self, prompt: str, temperature: Optional[float] = None) -> Optional[str]:
         if self._repair_analyze_fn is not None:
@@ -1374,7 +1678,7 @@ class SyntheticValidator:
         table_penalties: Optional[Dict[str, float]] = None,
         attempt: int = 1,
     ) -> Optional[Dict[str, Any]]:
-        """Deterministic fallback when LLM output is missing or no-op."""
+        """Deterministic bounded repair planner."""
         if min_rows <= 0 or actual_rows >= min_rows:
             return None
 
@@ -2286,7 +2590,7 @@ class SyntheticValidator:
         )
         self._emit_progress(
             f"start file={sql_file} target={target_rows} range={min_rows}-{max_rows} "
-            f"retries={self.llm_max_retries} coverage_budget_s={self.coverage_time_budget_s}"
+            f"coverage_budget_s={self.coverage_time_budget_s}"
         )
 
         # 1b. Transpile to DuckDB if source dialect differs
@@ -2342,7 +2646,21 @@ class SyntheticValidator:
                     fk_relationships[table_name][col] = target
 
         # 5. Extract filter values from WHERE clause for data generation
+        self._predicate_type_hints.clear()
         filter_values = self._extract_filter_values(sql, tables)
+        # 5b. Override column types using predicate context (e.g. BETWEEN with
+        #     CAST(... AS DATE) bounds proves the column is DATE, not DECIMAL).
+        for (hint_table, hint_col), hint_type in self._predicate_type_hints.items():
+            col_info = tables.get(hint_table, {}).get('columns', {}).get(hint_col)
+            if col_info is not None:
+                current_type = col_info.get('type', '') if isinstance(col_info, dict) else str(col_info)
+                if current_type.upper() != hint_type.upper():
+                    logger.debug("  type override %s.%s: %s -> %s (predicate context)",
+                                 hint_table, hint_col, current_type, hint_type)
+                    if isinstance(col_info, dict):
+                        col_info['type'] = hint_type
+                    else:
+                        tables[hint_table]['columns'][hint_col] = {'type': hint_type}
         join_graph = self._build_join_column_graph(sql, tables)
         filter_values = self._propagate_filter_values_across_joins(filter_values, join_graph, tables)
 
@@ -2699,7 +3017,7 @@ class SyntheticValidator:
                     table_penalties=table_penalties,
                     attempt=current_attempt + 1,
                 )
-                if plan_source == "llm" and fallback_plan:
+                if fallback_plan:
                     plan = fallback_plan
                     plan_source = "fallback"
                     plan_actions = self._filter_actions_for_mode(plan.get('actions', []))
@@ -2751,6 +3069,7 @@ class SyntheticValidator:
         original_sql: str,
         optimized_sql: str,
         target_rows: int = 100,
+        witness_mode: str = "single",
     ) -> Dict[str, Any]:
         """Validate that optimized SQL produces same results as original.
 
@@ -2762,6 +3081,8 @@ class SyntheticValidator:
             original_sql: Original query SQL string.
             optimized_sql: Optimized query SQL string.
             target_rows: Number of synthetic rows per table (default 100).
+            witness_mode: ``"single"`` (default) for current behavior, or
+                ``"multi"`` to also test clone + boundary-fail witnesses.
 
         Returns:
             Dict with keys:
@@ -2869,6 +3190,7 @@ class SyntheticValidator:
                     dst.setdefault(col, target)
 
         # 5) Merge filter literals from both queries and propagate over join graph.
+        self._predicate_type_hints.clear()
         filter_values: Dict[str, Dict[str, list]] = {}
         for extracted in (
             self._extract_filter_values(orig_exec, merged_tables),
@@ -2879,6 +3201,16 @@ class SyntheticValidator:
                 for col_name, vals in col_map.items():
                     dst_vals = dst_cols.setdefault(col_name, [])
                     self._append_unique(dst_vals, list(vals))
+        # 5b) Override column types using predicate context.
+        for (hint_table, hint_col), hint_type in self._predicate_type_hints.items():
+            col_info = merged_tables.get(hint_table, {}).get('columns', {}).get(hint_col)
+            if col_info is not None:
+                current_type = col_info.get('type', '') if isinstance(col_info, dict) else str(col_info)
+                if current_type.upper() != hint_type.upper():
+                    if isinstance(col_info, dict):
+                        col_info['type'] = hint_type
+                    else:
+                        merged_tables[hint_table]['columns'][hint_col] = {'type': hint_type}
 
         join_graph = self._build_join_column_graph(orig_exec, merged_tables)
         opt_graph = self._build_join_column_graph(opt_exec, merged_tables)
@@ -3030,154 +3362,53 @@ class SyntheticValidator:
         if not match:
             return base_result
 
-        # Adversarial phase: add-only attempts to find divergence.
-        adversarial_started_at = time.monotonic()
-        adversarial_deadline = (
-            adversarial_started_at + float(self.adversarial_time_budget_s)
-            if self.adversarial_time_budget_s > 0
-            else None
-        )
-        repair_log: List[Dict[str, Any]] = []
-        attempt = 0
-        prior_row_signal = max(len(orig_rows), len(opt_rows))
-        pair_sql = f"-- ORIGINAL\n{orig_exec}\n-- OPTIMIZED\n{opt_exec}"
-        self._emit_progress(
-            f"adversarial start budget_s={self.adversarial_time_budget_s} retries={self.llm_max_retries}"
-        )
+        # Multi-witness mode: run clone + boundary-fail witnesses for higher recall.
+        if witness_mode == "multi" and match:
+            from qt_sql.validation.witness_generator import MultiRowWitnessGenerator
 
-        while (
-            self.llm_max_retries > 0
-            and attempt < self.llm_max_retries
-            and (adversarial_deadline is None or time.monotonic() < adversarial_deadline)
-        ):
-            plan = self._request_llm_repair_plan(
-                sql=pair_sql,
-                last_error=None,
-                actual_rows=prior_row_signal,
-                min_rows=1,
-                max_rows=max(1000, prior_row_signal * 20),
+            witness_gen = MultiRowWitnessGenerator(
+                conn=self.conn,
                 tables=merged_tables,
-                fk_relationships=fk_relationships,
                 filter_values=filter_values,
-                table_row_counts=table_row_counts,
-                generation_order=generation_order,
-                attempt=attempt + 1,
-                repair_log=repair_log,
-                phase="adversarial",
-            )
-            if not plan:
-                break
-
-            plan_actions = self._filter_actions_for_mode(plan.get("actions", []))
-            changed, notes, _min_unused, _max_unused, generation_order = self._apply_llm_repair_actions(
-                actions=plan_actions,
-                tables=merged_tables,
                 fk_relationships=fk_relationships,
-                filter_values=filter_values,
-                table_row_counts=table_row_counts,
                 generation_order=generation_order,
-                min_rows=0,
-                max_rows=10**9,
+                table_row_counts=table_row_counts,
             )
-            attempt += 1
-            if not changed:
-                break
+            witness_results = []
+            for witness_name, populate_fn in witness_gen.witness_variants():
+                try:
+                    populate_fn()
+                    w_exec = _execute_pair_once()
+                    if not w_exec.get("orig_success") or not w_exec.get("opt_success"):
+                        witness_results.append({
+                            "witness": witness_name,
+                            "match": True,
+                            "reason": f"skip: execution error",
+                        })
+                        continue
+                    w_match, w_rc_match, w_reason = _compare_rows(
+                        w_exec["orig_rows"], w_exec["opt_rows"]
+                    )
+                    witness_results.append({
+                        "witness": witness_name,
+                        "match": w_match,
+                        "orig_rows": len(w_exec["orig_rows"]),
+                        "opt_rows": len(w_exec["opt_rows"]),
+                        "reason": w_reason,
+                    })
+                    if not w_match:
+                        base_result["match"] = False
+                        base_result["reason"] = f"Witness '{witness_name}' mismatch: {w_reason}"
+                        base_result["witness_results"] = witness_results
+                        return base_result
+                except Exception as e:
+                    witness_results.append({
+                        "witness": witness_name,
+                        "match": True,
+                        "reason": f"skip: {str(e)[:120]}",
+                    })
+            base_result["witness_results"] = witness_results
 
-            _populate_pair_data()
-            exec_result = _execute_pair_once()
-            if not exec_result.get("orig_success", False) or not exec_result.get("opt_success", False):
-                mismatch_reason = exec_result.get("reason", "Adversarial execution failed")
-                effort = {
-                    "ts": datetime.now().isoformat(),
-                    "attempt": attempt,
-                    "phase": "adversarial",
-                    "plan_note": plan.get("note", ""),
-                    "actions": notes,
-                    "match": False,
-                    "row_count_match": False,
-                    "orig_rows": len(exec_result.get("orig_rows", [])),
-                    "opt_rows": len(exec_result.get("opt_rows", [])),
-                    "reason": mismatch_reason,
-                }
-                self._append_adversarial_effort(effort)
-                repair_log.append({
-                    "attempt": attempt,
-                    "source": "llm",
-                    "rows_before": prior_row_signal,
-                    "rows_after": max(len(exec_result.get("orig_rows", [])), len(exec_result.get("opt_rows", []))),
-                    "row_delta": 0,
-                    "regressed": False,
-                    "plan_actions": [a for a in plan_actions if isinstance(a, dict)],
-                })
-                return {
-                    'match': False,
-                    'orig_success': bool(exec_result.get("orig_success", False)),
-                    'opt_success': bool(exec_result.get("opt_success", False)),
-                    'orig_rows': len(exec_result.get("orig_rows", [])),
-                    'opt_rows': len(exec_result.get("opt_rows", [])),
-                    'orig_error': exec_result.get("orig_error"),
-                    'opt_error': exec_result.get("opt_error"),
-                    'row_count_match': False,
-                    'reason': f"Adversarial execution failure: {mismatch_reason}",
-                    'adversarial_attempts': attempt,
-                    'adversarial_timeout': False,
-                    'adversarial_elapsed_s': round(max(0.0, time.monotonic() - adversarial_started_at), 3),
-                    'adversarial_history': repair_log,
-                }
-
-            orig_rows = exec_result["orig_rows"]
-            opt_rows = exec_result["opt_rows"]
-            match, row_count_match, reason = _compare_rows(orig_rows, opt_rows)
-            after_signal = max(len(orig_rows), len(opt_rows))
-            effort = {
-                "ts": datetime.now().isoformat(),
-                "attempt": attempt,
-                "phase": "adversarial",
-                "plan_note": plan.get("note", ""),
-                "actions": notes,
-                "match": bool(match),
-                "row_count_match": bool(row_count_match),
-                "orig_rows": len(orig_rows),
-                "opt_rows": len(opt_rows),
-                "reason": reason,
-            }
-            self._append_adversarial_effort(effort)
-            repair_log.append({
-                "attempt": attempt,
-                "source": "llm",
-                "rows_before": prior_row_signal,
-                "rows_after": after_signal,
-                "row_delta": after_signal - prior_row_signal,
-                "regressed": after_signal < prior_row_signal,
-                "plan_actions": [a for a in plan_actions if isinstance(a, dict)],
-            })
-            prior_row_signal = after_signal
-            self._emit_progress(
-                f"adversarial attempt={attempt} match={match} rows={len(orig_rows)}:{len(opt_rows)} reason={reason[:120]}"
-            )
-            if not match:
-                return {
-                    'match': False,
-                    'orig_success': True,
-                    'opt_success': True,
-                    'orig_rows': len(orig_rows),
-                    'opt_rows': len(opt_rows),
-                    'orig_error': None,
-                    'opt_error': None,
-                    'row_count_match': row_count_match,
-                    'reason': f'Adversarial mismatch found: {reason}',
-                    'adversarial_attempts': attempt,
-                    'adversarial_timeout': False,
-                    'adversarial_elapsed_s': round(max(0.0, time.monotonic() - adversarial_started_at), 3),
-                    'adversarial_history': repair_log,
-                }
-
-        base_result['adversarial_attempts'] = attempt
-        base_result['adversarial_timeout'] = bool(
-            adversarial_deadline is not None and time.monotonic() >= adversarial_deadline
-        )
-        base_result['adversarial_elapsed_s'] = round(max(0.0, time.monotonic() - adversarial_started_at), 3)
-        base_result['adversarial_history'] = repair_log
         return base_result
 
     @staticmethod
@@ -3241,8 +3472,13 @@ class SyntheticValidator:
         col_expr: exp.Column,
         alias_map: Dict[str, str],
         tables: Dict,
+        cte_lineage: Optional[Dict[str, Dict[str, Tuple[str, str]]]] = None,
     ) -> Optional[Tuple[str, str]]:
         table_name = alias_map.get(col_expr.table, col_expr.table)
+        if cte_lineage and table_name in cte_lineage:
+            mapped = cte_lineage[table_name].get(col_expr.name.lower())
+            if mapped:
+                return mapped
         if not table_name or table_name not in tables:
             table_name = get_table_for_column(col_expr.name, tables)
         if not table_name or table_name not in tables:
@@ -3261,6 +3497,67 @@ class SyntheticValidator:
             return graph
 
         alias_map, _ = self._build_alias_map(parsed)
+        cte_lineage: Dict[str, Dict[str, Tuple[str, str]]] = {}
+
+        # Include CTE aliases so outer predicates on CTE outputs can resolve.
+        for cte in parsed.find_all(exp.CTE):
+            if cte.alias:
+                alias_map[cte.alias] = cte.alias
+        for table in parsed.find_all(exp.Table):
+            if table.alias:
+                alias_map[table.alias] = table.name
+            alias_map[table.name] = table.name
+
+        def _iter_select_nodes(node: Optional[exp.Expression]) -> List[exp.Select]:
+            if node is None:
+                return []
+            if isinstance(node, exp.Select):
+                return [node]
+            if isinstance(node, exp.Subquery):
+                return _iter_select_nodes(node.this)
+            if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
+                return _iter_select_nodes(node.left) + _iter_select_nodes(node.right)
+            found = node.find(exp.Select)
+            return [found] if found is not None else []
+
+        # Build direct CTE output-column lineage to base columns.
+        for cte in parsed.find_all(exp.CTE):
+            cte_name = cte.alias
+            if not cte_name:
+                continue
+            out_map: Dict[str, Tuple[str, str]] = {}
+            for select in _iter_select_nodes(cte.this):
+                local_alias: Dict[str, str] = {}
+                for table in select.find_all(exp.Table):
+                    if table.alias:
+                        local_alias[table.alias] = table.name
+                    local_alias[table.name] = table.name
+                for sel in select.expressions:
+                    out_col = getattr(sel, "alias_or_name", None)
+                    if not out_col:
+                        continue
+                    source_expr = sel.this if isinstance(sel, exp.Alias) else sel
+                    if not isinstance(source_expr, exp.Column):
+                        continue
+                    source_table = local_alias.get(source_expr.table, source_expr.table)
+                    mapped: Optional[Tuple[str, str]] = None
+                    if source_table in tables:
+                        source_col = self._resolve_column_name(source_table, source_expr.name, tables)
+                        if source_col:
+                            mapped = (source_table, source_col)
+                    elif source_table in cte_lineage:
+                        mapped = cte_lineage[source_table].get(source_expr.name.lower())
+                    else:
+                        guessed_table = get_table_for_column(source_expr.name, tables)
+                        if guessed_table and guessed_table in tables:
+                            source_col = self._resolve_column_name(guessed_table, source_expr.name, tables)
+                            if source_col:
+                                mapped = (guessed_table, source_col)
+                    if mapped and out_col.lower() not in out_map:
+                        out_map[out_col.lower()] = mapped
+            if out_map:
+                cte_lineage[cte_name] = out_map
+
         eq_sources: List[exp.EQ] = []
         for join in parsed.find_all(exp.Join):
             eq_sources.extend(join.find_all(exp.EQ))
@@ -3272,8 +3569,8 @@ class SyntheticValidator:
         for eq in eq_sources:
             if not (isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Column)):
                 continue
-            left_ref = self._resolve_column_ref(eq.left, alias_map, tables)
-            right_ref = self._resolve_column_ref(eq.right, alias_map, tables)
+            left_ref = self._resolve_column_ref(eq.left, alias_map, tables, cte_lineage)
+            right_ref = self._resolve_column_ref(eq.right, alias_map, tables, cte_lineage)
             if not left_ref or not right_ref or left_ref == right_ref:
                 continue
             graph.setdefault(left_ref, set()).add(right_ref)
@@ -3639,7 +3936,7 @@ class SyntheticValidator:
 
         Returns: {table_name: {column_name: [values]}}
         """
-        filter_values = {}
+        filter_values: Dict[str, Dict[str, List[Any]]] = {}
         parsed = sqlglot.parse_one(sql)
 
         # Build alias map (including CTE references for outer predicates)
@@ -3652,73 +3949,51 @@ class SyntheticValidator:
                 alias_map[table.alias] = table.name
             alias_map[table.name] = table.name
 
-        # Build best-effort lineage for simple CTE output aliases:
-        # cte_col -> base_table.base_col when projection is direct column alias.
-        cte_lineage: Dict[str, Dict[str, Tuple[str, str]]] = {}
-        for cte in parsed.find_all(exp.CTE):
-            cte_name = cte.alias
-            if not cte_name:
-                continue
-            cte_query = cte.this
-            select = cte_query.find(exp.Select) if cte_query is not None else None
-            if select is None:
-                continue
-
-            local_alias = {}
-            for table in cte_query.find_all(exp.Table):
-                if table.alias:
-                    local_alias[table.alias] = table.name
-                local_alias[table.name] = table.name
-
-            out_map: Dict[str, Tuple[str, str]] = {}
-            for sel in select.expressions:
-                out_col = getattr(sel, 'alias_or_name', None)
-                src_col_expr = None
-                if isinstance(sel, exp.Alias) and isinstance(sel.this, exp.Column):
-                    src_col_expr = sel.this
-                elif isinstance(sel, exp.Column):
-                    src_col_expr = sel
-                if not out_col or not src_col_expr:
-                    continue
-
-                src_table = local_alias.get(src_col_expr.table, src_col_expr.table)
-                if not src_table or src_table not in tables:
-                    src_table = get_table_for_column(src_col_expr.name, tables)
-                if not src_table or src_table not in tables:
-                    continue
-                src_col = self._resolve_column_name(src_table, src_col_expr.name, tables) or src_col_expr.name
-                out_map[out_col.lower()] = (src_table, src_col)
-
-            if out_map:
-                cte_lineage[cte_name] = out_map
-
-        def _resolve_filter_column(col_expr: exp.Column) -> Optional[Tuple[str, str]]:
-            table_ref = alias_map.get(col_expr.table, col_expr.table)
-            col_name = col_expr.name
-
-            if table_ref in tables:
-                real_col = self._resolve_column_name(table_ref, col_name, tables)
-                if real_col:
-                    return table_ref, real_col
-
-            # Predicate on a CTE output column: map back to base column if known.
-            if table_ref in cte_lineage:
-                mapped = cte_lineage[table_ref].get(col_name.lower())
-                if mapped:
-                    return mapped
-
-            guessed_table = get_table_for_column(col_name, tables)
-            if guessed_table and guessed_table in tables:
-                real_col = self._resolve_column_name(guessed_table, col_name, tables)
-                if real_col:
-                    return guessed_table, real_col
-            return None
+        def _append_filter_value(table_name: str, col_name: str, value: Any) -> None:
+            table_map = filter_values.setdefault(table_name, {})
+            col_values = table_map.setdefault(col_name, [])
+            if value not in col_values:
+                col_values.append(value)
 
         def _format_const_number(v: float) -> str:
             if abs(v - round(v)) < 1e-9:
                 return str(int(round(v)))
             text = f"{v:.12f}".rstrip('0').rstrip('.')
             return text if text else "0"
+
+        def _extract_date_literal(node: Optional[exp.Expression]) -> Optional[datetime]:
+            if node is None:
+                return None
+            if isinstance(node, exp.Paren):
+                return _extract_date_literal(node.this)
+            if isinstance(node, exp.Cast):
+                target = node.args.get("to")
+                target_txt = target.sql().upper() if target is not None else ""
+                if "DATE" in target_txt:
+                    return _extract_date_literal(node.this)
+            if isinstance(node, exp.Literal):
+                txt = str(node.this).strip("'\"")
+                for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+                    try:
+                        return datetime.strptime(txt, fmt)
+                    except ValueError:
+                        continue
+            return None
+
+        def _extract_interval_days(node: Optional[exp.Expression]) -> Optional[int]:
+            if not isinstance(node, exp.Interval):
+                return None
+            unit = node.args.get("unit")
+            unit_txt = unit.sql().upper() if unit is not None else "DAY"
+            if "DAY" not in unit_txt:
+                return None
+            val_node = node.this
+            if isinstance(val_node, exp.Literal):
+                try:
+                    return int(float(str(val_node.this).strip("'\"")))
+                except (TypeError, ValueError):
+                    return None
+            return None
 
         def _extract_const_value(node: Optional[exp.Expression]) -> Optional[str]:
             if node is None:
@@ -3736,6 +4011,19 @@ class SyntheticValidator:
                 except (TypeError, ValueError):
                     return None
             if isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+                # Date arithmetic constants: DATE +/- INTERVAL n DAY.
+                if isinstance(node, (exp.Add, exp.Sub)):
+                    left_date = _extract_date_literal(node.left)
+                    right_date = _extract_date_literal(node.right)
+                    left_days = _extract_interval_days(node.left)
+                    right_days = _extract_interval_days(node.right)
+                    if left_date is not None and right_days is not None:
+                        out_date = left_date + timedelta(days=right_days if isinstance(node, exp.Add) else -right_days)
+                        return out_date.strftime("%Y-%m-%d")
+                    if right_date is not None and left_days is not None and isinstance(node, exp.Add):
+                        out_date = right_date + timedelta(days=left_days)
+                        return out_date.strftime("%Y-%m-%d")
+
                 left = _extract_const_value(node.left)
                 right = _extract_const_value(node.right)
                 if left is None or right is None:
@@ -3760,35 +4048,471 @@ class SyntheticValidator:
                 return _extract_const_value(node.this)
             return None
 
+        def _extract_const_float(node: Optional[exp.Expression]) -> Optional[float]:
+            txt = _extract_const_value(node)
+            if txt is None:
+                return None
+            try:
+                return float(txt)
+            except (TypeError, ValueError):
+                return None
+
+        def _iter_select_nodes(node: Optional[exp.Expression]) -> List[exp.Select]:
+            if node is None:
+                return []
+            if isinstance(node, exp.Select):
+                return [node]
+            if isinstance(node, exp.Subquery):
+                return _iter_select_nodes(node.this)
+            if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
+                return _iter_select_nodes(node.left) + _iter_select_nodes(node.right)
+            found = node.find(exp.Select)
+            return [found] if found is not None else []
+
+        def _resolve_source_column(
+            col_expr: exp.Column,
+            local_alias: Dict[str, str],
+        ) -> Optional[Tuple[str, str]]:
+            src_table = local_alias.get(col_expr.table, col_expr.table)
+            if not src_table or src_table not in tables:
+                src_table = get_table_for_column(col_expr.name, tables)
+            if not src_table or src_table not in tables:
+                return None
+            src_col = self._resolve_column_name(src_table, col_expr.name, tables) or col_expr.name
+            return src_table, src_col
+
+        def _extract_linear_terms(
+            node: Optional[exp.Expression],
+            local_alias: Dict[str, str],
+            scale: float = 1.0,
+        ) -> Optional[List[Tuple[str, str, float]]]:
+            if node is None:
+                return None
+            if isinstance(node, exp.Paren):
+                return _extract_linear_terms(node.this, local_alias, scale)
+            if isinstance(node, exp.Cast):
+                return _extract_linear_terms(node.this, local_alias, scale)
+            if isinstance(node, exp.Neg):
+                return _extract_linear_terms(node.this, local_alias, -scale)
+            if isinstance(node, exp.Column):
+                resolved = _resolve_source_column(node, local_alias)
+                if not resolved:
+                    return None
+                table_name, col_name = resolved
+                return [(table_name, col_name, scale)]
+            if isinstance(node, exp.Add):
+                left_terms = _extract_linear_terms(node.left, local_alias, scale)
+                right_terms = _extract_linear_terms(node.right, local_alias, scale)
+                if left_terms is None or right_terms is None:
+                    return None
+                return left_terms + right_terms
+            if isinstance(node, exp.Sub):
+                left_terms = _extract_linear_terms(node.left, local_alias, scale)
+                right_terms = _extract_linear_terms(node.right, local_alias, -scale)
+                if left_terms is None or right_terms is None:
+                    return None
+                return left_terms + right_terms
+            if isinstance(node, exp.Mul):
+                left_const = _extract_const_float(node.left)
+                right_const = _extract_const_float(node.right)
+                if left_const is not None:
+                    return _extract_linear_terms(node.right, local_alias, scale * left_const)
+                if right_const is not None:
+                    return _extract_linear_terms(node.left, local_alias, scale * right_const)
+                return None
+            if isinstance(node, exp.Div):
+                right_const = _extract_const_float(node.right)
+                if right_const is None or abs(right_const) < 1e-12:
+                    return None
+                return _extract_linear_terms(node.left, local_alias, scale / right_const)
+            return None
+
+        def _column_epsilon(table_name: str, col_name: str) -> float:
+            col = self._resolve_column_name(table_name, col_name, tables) or col_name
+            col_info = tables.get(table_name, {}).get("columns", {}).get(col, {})
+            if isinstance(col_info, dict):
+                col_type = str(col_info.get("type", ""))
+            else:
+                col_type = str(col_info or "")
+            return 1.0 if "INT" in col_type.upper() else 0.01
+
+        def _invert_op(op: str) -> str:
+            return {
+                ">": "<",
+                ">=": "<=",
+                "<": ">",
+                "<=": ">=",
+                "=": "=",
+            }.get(op, op)
+
+        # Build best-effort lineage for CTE output aliases:
+        # - direct columns: cte_col -> base_table.base_col
+        # - aggregate expressions: sidecar carrying (agg, linear terms)
+        cte_lineage: Dict[str, Dict[str, Tuple[str, str]]] = {}
+        cte_agg_sidecar: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        for cte in parsed.find_all(exp.CTE):
+            cte_name = cte.alias
+            if not cte_name:
+                continue
+            cte_query = cte.this
+            select_nodes = _iter_select_nodes(cte_query)
+            if not select_nodes:
+                continue
+
+            out_map: Dict[str, Tuple[str, str]] = {}
+            agg_map: Dict[str, List[Dict[str, Any]]] = {}
+            for select in select_nodes:
+                local_alias: Dict[str, str] = {}
+                for table in select.find_all(exp.Table):
+                    if table.alias:
+                        local_alias[table.alias] = table.name
+                    local_alias[table.name] = table.name
+
+                for sel in select.expressions:
+                    out_col = getattr(sel, "alias_or_name", None)
+                    if not out_col:
+                        continue
+                    out_col_l = out_col.lower()
+
+                    source_expr = sel.this if isinstance(sel, exp.Alias) else sel
+                    if isinstance(source_expr, exp.Column):
+                        resolved = _resolve_source_column(source_expr, local_alias)
+                        if resolved and out_col_l not in out_map:
+                            out_map[out_col_l] = resolved
+
+                    agg_node: Optional[exp.Expression] = None
+                    if isinstance(source_expr, (exp.Sum, exp.Avg, exp.Min, exp.Max)):
+                        agg_node = source_expr
+                    else:
+                        agg_node = source_expr.find(exp.Sum) or source_expr.find(exp.Avg)
+                        if agg_node is None:
+                            agg_node = source_expr.find(exp.Min) or source_expr.find(exp.Max)
+                    if agg_node is None:
+                        continue
+                    agg_arg = agg_node.this
+                    terms = _extract_linear_terms(agg_arg, local_alias)
+                    if not terms:
+                        continue
+                    agg_map.setdefault(out_col_l, []).append(
+                        {
+                            "agg": agg_node.key.lower(),
+                            "terms": terms,
+                        }
+                    )
+
+            if out_map:
+                cte_lineage[cte_name] = out_map
+            if agg_map:
+                cte_agg_sidecar[cte_name] = agg_map
+
+        def _resolve_filter_column(col_expr: exp.Column) -> Optional[Tuple[str, str]]:
+            table_ref = alias_map.get(col_expr.table, col_expr.table)
+            col_name = col_expr.name
+
+            if table_ref in tables:
+                real_col = self._resolve_column_name(table_ref, col_name, tables)
+                if real_col:
+                    return table_ref, real_col
+
+            # Predicate on a CTE output column: map back to base column if known.
+            if table_ref in cte_lineage:
+                mapped = cte_lineage[table_ref].get(col_name.lower())
+                if mapped:
+                    return mapped
+
+            guessed_table = get_table_for_column(col_name, tables)
+            if guessed_table and guessed_table in tables:
+                real_col = self._resolve_column_name(guessed_table, col_name, tables)
+                if real_col:
+                    return guessed_table, real_col
+            return None
+
+        def _resolve_substring_prefix_target(
+            node: Optional[exp.Expression],
+        ) -> Optional[Tuple[str, str, int]]:
+            if not isinstance(node, exp.Substring):
+                return None
+            source_col = node.this
+            if not isinstance(source_col, exp.Column):
+                return None
+            start_txt = _extract_const_value(node.args.get("start"))
+            length_txt = _extract_const_value(node.args.get("length"))
+            try:
+                start_pos = int(float(start_txt)) if start_txt is not None else 1
+                prefix_len = int(float(length_txt)) if length_txt is not None else None
+            except (TypeError, ValueError):
+                return None
+            if start_pos != 1 or not prefix_len or prefix_len <= 0:
+                return None
+            resolved = _resolve_filter_column(source_col)
+            if not resolved:
+                return None
+            table_name, col_name = resolved
+            return table_name, col_name, prefix_len
+
+        def _apply_aggregate_sidecar_constraint(
+            col_expr: exp.Column,
+            op: str,
+            const_node: Optional[exp.Expression],
+        ) -> bool:
+            table_ref = alias_map.get(col_expr.table, col_expr.table)
+            if table_ref not in cte_agg_sidecar:
+                return False
+            agg_specs = cte_agg_sidecar[table_ref].get(col_expr.name.lower(), [])
+            if not agg_specs:
+                return False
+
+            threshold = _extract_const_float(const_node)
+            if threshold is None:
+                return False
+
+            applied = False
+            for spec in agg_specs:
+                agg_kind = str(spec.get("agg", "")).lower()
+                if agg_kind not in {"sum", "avg"}:
+                    continue
+                terms = spec.get("terms") or []
+                if not terms:
+                    continue
+
+                # Generic single-term linear aggregate: SUM(k*x) op c -> x op c/k.
+                if len(terms) == 1:
+                    t_table, t_col, coef = terms[0]
+                    if abs(coef) < 1e-12:
+                        continue
+                    eff_op = op
+                    eff_threshold = threshold / coef
+                    if coef < 0:
+                        eff_op = _invert_op(eff_op)
+                    if eff_op in {">", ">=", "<", "<=", "="}:
+                        _append_filter_value(t_table, t_col, f"{eff_op}:{_format_const_number(eff_threshold)}" if eff_op != "=" else _format_const_number(eff_threshold))
+                        applied = True
+                    continue
+
+                # Two-term SUM/AVG linear form: (a - b) op c.
+                pos_terms = [t for t in terms if t[2] > 0]
+                neg_terms = [t for t in terms if t[2] < 0]
+                if len(pos_terms) != 1 or len(neg_terms) != 1:
+                    continue
+
+                pos_table, pos_col, pos_coef = pos_terms[0]
+                neg_table, neg_col, neg_coef = neg_terms[0]
+                if abs(pos_coef - 1.0) > 1e-9 or abs(neg_coef + 1.0) > 1e-9:
+                    continue
+
+                pos_eps = _column_epsilon(pos_table, pos_col)
+                if op == ">":
+                    pos_bound = threshold + pos_eps
+                    _append_filter_value(pos_table, pos_col, f">:{_format_const_number(pos_bound)}")
+                    _append_filter_value(neg_table, neg_col, "0")
+                    applied = True
+                elif op == ">=":
+                    _append_filter_value(pos_table, pos_col, f">=:{_format_const_number(threshold)}")
+                    _append_filter_value(neg_table, neg_col, "0")
+                    applied = True
+                elif op == "<":
+                    pos_bound = threshold - pos_eps
+                    _append_filter_value(pos_table, pos_col, f"<:{_format_const_number(pos_bound)}")
+                    _append_filter_value(neg_table, neg_col, "0")
+                    applied = True
+                elif op == "<=":
+                    _append_filter_value(pos_table, pos_col, f"<=:{_format_const_number(threshold)}")
+                    _append_filter_value(neg_table, neg_col, "0")
+                    applied = True
+                elif op == "=":
+                    _append_filter_value(pos_table, pos_col, _format_const_number(threshold))
+                    _append_filter_value(neg_table, neg_col, "0")
+                    applied = True
+
+            return applied
+
+        def _extract_avg_multiplier(
+            node: Optional[exp.Expression],
+            expected_col: str,
+        ) -> Optional[float]:
+            if node is None:
+                return None
+            if isinstance(node, exp.Paren):
+                return _extract_avg_multiplier(node.this, expected_col)
+            if isinstance(node, exp.Cast):
+                return _extract_avg_multiplier(node.this, expected_col)
+            if isinstance(node, exp.Alias):
+                return _extract_avg_multiplier(node.this, expected_col)
+
+            def _avg_target(expr_node: Optional[exp.Expression]) -> Optional[exp.Column]:
+                if not isinstance(expr_node, exp.Avg):
+                    return None
+                target = expr_node.this
+                return target if isinstance(target, exp.Column) else None
+
+            if isinstance(node, exp.Avg):
+                target = _avg_target(node)
+                if target and target.name.lower() == expected_col.lower():
+                    return 1.0
+                return None
+            if isinstance(node, exp.Mul):
+                left_avg = _avg_target(node.left)
+                right_avg = _avg_target(node.right)
+                left_const = _extract_const_float(node.left)
+                right_const = _extract_const_float(node.right)
+                if left_avg and right_const is not None and left_avg.name.lower() == expected_col.lower():
+                    return float(right_const)
+                if right_avg and left_const is not None and right_avg.name.lower() == expected_col.lower():
+                    return float(left_const)
+                return None
+            if isinstance(node, exp.Div):
+                left_avg = _avg_target(node.left)
+                right_const = _extract_const_float(node.right)
+                if left_avg and right_const and abs(right_const) > 1e-12 and left_avg.name.lower() == expected_col.lower():
+                    return 1.0 / float(right_const)
+                return None
+            return None
+
+        def _apply_correlated_avg_sidecar_constraint(
+            col_expr: exp.Column,
+            op: str,
+            subquery_node: Optional[exp.Expression],
+        ) -> bool:
+            table_ref = alias_map.get(col_expr.table, col_expr.table)
+            if table_ref not in cte_agg_sidecar:
+                return False
+
+            if not isinstance(subquery_node, (exp.Subquery, exp.Select)):
+                return False
+            sub_select = subquery_node.find(exp.Select) if isinstance(subquery_node, exp.Subquery) else subquery_node
+            if sub_select is None or not sub_select.expressions:
+                return False
+
+            # Ensure the RHS aggregate references the same projected metric alias.
+            mult = _extract_avg_multiplier(sub_select.expressions[0], col_expr.name)
+            if mult is None or not (0.0 < mult < 2.0):
+                return False
+
+            agg_specs = cte_agg_sidecar.get(table_ref, {}).get(col_expr.name.lower(), [])
+            if not agg_specs:
+                return False
+
+            # Resolve correlated key(s) from scalar subquery WHERE:
+            # one side outer reference, other side local subquery alias.
+            local_aliases: Set[str] = set()
+            for sub_table in sub_select.find_all(exp.Table):
+                local_aliases.add(sub_table.alias_or_name)
+                if sub_table.alias:
+                    local_aliases.add(sub_table.alias)
+
+            correlated_inner_cols: List[str] = []
+            sub_where = sub_select.find(exp.Where)
+            if sub_where is not None:
+                for sub_eq in sub_where.find_all(exp.EQ):
+                    if not isinstance(sub_eq.left, exp.Column) or not isinstance(sub_eq.right, exp.Column):
+                        continue
+                    left_local = bool(sub_eq.left.table in local_aliases)
+                    right_local = bool(sub_eq.right.table in local_aliases)
+                    if left_local == right_local:
+                        continue
+                    inner_col = sub_eq.left if left_local else sub_eq.right
+                    correlated_inner_cols.append(inner_col.name)
+
+            # For N=2 witness rows:
+            # x > k*avg(x) => x > (k/(2-k))*v. Emit low + high boundary-friendly values.
+            slope = float(mult) / max(1e-9, (2.0 - float(mult)))
+            if slope <= 0.0:
+                return False
+
+            applied = False
+            for spec in agg_specs:
+                agg_kind = str(spec.get("agg", "")).lower()
+                if agg_kind not in {"sum", "avg"}:
+                    continue
+                terms = spec.get("terms") or []
+                if len(terms) != 1:
+                    continue
+                t_table, t_col, coef = terms[0]
+                if abs(coef) < 1e-12:
+                    continue
+
+                eff_op = op
+                if coef < 0:
+                    eff_op = _invert_op(eff_op)
+
+                if eff_op not in {">", ">="}:
+                    continue
+
+                eps = _column_epsilon(t_table, t_col)
+                villain = max(eps * 10.0, 1.0)
+                hero_floor = slope * villain
+                hero_low = hero_floor + (eps if eff_op == ">" else 0.0)
+                hero_high = max(hero_low + eps, hero_low * 4.0)
+
+                _append_filter_value(t_table, t_col, _format_const_number(villain))
+                _append_filter_value(t_table, t_col, _format_const_number(hero_low))
+                _append_filter_value(t_table, t_col, _format_const_number(hero_high))
+                applied = True
+
+                # Bind correlated grouping keys to a stable bucket value so
+                # witness rows land in the same correlation partition.
+                lineage = cte_lineage.get(table_ref, {})
+                for corr_col in correlated_inner_cols:
+                    mapped = lineage.get(corr_col.lower())
+                    if mapped:
+                        key_table, key_col = mapped
+                        _append_filter_value(key_table, key_col, "1")
+
+            return applied
+
+        substring_prefix_links: List[Tuple[Tuple[str, str, int], Tuple[str, str, int]]] = []
+
         for where in parsed.find_all(exp.Where):
             # Equality filters: col = literal
             for eq in where.find_all(exp.EQ):
-                if isinstance(eq.left, exp.Column):
-                    resolved = _resolve_filter_column(eq.left)
+                left_col = eq.left if isinstance(eq.left, exp.Column) else None
+                right_col = eq.right if isinstance(eq.right, exp.Column) else None
+                left_val = _extract_const_value(eq.left)
+                right_val = _extract_const_value(eq.right)
+
+                left_prefix = _resolve_substring_prefix_target(eq.left)
+                right_prefix = _resolve_substring_prefix_target(eq.right)
+                if left_prefix and right_prefix and left_prefix[2] == right_prefix[2]:
+                    substring_prefix_links.append((left_prefix, right_prefix))
+
+                if left_col and right_val is not None:
+                    resolved = _resolve_filter_column(left_col)
                     if resolved:
-                        val = _extract_const_value(eq.right)
-                        if val is None:
-                            continue
                         table, col = resolved
-                        if table not in filter_values:
-                            filter_values[table] = {}
-                        if col not in filter_values[table]:
-                            filter_values[table][col] = []
-                        filter_values[table][col].append(val)
+                        _append_filter_value(table, col, right_val)
+                    else:
+                        _apply_aggregate_sidecar_constraint(left_col, "=", eq.right)
+                if right_col and left_val is not None:
+                    resolved = _resolve_filter_column(right_col)
+                    if resolved:
+                        table, col = resolved
+                        _append_filter_value(table, col, left_val)
+                    else:
+                        _apply_aggregate_sidecar_constraint(right_col, "=", eq.left)
 
             # IN filters: col IN (val1, val2, ...)
             for in_expr in where.find_all(exp.In):
-                if isinstance(in_expr.this, exp.Column):
-                    resolved = _resolve_filter_column(in_expr.this)
-                    if resolved:
-                        table, col = resolved
-                        if table not in filter_values:
-                            filter_values[table] = {}
-                        if col not in filter_values[table]:
-                            filter_values[table][col] = []
-                        for v in in_expr.expressions:
-                            if isinstance(v, exp.Literal):
-                                filter_values[table][col].append(v.this)
+                resolved = None
+                substring_prefix_len: Optional[int] = None
+                target_expr = in_expr.this
+
+                if isinstance(target_expr, exp.Column):
+                    resolved = _resolve_filter_column(target_expr)
+                else:
+                    prefix_target = _resolve_substring_prefix_target(target_expr)
+                    if prefix_target:
+                        resolved = (prefix_target[0], prefix_target[1])
+                        substring_prefix_len = prefix_target[2]
+
+                if resolved:
+                    table, col = resolved
+                    for v in in_expr.expressions:
+                        if not isinstance(v, exp.Literal):
+                            continue
+                        value_txt = str(v.this)
+                        if substring_prefix_len is not None:
+                            value_txt = value_txt.strip("'\"")[:substring_prefix_len]
+                        _append_filter_value(table, col, value_txt)
 
             # BETWEEN: col BETWEEN low AND high
             for between in where.find_all(exp.Between):
@@ -3796,28 +4520,117 @@ class SyntheticValidator:
                     resolved = _resolve_filter_column(between.this)
                     if resolved:
                         table, col = resolved
-                        low = _extract_const_value(between.args.get('low'))
-                        high = _extract_const_value(between.args.get('high'))
+                        low_node = between.args.get('low')
+                        high_node = between.args.get('high')
+                        low = _extract_const_value(low_node)
+                        high = _extract_const_value(high_node)
                         if low is not None and high is not None:
-                            if table not in filter_values:
-                                filter_values[table] = {}
-                            filter_values[table][col] = [f"BETWEEN:{low}:{high}"]
+                            filter_values.setdefault(table, {})[col] = [f"BETWEEN:{low}:{high}"]
+                        # Predicate-context type hint: if bounds are date expressions,
+                        # the column must be DATE regardless of name heuristics.
+                        if _is_date_expression(low_node) or _is_date_expression(high_node):
+                            self._predicate_type_hints[(table, col)] = 'DATE'
+
+            # EQ: col = CAST(... AS DATE) or col = DATE '...' + INTERVAL
+            for eq in where.find_all(exp.EQ):
+                for side_col, side_val in [
+                    (eq.left, eq.right),
+                    (eq.right, eq.left),
+                ]:
+                    if isinstance(side_col, exp.Column) and _is_date_expression(side_val):
+                        resolved = _resolve_filter_column(side_col)
+                        if resolved:
+                            self._predicate_type_hints[resolved] = 'DATE'
+
+            # col +/- INTERVAL in comparisons (GT/GTE/LT/LTE)
+            for cmp_cls in (exp.GT, exp.GTE, exp.LT, exp.LTE):
+                for cmp in where.find_all(cmp_cls):
+                    for side_col, side_val in [
+                        (cmp.left, cmp.right),
+                        (cmp.right, cmp.left),
+                    ]:
+                        if isinstance(side_col, exp.Column) and _is_date_expression(side_val):
+                            resolved = _resolve_filter_column(side_col)
+                            if resolved:
+                                self._predicate_type_hints[resolved] = 'DATE'
+                    # Also check if the column side itself has date arithmetic
+                    # e.g., col + INTERVAL '30 day' > DATE '2000-01-01'
+                    for side in (cmp.left, cmp.right):
+                        if isinstance(side, (exp.Add, exp.Sub)):
+                            col_node = None
+                            if isinstance(side.left, exp.Column) and _is_date_expression(side.right):
+                                col_node = side.left
+                            elif isinstance(side.right, exp.Column) and _is_date_expression(side.left):
+                                col_node = side.right
+                            if col_node is not None:
+                                resolved = _resolve_filter_column(col_node)
+                                if resolved:
+                                    self._predicate_type_hints[resolved] = 'DATE'
 
             # GT/GTE/LT: col > literal
             for cmp_cls, op in [(exp.GT, '>'), (exp.GTE, '>='), (exp.LT, '<'), (exp.LTE, '<=')]:
                 for cmp in where.find_all(cmp_cls):
-                    if isinstance(cmp.left, exp.Column):
-                        resolved = _resolve_filter_column(cmp.left)
+                    left_col = cmp.left if isinstance(cmp.left, exp.Column) else None
+                    right_col = cmp.right if isinstance(cmp.right, exp.Column) else None
+                    right_subquery = cmp.right if isinstance(cmp.right, (exp.Subquery, exp.Select)) else None
+                    left_subquery = cmp.left if isinstance(cmp.left, (exp.Subquery, exp.Select)) else None
+                    right_val = _extract_const_value(cmp.right)
+                    left_val = _extract_const_value(cmp.left)
+
+                    if left_col and right_subquery is not None:
+                        _apply_correlated_avg_sidecar_constraint(left_col, op, right_subquery)
+                    if right_col and left_subquery is not None:
+                        _apply_correlated_avg_sidecar_constraint(right_col, _invert_op(op), left_subquery)
+
+                    if left_col and right_val is not None:
+                        resolved = _resolve_filter_column(left_col)
                         if resolved:
-                            val = _extract_const_value(cmp.right)
-                            if val is None:
-                                continue
                             table, col = resolved
-                            if table not in filter_values:
-                                filter_values[table] = {}
-                            if col not in filter_values[table]:
-                                filter_values[table][col] = []
-                            filter_values[table][col].append(f"{op}:{val}")
+                            _append_filter_value(table, col, f"{op}:{right_val}")
+                        else:
+                            _apply_aggregate_sidecar_constraint(left_col, op, cmp.right)
+                    if right_col and left_val is not None:
+                        inv = _invert_op(op)
+                        resolved = _resolve_filter_column(right_col)
+                        if resolved:
+                            table, col = resolved
+                            _append_filter_value(table, col, f"{inv}:{left_val}")
+                        else:
+                            _apply_aggregate_sidecar_constraint(right_col, inv, cmp.left)
+
+        def _equality_prefixes(values: List[Any], prefix_len: int) -> List[str]:
+            out: List[str] = []
+            for raw_val in values:
+                txt = str(raw_val).strip()
+                if not txt or txt.startswith("BETWEEN:"):
+                    continue
+                if ":" in txt and txt[0] in {">", "<"}:
+                    continue
+                pref = txt.strip("'\"")[:prefix_len]
+                if pref and pref not in out:
+                    out.append(pref)
+            return out
+
+        for left, right in substring_prefix_links:
+            l_table, l_col, l_len = left
+            r_table, r_col, r_len = right
+            if l_len != r_len:
+                continue
+            l_vals = filter_values.get(l_table, {}).get(l_col, [])
+            r_vals = filter_values.get(r_table, {}).get(r_col, [])
+            l_pref = _equality_prefixes(l_vals, l_len)
+            r_pref = _equality_prefixes(r_vals, r_len)
+            if l_pref and not r_pref:
+                for p in l_pref:
+                    _append_filter_value(r_table, r_col, p)
+            elif r_pref and not l_pref:
+                for p in r_pref:
+                    _append_filter_value(l_table, l_col, p)
+            elif l_pref and r_pref:
+                common = [p for p in l_pref if p in set(r_pref)]
+                if common:
+                    filter_values.setdefault(l_table, {})[l_col] = common
+                    filter_values.setdefault(r_table, {})[r_col] = common
 
         return filter_values
 
@@ -4067,6 +4880,10 @@ class SyntheticValidator:
             """Extract (table, filter_cols) from a scalar subquery node."""
             sub = subquery_node.find(exp.Select) if isinstance(subquery_node, exp.Subquery) else subquery_node
             if sub is None:
+                return None
+            # DISTINCT scalar subqueries already encode their own cardinality
+            # contract; forcing table-level dedup can collapse join support rows.
+            if sub.find(exp.Distinct):
                 return None
             sub_tables = list(sub.find_all(exp.Table))
             if not sub_tables:

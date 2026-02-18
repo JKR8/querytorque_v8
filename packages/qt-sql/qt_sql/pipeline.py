@@ -894,8 +894,8 @@ class Pipeline:
             )
         if not self.config.benchmark_dsn:
             self.config.benchmark_dsn = self.config.db_path_or_dsn
-        # max_iterations = snipe_rounds + 1 (1 analyst + N snipes)
-        effective_max_iterations = self.config.snipe_rounds + 1
+        # max_iterations = compiler_rounds + 1 (1 analyst/workers + N compiler)
+        effective_max_iterations = self.config.compiler_rounds + 1
         session = BeamSession(
             pipeline=self,
             query_id=query_id,
@@ -1906,9 +1906,12 @@ class Pipeline:
         from .prompts.analyst_briefing import (
             format_duckdb_explain_tree,
             format_pg_explain_tree,
+            format_snowflake_explain_tree,
         )
 
-        is_duckdb = dialect.lower() in ("duckdb",)
+        dialect_norm = (dialect or "").lower()
+        is_duckdb = dialect_norm in ("duckdb",)
+        is_snowflake = dialect_norm in ("snowflake",)
 
         search_paths = [
             self.benchmark_dir / "explains" / f"{query_id}.json",
@@ -1933,8 +1936,17 @@ class Pipeline:
                         # Fallback: plan_text may be JSON string or box-drawing
                         if plan_text:
                             return format_duckdb_explain_tree(plan_text)
+                    elif is_snowflake:
+                        if plan_json:
+                            rendered = format_snowflake_explain_tree(plan_json)
+                            if rendered:
+                                return rendered
+                        if plan_text:
+                            rendered = format_snowflake_explain_tree(plan_text)
+                            if rendered:
+                                return rendered
                     else:
-                        # PG/Snowflake: render plan_json via PG formatter
+                        # PostgreSQL: render plan_json via PG formatter
                         if plan_json:
                             rendered = format_pg_explain_tree(plan_json)
                             if rendered:

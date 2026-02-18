@@ -1,0 +1,264 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows three separate correlated subquery branches (store_sales EXISTS, web_sales NOT EXISTS, catalog_sales NOT EXISTS) each performing nested loops with date_dim and large fact table scans, causing repeated work and high I/O. The primary bottleneck is the correlated execution pattern and lack of early filtering on customer dimension before joining to large fact tables.",
+    "reasoning_trace": [
+      "Three correlated subqueries drive nested loops with date_dim and large fact table scans (store_sales 16M rows, web_sales 7M rows, catalog_sales 14M rows).",
+      "Customer dimension filters (ca_state, cd_marital_status, cd_education_status) apply early but still produce 1447 rows before correlated subquery execution.",
+      "Each subquery repeats date_dim scan (3 times) and performs index scans on large fact tables with list_price filters applied late.",
+      "Cardinality estimation error at Gather (est=3,157 vs act=91K) indicates planner underestimates outer row count driving correlated loops."
+    ],
+    "cost_spine": ["Nested Loop (rows=914, time=58251.755)", "Nested Loop (rows=986, time=19176.95)", "Hash Join (rows=1447, time=1575.593)", "Gather Merge (rows=1011, time=1938.813)"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (store_sales EXISTS)",
+        "why": "Correlated branch scans store_sales 16M rows via index scan for each outer row",
+        "evidence": "rows=164518, time=467.283, repeated for 1447 outer rows"
+      },
+      {
+        "op": "Nested Loop (web_sales NOT EXISTS)",
+        "why": "Correlated anti-join scans web_sales 7M rows via index scan for each outer row",
+        "evidence": "rows=30391, time=226.716, repeated for 986 outer rows"
+      },
+      {
+        "op": "Nested Loop (catalog_sales NOT EXISTS)",
+        "why": "Correlated anti-join scans catalog_sales 14M rows via index scan for each outer row",
+        "evidence": "rows=71636, time=425.63, repeated for 914 outer rows"
+      },
+      {
+        "op": "Hash Join (customer + customer_address)",
+        "why": "Produces 1447 rows that drive all correlated subqueries",
+        "evidence": "rows=1447, time=1575.593, feeds all three nested loops"
+      }
+    ],
+    "do_not_do": [
+      "Do not convert EXISTS/NOT EXISTS to materialized CTEs that break PostgreSQL's semi-join optimization (guard G_PG_EXISTS_PROTECTED)",
+      "Do not split same-column OR predicates to UNION ALL (guard G_PG_OR_INDEX_PROTECTED)",
+      "Do not duplicate heavy CTE bodies for each subquery (guard G_PG_CTE_DUPLICATION_STOP)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Pre-filter customer dimension (customer, customer_address, customer_demographics) into a CTE with all filters applied, then decorrelate the three subqueries by converting them to anti/semi-joins with pre-materialized date keys and fact table customer keys.",
+      "dag_target_hint": "Replace final_select with CTE chain: filtered_customers, date_range, store_customers, web_customers, catalog_customers, then join with appropriate EXISTS/NOT EXISTS logic via LEFT JOIN/IS NULL.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')", "c.c_current_addr_sk = ca.ca_address_sk", "cd_demo_sk = c.c_current_cdemo_sk"],
+        "output_must_preserve": ["cd_gender", "cd_marital_status", "cd_education_status", "cd_purchase_estimate", "cd_credit_rating", "count(*) aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:CAUTION", "G_PG_CORR_FACT_COUNT:REVIEW"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Correlated nested loops disappear, replaced by hash semi/anti-joins with pre-materialized customer keys; date_dim scanned once; fact table scans reduced via early customer filtering.",
+      "recommended_patch_ops": ["insert_cte_filtered_customers", "insert_cte_date_range", "insert_cte_store_customers", "insert_cte_web_customers", "insert_cte_catalog_customers", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot — decorrelates all three correlated subqueries and reduces repeated fact table scans.",
+      "recommended_examples": ["pg_shared_scan_decorrelate", "early_filter_decorrelate"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Create a CTE for date_range (d_date_sk for d_year=1999 and d_moy between 3 and 5), convert comma joins to explicit JOIN syntax, and push date_sk filter directly into each fact table join.",
+      "dag_target_hint": "Change final_select: add date_range CTE, rewrite subqueries as explicit JOINs with date_range CTE, convert main FROM clause to explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')", "d_year=1999", "d_moy between 3 and 5", "ss_list_price between 52 and 141", "ws_list_price between 52 and 141", "cs_list_price between 52 and 141"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Date_dim scanned once via CTE, explicit joins enable better cardinality estimates, fact table joins get date_sk pushdown.",
+      "recommended_patch_ops": ["insert_cte_date_range", "replace_comma_joins_with_explicit", "add_date_sk_predicate_to_fact_joins"],
+      "rank_rationale": "Addresses secondary hotspot — repeated date_dim scans and comma join weakness.",
+      "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (customer_address by ca_state, customer_demographics by marital/education, date_dim by year/moy) into separate CTEs, then join with fact tables using explicit JOIN syntax.",
+      "dag_target_hint": "Change final_select: add CTEs for ca_filtered, cd_filtered, date_range, then rewrite main query and subqueries to reference these CTEs.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')", "d_year=1999", "d_moy between 3 and 5"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.72,
+      "expected_explain_delta": "Dimension tables become tiny hash tables, fact table joins get surrogate key filters early, reduced nested loop iterations.",
+      "recommended_patch_ops": ["insert_cte_ca_filtered", "insert_cte_cd_filtered", "insert_cte_date_range", "replace_comma_joins_with_explicit", "rewrite_subqueries_with_cte_references"],
+      "rank_rationale": "Addresses dimension filtering and join topology — reduces rows entering correlated subqueries.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered customer set once, then derive all three channel checks from the same materialized set to avoid repeated customer dimension scans.",
+      "dag_target_hint": "Change final_select: add CTE filtered_customers with all dimension filters, then reference it in three separate channel CTEs (store, web, catalog) that check existence.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL materializes CTEs by default; reusing filtered customer set could reduce dimension scan work and improve correlation estimates.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Customer dimension scanned once, CTE materialized, three channel checks become independent joins against materialized customer keys.",
+      "recommended_patch_ops": ["insert_cte_filtered_customers", "insert_cte_store_check", "insert_cte_web_check", "insert_cte_catalog_check", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — tests CTE materialization benefit for shared customer dimension scan.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared date filter into a single CTE, create separate channel CTEs that join date CTE with respective fact table and list_price filter, then join channel CTEs with filtered customer set.",
+      "dag_target_hint": "Change final_select: add date_range CTE, store_sales_filtered CTE, web_sales_filtered CTE, catalog_sales_filtered CTE, then rewrite EXISTS/NOT EXISTS as joins with these CTEs.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')", "d_year=1999", "d_moy between 3 and 5", "list_price between 52 and 141 for each channel"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate from DuckDB; may help PostgreSQL push date filter into fact table scans and reduce repeated date_dim work.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date_dim scanned once, each fact table gets date_sk pushdown, channel CTEs become small hash tables for customer join.",
+      "recommended_patch_ops": ["insert_cte_date_range", "insert_cte_store_filtered", "insert_cte_web_filtered", "insert_cte_catalog_filtered", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — tests shared dimension extraction across multiple channels (portability candidate).",
+      "recommended_examples": ["shared_dimension_multi_channel"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Create separate date CTEs for each subquery alias (date_dim, date_dim_1, date_dim_2) to allow predicate pushdown into each fact table scan, while keeping subqueries correlated but with pre-filtered date keys.",
+      "dag_target_hint": "Change final_select: add three CTEs date_range1, date_range2, date_range3 with same filter, rewrite subqueries to reference respective date CTE.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')", "d_year=1999", "d_moy between 3 and 5"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; may help PostgreSQL push date filter into each subquery's fact table scan even with correlation.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Each subquery gets its own date CTE, date_dim scans become CTE scans, fact table joins get date_sk pushdown.",
+      "recommended_patch_ops": ["insert_cte_date_range1", "insert_cte_date_range2", "insert_cte_date_range3", "rewrite_subqueries_with_cte_references"],
+      "rank_rationale": "Exploration — tests per-alias date CTE isolation for correlated subqueries (portability candidate).",
+      "recommended_examples": ["multi_date_range_cte"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate three separate fact table scans into a single scan of a union of all sales data with channel labeling, then use conditional aggregation to compute EXISTS/NOT EXISTS logic per customer.",
+      "dag_target_hint": "Change final_select: add CTE all_sales that unions store_sales, web_sales, catalog_sales with channel flag, then join with filtered customers and use CASE/aggregation to implement EXISTS/NOT EXISTS.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')", "d_year=1999", "d_moy between 3 and 5", "list_price between 52 and 141"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; may reduce total fact table I/O by scanning each fact table once instead of per-customer nested loops.",
+      "confidence": 0.48,
+      "expected_explain_delta": "Three separate nested loops replaced by single scan of unioned sales data with channel filtering, reduced repeated index scans.",
+      "recommended_patch_ops": ["insert_cte_all_sales", "replace_from", "replace_where_predicate", "add_conditional_aggregation"],
+      "rank_rationale": "Exploration — tests scan consolidation for multiple fact tables (portability candidate).",
+      "recommended_examples": ["channel_bitmap_aggregation"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Extract shared date filter into CTE, decorrelate each subquery into separate CTEs that compute customer keys meeting condition, then combine via UNION/EXCEPT logic to implement EXISTS/NOT EXISTS.",
+      "dag_target_hint": "Change final_select: add date_range CTE, store_customers CTE, web_customers CTE, catalog_customers CTE, then rewrite main query to join filtered customers with these CTEs using set operations.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_state in ('GA','KY','SD')", "cd_marital_status in ('D','W','U')", "cd_education_status in ('Primary','College')", "d_year=1999", "d_moy between 3 and 5", "list_price between 52 and 141"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:CAUTION", "G_PG_CORR_FACT_COUNT:REVIEW"],
+      "exploration": true,
+      "exploration_hypothesis": "Portability candidate; alternative decorrelation shape using UNION to combine channel checks may improve plan shape.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Correlated subqueries become independent CTEs, set operations replace nested loops, reduced fact table rescans.",
+      "recommended_patch_ops": ["insert_cte_date_range", "insert_cte_store_customers", "insert_cte_web_customers", "insert_cte_catalog_customers", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — tests composite decorrelation with UNION (portability candidate).",
+      "recommended_examples": ["composite_decorrelate_union"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence; PostgreSQL has BitmapOr strength (guard G_PG_OR_INDEX_PROTECTED)."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregate in subqueries to push down; main aggregation is after all joins."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Snowflake-specific transform; not applicable to PostgreSQL runtime dialect."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "Snowflake-specific transform; not applicable to PostgreSQL runtime dialect."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN in query; all joins are inner equi-joins."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join in query; all joins are equality on surrogate keys."
+    }
+  ]
+}

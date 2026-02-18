@@ -1,0 +1,154 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query suffers from expensive INTERSECT operations in the cross_items CTE and inefficient nested loops in the final select due to comma joins and late filtering. Replacing INTERSECT with EXISTS and converting comma joins to explicit joins with early filtering can reduce I/O and improve performance.",
+    "reasoning_trace": [
+      "INTERSECT SetOp in cross_items consumes 7140 ms with high row amplification from fact table scans.",
+      "Nested Loop in final select has severe cardinality underestimation (est=9, act=273K) leading to 51545 ms runtime.",
+      "Comma joins in FROM clauses prevent optimal join ordering and filter pushdown, contributing to nested loop amplification."
+    ],
+    "cost_spine": ["SetOp (cross_items)", "Nested Loop (final select)", "Aggregate (avg_sales)", "Hash Join (cross_items)"],
+    "hotspots": [
+      {
+        "op": "Nested Loop",
+        "why": "cardinality underestimation and high row amplification in final select joins",
+        "evidence": "rows=272575 time=51545.606 ms"
+      },
+      {
+        "op": "SetOp",
+        "why": "expensive INTERSECT operation materializing large sets from multiple fact tables",
+        "evidence": "rows=383 time=7140.2 ms"
+      },
+      {
+        "op": "Aggregate",
+        "why": "computation of average sales from union all of three channels with significant input volume",
+        "evidence": "time=1956.682 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union split on indexed predicates (PostgreSQL BitmapOr strength)",
+      "avoid duplicating CTE bodies to prevent materialization fences",
+      "keep EXISTS semi-join optimizations protected from materialization rewrites"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT operations in cross_items CTE with EXISTS subqueries to avoid full materialization and sorting, while preserving all filters on item and date dimensions.",
+      "dag_target_hint": "Change cross_items node SQL to use EXISTS instead of INTERSECT, modifying the SetOp structure.",
+      "node_contract": {
+        "from_must_include": ["item", "store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["i_category IN ('Electronics', 'Jewelry', 'Men')", "i_manager_id BETWEEN 91 and 100", "ss_wholesale_cost BETWEEN 35 AND 55", "cs_wholesale_cost BETWEEN 35 AND 55", "ws_wholesale_cost BETWEEN 35 AND 55", "d_year between 1999 AND 1999 + 2"],
+        "output_must_preserve": ["ss_item_sk as unique key set"]
+      },
+      "gates_checked": ["G_PG_EXISTS_PROTECTED:PASS (not breaking EXISTS)", "set_op_semantic_safety:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "SetOp replaced with semi-joins, reducing materialization and sorting overhead in cross_items.",
+      "recommended_patch_ops": ["replace_set_operation", "modify_cte_definition"],
+      "recommended_examples": ["pg_intersect_to_exists"],
+      "rank_rationale": "Targets primary hotspot — INTERSECT operation is a known bottleneck with gold example support.",
+      "gold_example_id": "pg_intersect_to_exists"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins in final select to explicit JOIN syntax and isolate date dimension filters into CTEs for better optimizer decisions and early filtering.",
+      "dag_target_hint": "Change final_select node FROM clause to use explicit JOINs (e.g., INNER JOIN) and add date CTEs for d_week_seq lookups.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_category IN ('Electronics', 'Jewelry', 'Men')", "i_manager_id BETWEEN 91 and 100", "ss_wholesale_cost BETWEEN 35 AND 55", "d_week_seq subquery filters"],
+        "output_must_preserve": ["all original output columns and aliases for this_year and last_year"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_EXPLICIT_JOIN_STYLE:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Explicit joins enable better cardinality estimates and join ordering, reducing nested loop amplification in final select.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_joins"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Addresses comma join weakness and secondary hotspot in final select joins with proven speedup.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push selective filters on item and date_dim earlier in the final select by pre-filtering dimensions into CTEs, reducing rows before joins to mitigate cardinality underestimation.",
+      "dag_target_hint": "Modify final_select WHERE clause and add filtered dimension CTEs for item and date_dim based on cross_items and d_week_seq.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "date_dim", "cross_items"],
+        "where_must_preserve": ["i_category IN ('Electronics', 'Jewelry', 'Men')", "i_manager_id BETWEEN 91 and 100", "ss_wholesale_cost BETWEEN 35 AND 55", "d_week_seq subquery filters", "cross_items IN condition"],
+        "output_must_preserve": ["grouping and aggregation results for this_year and last_year"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_PREDICATE_BLINDNESS:PASS", "early_filter_semantic:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Filters applied earlier reduce input to nested loops, lowering row amplification and improving join efficiency.",
+      "recommended_patch_ops": ["insert_cte", "modify_where", "push_predicates"],
+      "recommended_examples": ["early_filter_decorrelate"],
+      "rank_rationale": "Targets filter placement to mitigate cardinality underestimation in the nested loop hotspot.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate sales data by channel (store, catalog, web) before computing the average in avg_sales CTE to reduce the size of union all input, while preserving the average calculation semantics.",
+      "dag_target_hint": "Change avg_sales node SQL to aggregate quantity*list_price per channel earlier in subqueries.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_year between 1999 and 1999 + 2", "ss_wholesale_cost BETWEEN 35 AND 55", "cs_wholesale_cost BETWEEN 35 AND 55", "ws_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["average_sales as scalar value computed from all channels"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-aggregation might reduce the input volume to the union all in avg_sales, but risk of semantic change if aggregation is not equivalent; exploration to test impact on secondary hotspot.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Aggregate pushed down reduces rows in union all branches, potentially lowering scan and computation cost in avg_sales.",
+      "recommended_patch_ops": ["modify_cte_definition", "push_aggregate"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — targets avg_sales aggregate which is a secondary hotspot, using underrepresented family C.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence; PostgreSQL BitmapOr strength makes this transform risky per regression registry."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "AST pre-screening indicates already decorrelated or no strong correlated subquery evidence in current plan."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "CTEs are already materialized by PostgreSQL default; additional materialization unlikely to benefit and may introduce fences."
+    }
+  ]
+}

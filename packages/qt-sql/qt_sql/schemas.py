@@ -118,24 +118,24 @@ class BenchmarkConfig:
     semantic_timeout_ms: int = 30_000  # 30s max per mini query
 
     target_speedup: float = 100.0
-    snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
+    compiler_rounds: int = 2  # Number of compiler synthesis rounds after workers
 
     # Workload-level concurrency defaults (used by `qt run` when CLI flags omitted)
     api_call_slots: int = 0          # Query-level parallel lanes (0=serial)
     benchmark_slots: int = 4         # Max concurrent SQL benchmark lanes
 
     # Beam execution mode (single-mode runtime)
-    beam_edit_mode: str = "dag"  # "dag" | "patchplan"
+    beam_edit_mode: str = "tree"  # "tree" | "patchplan"
     wide_max_probes: int = 16     # Max probes for wide mode
     wide_worker_parallelism: int = 8  # Max concurrent worker LLM calls per query in beam mode
     beam_llm_provider: str = ""   # Optional BEAM-only provider override
     beam_llm_model: str = ""      # Optional BEAM-only model override
-    beam_qwen_workers: int = 8    # Number of qwen worker probes to execute
-    beam_reasoner_workers: int = 0  # Number of reasoner worker probes to execute
-    beam_qwen_provider: str = ""  # Optional qwen-lane provider override
-    beam_qwen_model: str = ""     # Optional qwen-lane model override
-    beam_reasoner_provider: str = ""  # Optional reasoner-lane provider override
-    beam_reasoner_model: str = ""     # Optional reasoner-lane model override
+    beam_workers: int = 8         # Number of worker probes to execute
+    beam_workers_per_star_bonus: int = 0  # Extra workers per importance star
+    beam_worker_provider: str = ""  # Optional worker-lane provider override
+    beam_worker_model: str = ""     # Optional worker-lane model override
+    beam_api_launch_interval_seconds: float = 0.0  # Stagger worker API call submission (seconds)
+    enable_reasoning_mode: bool = False  # Explicit reasoning mode for analyst/compiler LLM calls
 
     # Beam benchmark run policy
     beam_baseline_runs: int = 3   # Original query timing runs
@@ -167,20 +167,22 @@ class BenchmarkConfig:
             semantic_sample_pct=data.get("semantic_sample_pct", 2.0),
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
             target_speedup=data.get("target_speedup", 100.0),
-            snipe_rounds=data.get("snipe_rounds", 2),
+            compiler_rounds=data.get("compiler_rounds", data.get("snipe_rounds", 2)),
             api_call_slots=data.get("api_call_slots", 0),
             benchmark_slots=data.get("benchmark_slots", 4),
-            beam_edit_mode=data.get("beam_edit_mode", "dag"),
+            beam_edit_mode=data.get("beam_edit_mode", "tree"),
             wide_max_probes=data.get("wide_max_probes", 16),
             wide_worker_parallelism=data.get("wide_worker_parallelism", 8),
             beam_llm_provider=data.get("beam_llm_provider", ""),
             beam_llm_model=data.get("beam_llm_model", ""),
-            beam_qwen_workers=data.get("beam_qwen_workers", 8),
-            beam_reasoner_workers=data.get("beam_reasoner_workers", 0),
-            beam_qwen_provider=data.get("beam_qwen_provider", ""),
-            beam_qwen_model=data.get("beam_qwen_model", ""),
-            beam_reasoner_provider=data.get("beam_reasoner_provider", ""),
-            beam_reasoner_model=data.get("beam_reasoner_model", ""),
+            beam_workers=data.get("beam_workers", data.get("beam_qwen_workers", 8)),
+            beam_workers_per_star_bonus=data.get("beam_workers_per_star_bonus", 0),
+            beam_worker_provider=data.get("beam_worker_provider", data.get("beam_qwen_provider", "")),
+            beam_worker_model=data.get("beam_worker_model", data.get("beam_qwen_model", "")),
+            beam_api_launch_interval_seconds=float(
+                data.get("beam_api_launch_interval_seconds", 0.0) or 0.0
+            ),
+            enable_reasoning_mode=bool(data.get("enable_reasoning_mode", False)),
             beam_baseline_runs=data.get("beam_baseline_runs", 3),
             beam_candidate_runs=data.get("beam_candidate_runs", 3),
             beam_winner_runs=data.get("beam_winner_runs", 3),

@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The execution plan shows no operator detail, indicating metadata-only explain. The query features a massive 18-table star-join with three date_dim aliases and late filtering on d1.d_year only in the outer self-join. Primary risk is unpruned fact scans (store_sales, catalog_sales) due to missing predicate pushdown across CTE boundaries and comma-join patterns. Secondary risk is massive intermediate aggregation before final self-join.",
+    "reasoning_trace": [
+      "Plan shows only GlobalStats Parts=0/0—Snowflake metadata-only explain indicates no runtime statistics available.",
+      "Query has 18-table comma-join in cross_sales CTE with three date_dim aliases (d1, d2, d3).",
+      "Filter on d1.d_year (syear=2000 and 2001) appears only in outer self-join, not pushed into CTE.",
+      "Catalog_sales and store_sales have BETWEEN filters on wholesale_cost but no date-range pushdown.",
+      "Cross_sales groups by 16 columns before final self-join, risking large intermediate cardinality."
+    ],
+    "cost_spine": ["Unknown (metadata-only explain)"],
+    "hotspots": [
+      {
+        "op": "store_sales scan",
+        "why": "largest fact table, likely full scan without date_sk pushdown",
+        "evidence": "no date filter on d1.d_date_sk in CTE; outer filter on d1.d_year only"
+      },
+      {
+        "op": "catalog_sales scan",
+        "why": "second large fact table, filter only on wholesale_cost",
+        "evidence": "cs_ui CTE has no date filter, joins catalog_sales and catalog_returns"
+      },
+      {
+        "op": "cross_sales aggregation",
+        "why": "group by 16 columns before self-join may produce large intermediate set",
+        "evidence": "group by includes three date columns, store, customer, address attributes"
+      }
+    ],
+    "do_not_do": [
+      "do not materialize EXISTS subqueries (none present)",
+      "do not convert comma joins to explicit JOIN if it breaks predicate pushdown assumptions",
+      "do not introduce large unfiltered CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range predicates to store_sales and catalog_sales joins based on d1.d_year filter from outer query, pushing into CTE via derived constant range.",
+      "dag_target_hint": "Modify cross_sales CTE WHERE clause to include ss_sold_date_sk BETWEEN derived_start_sk AND derived_end_sk and cs_sold_date_sk BETWEEN derived_start_sk AND derived_end_sk.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "date_dim d1"],
+        "where_must_preserve": ["ss_sold_date_sk = d1.d_date_sk", "cs_sold_date_sk = d1.d_date_sk", "d1.d_year in (2000, 2001)"],
+        "output_must_preserve": ["All original output columns and grouping keys"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Micro-partition pruning on store_sales and catalog_sales via sold_date_sk range, reducing scanned bytes.",
+      "recommended_patch_ops": ["derive_date_sk_range", "add_predicate_to_cte", "verify_range_semantics"],
+      "rank_rationale": "Primary hotspot—most impactful for I/O reduction on largest fact tables.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by (ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_store_sk, ss_promo_sk, ss_cdemo_sk, ss_hdemo_sk, ss_addr_sk) before joining dimensions, preserving all necessary aggregates (sums, count).",
+      "dag_target_hint": "Replace cross_sales CTE with a staged CTE that first aggregates store_sales, then joins to other tables.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["All original aggregate results (cnt, s1, s2, s3) and grouping key compatibility"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate operator moves below joins, reducing rows flowing into massive star-join.",
+      "recommended_patch_ops": ["insert_aggregate_cte", "replace_from_in_cross_sales", "adjust_group_by"],
+      "rank_rationale": "Secondary hotspot—reduces intermediate cardinality before expensive 18-table join.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter selective dimension tables (promotion, customer_demographics cd1/cd2, household_demographics hd1/hd2, customer_address ad2) into CTEs before joining to fact, reducing hash table size and enabling earlier predicate pushdown.",
+      "dag_target_hint": "Add CTEs for filtered dimension subsets, then join them in cross_sales.",
+      "node_contract": {
+        "from_must_include": ["promotion", "customer_demographics cd1", "customer_demographics cd2", "household_demographics hd1", "household_demographics hd2", "customer_address ad2"],
+        "where_must_preserve": ["p_channel_email = 'Y'", "p_channel_tv = 'Y'", "p_channel_radio = 'Y'", "ad2.ca_state in ('KS','OH','VA')", "cd1.cd_marital_status in ('S', 'S', 'S')", "cd1.cd_education_status in ('Advanced Degree', '4 yr Degree', '4 yr Degree')", "cd2.cd_marital_status in ('S', 'S', 'S')", "cd2.cd_education_status in ('Advanced Degree', '4 yr Degree', '4 yr Degree')"],
+        "output_must_preserve": ["All join keys and columns needed for grouping"]
+      },
+      "gates_checked": ["no_unfiltered_large_cte:PASS", "multi_dimension_prefetch_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Dimension tables are small but have selective filters; pre-filtering may reduce build-side size and improve join order.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Small hash tables built from pre-filtered dimension CTEs, reducing join work and enabling better join order.",
+      "recommended_patch_ops": ["create_dimension_ctes", "replace_dimension_scans_with_cte_refs"],
+      "rank_rationale": "Exploration—targets secondary dimension join amplification, underrepresented family A.",
+      "recommended_examples": ["dimension_cte_isolate"],
+      "gold_example_id": "dimension_cte_isolate"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the cs_ui CTE to avoid re-computation of catalog_sales-catalog_returns join and aggregation across two references in cross_sales (though only referenced once, Snowflake may inline; explicit materialization may improve plan stability).",
+      "dag_target_hint": "Add MATERIALIZED keyword to cs_ui CTE definition.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": ["cs_item_sk = cr_item_sk", "cs_order_number = cr_order_number", "cs_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["cs_item_sk", "sale", "refund", "HAVING sum(cs_ext_list_price)>2*sum(cr_refunded_cash+cr_reversed_charge+cr_store_credit)"]
+      },
+      "gates_checked": ["cte_reuse_possible:PASS", "no_unfiltered_large_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit materialization may prevent suboptimal inlining and improve join planning with cs_ui.",
+      "confidence": 0.45,
+      "expected_explain_delta": "CTE materialized as separate subplan, possibly changing join order and aggregation timing.",
+      "recommended_patch_ops": ["add_materialized_keyword"],
+      "rank_rationale": "Exploration—low-risk transform targeting CTE materialization family E.",
+      "recommended_examples": ["materialize_cte"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar subqueries present in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No multi-column OR predicates blocking index usage."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN with subsequent WHERE filter eliminating NULLs; all joins are inner equi-joins."
+    }
+  ]
+}

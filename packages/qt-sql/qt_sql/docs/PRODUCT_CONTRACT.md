@@ -304,7 +304,7 @@ Generous limits (2x observed maximums) to avoid premature truncation while bound
 | `SnipeAnalysis` | `prompts/swarm_parsers.py` | Failure synthesis, refined strategy for sniper worker |
 | `WorkerAssignment` | `prompts/swarm_parsers.py` | Legacy fan-out assignment structure |
 
-**Spec Links:** `prompts/sql_rewrite_spec.md` (DAP v1.0), `prompts/samples/PROMPT_SPEC.md`, `prompts/samples/V0/` (11 rendered samples)
+**Spec Links:** `prompts/sql_rewrite_spec.md` (DAP v1.0), `prompts/archive/samples/PROMPT_SPEC.md`, `prompts/archive/samples/V0/` (archived rendered samples)
 
 ---
 
@@ -612,7 +612,7 @@ Returns `{ "status": "ok", "version": "2.0.0", "llm_configured": true, "llm_prov
 | `python3 -m qt_sql.tag_index --rebuild` | Force rebuild index |
 | `python3 -m qt_sql.plan_scanner` | Run plan-space scanner (PG) |
 | `python3 -m qt_sql.scanner_knowledge.build_all` | Build scanner knowledge from findings |
-| `python3 -m qt_sql.prompts.samples.generate_sample` | Render prompt samples to `prompts/samples/V0/` |
+| `python3 -m qt_sql.prompts.samples.generate_sample` | Render archived prompt samples to `prompts/archive/samples/V0/` |
 | `python3 -m qt_sql.build_blackboard <batch_dir>` | Build blackboard from swarm batch |
 | `python3 -m qt_sql.build_blackboard --global` | Build global best-of-all-sources blackboard |
 | `python3 -m qt_sql.benchmarks.build_best` | Build best-of artifacts from leaderboard |

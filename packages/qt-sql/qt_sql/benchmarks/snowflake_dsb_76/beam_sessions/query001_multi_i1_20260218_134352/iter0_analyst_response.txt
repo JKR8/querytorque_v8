@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a full scan of STORE_RETURNS (124 GB) and a correlated scalar aggregate subquery that re-scans aggregated data per store. Decorrelating the subquery and pre-aggregating the fact table by store key may reduce the work.",
+    "reasoning_trace": [
+      "STORE_RETURNS scan is 124 GB (7070/7070 parts) and is the largest I/O operation.",
+      "Correlated subquery computes AVG(ctr_total_return) per store_sk, requiring a re-aggregation of the CTE per outer row.",
+      "Plan shows a join (node 1.7) and aggregate (node 1.9) for the correlation, indicating per-store re-computation.",
+      "Dimension tables (STORE, CUSTOMER, CUSTOMER_DEMOGRAPHICS, DATE_DIM) are already fully pruned (parts=1/1 or 261/261)."
+    ],
+    "cost_spine": ["TableScan (STORE_RETURNS)", "Aggregate", "CTE (customer_total_return)", "Join (correlated subquery)", "Join (store, customer, customer_demographics)", "SortWithLimit"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_RETURNS)",
+        "why": "largest I/O volume (124 GB), full table scan",
+        "evidence": "parts=7070/7070 bytes=124763446272"
+      },
+      {
+        "op": "InnerJoin (correlated subquery)",
+        "why": "correlated scalar aggregate re-scans aggregated CTE per store_sk",
+        "evidence": "node 1.7 joinFilter uses aggregate from node 1.9, which groups by CTR2.CTR_STORE_SK"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS/NOT EXISTS (Snowflake already optimizes semi-joins)",
+      "avoid wrapping partition keys in functions (protect micro-partition pruning)",
+      "avoid same-column OR to UNION ALL (no OR hotspot in plan)",
+      "do not introduce unfiltered large CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery into 3 CTEs: (1) shared scan of store_returns with date_dim filter and ratio condition, (2) per-store_sk average threshold, (3) filtered main query joining threshold CTE.",
+      "dag_target_hint": "Replace correlated subquery in final_select with a join to precomputed store_sk average CTE.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year = 2002", "sr_return_amt / sr_return_quantity BETWEEN 108 AND 167"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return", "final ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Correlated join (node 1.7) and aggregate (node 1.9) replaced by a single scan and pre‑computed threshold join.",
+      "recommended_patch_ops": ["insert_cte_shared_scan", "insert_cte_threshold", "replace_final_select_subquery_with_join"],
+      "rank_rationale": "Targets the secondary hotspot (correlated scalar aggregate) with a native Snowflake transform and strong gold‑example evidence.",
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate store_returns by store_sk before joining with date_dim and applying the ratio condition, then aggregate by customer_sk, store_sk, reason_sk in the CTE.",
+      "dag_target_hint": "Modify customer_total_return CTE definition to first aggregate by store_sk, then expand to three‑column grouping.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year = 2002", "sr_return_amt / sr_return_quantity BETWEEN 108 AND 167"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "The CTE groups by three columns, but the correlated subquery only needs store_sk aggregates. Pushing aggregation by store_sk first may reduce the data volume before the three‑column grouping.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Aggregate node (1.14) may shift earlier, reducing rows flowing into the three‑column aggregate.",
+      "recommended_patch_ops": ["replace_cte_definition", "add_intermediate_aggregate_cte"],
+      "rank_rationale": "Exploration targeting the primary hotspot (STORE_RETURNS scan) by reducing rows before the three‑column aggregate.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Create a shared‑scan CTE for store_returns joined with date_dim, then derive two aggregates from it: one for the three‑column grouping (customer, store, reason) and one for the per‑store average threshold.",
+      "dag_target_hint": "Replace the existing CTE with a shared scan CTE, then two dependent CTEs for the different aggregations.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "date_dim"],
+        "where_must_preserve": ["d_year = 2002", "sr_return_amt / sr_return_quantity BETWEEN 108 AND 167"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return", "final ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared‑scan decorrelation may reduce redundant scanning of the fact table for the two aggregate paths (three‑column group and store‑level average).",
+      "confidence": 0.60,
+      "expected_explain_delta": "Two separate aggregates (nodes 1.14 and 1.9) become dependent on a single shared scan, potentially reducing I/O.",
+      "recommended_patch_ops": ["insert_cte_shared_scan", "insert_cte_three_column_agg", "insert_cte_store_avg", "replace_final_select_subquery_with_join"],
+      "rank_rationale": "Exploration variant of decorrelation, targeting the same secondary hotspot with a different native Snowflake transform.",
+      "recommended_examples": ["sf_shared_scan_decorrelate"],
+      "gold_example_id": "sf_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre‑filter the dimension tables (store, customer, customer_demographics) into CTEs and join them with the customer_total_return CTE earlier in the final_select.",
+      "dag_target_hint": "Wrap each dimension table scan in a CTE with its respective filters, then join them in the final_select.",
+      "node_contract": {
+        "from_must_include": ["store", "customer", "customer_demographics"],
+        "where_must_preserve": ["s_state IN ('IL', 'KY', 'TX')", "cd_marital_status IN ('M', 'M')", "cd_education_status IN ('Advanced Degree', 'College')", "cd_gender = 'F'", "c_birth_month = 2", "c_birth_year BETWEEN 1965 AND 1971"],
+        "output_must_preserve": ["c_customer_id", "final ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["dimension_already_pruned:CAUTION", "no_large_new_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Dimension tables are already fully pruned (parts=1/1), but early materialization into tiny CTEs may help the optimizer choose a better join order.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Dimension scans become CTE scans, potentially influencing join order and hash table build side.",
+      "recommended_patch_ops": ["insert_cte_store", "insert_cte_customer", "insert_cte_customer_demographics", "replace_final_select_from_clause"],
+      "rank_rationale": "Exploration targeting join topology, using a portability‑candidate transform with low confidence due to already‑pruned dimensions.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "No UNION ALL or multi‑fact table pattern in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "No multi‑fact comma‑join pattern; only one fact table (store_returns)."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "CTE is already materialized (WithClause), no repeated scan evidence."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN followed by WHERE filter on right table; all joins are inner."
+    }
+  ]
+}

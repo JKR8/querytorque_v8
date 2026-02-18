@@ -1,0 +1,943 @@
+## Role
+
+You are a **Senior SQL Rewrite Engineer**.
+Active SQL dialect is the runtime `postgresql` declared in the Runtime Dialect Contract.
+
+You must apply **one assigned transform** and return **one tree-plan JSON object**.
+One worker equals one probe equals one transform.
+
+Success condition:
+- produce a semantically safe, executable tree candidate
+- preserve all required output semantics
+- return strict JSON on first attempt
+
+Failure behavior:
+- if required input is missing or contradictory, return a safe no-change tree plan
+
+---
+
+## Prompt Map (cache friendly)
+
+### Phase A — Cached Instructions (static)
+A1. Terminology and decision policy
+A2. Input contract and fallback behavior
+A3. Tree output contract and typed schema
+A4. Semantic guards and hard bans
+A5. Node-change discipline
+A6. Verification attestation
+A7. Worked valid and invalid examples
+
+### Phase B — Probe-Specific Input (dynamic; after cache boundary)
+B1. Shared analyst hypothesis
+B2. Probe assignment (transform, target, node_contract, gates_checked)
+B3. Analyst do_not_do list
+B4. Original SQL
+B5. Optional execution plan snippet
+B6. IR node map (S0 and anchor hashes)
+B7. Current tree node map (node ids, parent links, outputs, root node)
+B8. Schema excerpt (tables, columns, nullability, keys, indexes)
+B9. Existing CTE names
+B10. Engine-specific knowledge profile
+
+---
+
+## Terminology (normative)
+
+- **assigned transform**: the transform_id in probe assignment.
+- **safe no-change**: valid tree payload where all nodes are unchanged and verification explains why.
+- **required input**: B2 probe assignment, B4 original SQL, and B7 tree node map.
+- **semantic drift**: any change to result rows, multiplicity, literals, aliases, order, or limit semantics.
+
+---
+
+## Input Contract
+
+Required inputs:
+- B2 probe assignment
+- B4 original SQL
+- B7 current tree node map
+
+Optional but useful:
+- B5 execution plan snippet
+- B8 schema excerpt
+- B10 engine profile
+
+Missing-input handling:
+- if any required input is missing or contradictory:
+  - return a valid safe no-change tree payload
+  - set `verification.executable` to `false`
+  - explain missing data in `hypothesis`
+  - keep `transform_id` and `family` aligned with assignment
+
+---
+
+## Decision Priority Ladder
+
+Resolve all tradeoffs in this order:
+1. semantic safety
+2. executability
+3. assignment fidelity
+4. expected plan improvement
+
+Never trade higher-priority constraints for lower-priority gains.
+
+---
+
+## Tree Output Contract (MUST follow)
+
+Tier-0 output contract:
+- first character must be `{` with no leading whitespace
+- top-level value must be one JSON object
+- no markdown fences, no prose, no commentary
+
+Top-level schema:
+
+| key | type | required | constraints |
+|---|---|---|---|
+| `probe_id` | string | yes | must match assigned probe id when provided |
+| `transform_id` | string | yes | must match assigned transform id |
+| `family` | string | yes | one of A, B, C, D, E, F |
+| `status` | string | yes | "success" or "failed" |
+| `failure_reason` | string | conditional | required when status is "failed"; explain what blocked the rewrite |
+| `partial_work` | object | conditional | required when status is "failed"; must satisfy partial-work schema |
+| `dialect` | string | yes | runtime dialect |
+| `hypothesis` | string | yes | one to three evidence-grounded sentences |
+| `reasoning_trace` | array | yes | one to four concise bullets |
+| `target_ir` | string | yes | post-change structure summary |
+| `verification` | object | yes | must satisfy verification schema |
+| `tree` | object | yes | must satisfy tree schema |
+
+Verification schema:
+
+| key | type | required | constraints |
+|---|---|---|---|
+| `executable` | boolean | yes | true or false |
+| `no_missing_tables` | boolean | yes | true or false |
+| `alias_consistent` | boolean | yes | true or false |
+| `no_orphan_scans` | boolean | yes | true or false |
+| `semantics_preserved` | boolean | yes | true or false |
+| `null_semantics_safe` | boolean | yes | true or false |
+| `ctes_selective_or_na` | boolean | yes | true or false |
+
+Tree schema:
+
+| key | type | required | constraints |
+|---|---|---|---|
+| `root_node_id` | string | yes | must exist in nodes |
+| `nodes` | array | yes | non-empty node objects |
+
+Node schema:
+
+| key | type | required | constraints |
+|---|---|---|---|
+| `node_id` | string | yes | unique within nodes |
+| `parent_node_id` | string or null | yes | `null` only for root; otherwise must resolve to a node id |
+| `sources` | array | yes | node-local sources (base tables or child nodes) |
+| `outputs` | array | yes | declared output columns |
+| `changed` | boolean | yes | true or false |
+| `sql` | string | conditional | required when changed is true; forbidden when false |
+
+Partial-work schema (required when status is "failed"):
+
+| key | type | description |
+|---|---|---|
+| `attempted_approach` | string | What rewrite strategy was tried |
+| `blocking_issue` | string | Specific technical obstacle |
+| `hypothesis_still_valid` | boolean | Whether the probe hypothesis might work with different execution |
+
+Global rules:
+- one or more changed nodes are allowed, and safe no-change mode may use zero changed nodes
+- include full runtime tree node set, not a partial subset
+- every non-root node has exactly one parent (`parent_node_id`)
+- tree must be acyclic and fully connected from `root_node_id`
+- preserve literals exactly
+- preserve final output columns, aliases, ordering semantics, and limit semantics
+- keep node ids stable when corresponding nodes remain in the tree
+
+---
+
+## Semantic Guards (MUST preserve)
+
+- Preserve WHERE, HAVING, and JOIN semantics unless assigned transform requires equivalent relational form.
+- Do not add stronger filters.
+- Preserve SELECT columns, aliases, ORDER BY, LIMIT, and DISTINCT semantics.
+- Follow analyst `node_contract` exactly.
+- If analyst `do_not_do` conflicts with rewrite intent, return safe no-change.
+- Preserve null behavior in EXISTS and NOT EXISTS rewrites.
+- Preserve multiplicity when replacing EXISTS with joins.
+- Keep alias consistency for all references.
+- Avoid duplicate large base scans introduced by rewrite.
+- On PostgreSQL, do not split same-column OR to UNION ALL by default.
+
+Retry handling:
+- if RETRY feedback is provided, fix reported gate failure first and keep rewrite intent otherwise unchanged.
+
+---
+
+## Node-Change Discipline
+
+- Primary target must be an assigned hotspot node from probe context.
+- You may change multiple nodes when needed for a coherent executable rewrite.
+- You may reorder sibling nodes only when parent links and semantics remain valid.
+- Do not rename unrelated nodes.
+- Changed node SQL may reference allowed tree nodes and allowed base sources.
+- Changed node outputs must match declared outputs.
+
+---
+
+## Worker Procedure (reasoning checklist)
+
+1. Validate required inputs and assignment fidelity.
+2. Validate node_contract and do_not_do compatibility.
+3. Draft rewrite shape. If rewrite is blocked by a technical obstacle,
+   set status to "failed" and fill failure_reason + partial_work with
+   structured field notes explaining what was attempted and why it failed.
+4. Run semantic and multiplicity self-check.
+5. Fill verification fields explicitly.
+6. Emit strict JSON only.
+
+---
+
+## Worked Valid Example
+
+{
+  "probe_id": "p09",
+  "transform_id": "aggregate_pushdown_fact_prejoin",
+  "family": "C",
+  "dialect": "duckdb",
+  "hypothesis": "Pre-aggregating returns by customer and store before final join reduces aggregate input while preserving output contract.",
+  "reasoning_trace": [
+    "Assigned hotspot is wide aggregation after joins.",
+    "Changing only customer_total_return reduces rows entering downstream operators.",
+    "Grouping keys preserve multiplicity and downstream join compatibility."
+  ],
+  "target_ir": "customer_total_return becomes early aggregate; final_select remains unchanged.",
+  "verification": {
+    "executable": true,
+    "no_missing_tables": true,
+    "alias_consistent": true,
+    "no_orphan_scans": true,
+    "semantics_preserved": true,
+    "null_semantics_safe": true,
+    "ctes_selective_or_na": true
+  },
+  "tree": {
+    "root_node_id": "final_select",
+    "nodes": [
+      {
+        "node_id": "final_select",
+        "parent_node_id": null,
+        "sources": ["customer_total_return", "store", "customer"],
+        "outputs": ["c_customer_id"],
+        "changed": false
+      },
+      {
+        "node_id": "customer_total_return",
+        "parent_node_id": "final_select",
+        "sources": ["store_returns", "date_dim"],
+        "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"],
+        "changed": true,
+        "sql": "SELECT sr.sr_customer_sk AS ctr_customer_sk, sr.sr_store_sk AS ctr_store_sk, SUM(sr.sr_fee) AS ctr_total_return FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk WHERE d.d_year = 2000 GROUP BY sr.sr_customer_sk, sr.sr_store_sk"
+      }
+    ]
+  }
+}
+
+---
+
+## Worked Failure Example (status "failed")
+
+{
+  "probe_id": "p04",
+  "transform_id": "aggregate_pushdown",
+  "family": "C",
+  "status": "failed",
+  "failure_reason": "Cannot pre-aggregate before join because GROUP BY keys are not a superset of downstream join keys.",
+  "partial_work": {
+    "attempted_approach": "Pre-aggregate store_sales by customer_sk before dimension join",
+    "blocking_issue": "store_sk is needed for downstream store join but not in GROUP BY",
+    "hypothesis_still_valid": false
+  },
+  "dialect": "duckdb",
+  "hypothesis": "Pre-aggregation blocked by downstream key dependency.",
+  "reasoning_trace": ["GROUP BY customer_sk loses store_sk needed for store dimension join."],
+  "target_ir": "No structural change.",
+  "verification": {
+    "executable": false,
+    "no_missing_tables": true,
+    "alias_consistent": true,
+    "no_orphan_scans": true,
+    "semantics_preserved": true,
+    "null_semantics_safe": true,
+    "ctes_selective_or_na": true
+  },
+  "tree": {
+    "root_node_id": "final_select",
+    "nodes": [
+      {
+        "node_id": "final_select",
+        "parent_node_id": null,
+        "sources": ["customer_total_return", "store", "customer"],
+        "outputs": ["c_customer_id"],
+        "changed": false
+      },
+      {
+        "node_id": "customer_total_return",
+        "parent_node_id": "final_select",
+        "sources": ["store_returns", "date_dim"],
+        "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"],
+        "changed": false
+      }
+    ]
+  }
+}
+
+---
+
+## Worked Invalid Example (do not produce)
+
+{
+  "probe_id": "p09",
+  "transform_id": "aggregate_pushdown_fact_prejoin",
+  "family": "C",
+  "dialect": "duckdb",
+  "hypothesis": "fast",
+  "reasoning_trace": [],
+  "target_ir": "changed",
+  "verification": {
+    "executable": true
+  },
+  "tree": {
+    "root_node_id": "missing_root",
+    "nodes": [
+      {
+        "node_id": "final_select",
+        "parent_node_id": "unknown_parent",
+        "sources": ["unknown_node"],
+        "outputs": ["c_customer_id"],
+        "changed": true
+      }
+    ]
+  }
+}
+
+Why invalid:
+- root_node_id missing from nodes
+- unresolved parent_node_id
+- unresolved source
+- changed node missing required sql
+- incomplete verification fields
+
+Corrective action:
+- emit full verification object with all required booleans
+- provide valid tree structure with resolvable dependencies
+- include full SQL for changed node
+
+---
+
+## Worked Safe No-Change Example
+
+{
+  "probe_id": "p12",
+  "transform_id": "join_topology_shift",
+  "family": "F",
+  "dialect": "duckdb",
+  "hypothesis": "Required node_contract fields are missing, so safe no-change output is returned.",
+  "reasoning_trace": [
+    "Assigned transform targets join graph but required preservation constraints are ambiguous.",
+    "No-change avoids semantic risk and enables corrected retry context."
+  ],
+  "target_ir": "No structural change.",
+  "verification": {
+    "executable": false,
+    "no_missing_tables": false,
+    "alias_consistent": false,
+    "no_orphan_scans": true,
+    "semantics_preserved": true,
+    "null_semantics_safe": true,
+    "ctes_selective_or_na": true
+  },
+  "tree": {
+    "root_node_id": "final_select",
+    "nodes": [
+      {
+        "node_id": "final_select",
+        "parent_node_id": null,
+        "sources": ["customer_total_return", "store", "customer"],
+        "outputs": ["c_customer_id"],
+        "changed": false
+      },
+      {
+        "node_id": "customer_total_return",
+        "parent_node_id": "final_select",
+        "sources": ["store_returns", "date_dim"],
+        "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"],
+        "changed": false
+      }
+    ]
+  }
+}
+
+---
+
+## Cache Boundary
+Everything below is probe-specific input.
+
+## Shared Analyst Hypothesis
+Two independent large aggregates (sb, sc) scan the same fact table (store_sales) and dimension (date_dim) with identical filters, causing repeated work. The merge join between these aggregates is a secondary bottleneck. Predicates on store and item are applied late after the expensive merge join.
+## Runtime Dialect Contract
+- target_dialect: postgres
+- runtime_dialect_is_source_of_truth: true
+- if static examples conflict, follow runtime dialect behavior
+## Probe Assignment
+- transform_id: pg_self_join_decomposition
+- family: E
+- target: Materialize the common store_sales+date_dim filtered result as a CTE, then compute sb and sc aggregates from that single materialized set.
+- phase: ?
+- exploration: no
+- worker_lane: scout
+- dialect: postgres
+- recommended_examples: `pg_self_join_decomposition`
+- recommended_patch_ops: `create_materialized_cte`, `replace_sb_subquery`, `replace_sc_subquery`
+- expected_explain_delta: Two Nested Loop scans become one CTE scan; aggregates read from materialized result.
+- equivalence_tier: unordered
+- existing_ctes: (none)
+
+### Gates Checked
+cte_reuse_required:PASS; cte_duplication_block:PASS; cte_exists_intersect_risk:PASS
+
+### Analyst Do-Not-Do
+- or_to_union: no OR predicate hotspot (PostgreSQL BitmapOr guard)
+- decorrelation transforms: no correlated subqueries in plan
+- duplicate heavy CTE bodies (CTE_DUPLICATION_STOP guard)
+- materialize simple EXISTS: no EXISTS in query
+
+### Node Contract
+
+```json
+{
+  "from_must_include": [
+    "store_sales",
+    "date_dim"
+  ],
+  "where_must_preserve": [
+    "d_month_seq between 1195 and 1195+11",
+    "ss_sales_price / ss_list_price BETWEEN 38*0.01 AND 48*0.01"
+  ],
+  "output_must_preserve": [
+    "ss_store_sk",
+    "ss_item_sk",
+    "ss_sales_price"
+  ]
+}
+```
+
+### Original SQL
+
+```sql
+select 
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+ 	from
+ 	    (select  ss_store_sk, ss_item_sk,
+ 		     sum(ss_sales_price) as revenue
+ 		from store_sales, date_dim
+ 		where ss_sold_date_sk = d_date_sk and d_month_seq between 1195 and 1195+11
+    and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+ 		group by ss_store_sk, ss_item_sk) sa
+ 	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+ 	from store_sales, date_dim
+ 	where ss_sold_date_sk = d_date_sk and d_month_seq between 1195 and 1195+11
+  and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+ 	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+       and i_manager_id BETWEEN 80 and 84
+       and s_state in ('IA','IL','NC')
+ order by s_store_name, i_item_desc
+limit 100;
+```
+
+### Execution Plan Snippet
+
+```
+Limit  (rows=0, time=4519.689)
+  Sort  (rows=0, time=4500.509)
+    Nested Loop  (rows=0, time=4500.477)
+      Merge Join  (rows=0, time=4500.475)
+        Aggregate  (rows=1, time=2548.813)
+          Gather Merge  (rows=2, time=2548.785)
+            Aggregate  (rows=212, time=1486.064)
+              Sort  (rows=412, time=1485.965)
+                Nested Loop  (rows=145949, time=1392.144)
+                  Index Only Scan on date_dim  (rows=122, time=19.584)
+                  Index Only Scan on store_sales  (rows=1196, time=11.165)
+        Materialize  (rows=0, time=1951.657)
+          Merge Join  (rows=0, time=1951.654)
+            Sort  (rows=1, time=0.146)
+              Seq Scan on store  (rows=1, time=0.136)
+            Aggregate  (rows=18, time=1951.491)
+              Aggregate  (rows=78259, time=1948.105)
+                Gather Merge  (rows=80174, time=1924.478)
+                  Aggregate  (rows=26918, time=1166.102)
+                    Sort  (rows=54570, time=1157.002)
+                      Nested Loop  (rows=145949, time=1055.923)
+                        Index Only Scan on date_dim (date_dim_1)  (rows=122, time=8.121)
+                        Index Only Scan on store_sales (store_sales_1)  (rows=1196, time=8.505)
+      Index Scan on item  (rows=0, time=0.0)
+```
+
+### Estimation Errors (Q-Error)
+### §2b-i. Cardinality Estimation Routing (Q-Error)
+
+Direction: OVER_EST (estimated >> actual — planner over-provisions, redundant work likely)
+Locus: AGGREGATE — worst mismatch at Aggregate (est=742, act=1)
+
+Pathology routing: P3, P2, P0, P7, P4, P6, P5, P1
+(Locus+Direction routing is 85% accurate at predicting where the winning transform operates)
+
+Structural signals:
+  - EST_ONE_NONLEAF: planner guessing on non-leaf node → check P0 (predicate pushback), P1 (repeated scans). Only P2 (decorrelation) if nested loops + correlated subquery confirmed in EXPLAIN
+  - REPEATED_TABLE: same table scanned multiple times → single-pass opportunity (P1)
+
+IMPORTANT: Cross-check structural signals against the PRUNING GUIDE in §III. If the EXPLAIN shows no nested loops, skip P2. If each table appears once, skip P1. The pruning guide overrides routing suggestions.
+
+
+### Current TREE Node Map
+
+```
+## Base Tree Spec
+Use this as the authoritative node tree for rewrite proposals.
+
+node: final_select
+  parent_node_id: None
+  sources: []
+  outputs: ['s_store_name', 'i_item_desc', 'revenue', 'i_current_price', 'i_wholesale_cost', 'i_brand']
+  sql: OMITTED
+
+root_node_id: final_select
+```
+
+### Analyst Reasoning Trace
+- Plan shows two independent Nested Loop → Index Only Scan paths on store_sales+date_dim (145,949 rows each) with similar cost (1392ms, 1056ms).
+- Each path performs an Aggregate (212 rows, 26918 rows) and a second Aggregate (1 row, 18 rows) before the Merge Join.
+- Merge Join between the two aggregate results is a high-cost node (4500ms total time).
+- Store and item filters are applied after the Merge Join (Seq Scan on store, Index Scan on item) with minimal cost, indicating late application.
+
+### Schema / Index / Stats Context
+- source: postgres
+- referenced_tables: 4
+
+| Table | Rows(est) | PK | Indexes |
+|-------|-----------|----|---------|
+| date_dim | 73049 | d_date_sk | date_dim_pkey, _dta_index_date_dim_6_661577395__k1_k7_k9, _dta_index_date_dim_6_661577395__k4_1, _dta_index_date_dim_6_661577395__k4_k3, _dta_index_date_dim_6_661577395__k7_k1, _dta_index_date_dim_6_661577395__k7_k11_k1 |
+| item | 102000 | i_item_sk | item_pkey, _dta_index_item_6_853578079__k13_k11_k1, _dta_index_item_6_853578079__k18, _dta_index_item_6_853578079__k1_2_5, _dta_index_item_6_853578079__k2_k1 |
+| store | 102 | s_store_sk | store_pkey, _dta_index_store_6_885578193__k1_2_6, _dta_index_store_6_885578193__k25_k1 |
+| store_sales | 28800492 | ss_item_sk, ss_ticket_number | store_sales_pkey, _dta_index_store_sales_5_1333579789__k4_k8_k3_k1_16, _dta_index_store_sales_6_1333579789__k10_k3, _dta_index_store_sales_6_1333579789__k1_k23_k14_k6_k8_k5_k7_3_4, _dta_index_store_sales_6_1333579789__k1_k3_11_13, _dta_index_store_sales_6_1333579789__k1_k3_k10_k4_k8_23 |
+
+### Column Signatures
+| Table | Column | Type | Nullable | Key Hint |
+|-------|--------|------|----------|----------|
+| date_dim | d_date_sk | integer | NO | PK |
+| date_dim | d_date_id | character | NO | - |
+| date_dim | d_date | date | YES | - |
+| date_dim | d_month_seq | integer | YES | - |
+| date_dim | d_week_seq | integer | YES | - |
+| date_dim | d_quarter_seq | integer | YES | - |
+| date_dim | d_year | integer | YES | - |
+| date_dim | d_dow | integer | YES | - |
+| date_dim | d_moy | integer | YES | - |
+| date_dim | d_dom | integer | YES | - |
+| date_dim | d_qoy | integer | YES | - |
+| date_dim | d_fy_year | integer | YES | - |
+| date_dim | d_fy_quarter_seq | integer | YES | - |
+| date_dim | d_fy_week_seq | integer | YES | - |
+| date_dim | d_day_name | character | YES | - |
+| date_dim | d_quarter_name | character | YES | - |
+| date_dim | d_holiday | character | YES | - |
+| date_dim | d_weekend | character | YES | - |
+| date_dim | d_following_holiday | character | YES | - |
+| date_dim | d_first_dom | integer | YES | - |
+| date_dim | d_last_dom | integer | YES | - |
+| date_dim | d_same_day_ly | integer | YES | - |
+| date_dim | d_same_day_lq | integer | YES | - |
+| date_dim | d_current_day | character | YES | - |
+| item | i_item_sk | integer | NO | PK |
+| item | i_item_id | character | NO | - |
+| item | i_rec_start_date | date | YES | - |
+| item | i_rec_end_date | date | YES | - |
+| item | i_item_desc | character varying | YES | - |
+| item | i_current_price | numeric | YES | - |
+| item | i_wholesale_cost | numeric | YES | - |
+| item | i_brand_id | integer | YES | - |
+| item | i_brand | character | YES | - |
+| item | i_class_id | integer | YES | - |
+| item | i_class | character | YES | - |
+| item | i_category_id | integer | YES | - |
+| item | i_category | character | YES | - |
+| item | i_manufact_id | integer | YES | - |
+| item | i_manufact | character | YES | - |
+| item | i_size | character | YES | - |
+| item | i_formulation | character | YES | - |
+| item | i_color | character | YES | - |
+| item | i_units | character | YES | - |
+| item | i_container | character | YES | - |
+| item | i_manager_id | integer | YES | - |
+| item | i_product_name | character | YES | - |
+| store | s_store_sk | integer | NO | PK |
+| store | s_store_id | character | NO | - |
+| store | s_rec_start_date | date | YES | - |
+| store | s_rec_end_date | date | YES | - |
+| store | s_closed_date_sk | integer | YES | - |
+| store | s_store_name | character varying | YES | - |
+| store | s_number_employees | integer | YES | - |
+| store | s_floor_space | integer | YES | - |
+| store | s_hours | character | YES | - |
+| store | s_manager | character varying | YES | - |
+| store | s_market_id | integer | YES | - |
+| store | s_geography_class | character varying | YES | - |
+| store | s_market_desc | character varying | YES | - |
+| store | s_market_manager | character varying | YES | - |
+| store | s_division_id | integer | YES | - |
+| store | s_division_name | character varying | YES | - |
+| store | s_company_id | integer | YES | - |
+| store | s_company_name | character varying | YES | - |
+| store | s_street_number | character varying | YES | - |
+| store | s_street_name | character varying | YES | - |
+| store | s_street_type | character | YES | - |
+| store | s_suite_number | character | YES | - |
+| store | s_city | character varying | YES | - |
+| store | s_county | character varying | YES | - |
+| store_sales | ss_sold_date_sk | integer | YES | - |
+| store_sales | ss_sold_time_sk | integer | YES | - |
+| store_sales | ss_item_sk | integer | NO | PK |
+| store_sales | ss_customer_sk | integer | YES | - |
+| store_sales | ss_cdemo_sk | integer | YES | - |
+| store_sales | ss_hdemo_sk | integer | YES | - |
+| store_sales | ss_addr_sk | integer | YES | - |
+| store_sales | ss_store_sk | integer | YES | - |
+| store_sales | ss_promo_sk | integer | YES | - |
+| store_sales | ss_ticket_number | integer | NO | PK |
+| store_sales | ss_quantity | integer | YES | - |
+| store_sales | ss_wholesale_cost | numeric | YES | - |
+| store_sales | ss_list_price | numeric | YES | - |
+| store_sales | ss_sales_price | numeric | YES | - |
+| store_sales | ss_ext_discount_amt | numeric | YES | - |
+| store_sales | ss_ext_sales_price | numeric | YES | - |
+| store_sales | ss_ext_wholesale_cost | numeric | YES | - |
+| store_sales | ss_ext_list_price | numeric | YES | - |
+| store_sales | ss_ext_tax | numeric | YES | - |
+| store_sales | ss_coupon_amt | numeric | YES | - |
+| store_sales | ss_net_paid | numeric | YES | - |
+| store_sales | ss_net_paid_inc_tax | numeric | YES | - |
+| store_sales | ss_net_profit | numeric | YES | - |
+
+### Engine-Specific Knowledge
+## Dialect Intelligence (POSTGRESQL)
+
+# PostgreSQL Dialect Knowledge
+
+## Engine Strengths (Do Not Fight)
+| Strength ID | Summary | Implication | Evidence |
+|---|---|---|---|
+| `BITMAP_OR_SCAN` | Indexed OR predicates use BitmapOr. | Avoid default OR-to-UNION rewrites when indexes are already used. | `engine_profile_postgresql.json` |
+| `SEMI_JOIN_EXISTS` | EXISTS/NOT EXISTS use semi-join early-stop. | Protect EXISTS paths from materialization rewrites. | `engine_profile_postgresql.json` |
+| `INNER_JOIN_REORDERING` | Inner joins reorder well via cost model. | Prefer cardinality reduction over manual join-order forcing. | `engine_profile_postgresql.json` |
+| `INDEX_ONLY_SCAN` | Covering indexes can avoid heap reads. | Small dimensions may not benefit from heavy CTE staging. | `engine_profile_postgresql.json` |
+| `PARALLEL_QUERY_EXECUTION` | Large scans/aggregates parallelize. | Extra CTE fences can reduce useful parallelism. | `engine_profile_postgresql.json` |
+| `JIT_COMPILATION` | Complex expressions are JIT-compiled on longer runs. | Expression complexity alone is not always the runtime bottleneck. | `engine_profile_postgresql.json` |
+
+## Global Guards
+| Guard ID | Rule | Severity | Fail Action | Source |
+|---|---|---|---|---|
+| `G_PG_OR_INDEX_PROTECTED` | Do not split same-column indexed OR predicates into UNION ALL. | `BLOCKER` | `SKIP_TRANSFORM` | `BITMAP_OR_SCAN`, `0.21x`, `0.26x` regressions |
+| `G_PG_EXISTS_PROTECTED` | Keep simple EXISTS/NOT EXISTS in native semi-join form. | `BLOCKER` | `SKIP_TRANSFORM` | `SEMI_JOIN_EXISTS`, `0.50x`, `0.75x` regressions |
+| `G_PG_CTE_DUPLICATION_STOP` | Never duplicate a 5+ table CTE body to push filters inward. | `BLOCKER` | `SKIP_TRANSFORM` | `CTE_MATERIALIZATION_FENCE` field notes |
+| `G_PG_SCALE_VALIDATION` | Validate at target scale before promoting rewrite. | `HIGH` | `REQUIRE_MANUAL_REVIEW` | SF5->SF10 drift note in profile |
+| `G_PG_LOW_BASELINE_SKIP_HEAVY` | If baseline is low (`<100ms`), avoid structural rewrite churn. | `MEDIUM` | `DOWNRANK_TO_EXPLORATION` | existing knowledge guidance |
+| `G_PG_EXPLICIT_JOIN_STYLE` | Normalize comma joins to explicit `JOIN ... ON`. | `MEDIUM` | `DOWNRANK_TO_EXPLORATION` | `COMMA_JOIN_WEAKNESS` |
+
+## Decision Gates (Normative Contract)
+| Gate ID | Scope | Type | Severity | Check | Pass Criteria | Fail Action | Evidence Required |
+|---|---|---|---|---|---|---|---|
+| `DG_TYPE_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Gate type validity | One of `SQL_PATTERN`, `PLAN_SIGNAL`, `RUNTIME_CONTEXT`, `SEMANTIC_RISK` | `REQUIRE_MANUAL_REVIEW` | gate row schema |
+| `DG_SEVERITY_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Severity validity | One of `BLOCKER`, `HIGH`, `MEDIUM` | `REQUIRE_MANUAL_REVIEW` | gate row schema |
+| `DG_FAIL_ACTION_ENUM` | global | `SEMANTIC_RISK` | `BLOCKER` | Fail action validity | One of `SKIP_PATHOLOGY`, `SKIP_TRANSFORM`, `DOWNRANK_TO_EXPLORATION`, `REQUIRE_MANUAL_REVIEW` | `REQUIRE_MANUAL_REVIEW` | gate row schema |
+| `DG_BLOCKER_POLICY` | global | `RUNTIME_CONTEXT` | `BLOCKER` | Any blocker failed | Failed blocker always blocks that pattern/transform path | `SKIP_PATHOLOGY` | failed gate log |
+| `DG_MIN_PATTERN_GATES` | pattern | `RUNTIME_CONTEXT` | `HIGH` | Gate coverage | Each pattern has at least 1 `SEMANTIC_RISK`, 1 `PLAN_SIGNAL`, 1 `RUNTIME_CONTEXT` gate | `REQUIRE_MANUAL_REVIEW` | pattern gate table |
+| `DG_EVIDENCE_BINDING` | global | `RUNTIME_CONTEXT` | `HIGH` | Claim traceability | Quantitative claims map to example IDs or benchmark artifacts | `REQUIRE_MANUAL_REVIEW` | evidence table row |
+
+## Gap-Driven Optimization Patterns
+
+### Pattern ID: `COMMA_JOIN_WEAKNESS` (`HIGH`)
+- Goal: `ARM_THE_OPTIMIZER`
+- Detect: comma-separated FROM with join predicates in WHERE and poor row estimates.
+- Preferred transforms: `date_cte_explicit_join`, `dimension_prefetch_star`, `explicit_join_materialized`.
+
+#### Decision Gates for `COMMA_JOIN_WEAKNESS`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_PG_COMMA_JOIN_PRESENT` | `SQL_PATTERN` | `HIGH` | Comma-join pattern exists | Multiple comma-joined relations with equi-join predicates | `SKIP_TRANSFORM` | SQL parse |
+| `G_PG_COMMA_FACT_FANOUT` | `RUNTIME_CONTEXT` | `HIGH` | Fact-table fanout | 1-2 fact tables; avoid broad multi-fact lockups | `DOWNRANK_TO_EXPLORATION` | join graph |
+| `G_PG_COMMA_SEMANTIC` | `SEMANTIC_RISK` | `MEDIUM` | Explicit-join conversion safety | Join predicates preserved exactly | `REQUIRE_MANUAL_REVIEW` | predicate diff |
+
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `pg_explicit_join_materialized` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `8.56x` | `WIN` |
+| `pg_dimension_prefetch_star` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `3.32x` | `WIN` |
+| `pg_date_cte_explicit_join` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `2.28x` | `WIN` |
+
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| Existing explicit join order rewritten unnecessarily | qualitative risk | `G_PG_COMMA_JOIN_PRESENT` | skip when joins already explicit |
+
+### Pattern ID: `CORRELATED_SUBQUERY_PARALYSIS` (`HIGH`)
+- Goal: `SETS_OVER_LOOPS`
+- Detect: correlated scalar aggregate subquery re-executes per outer row.
+- Preferred transforms: `inline_decorrelate_materialized`, `pg_shared_scan_decorrelate`, `pg_state_avg_decorrelate`, `early_filter_decorrelate`.
+
+#### Decision Gates for `CORRELATED_SUBQUERY_PARALYSIS`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_PG_CORR_SCALAR_REQUIRED` | `SQL_PATTERN` | `BLOCKER` | Correlated scalar aggregate exists | Pattern present and correlation key identified | `SKIP_PATHOLOGY` | SQL + AST |
+| `G_PG_CORR_ALREADY_DECORRELATED` | `PLAN_SIGNAL` | `HIGH` | Already hash-decorrelated | Skip if plan already flattened on correlation key | `SKIP_TRANSFORM` | EXPLAIN |
+| `G_PG_CORR_EXISTS_PROTECTION` | `SEMANTIC_RISK` | `BLOCKER` | EXISTS/NOT EXISTS transform request | Keep EXISTS protected | `SKIP_PATHOLOGY` | SQL + plan |
+| `G_PG_CORR_FACT_COUNT` | `RUNTIME_CONTEXT` | `HIGH` | Fact-join complexity | 1-2 fact tables preferred; 3+ needs manual review | `REQUIRE_MANUAL_REVIEW` | join graph |
+
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `pg_shared_scan_decorrelate` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `8043.91x (timeout rescue)` | `WIN` |
+| `inline_decorrelate_materialized` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `1465x (timeout rescue)` | `WIN` |
+| `pg_state_avg_decorrelate` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `438.93x (timeout rescue)` | `WIN` |
+| `early_filter_decorrelate` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `27.80x` | `WIN` |
+
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| EXISTS path materialized | `0.75x` | `G_PG_CORR_EXISTS_PROTECTION` | preserve semi-join EXISTS shape |
+| Multi-fact lock during decorrelation | `0.51x` | `G_PG_CORR_FACT_COUNT` | avoid aggressive decorrelation on broad multi-fact joins |
+
+### Pattern ID: `NON_EQUI_JOIN_INPUT_BLINDNESS` (`HIGH`)
+- Goal: `MINIMIZE_ROWS_TOUCHED`
+- Detect: non-equi join with high input cardinality and late selectivity.
+- Preferred transforms: `materialized_dimension_fact_prefilter`.
+
+#### Decision Gates for `NON_EQUI_JOIN_INPUT_BLINDNESS`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_PG_NONEQUI_PRESENT` | `SQL_PATTERN` | `HIGH` | Non-equi predicate exists | BETWEEN/< /> on join path | `SKIP_TRANSFORM` | SQL parse |
+| `G_PG_NONEQUI_CARDINALITY` | `PLAN_SIGNAL` | `HIGH` | Input size pressure | Large inputs on both sides with late drop | `DOWNRANK_TO_EXPLORATION` | plan rows |
+| `G_PG_NONEQUI_FILTER_QUALITY` | `SEMANTIC_RISK` | `HIGH` | Prefilter selectivity realism | Tight, not loose superset prefilter | `SKIP_TRANSFORM` | predicate audit |
+
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `pg_materialized_dimension_fact_prefilter` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `12.07x` | `WIN` |
+
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| Loose OR/UNION superset filter | `0.79x` | `G_PG_NONEQUI_FILTER_QUALITY` | require tight prefilter predicates only |
+
+### Pattern ID: `CTE_MATERIALIZATION_FENCE` (`MEDIUM`)
+- Goal: `ARM_THE_OPTIMIZER`
+- Detect: large CTE fences block predicate pushdown or parallel flow.
+- Preferred transforms: strategic materialization only when reuse is real.
+
+#### Decision Gates for `CTE_MATERIALIZATION_FENCE`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_PG_CTE_DUPLICATION_BLOCK` | `SEMANTIC_RISK` | `BLOCKER` | CTE body duplication | No duplication of heavy CTE bodies | `SKIP_PATHOLOGY` | rewrite diff |
+| `G_PG_CTE_REUSE_REQUIRED` | `RUNTIME_CONTEXT` | `HIGH` | Reuse benefit | CTE has meaningful multi-consumer reuse | `DOWNRANK_TO_EXPLORATION` | reference count |
+| `G_PG_CTE_EXISTS_INTERSECT_RISK` | `PLAN_SIGNAL` | `HIGH` | High-risk contexts | avoid problematic EXISTS or INTERSECT fences | `SKIP_TRANSFORM` | SQL + EXPLAIN |
+
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `profile_note_strategic_materialization` | `n/a` | `n/a` | `engine profile` | `n/a` | `n/a` | `1.95x` | `WIN` |
+
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| Fence blocked pushdown | `0.74x` | `G_PG_CTE_REUSE_REQUIRED` | avoid forced fence without reuse |
+| Date CTE fence blocked INTERSECT optimization | `0.77x` | `G_PG_CTE_EXISTS_INTERSECT_RISK` | avoid fence in set-operation paths |
+| Duplicated 18-table CTE body | `0.65x` | `G_PG_CTE_DUPLICATION_BLOCK` | filter materialized output, not CTE body copy |
+
+### Pattern ID: `CROSS_CTE_PREDICATE_BLINDNESS` (`MEDIUM`)
+- Goal: `SMALLEST_SET_FIRST`
+- Detect: selective predicates applied too late after CTE boundaries.
+- Preferred transforms: `date_cte_explicit_join`, `early_filter_decorrelate`, explicit join cleanup.
+
+#### Decision Gates for `CROSS_CTE_PREDICATE_BLINDNESS`
+| Gate ID | Type | Severity | Check | Pass Criteria | Fail Action | Evidence |
+|---|---|---|---|---|---|---|
+| `G_PG_CROSS_CTE_COMMA_JOIN_PAIRING` | `SQL_PATTERN` | `HIGH` | Comma-join pairing with filter push | perform explicit join cleanup with push | `DOWNRANK_TO_EXPLORATION` | SQL rewrite plan |
+| `G_PG_CROSS_CTE_SCALE_GUARD` | `RUNTIME_CONTEXT` | `HIGH` | Target-scale confidence | evidence validated near target scale | `REQUIRE_MANUAL_REVIEW` | benchmark scope |
+| `G_PG_CROSS_CTE_SETOP_RISK` | `SEMANTIC_RISK` | `MEDIUM` | Set-op sensitivity | avoid blind pushdown through INTERSECT/EXCEPT-heavy shapes | `SKIP_TRANSFORM` | SQL structure |
+
+#### Evidence Table
+| Example ID | Query | Warehouse | Validation | Orig ms | Opt ms | Speedup | Outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `pg_date_cte_explicit_join` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `2.28x` | `WIN` |
+| `pg_dimension_prefetch_star` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `3.32x` | `WIN` |
+| `early_filter_decorrelate` | `n/a` | `n/a` | `n/a` | `n/a` | `n/a` | `27.80x` | `WIN` |
+
+#### Failure Modes
+| Pattern | Impact | Triggered Gate | Mitigation |
+|---|---|---|---|
+| SF5 win did not hold at SF10 | `0.97x` at target | `G_PG_CROSS_CTE_SCALE_GUARD` | require target-scale validation |
+| Over-decomposition of efficient query | `0.55x` | `G_PG_CROSS_CTE_SETOP_RISK` | avoid excessive decomposition |
+
+## Pruning Guide
+| Plan shows | Skip |
+|---|---|
+| All joins already explicit and estimates stable | `COMMA_JOIN_WEAKNESS` |
+| No correlated scalar aggregate in SQL/plan | `CORRELATED_SUBQUERY_PARALYSIS` |
+| No non-equi join predicate | `NON_EQUI_JOIN_INPUT_BLINDNESS` |
+| CTE is single-use and not expensive | `CTE_MATERIALIZATION_FENCE` |
+| Predicate already applied at the earliest valid node | `CROSS_CTE_PREDICATE_BLINDNESS` |
+| Baseline < 100ms | most structural rewrite paths |
+
+## Regression Registry
+| Severity | Transform | Speedup | Query | Root Cause |
+|---|---|---:|---|---|
+| `SEVERE` | `or_to_union` style split on indexed OR | `0.21x` | `n/a` | fought BitmapOr strength |
+| `SEVERE` | `or_to_union` style split on indexed OR | `0.26x` | `n/a` | fought BitmapOr strength |
+| `MAJOR` | decorrelation on protected EXISTS path | `0.50x` | `n/a` | semi-join path broken |
+| `MODERATE` | broad decorrelation on multi-fact shape | `0.51x` | `n/a` | join-order lock |
+| `MODERATE` | duplicated deep CTE body | `0.65x` | `n/a` | forced materialization cost |
+| `MODERATE` | CTE fence blocked pushdown | `0.74x` | `n/a` | optimization fence |
+| `MODERATE` | CTE fence harmed set-op path | `0.77x` | `n/a` | blocked INTERSECT optimization |
+| `MINOR` | loose prefilter before non-equi join | `0.79x` | `n/a` | low-selectivity staging |
+
+## Notes
+- Config tuning is separate from rewrite logic. Use `knowledge/config/postgresql.json` after semantic-safe SQL is established.
+- `set_local_config_intel` in engine profile is authoritative for runtime knobs, not this rewrite playbook.
+
+### Transform Recipe
+- `transform_id`: `pg_self_join_decomposition`
+- `family`: `E`
+- `principle`: Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.
+- `expected_features`: `AGG_AVG`, `AGG_SUM`, `BETWEEN`, `DATE_DIM`, `GROUP_BY`
+
+### Gold TREE Pattern Reference
+- `plan_id`: `gold_postgresql_pg_self_join_decomposition`
+- `root_node_id`: `final_select`
+- `nodes`: `final_select`
+- `changed_nodes`: `final_select`
+- Reuse TREE shape and invariants, not literal table/column names.
+
+
+## Runtime Override: Scout Lane
+You are a scout worker.
+- Stay within ONE family strategy: the assigned `family` and `transform_id`.
+- Do not combine multiple families in one rewrite.
+- If you cannot complete the rewrite, set status to 'failed' and fill
+  failure_reason + partial_work with structured field notes.
+- Preserve semantics and hard bans.
+
+
+## Runtime Override: TREE Mode (Takes Precedence)
+Ignore any conflicting output-shape instructions above.
+Output mode is TREE JSON; keep the full schema from the worker template.
+Worker constraints:
+- one or more changed nodes are allowed (zero only for safe no-change)
+- every changed node must include full executable SQL in `sql`
+- unchanged nodes should omit `sql`
+- include the complete runtime tree node set (not a partial subset)
+- first character must be `{` (no prose/markdown)
+
+## RETRY — Gate failure feedback (attempt 2/2)
+Your previous rewrite failed validation. Return a corrected TREE JSON object only.
+First character must be `{` and output must contain no markdown/prose.
+
+### Failure Object
+```json
+{
+  "probe_id": "p02",
+  "transform_id": "pg_self_join_decomposition",
+  "gate": "any_failure",
+  "status": "FAIL",
+  "error": "Node `shared_store_sales_date` missing parent_node_id"
+}
+```
+
+### Previous Worker Output (attempt 1)
+```
+{
+  "probe_id": "scout_1",
+  "transform_id": "pg_self_join_decomposition",
+  "family": "E",
+  "status": "success",
+  "dialect": "postgresql",
+  "hypothesis": "Materializing the shared store_sales+date_dim scan as a CTE reduces repeated work. Both sb and sc aggregates can then derive from this single materialized set, avoiding redundant scans.",
+  "reasoning_trace": [
+    "Two Nested Loop scans on store_sales+date_dim with identical filters are present in the plan.",
+    "Each path performs independent Aggregates before a high-cost Merge Join.",
+    "Introducing a CTE for the common filtered scan enables reuse and removes redundancy."
+  ],
+  "target_ir": "Introduce a CTE named 'shared_store_sales_date' that materializes the filtered store_sales+date_dim join. Replace both sb and sc subqueries to read from this CTE.",
+  "verification": {
+    "executable": true,
+    "no_missing_tables": true,
+    "alias_consistent": true,
+    "no_orphan_scans": true,
+    "semantics_preserved": true,
+    "null_semantics_safe": true,
+    "ctes_selective_or_na": true
+  },
+  "tree": {
+    "root_node_id": "final_select",
+    "nodes": [
+      {
+        "node_id": "final_select",
+        "parent_node_id": null,
+        "sources": ["store", "item", "sb", "sc"],
+        "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+        "changed": true,
+        "sql": "SELECT s.s_store_name, i.i_item_desc, sc.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM store s, item i, sb, sc WHERE sb.ss_store_sk = sc.ss_store_sk AND sc.revenue <= 0.1 * sb.ave AND s.s_store_sk = sc.ss_store_sk AND i.i_item_sk = sc.ss_item_sk AND i.i_manager_id BETWEEN 80 AND 84 AND s.s_state IN ('IA','IL','NC') ORDER BY s.s_store_name, i.i_item_desc LIMIT 100"
+      },
+      {
+        "node_id": "sb",
+        "parent_node_id": "final_select",
+        "sources": ["shared_store_sales_date"],
+        "outputs": ["ss_store_sk", "ave"],
+        "changed": true,
+        "sql": "SELECT ss_store_sk, AVG(revenue) AS ave FROM (SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM shared_store_sales_date GROUP BY ss_store_sk, ss_item_sk) sa GROUP BY ss_store_sk"
+      },
+      {
+        "node_id": "sc",
+        "parent_node_id": "final_select",
+        "sources": ["shared_store_sales_date"],
+        "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+        "changed": true,
+        "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM shared_store_sales_date GROUP BY ss_store_sk, ss_item_sk"
+      },
+      {
+        "node_id": "shared_store_sales_date",
+        "parent_node_id": null,
+        "sources": ["store_sales", "date_dim"],
+        "outputs": ["ss_store_sk", "ss_item_sk", "ss_sales_price"],
+        "changed": true,
+        "sql": "WITH shared_store_sales_date AS (SELECT ss.ss_store_sk, ss.ss_item_sk, ss.ss_sales_price FROM store_sales ss JOIN date_dim dd ON ss.ss_sold_date_sk = dd.d_date_sk WHERE dd.d_month_seq BETWEEN 1195 AND 1195 + 11 AND ss.ss_sales_price / ss.ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01) SELECT * FROM shared_store_sales_date"
+      }
+    ]
+  }
+}
+```
+
+Fix only what caused the gate failure while preserving transform intent and semantics.
+Output ONLY valid TREE JSON.
+Do not emit PatchPlan `steps`/`payload` fields in TREE mode.

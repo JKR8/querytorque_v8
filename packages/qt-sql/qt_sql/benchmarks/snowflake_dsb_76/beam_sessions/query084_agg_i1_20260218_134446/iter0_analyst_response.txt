@@ -1,0 +1,264 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The execution plan shows a full scan of STORE_RETURNS (124 GB) despite selective filters on dimension tables, because join filters do not prune micro-partitions. Pre-computing filtered dimension keys in CTEs can reduce the fact table scan by pushing selectivity earlier, leveraging Snowflake's join pushdown or CTE materialization.",
+    "reasoning_trace": [
+      "STORE_RETURNS scan accounts for over 99% of total bytes scanned (124,763,446,272 bytes), indicating a dominant I/O hotspot.",
+      "Dimension tables (INCOME_BAND, HOUSEHOLD_DEMOGRAPHICS, CUSTOMER_DEMOGRAPHICS) are fully pruned (parts=1/1) but small, suggesting filters are applied early but not propagated to the fact table.",
+      "Join path places STORE_RETURNS last via CUSTOMER_DEMOGRAPHICS, preventing early pruning of the fact table scan."
+    ],
+    "cost_spine": ["TableScan (STORE_RETURNS)", "InnerJoin with CUSTOMER_DEMOGRAPHICS", "InnerJoin with CUSTOMER", "InnerJoin with CUSTOMER_ADDRESS", "Filter on CA_CITY", "Filter on INCOME_BAND"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_RETURNS)",
+        "why": "massive I/O volume dominant in plan",
+        "evidence": "bytes=124763446272, parts=7070/7070"
+      },
+      {
+        "op": "TableScan (CUSTOMER)",
+        "why": "significant I/O but secondary",
+        "evidence": "bytes=2328538624, parts=261/261"
+      },
+      {
+        "op": "TableScan (CUSTOMER_ADDRESS)",
+        "why": "moderate I/O with early filter",
+        "evidence": "bytes=776454656, parts=256/256"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS patterns (none present in query)",
+      "avoid introducing unfiltered large CTEs that could increase I/O",
+      "do not wrap filter keys (e.g., CA_CITY, IB_LOWER_BOUND) in functions to preserve micro-partition pruning",
+      "avoid converting comma joins to explicit JOIN if plan already shows InnerJoin nodes, unless evidence suggests benefit"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "E",
+      "target": "Create CTEs for filtered INCOME_BAND, HOUSEHOLD_DEMOGRAPHICS, CUSTOMER_ADDRESS, CUSTOMER, and CUSTOMER_DEMOGRAPHICS, compute relevant CD_DEMO_SK set from their joins, then join with STORE_RETURNS on SR_CDEMO_SK in that set.",
+      "dag_target_hint": "Change final_select SQL to add CTEs and modify FROM clause.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may inline single-ref CTEs, but materializing filtered dimension sets could reduce STORE_RETURNS scan by pushing join selectivity.",
+      "confidence": 0.75,
+      "expected_explain_delta": "STORE_RETURNS scan parts reduced due to pushed filter on SR_CDEMO_SK from pre-computed dimension CTEs.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "preserve_join_conditions"],
+      "recommended_examples": ["multi_dimension_prefetch_gold"],
+      "rank_rationale": "Targets primary hotspot (STORE_RETURNS scan) with high expected impact through early dimension filtering.",
+      "gold_example_id": "multi_dimension_prefetch_gold"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Extract each dimension table (INCOME_BAND, HOUSEHOLD_DEMOGRAPHICS, CUSTOMER_ADDRESS, CUSTOMER, CUSTOMER_DEMOGRAPHICS) into separate CTEs with their filters applied, then join these CTEs sequentially before joining with STORE_RETURNS.",
+      "dag_target_hint": "Change final_select SQL to add multiple CTEs and restructure joins.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Isolating dimensions into CTEs may create small hash tables for faster joins and better predicate pushdown in Snowflake.",
+      "confidence": 0.70,
+      "expected_explain_delta": "Reduced I/O on dimension scans and potential better join order leading to smaller STORE_RETURNS probe set.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "preserve_join_conditions"],
+      "recommended_examples": [],
+      "rank_rationale": "Addresses primary hotspot with a different mechanism than p01, focusing on individual dimension isolation.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Build a CTE chain: first CTE filters INCOME_BAND and HOUSEHOLD_DEMOGRAPHICS, second CTE joins with CUSTOMER and CUSTOMER_ADDRESS, third CTE computes CD_DEMO_SK set, then join with STORE_RETURNS.",
+      "dag_target_hint": "Change final_select SQL to implement staged CTE pipeline.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may optimize join order and reduce intermediate row flow before the fact table scan.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Progressive row reduction in CTEs leading to fewer rows joined with STORE_RETURNS.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "preserve_join_conditions"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe targeting primary hotspot with a phased approach to dimension filtering.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the result of joining all dimension tables (filtered) into a CTE, then join this CTE with STORE_RETURNS on CD_DEMO_SK.",
+      "dag_target_hint": "Change final_select SQL to add a materialized CTE for dimension join result.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the dimension join may force Snowflake to compute it once, potentially improving join performance with STORE_RETURNS.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension join materialized, reducing repeated computation and possibly optimizing join with STORE_RETURNS.",
+      "recommended_patch_ops": ["insert_cte_with_materialize_hint", "replace_from"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe for materialization benefits on dimension join, secondary to primary hotspot.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Apply all dimension filters (CA_CITY, IB bounds) early in CTEs before any joins, then join these filtered dimension sets with CUSTOMER and CUSTOMER_DEMOGRAPHICS, finally with STORE_RETURNS.",
+      "dag_target_hint": "Change final_select SQL to prioritize filter application in CTEs.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering may improve predicate pushdown and reduce row flow early in the plan, even if Snowflake already applies filters early.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Filters applied at scan level in CTEs, potentially reducing intermediate row counts.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "preserve_filters"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe focusing on early filter placement, targeting secondary hotspots.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions into CTEs and use explicit INNER JOIN syntax instead of comma joins, then join with STORE_RETURNS.",
+      "dag_target_hint": "Change final_select SQL to convert comma joins to explicit INNER JOIN and add dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_JOINFILTER_PRESERVE:PASS", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax may provide better join order hints or optimization in Snowflake, combined with prefetched dimensions.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Join topology may shift with explicit joins, improving cardinality estimates and reducing STORE_RETURNS scan.",
+      "recommended_patch_ops": ["replace_comma_joins_with_inner_join", "insert_cte", "preserve_join_conditions"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe for join syntax change and dimension prefetch, targeting secondary hotspots.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Ensure all joins are explicit INNER JOIN syntax (original uses comma joins) to potentially aid Snowflake's optimizer in join planning.",
+      "dag_target_hint": "Change final_select SQL to replace comma joins with INNER JOIN clauses.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["semantic_safety:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit INNER JOIN syntax might improve join order optimization or predicate pushdown in Snowflake, even though plan shows InnerJoin nodes.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Minimal change; may not alter plan significantly but tests join syntax sensitivity.",
+      "recommended_patch_ops": ["replace_comma_joins_with_inner_join"],
+      "recommended_examples": [],
+      "rank_rationale": "Low-confidence exploration probe for join syntax, targeting potential optimizer improvements.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered dimension sets and pre-join them with CUSTOMER to compute a reduced key set before joining with STORE_RETURNS, using CTEs for staging.",
+      "dag_target_hint": "Change final_select SQL to add materialized CTEs for dimension and customer pre-join.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567", "ib_upper_bound <= 73567", "join conditions as per original"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materialization and prefiltering may reduce the search space for joins, especially if Snowflake benefits from staged reduction.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Reduced row flow into final join with STORE_RETURNS due to pre-computed key sets.",
+      "recommended_patch_ops": ["insert_cte_with_materialize_hint", "replace_from", "preserve_join_conditions"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe with low confidence, testing materialization and prefiltering for join topology.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "No date_dim table or date_sk join in query; transform requires date filter and sold_date_sk linkage."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "No UNION ALL or date_dim in query; transform not applicable."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in the original SQL; plan shows no nested loops or correlation evidence."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY or aggregate functions in query; plan shows no aggregation operators."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicates in query; plan evidence does not show OR-related hotspots."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query; transform not applicable."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries in query; gap CORRELATED_SUBQUERY_PARALYSIS not present."
+    },
+    {
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "reason": "No date_dim table in query; transform requires date dimension."
+    }
+  ]
+}

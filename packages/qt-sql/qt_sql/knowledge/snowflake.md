@@ -45,7 +45,9 @@
 
 ## Gap-Driven Optimization Patterns
 
-### Pattern ID: `CORRELATED_SUBQUERY_PARALYSIS` (`HIGH`)
+Use numbered pattern blocks below as independent decision scopes; evaluate each block against its own gates before applying any transform.
+
+### Pattern 1/2 — Pattern ID: `CORRELATED_SUBQUERY_PARALYSIS` (`HIGH`)
 - Goal: `DECORRELATE`
 - Detect: correlated scalar aggregate subquery re-scans fact table per outer row.
 - Preferred transforms: `sf_inline_decorrelate`, `sf_shared_scan_decorrelate`.
@@ -69,7 +71,9 @@
 |---|---|---|---|
 | none observed in curated examples | `n/a` | `n/a` | keep blocker gates enforced |
 
-### Pattern ID: `PREDICATE_TRANSITIVITY_FAILURE` (`n/a in engine_profile`)
+---
+
+### Pattern 2/2 — Pattern ID: `PREDICATE_TRANSITIVITY_FAILURE` (`n/a in engine_profile`)
 - Goal: `SK_PUSHDOWN`
 - Detect: date_dim filter exists but sold_date_sk range is not pushed into fact scans, often across UNION ALL or multi-fact comma-join shapes.
 - Preferred transforms: `sf_sk_pushdown_union_all`, `sf_sk_pushdown_multi_fact`.

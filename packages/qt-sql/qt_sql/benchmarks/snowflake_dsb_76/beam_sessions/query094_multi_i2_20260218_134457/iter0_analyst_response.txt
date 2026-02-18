@@ -1,0 +1,290 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 3,
+    "probe_count": 12,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The execution plan reveals massive I/O from two full scans of WEB_SALES (461 GB each) due to correlated EXISTS and NOT EXISTS subqueries, despite Snowflake's semi-join optimization. Date filter on DATE_DIM is selective but may not be pushed down to fact table scans, preventing micro-partition pruning. Aggregation occurs after joining large datasets, suggesting opportunities for early reduction.",
+    "reasoning_trace": [
+      "WEB_SALES scanned twice with 461 GB each, dominating total I/O of 962 GB.",
+      "DATE_DIM fully pruned (parts=1/1), indicating selective filter, but no date_sk filter visible on WEB_SALES scan.",
+      "EXISTS and NOT EXISTS implemented as SemiJoin and AntiJoin, likely already decorrelated."
+    ],
+    "cost_spine": ["TableScan (WEB_SALES)", "InnerJoin (DATE_DIM)", "SemiJoin (EXISTS)", "AntiJoin (NOT EXISTS)", "Aggregate"],
+    "hotspots": [
+      {"op": "TableScan (WEB_SALES) for ws1", "why": "largest I/O volume with late filters", "evidence": "parts=27579/27579 bytes=461041485824"},
+      {"op": "TableScan (WEB_SALES) for ws2", "why": "repeated scan for EXISTS check", "evidence": "parts=27579/27579 bytes=461041485824"},
+      {"op": "AntiJoin on WEB_RETURNS", "why": "significant scan volume", "evidence": "parts=2289/2289 bytes=39149218304"}
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS/NOT EXISTS into broad CTE branches",
+      "avoid wrapping partition keys in functions",
+      "avoid destructive shape rewrites when join-filter behavior is strong"
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN filter derived from DATE_DIM date range to WEB_SALES scan in the main FROM clause to enable micro-partition pruning.",
+      "dag_target_hint": "Change final_select FROM clause to include date_sk range condition on ws_ship_date_sk.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim"],
+        "where_must_preserve": ["d_date between '1999-10-01' and cast('1999-10-01' as date) + interval '60 day'"],
+        "output_must_preserve": ["all original output columns and aggregates"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "TableScan on WEB_SALES shows reduced parts scanned due to date_sk filter pushdown.",
+      "recommended_patch_ops": ["add_where_predicate", "modify_from"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets primary hotspot — date filter pushdown could significantly reduce I/O on largest scan.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate WEB_SALES by ws_order_number to compute sum(ws_ext_ship_cost), sum(ws_net_profit), and count(distinct ws_order_number) before joining with dimension tables.",
+      "dag_target_hint": "Insert a CTE that aggregates WEB_SALES and change final_select to join with this CTE.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1"],
+        "where_must_preserve": ["ws_list_price between 253 and 282", "ws_ship_date_sk is not null", "ws_ship_addr_sk is not null", "ws_web_site_sk is not null"],
+        "output_must_preserve": ["aggregate results and distinct count semantics"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Aggregate node moves earlier in plan, reducing rows input to joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Addresses aggregation after large joins, potentially reducing data volume.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate the two WEB_SALES scans into a single scan with conditional logic to handle EXISTS check for ws_warehouse_sk difference.",
+      "dag_target_hint": "Modify final_select to scan WEB_SALES once and use CASE or flag to identify rows for EXISTS.",
+      "node_contract": {
+        "from_must_include": ["web_sales"],
+        "where_must_preserve": ["ws_list_price between 253 and 282", "date filters", "dimension join conditions"],
+        "output_must_preserve": ["EXISTS semantics and aggregate results"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Repeated scans of WEB_SALES could be merged into one pass to reduce I/O.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Reduction in TableScan nodes for WEB_SALES from two to one.",
+      "recommended_patch_ops": ["rewrite_exists_logic", "modify_from"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — targets repeated scan hotspot with a consolidation approach.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated EXISTS into a shared CTE that scans WEB_SALES once and computes keys for semi-join.",
+      "dag_target_hint": "Add CTE for WEB_SALES scan and change EXISTS to join with this CTE.",
+      "node_contract": {
+        "from_must_include": ["web_sales"],
+        "where_must_preserve": ["ws_warehouse_sk <> ws2.ws_warehouse_sk", "other filters"],
+        "output_must_preserve": ["semi-join semantics and final aggregates"]
+      },
+      "gates_checked": ["G_SF_CORR_SIMPLE_EXISTS_SKIP:DOWNRANK", "G_SF_CORR_FACT_CONTEXT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Despite semi-join optimization, shared scan might reduce I/O if scan is repeated.",
+      "confidence": 0.60,
+      "expected_explain_delta": "SemiJoin input changes, potentially reducing scan work.",
+      "recommended_patch_ops": ["insert_cte", "replace_exists"],
+      "recommended_examples": ["sf_shared_scan_decorrelate"],
+      "rank_rationale": "Exploration — tests if manual decorrelation can improve over native semi-join.",
+      "gold_example_id": "sf_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Create a CTE for filtered WEB_SALES data and reference it in main query and EXISTS subquery.",
+      "dag_target_hint": "Insert a CTE with filtered WEB_SALES and adjust final_select and EXISTS to use it.",
+      "node_contract": {
+        "from_must_include": ["web_sales"],
+        "where_must_preserve": ["all original filters on WEB_SALES"],
+        "output_must_preserve": ["query results and subquery semantics"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing filtered data once could avoid repeated scans.",
+      "confidence": 0.55,
+      "expected_explain_delta": "TableScan nodes reduced or consolidated, with CTE materialization.",
+      "recommended_patch_ops": ["insert_cte", "modify_from"],
+      "recommended_examples": ["materialize_cte"],
+      "rank_rationale": "Exploration — targets reuse of scanned data to reduce I/O.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter dimension tables (DATE_DIM, CUSTOMER_ADDRESS, WEB_SITE) into CTEs before joining with WEB_SALES.",
+      "dag_target_hint": "Add CTEs for each dimension with filters and change final_select to join with these CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date range", "ca_state in list", "web_gmt_offset >= -5"],
+        "output_must_preserve": ["join keys and final output"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering of dimensions might reduce the size of fact table joins.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Dimension scans become CTE materializations, potentially reducing join work.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["early_filter"],
+      "rank_rationale": "Exploration — tests early reduction via dimension prefetching.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre-filter all selective dimensions into CTEs and join with WEB_SALES in a staged manner to compound selectivity.",
+      "dag_target_hint": "Create a chain of CTEs filtering dimensions and progressively joining with WEB_SALES.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer_address", "web_site", "web_sales ws1"],
+        "where_must_preserve": ["all dimension filters"],
+        "output_must_preserve": ["final aggregates and distinct count"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged join pipeline could reduce fact table scan size through combined dimension selectivity.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Plan shows reduced scan on WEB_SALES due to early dimension joins.",
+      "recommended_patch_ops": ["insert_cte", "modify_join_order"],
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "rank_rationale": "Exploration — tests multi-dimension prefetch for I/O reduction.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax for potential optimizer improvements.",
+      "dag_target_hint": "Change final_select FROM clause to use explicit JOIN ... ON syntax.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["all join conditions and filters"],
+        "output_must_preserve": ["query results and semantics"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax might lead to better join order or filter pushdown in Snowflake.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Join operators remain similar but with explicit syntax, potentially affecting plan shape.",
+      "recommended_patch_ops": ["replace_from"],
+      "recommended_examples": ["inner_join_conversion"],
+      "rank_rationale": "Exploration — low-risk syntax change to test join planning.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p09",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Decorrelate EXISTS and NOT EXISTS into UNION of key sets from pre-materialized CTEs.",
+      "dag_target_hint": "Create CTEs for WEB_SALES and WEB_RETURNS keys and use UNION in final join.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns"],
+        "where_must_preserve": ["EXISTS and NOT EXISTS conditions"],
+        "output_must_preserve": ["anti-join and semi-join semantics"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Union-based decorrelation might handle correlated subqueries more efficiently than native semi-joins.",
+      "confidence": 0.40,
+      "expected_explain_delta": "SemiJoin and AntiJoin replaced with UNION and join patterns.",
+      "recommended_patch_ops": ["insert_cte", "replace_subqueries"],
+      "recommended_examples": ["composite_decorrelate_union"],
+      "rank_rationale": "Exploration — tests alternative decorrelation method for subqueries.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p10",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Use bitmap or conditional aggregation to handle EXISTS logic in a single pass over WEB_SALES.",
+      "dag_target_hint": "Modify aggregate to include CASE expressions for EXISTS check during scan.",
+      "node_contract": {
+        "from_must_include": ["web_sales"],
+        "where_must_preserve": ["filters and join conditions"],
+        "output_must_preserve": ["aggregate results and EXISTS semantics"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Conditional aggregation could consolidate scans and reduce I/O.",
+      "confidence": 0.35,
+      "expected_explain_delta": "Aggregate node incorporates EXISTS logic, reducing separate scans.",
+      "recommended_patch_ops": ["rewrite_aggregate", "modify_from"],
+      "recommended_examples": ["channel_bitmap_aggregation"],
+      "rank_rationale": "Exploration — tests aggregation-based scan consolidation.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p11",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Isolate DATE_DIM filter into a CTE for early materialization, even though it's already pruned.",
+      "dag_target_hint": "Add a CTE for DATE_DIM with date filter and join in final_select.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_date range"],
+        "output_must_preserve": ["date_sk join key"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "CTE materialization might improve join performance despite existing pruning.",
+      "confidence": 0.30,
+      "expected_explain_delta": "DATE_DIM scan becomes CTE materialization, with minimal change to plan.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["date_cte_isolate"],
+      "rank_rationale": "Exploration — low-confidence probe on already-optimized dimension.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p12",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Adapt self-join decomposition for repeated WEB_SALES scans by splitting into separate CTEs with different filters.",
+      "dag_target_hint": "Create separate CTEs for ws1 and ws2 scans with their respective filters.",
+      "node_contract": {
+        "from_must_include": ["web_sales"],
+        "where_must_preserve": ["filters for ws1 and ws2"],
+        "output_must_preserve": ["join semantics and aggregate results"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Splitting scans into specialized CTEs might optimize filter pushdown.",
+      "confidence": 0.25,
+      "expected_explain_delta": "TableScan nodes become CTE materializations with focused filters.",
+      "recommended_patch_ops": ["insert_cte", "modify_from"],
+      "recommended_examples": ["self_join_decomposition"],
+      "rank_rationale": "Exploration — tests decomposition of repeated scans for better filtering.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {"transform_id": "or_to_union", "family": "D", "reason": "No OR predicate in query."},
+    {"transform_id": "intersect_to_exists", "family": "D", "reason": "No INTERSECT operation in query."},
+    {"transform_id": "rollup_to_union_windowing", "family": "D", "reason": "No ROLLUP in query."},
+    {"transform_id": "union_cte_split", "family": "D", "reason": "No UNION in query."},
+    {"transform_id": "pg_self_join_decomposition", "family": "E", "reason": "Engine-specific for PostgreSQL, not Snowflake."},
+    {"transform_id": "deferred_window_aggregation", "family": "C", "reason": "No window functions in query."},
+    {"transform_id": "sf_inline_decorrelate", "family": "B", "reason": "Designed for scalar aggregate subqueries, not simple EXISTS in this query."},
+    {"transform_id": "sf_sk_pushdown_union_all", "family": "A", "reason": "No UNION ALL in query, not directly applicable."}
+  ]
+}

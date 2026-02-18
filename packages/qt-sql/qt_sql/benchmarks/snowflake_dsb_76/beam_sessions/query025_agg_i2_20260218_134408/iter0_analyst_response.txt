@@ -1,0 +1,187 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Dominant I/O is from three large fact-table scans (store_sales 1.2TB, catalog_sales 920GB, store_returns 124GB) with no explicit date_sk range predicates, blocking micro‑partition pruning. Aggregations occur after joining these wide rows, amplifying compute. Push date_sk filters into fact scans and pre‑aggregate before joins.",
+    "reasoning_trace": [
+      "GlobalStats shows 132k/134k parts scanned (2257GB total), dominated by fact‑table TableScans.",
+      "Date_dim filters (d_moy, d_year) are applied after the join, not pushed into fact‑scan predicates.",
+      "Aggregate tree shows repeated partial aggregation layers, suggesting join blow‑up before final group‑by.",
+      "No nested loops or set operations; family B and D are not indicated.",
+      "Engine is Snowflake; native pushdown transforms are preferred for micro‑partition pruning."
+    ],
+    "cost_spine": ["TableScan STORE_SALES", "TableScan CATALOG_SALES", "TableScan STORE_RETURNS", "InnerJoin chain", "Aggregate ladder"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest I/O volume (1.2TB) without date_sk predicate",
+        "evidence": "parts=70412/72718 bytes=1212628258304"
+      },
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "second‑largest I/O volume (920GB) without date_sk predicate",
+        "evidence": "parts=54721/54922 bytes=920184101376"
+      },
+      {
+        "op": "TableScan (STORE_RETURNS)",
+        "why": "third‑largest I/O volume (124GB) without date_sk predicate",
+        "evidence": "parts=7070/7070 bytes=124763446272"
+      },
+      {
+        "op": "Aggregate ladder (nodes 1.2–1.4)",
+        "why": "multiple aggregation layers after wide joins, compute amplification",
+        "evidence": "Aggregate nodes stacked after joins, input rows large before final group‑by"
+      }
+    ],
+    "do_not_do": [
+      "do not convert to UNION ALL without OR‑block evidence",
+      "do not materialize CTEs that duplicate large fact scans",
+      "do not wrap date_sk column in functions (breaks pruning)",
+      "do not disrupt existing join‑filter pushdown (already present in plan)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range filters to each fact‑table scan derived from date_dim predicates, enabling micro‑partition pruning. Compute min/max date_sk from filtered date_dim CTE for each alias (d1, d2, d3) and push into corresponding fact‑table WHERE clauses.",
+      "dag_target_hint": "Replace fact‑table FROM clauses with filtered subqueries containing date_sk BETWEEN.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["d1.d_moy = 2 AND d1.d_year = 2000", "d2.d_moy BETWEEN 2 AND 4 AND d2.d_year = 2000", "d3.d_moy BETWEEN 2 AND 4 AND d3.d_year = 2000"],
+        "output_must_preserve": ["all original columns", "group‑by keys", "aggregate semantics for stddev_samp"]
+      },
+      "gates_checked": [
+        "G_SF_SK_DATE_FILTER_REQUIRED:PASS",
+        "G_SF_SK_SCAN_PRESSURE:PASS",
+        "G_SF_SK_COMPUTE_BOUND_SKIP:PASS",
+        "G_SF_SK_RANGE_SEMANTICS:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.88,
+      "expected_explain_delta": "Fact‑table TableScan nodes show predicate pushdown of date_sk BETWEEN; scanned partitions drop significantly.",
+      "recommended_patch_ops": ["insert_cte_date_sk_ranges", "replace_fact_scan_with_filtered_subquery"],
+      "rank_rationale": "Primary hotspot — addresses largest I/O bottleneck via native Snowflake micro‑partition pruning.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate each fact table by its join keys (customer_sk, item_sk, ticket_number, store_sk) and grouping keys (item_id, item_desc, store_id, store_name) before joining, reducing rows flowing into the main join tree.",
+      "dag_target_hint": "Replace base fact scans with aggregated CTEs, then join aggregated results.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales"],
+        "where_must_preserve": ["date‑dim filters (via date_sk BETWEEN if added)"],
+        "output_must_preserve": ["group‑by keys", "aggregate semantics for stddev_samp (preserve sum, sum of squares, count)"]
+      },
+      "gates_checked": [
+        "agg_key_compatibility:PASS",
+        "duplication_sensitive_metrics:none",
+        "G_SF_CTE_REUSE_RULE:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate nodes move closer to fact scans; join input row counts drop; intermediate aggregate layers shrink.",
+      "recommended_patch_ops": ["insert_cte_agg_store_sales", "insert_cte_agg_store_returns", "insert_cte_agg_catalog_sales", "rewrite_main_from_to_use_aggregated_ctes"],
+      "rank_rationale": "Secondary hotspot — reduces compute amplification from joining wide rows before aggregation.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Isolate each date_dim filter into separate CTEs (d1_cte, d2_cte, d3_cte) containing only the surrogate keys for the filtered date ranges, then join those CTEs with fact tables.",
+      "dag_target_hint": "Replace date_dim table references with CTE references; keep existing join conditions.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["d1.d_moy = 2 AND d1.d_year = 2000", "d2.d_moy BETWEEN 2 AND 4 AND d2.d_year = 2000", "d3.d_moy BETWEEN 2 AND 4 AND d3.d_year = 2000"],
+        "output_must_preserve": ["date_sk join keys", "no extra columns"]
+      },
+      "gates_checked": [
+        "G_SF_CTE_REUSE_RULE:PASS",
+        "G_SF_LOW_BASELINE_SKIP_HEAVY:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Even though date_dim scans are small, isolating them into CTEs may improve join‑order flexibility and predicate pushdown in Snowflake.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Date_dim TableScan nodes become tiny CTE scans; join order may shift to build smaller hash tables earlier.",
+      "recommended_patch_ops": ["insert_cte_d1", "insert_cte_d2", "insert_cte_d3", "replace_date_dim_with_cte"],
+      "rank_rationale": "Exploration — targets secondary dimension scans; uses underrepresented family A.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma‑separated joins to explicit INNER JOIN syntax, preserving all existing join conditions, to give optimizer clearer join‑graph semantics.",
+      "dag_target_hint": "Rewrite FROM clause to use explicit JOIN ... ON syntax.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales", "date_dim d1", "date_dim d2", "date_dim d3", "store", "item"],
+        "where_must_preserve": ["all original join conditions and filters"],
+        "output_must_preserve": ["all columns and aggregate semantics"]
+      },
+      "gates_checked": [
+        "join_multiplicity_safe:PASS",
+        "G_SF_JOINFILTER_PRESERVE:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax may improve Snowflake’s cost‑based join ordering and filter pushdown for this complex multi‑fact join.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Join operator semantics unchanged; possible minor join‑order or filter‑placement improvements.",
+      "recommended_patch_ops": ["rewrite_from_comma_to_join"],
+      "rank_rationale": "Exploration — join‑topology family underrepresented; low risk, potential marginal gain.",
+      "recommended_examples": ["inner_join_conversion"],
+      "gold_example_id": "inner_join_conversion"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in query."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "Query does not repeat scans of the same fact table with different filters; each fact table appears once."
+    },
+    {
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "reason": "No scalar subqueries to consolidate."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries detected."
+    }
+  ]
+}

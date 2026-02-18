@@ -224,7 +224,7 @@ python3 -m qt_sql.build_blackboard --global
 # Rebuild tag-based example index
 python3 -m qt_sql.tag_index
 
-# Regenerate V0 prompt samples
+# Regenerate archived V0 prompt samples
 python3 -m qt_sql.prompts.samples.generate_sample
 ```
 

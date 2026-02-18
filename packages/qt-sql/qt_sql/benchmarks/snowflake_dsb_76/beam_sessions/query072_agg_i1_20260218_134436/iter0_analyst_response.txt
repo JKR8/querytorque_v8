@@ -1,0 +1,168 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The EXPLAIN plan is truncated, hiding operator details, but the query joins large fact tables (catalog_sales, inventory) with a non‑equi join and multiple dimension filters. The dominant I/O likely comes from scanning catalog_sales and inventory before applying selective dimension filters; pushdown of date‑key ranges and early dimension pre‑filtering can prune micro‑partitions earlier. A secondary hotspot is the non‑equi join (inv_quantity_on_hand < cs_quantity) that may benefit from staged reduction.",
+    "reasoning_trace": [
+      "Plan shows only final Result and SortWithLimit nodes—no per‑operator I/O or timing.",
+      "Query joins catalog_sales (fact) with inventory (large) using a non‑equi join.",
+      "Three date_dim aliases (d1, d2, d3) with filters; date‑key pushdown may prune fact scans.",
+      "Multiple dimension filters (hd_buy_potential, cd_marital_status, i_category, cs_wholesale_cost) are selective but may be applied late.",
+      "No correlated subqueries, no UNION/INTERSECT, no window functions.",
+      "Left joins to promotion and catalog_returns are nullable and do not filter rows."
+    ],
+    "cost_spine": ["Scan catalog_sales", "Scan inventory", "Join (non‑equi)", "Join dimensions", "Aggregate", "SortWithLimit"],
+    "hotspots": [
+      {
+        "op": "Scan catalog_sales",
+        "why": "largest fact table, filtered via date_dim d1 (d_year=1998) and d3 (d_date > d1.d_date + 3 days)",
+        "evidence": "No micro‑partition pruning seen; date filters on dimension may not push down."
+      },
+      {
+        "op": "Scan inventory",
+        "why": "second large table, joined with non‑equi condition and filtered via date_dim d2",
+        "evidence": "Join condition inv_quantity_on_hand < cs_quantity may force full scan."
+      },
+      {
+        "op": "Non‑equi join (inventory ↔ catalog_sales)",
+        "why": "inequality join may produce large intermediate rows before aggregation",
+        "evidence": "Condition inv_quantity_on_hand < cs_quantity cannot use hash join efficiently."
+      }
+    ],
+    "do_not_do": [
+      "Do not materialize EXISTS/NOT EXISTS (no correlated subqueries present).",
+      "Do not split OR to UNION ALL (no OR predicate in WHERE).",
+      "Avoid introducing unfiltered large CTEs.",
+      "Do not convert left joins to inner joins (promotion and catalog_returns are nullable)."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN range to catalog_sales and inventory using d1.d_year=1998, d2.d_week_seq = d1.d_week_seq, and d3.d_date > d1.d_date + interval '3 days' to prune micro‑partitions.",
+      "dag_target_hint": "Replace FROM clause of catalog_sales and inventory scans with filtered CTEs that embed date_sk ranges derived from date_dim filters.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "inventory", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["d1.d_year = 1998", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'", "inv_quantity_on_hand < cs_quantity"],
+        "output_must_preserve": ["All original columns and aggregation semantics"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Catalog_sales and inventory scans show reduced partitions read due to pushed date_sk range.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "add_predicate"],
+      "rank_rationale": "Primary hotspot—directly targets fact‑table scan pruning, native Snowflake transform with evidence.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre‑filter selective dimensions (item, customer_demographics, household_demographics, date_dim d1, d2, d3) into separate CTEs before joining to catalog_sales and inventory, compounding selectivity.",
+      "dag_target_hint": "Insert CTEs for filtered dimensions, then join them with catalog_sales and inventory in a staged pipeline.",
+      "node_contract": {
+        "from_must_include": ["item", "customer_demographics", "household_demographics", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["i_category IN ('Children', 'Jewelry', 'Men')", "cd_marital_status = 'U'", "cd_dep_count between 9 and 11", "hd_buy_potential = '>10000'", "d1.d_year = 1998", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'"],
+        "output_must_preserve": ["All join keys and original filter semantics"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_FILTER_FUNCTION_WRAP:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Snowflake may already push dimension filters, but materializing them as CTEs could force early reduction and better join order.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Dimension scans become tiny CTE materializations; catalog_sales scan rows drop due to compounded early filters.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_join_order"],
+      "rank_rationale": "Exploration—targets secondary hotspot (dimension scans) and uses underrepresented family A (early filtering).",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Stage‑reduce both sides of the non‑equi join: create CTEs for filtered catalog_sales and filtered inventory, then join them on inv_quantity_on_hand < cs_quantity.",
+      "dag_target_hint": "Insert two CTEs—filtered_cs and filtered_inv—that apply all dimension filters and date‑key pushdown, then perform the non‑equi join between them.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "inventory"],
+        "where_must_preserve": ["inv_quantity_on_hand < cs_quantity", "d1.d_year = 1998", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'"],
+        "output_must_preserve": ["All columns needed for downstream joins and aggregation"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Non‑equi join may be compute‑heavy; reducing input sizes before the inequality may lower intermediate row count.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Non‑equi join operator input rows decrease; join time reduces.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_join_order"],
+      "rank_rationale": "Exploration—targets non‑equi join hotspot, uses family F (join topology) which is underrepresented.",
+      "recommended_examples": ["materialized_dimension_fact_prefilter"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate catalog_sales by (cs_item_sk, cs_sold_date_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk) before joining to dimensions, then final aggregate by dimension columns.",
+      "dag_target_hint": "Insert a CTE that groups catalog_sales by its join keys, computing partial aggregates (counts and sums), then join to dimensions and compute final sums.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["Grouping key compatibility with downstream joins", "SUM and COUNT semantics unchanged"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Rows entering the multi‑way join drop significantly; aggregate node moves earlier in plan.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_group_by"],
+      "rank_rationale": "Targets secondary hotspot (large join before aggregation) and uses family C (aggregation pushdown) with portable transform.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in query."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "No correlated subquery pattern."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in WHERE clause."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set‑operation pattern."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Left joins (promotion, catalog_returns) are nullable and not filtered in WHERE; converting to inner would change semantics."
+    }
+  ]
+}

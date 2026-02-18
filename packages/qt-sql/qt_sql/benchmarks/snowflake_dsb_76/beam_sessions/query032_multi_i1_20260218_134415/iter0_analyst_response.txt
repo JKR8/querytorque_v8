@@ -1,0 +1,156 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The query suffers from a correlated scalar subquery causing repeated full scans of the catalog_sales table, accounting for the majority of I/O. Decorrelating the subquery into a CTE can eliminate the redundant scan and reduce I/O volume, while secondary hotspots like OR conditions on dimension filters may block efficient pruning.",
+    "reasoning_trace": [
+      "CATALOG_SALES is scanned twice with identical date and item filters, except for correlation in the subquery.",
+      "Correlated subquery on avg(cs_ext_discount_amt) per item key forces per-item re-execution, leading to repeated scans.",
+      "OR condition on ITEM (i_manufact_id IN list or i_manager_id BETWEEN) may inhibit micro-partition pruning in Snowflake.",
+      "GlobalStats show 1.8 terabytes scanned, indicating significant I/O pressure from fact table scans."
+    ],
+    "cost_spine": ["TableScan (CATALOG_SALES)", "InnerJoin", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "repeated scan due to correlated scalar subquery",
+        "evidence": "parts=54922/54922 bytes=923617475584 scanned twice in nodes [1.13] and [1.24]"
+      },
+      {
+        "op": "Filter on ITEM",
+        "why": "OR condition on different columns may block efficient pruning",
+        "evidence": "OR on i_manufact_id and i_manager_id in node [1.16], with small scan but potential for improved selectivity"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS paths (not applicable here)",
+      "avoid unfiltered large CTEs that could increase memory usage",
+      "do not wrap partition keys in functions to preserve micro-partition pruning",
+      "avoid same-column OR to UNION ALL splits unless evidence shows pruning issues"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery into 3 CTEs: shared scan of catalog_sales with date and item filters, per-key threshold CTE computing 1.3 * avg(cs_ext_discount_amt), and main query joining with threshold CTE to filter cs_ext_discount_amt > threshold.",
+      "dag_target_hint": "Change final_select to reference CTEs for threshold computation and eliminate correlated subquery.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_date between '1998-01-06' and cast('1998-01-06' as date) + interval '90 day'", "i_manufact_id in (47, 226, 612, 676, 818) or i_manager_id between 71 and 100", "cs_ext_discount_amt > computed_threshold"],
+        "output_must_preserve": ["sum(cs_ext_discount_amt) as excess discount amount", "ORDER BY sum(cs_ext_discount_amt) and LIMIT 100 behavior"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "Eliminate one TableScan on CATALOG_SALES, reduce aggregate nodes, and change join shape to use pre-computed threshold CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "rank_rationale": "Targets primary hotspot — correlated subquery drives repeated fact table scan with high evidence and gold example support.",
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR condition on ITEM into UNION ALL branches: one branch for i_manufact_id IN (47, 226, 612, 676, 818) and another for i_manager_id BETWEEN 71 and 100, ensuring join compatibility with catalog_sales.",
+      "dag_target_hint": "Modify ITEM filter in final_select or within a CTE to use UNION ALL over separate predicate branches.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_item_sk = cs_item_sk for join integrity"],
+        "output_must_preserve": ["i_item_sk as join key and all original column references"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS", "G_SF_FILTER_FUNCTION_WRAP:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "OR condition on different columns may block efficient micro-partition pruning in Snowflake; splitting into UNION ALL could enable better predicate pushdown and reduce scanned bytes.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Change ITEM scan to multiple branches in explain plan, potentially reducing filtered rows and improving join efficiency.",
+      "recommended_patch_ops": ["replace_where_predicate", "insert_union_all"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — targets secondary hotspot on dimension filter that may improve selectivity propagation.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit INNER JOIN syntax with ON clauses: FROM catalog_sales INNER JOIN item ON i_item_sk = cs_item_sk INNER JOIN date_dim ON d_date_sk = cs_sold_date_sk.",
+      "dag_target_hint": "Change final_select FROM clause to use explicit JOIN ... ON ... syntax while preserving all conditions.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_date between '1998-01-06' and cast('1998-01-06' as date) + interval '90 day'", "i_manufact_id in (47, 226, 612, 676, 818) or i_manager_id between 71 and 100", "cs_ext_discount_amt > subquery threshold"],
+        "output_must_preserve": ["all original output columns, aliases, and order/limit semantics"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS", "G_SF_JOINFILTER_PRESERVE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax might provide better hints to Snowflake's cost-based optimizer for join ordering or filter pushdown, though native support is robust.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Minimal change in explain plan, but potential for improved join strategy or predicate placement.",
+      "recommended_patch_ops": ["replace_from"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — low-risk probe to test if explicit join syntax affects plan generation in Snowflake.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate main query and subquery scans into a single CTE that computes both the sum for filtering and the average threshold in one pass using conditional aggregates (e.g., CASE expressions).",
+      "dag_target_hint": "Create a CTE that scans catalog_sales once with aggregates for both cs_ext_discount_amt sum and avg, then join with dimensions.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "date_dim", "item"],
+        "where_must_preserve": ["date and item filters as in original query"],
+        "output_must_preserve": ["cs_ext_discount_amt values, computed thresholds, and final sum semantics"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:avg preserved", "G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single scan with CASE aggregates could reduce I/O by avoiding repeated table access, though decorrelation may be more effective.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Reduce number of TableScan nodes on CATALOG_SALES to one and consolidate aggregate work.",
+      "recommended_patch_ops": ["insert_cte", "replace_aggregate"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — alternative approach to eliminate repeated scans using conditional aggregation, targeting the primary hotspot with a different mechanism.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregates are already pushed down in the current plan (e.g., node [1.7] aggregates catalog_sales by cs_item_sk before joins)."
+    },
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Filters on dimension tables (date_dim and item) are already applied early in the plan, with small scan volumes."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "Similar to sf_inline_decorrelate, preferring the native transform with higher confidence and gold example support."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "No evidence of predicate transitivity failure; date filters are already joined via d_date_sk with join filters in plan."
+    }
+  ]
+}

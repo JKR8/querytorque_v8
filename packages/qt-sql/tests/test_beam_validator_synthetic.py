@@ -1428,3 +1428,328 @@ class TestDSB76SyntheticDatasetReadiness:
         assert result["opt_success"] is True, result
         assert result["match"] is True, result
         assert result["orig_rows"] > 0, result
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Predicate-context type inference
+# ---------------------------------------------------------------------------
+
+class TestPredicateContextTypeInference:
+    """Verify that predicate context (BETWEEN with CAST-DATE, col+INTERVAL, col=DATE)
+    overrides name-based heuristic type inference."""
+
+    def test_between_cast_date_overrides_decimal(self):
+        """Column used in BETWEEN with CAST(... AS DATE) bounds must be typed DATE."""
+        from qt_sql.validation.synthetic_validator import SchemaExtractor, SyntheticValidator
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+        SELECT t.amount
+        FROM transactions t
+        JOIN calendar c ON t.txn_date = c.cal_date
+        WHERE c.cal_date BETWEEN CAST('2020-01-01' AS DATE) AND CAST('2020-12-31' AS DATE)
+        """
+        extractor = SchemaExtractor(sql)
+        tables = extractor.extract_tables()
+        v._predicate_type_hints.clear()
+        v._extract_filter_values(sql, tables)
+        assert ("calendar", "cal_date") in v._predicate_type_hints
+        assert v._predicate_type_hints[("calendar", "cal_date")] == "DATE"
+
+    def test_col_plus_interval_gets_date_hint(self):
+        """Column in arithmetic with INTERVAL must be inferred as DATE."""
+        from qt_sql.validation.synthetic_validator import SchemaExtractor, SyntheticValidator
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+        SELECT *
+        FROM orders o
+        WHERE o.order_date + INTERVAL '30' DAY > CAST('2021-06-01' AS DATE)
+        """
+        extractor = SchemaExtractor(sql)
+        tables = extractor.extract_tables()
+        v._predicate_type_hints.clear()
+        v._extract_filter_values(sql, tables)
+        assert ("orders", "order_date") in v._predicate_type_hints
+        assert v._predicate_type_hints[("orders", "order_date")] == "DATE"
+
+    def test_eq_cast_date_gets_hint(self):
+        """col = CAST('...' AS DATE) should produce a DATE type hint."""
+        from qt_sql.validation.synthetic_validator import SchemaExtractor, SyntheticValidator
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+        SELECT * FROM events e
+        WHERE e.event_dt = CAST('2022-03-15' AS DATE)
+        """
+        extractor = SchemaExtractor(sql)
+        tables = extractor.extract_tables()
+        v._predicate_type_hints.clear()
+        v._extract_filter_values(sql, tables)
+        assert ("events", "event_dt") in v._predicate_type_hints
+        assert v._predicate_type_hints[("events", "event_dt")] == "DATE"
+
+    def test_type_override_applied_in_validate(self, tmp_path):
+        """Full validate() flow should apply predicate type override to tables dict."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = (
+            "SELECT dd.d_date, COUNT(*)\n"
+            "FROM date_dim dd\n"
+            "WHERE dd.d_date BETWEEN CAST('2000-01-01' AS DATE) AND CAST('2000-12-31' AS DATE)\n"
+            "GROUP BY dd.d_date"
+        )
+        sql_file = tmp_path / "date_test.sql"
+        sql_file.write_text(sql, encoding="utf-8")
+        result = v.validate(str(sql_file), target_rows=10)
+        assert result["success"] is True, result
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Generic (non-TPC-DS) schema tests
+# ---------------------------------------------------------------------------
+
+class TestGenericSchemas:
+    """Verify the engine works on non-TPC-DS schemas — e-commerce, SaaS, etc."""
+
+    def test_ecommerce_schema_validates(self, tmp_path):
+        """Simple e-commerce query with customers, orders, products tables."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        sql = (
+            "SELECT c.customer_name, COUNT(o.order_id) AS order_count\n"
+            "FROM customers c\n"
+            "JOIN orders o ON c.customer_id = o.customer_id\n"
+            "WHERE o.order_date >= CAST('2023-01-01' AS DATE)\n"
+            "GROUP BY c.customer_name\n"
+            "HAVING COUNT(o.order_id) > 1"
+        )
+        sql_file = tmp_path / "ecommerce.sql"
+        sql_file.write_text(sql, encoding="utf-8")
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        result = v.validate(str(sql_file), target_rows=10)
+        assert result["success"] is True, result
+
+    def test_saas_analytics_schema(self, tmp_path):
+        """SaaS analytics query with subscriptions and usage tables."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        sql = (
+            "SELECT s.plan_type, SUM(u.call_count) AS total_calls\n"
+            "FROM subscriptions s\n"
+            "JOIN usage_logs u ON s.subscription_id = u.subscription_id\n"
+            "WHERE u.log_date BETWEEN CAST('2024-01-01' AS DATE) AND CAST('2024-06-30' AS DATE)\n"
+            "GROUP BY s.plan_type"
+        )
+        sql_file = tmp_path / "saas.sql"
+        sql_file.write_text(sql, encoding="utf-8")
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        result = v.validate(str(sql_file), target_rows=10)
+        assert result["success"] is True, result
+
+    def test_temporal_dimension_detection(self):
+        """_is_temporal_dimension correctly identifies temporal dims by column inspection."""
+        from qt_sql.validation.synthetic_validator import _is_temporal_dimension
+        # Classic date_dim
+        assert _is_temporal_dimension("date_dim", {
+            "d_date_sk": {"type": "INTEGER"},
+            "d_date": {"type": "DATE"},
+            "d_year": {"type": "INTEGER"},
+            "d_month": {"type": "INTEGER"},
+        })
+        # Generic calendar table
+        assert _is_temporal_dimension("calendar", {
+            "cal_id": {"type": "INTEGER"},
+            "cal_date": {"type": "DATE"},
+            "cal_year": {"type": "INTEGER"},
+            "cal_month": {"type": "INTEGER"},
+            "cal_quarter": {"type": "INTEGER"},
+        })
+        # Non-temporal table
+        assert not _is_temporal_dimension("products", {
+            "product_id": {"type": "INTEGER"},
+            "product_name": {"type": "VARCHAR(100)"},
+            "price": {"type": "DECIMAL(18,2)"},
+        })
+
+    def test_validate_sql_pair_generic_schema(self):
+        """validate_sql_pair works on non-TPC-DS schemas."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        original = (
+            "SELECT c.city, COUNT(*) AS cnt\n"
+            "FROM stores s JOIN cities c ON s.city_id = c.city_id\n"
+            "GROUP BY c.city"
+        )
+        optimized = (
+            "SELECT c.city, COUNT(*) AS cnt\n"
+            "FROM stores s JOIN cities c ON s.city_id = c.city_id\n"
+            "GROUP BY c.city"
+        )
+        result = v.validate_sql_pair(original_sql=original, optimized_sql=optimized)
+        assert result["match"] is True, result
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Multi-Row Witness Generation
+# ---------------------------------------------------------------------------
+
+class TestMultiRowWitness:
+    """Verify multi-row witness generation detects equivalence issues."""
+
+    def test_multi_witness_passes_identical_queries(self):
+        """Identical queries should pass all witness variants."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = (
+            "SELECT p.product_name, COUNT(*) AS cnt\n"
+            "FROM products p JOIN sales s ON p.product_id = s.product_id\n"
+            "GROUP BY p.product_name"
+        )
+        result = v.validate_sql_pair(
+            original_sql=sql,
+            optimized_sql=sql,
+            witness_mode="multi",
+        )
+        assert result["match"] is True, result
+        assert "witness_results" in result
+        for wr in result["witness_results"]:
+            assert wr["match"] is True, wr
+
+    def test_multi_witness_single_mode_no_witnesses(self):
+        """In single mode, no witness_results key should be present."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = (
+            "SELECT p.product_name, COUNT(*) AS cnt\n"
+            "FROM products p JOIN sales s ON p.product_id = s.product_id\n"
+            "GROUP BY p.product_name"
+        )
+        result = v.validate_sql_pair(
+            original_sql=sql,
+            optimized_sql=sql,
+            witness_mode="single",
+        )
+        assert result["match"] is True, result
+        assert "witness_results" not in result
+
+    def test_clone_witness_shifts_keys(self):
+        """Clone witness should shift surrogate keys while preserving data."""
+        import duckdb
+        from qt_sql.validation.witness_generator import MultiRowWitnessGenerator
+
+        conn = duckdb.connect(":memory:")
+        tables = {
+            "items": {
+                "columns": {
+                    "item_id": {"type": "INTEGER"},
+                    "item_name": {"type": "VARCHAR(50)"},
+                }
+            }
+        }
+        conn.execute('CREATE TABLE items (item_id INTEGER, item_name VARCHAR(50))')
+        conn.execute("INSERT INTO items VALUES (1, 'foo'), (2, 'bar')")
+
+        gen = MultiRowWitnessGenerator(
+            conn=conn,
+            tables=tables,
+            filter_values={},
+            fk_relationships={},
+            generation_order=["items"],
+            table_row_counts={"items": 10},
+        )
+        # Run clone witness populate
+        gen._populate_clone_witness()
+        rows = conn.execute("SELECT item_id FROM items ORDER BY item_id").fetchall()
+        # All item_ids should be >= 10001 (shifted by +10000)
+        assert all(r[0] >= 10001 for r in rows), f"Expected shifted keys, got {rows}"
+        conn.close()
+
+    def test_witness_generator_import(self):
+        """MultiRowWitnessGenerator is importable from validation package."""
+        from qt_sql.validation import MultiRowWitnessGenerator
+        assert MultiRowWitnessGenerator is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Determinism & Regression Tests
+# ---------------------------------------------------------------------------
+
+class TestDeterminismInvariants:
+    """Verify that same SQL + same config produces identical synthetic data."""
+
+    def test_validate_pair_deterministic(self):
+        """Two calls to validate_sql_pair with same input produce same result."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        sql = (
+            "SELECT c.city_name, SUM(o.total_amount) AS revenue\n"
+            "FROM customers c JOIN orders o ON c.customer_id = o.customer_id\n"
+            "GROUP BY c.city_name"
+        )
+        v1 = SyntheticValidator(reference_db=None, dialect="duckdb")
+        r1 = v1.validate_sql_pair(original_sql=sql, optimized_sql=sql, target_rows=50)
+        v2 = SyntheticValidator(reference_db=None, dialect="duckdb")
+        r2 = v2.validate_sql_pair(original_sql=sql, optimized_sql=sql, target_rows=50)
+        assert r1["match"] == r2["match"]
+        assert r1["orig_rows"] == r2["orig_rows"]
+        assert r1["opt_rows"] == r2["opt_rows"]
+
+    def test_validate_file_deterministic(self, tmp_path):
+        """Two calls to validate() with same SQL file produce same row count."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+        sql = (
+            "SELECT p.product_name, COUNT(*) AS cnt\n"
+            "FROM products p JOIN sales s ON p.product_id = s.product_id\n"
+            "GROUP BY p.product_name"
+        )
+        sql_file = tmp_path / "determ.sql"
+        sql_file.write_text(sql, encoding="utf-8")
+        v1 = SyntheticValidator(reference_db=None, dialect="duckdb")
+        r1 = v1.validate(str(sql_file), target_rows=50)
+        v2 = SyntheticValidator(reference_db=None, dialect="duckdb")
+        r2 = v2.validate(str(sql_file), target_rows=50)
+        assert r1["success"] == r2["success"]
+        assert r1["actual_rows"] == r2["actual_rows"]
+
+
+class TestKnownBugRegressions:
+    """Regression tests for previously fixed bugs."""
+
+    def test_d_date_not_decimal(self):
+        """Regression: d_date must be DATE, not DECIMAL (name heuristic bug)."""
+        from qt_sql.validation.synthetic_validator import SchemaExtractor
+        sql = "SELECT d.d_date FROM date_dim d WHERE d.d_date = CAST('2000-01-01' AS DATE)"
+        extractor = SchemaExtractor(sql)
+        tables = extractor.extract_tables()
+        col_type = tables["date_dim"]["columns"]["d_date"]
+        if isinstance(col_type, dict):
+            col_type = col_type.get("type", "")
+        assert "DATE" in col_type.upper(), f"d_date should be DATE, got {col_type}"
+
+    def test_scope_aware_column_resolution(self):
+        """Regression: columns in subqueries resolve to correct scope."""
+        from qt_sql.validation.synthetic_validator import SchemaExtractor
+        sql = (
+            "SELECT a.order_id\n"
+            "FROM orders a\n"
+            "WHERE a.order_id IN (\n"
+            "  SELECT b.order_id FROM returns b WHERE b.return_qty > 0\n"
+            ")"
+        )
+        extractor = SchemaExtractor(sql)
+        tables = extractor.extract_tables()
+        # Both tables should be present
+        assert "orders" in tables
+        assert "returns" in tables
+        # return_qty belongs to returns, not orders
+        assert "return_qty" in tables["returns"]["columns"]
+
+    def test_multi_alias_tracking(self):
+        """Regression: same table with different aliases should be one schema entry."""
+        from qt_sql.validation.synthetic_validator import SchemaExtractor
+        sql = (
+            "SELECT a.item_id, b.item_id\n"
+            "FROM items a\n"
+            "JOIN items b ON a.item_id = b.item_id"
+        )
+        extractor = SchemaExtractor(sql)
+        tables = extractor.extract_tables()
+        # items should appear once, not duplicated as 'a' and 'b'
+        assert "items" in tables
+        assert "a" not in tables
+        assert "b" not in tables

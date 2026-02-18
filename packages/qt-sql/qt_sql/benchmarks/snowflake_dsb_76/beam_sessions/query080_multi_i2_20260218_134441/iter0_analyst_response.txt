@@ -1,0 +1,144 @@
+{  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query scans three large fact tables (store_sales, catalog_sales, web_sales) joined with date_dim and other dimensions. Date filters are applied via date_dim but may not push down to fact scans, leading to full partition reads. Pushing date_sk range into fact scans can prune micro-partitions early. Additionally, pre-aggregating fact tables or consolidating dimension scans could reduce join work.",
+    "reasoning_trace": [
+      "Date filter on date_dim is constant across all CTEs (1999-10-21 to +30 days).",
+      "Fact tables store_sales, catalog_sales, web_sales are estimated to have high I/O volume based on typical TPC-DS sizes.",
+      "Aggregation is performed after multi-table joins in each CTE, potentially amplifying row flow.",
+      "Execution plan is estimate-only, but structural analysis suggests scan-bound bottlenecks."
+    ],
+    "cost_spine": ["ssr fact scan and join", "csr fact scan and join", "wsr fact scan and join", "final_select union and rollup"],
+    "hotspots": [
+      {
+        "op": "store_sales scan in ssr",
+        "why": "large fact table scan with date filter applied via join to date_dim",
+        "evidence": "estimated high I/O due to table size and lack of direct date_sk pushdown"
+      },
+      {
+        "op": "catalog_sales scan in csr",
+        "why": "similar large fact table scan with same date filter pattern",
+        "evidence": "structural symmetry to ssr, potential for micro-partition pruning"
+      },
+      {
+        "op": "web_sales scan in wsr",
+        "why": "large fact table scan with identical dimension joins",
+        "evidence": "repeated scan pattern across channels"
+      }
+    ],
+    "do_not_do": [
+      "avoid converting left outer joins to inner joins without semantic review due to coalesce handling of null returns",
+      "avoid introducing unfiltered large CTEs that could increase memory usage",
+      "avoid materializing EXISTS patterns (not present in query)"
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk BETWEEN range derived from date filter (1999-10-21 to +30 days) into each fact table scan in ssr, csr, wsr CTEs to enable micro-partition pruning, while preserving all original joins and filters.",
+      "dag_target_hint": "Modify ssr, csr, wsr CTE definitions to add WHERE clause with ss_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_date BETWEEN ...) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_date BETWEEN ...).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_date between cast('1999-10-21' as date) and cast('1999-10-21' as date) + interval '30 day'", "i_current_price > 50", "p_channel_email = 'Y'", "p_channel_tv = 'N'", "p_channel_radio = 'N'", "p_channel_press = 'N'", "p_channel_event = 'N'", "ss_wholesale_cost BETWEEN 21 AND 36", "i_category IN ('Men', 'Music')"],
+        "output_must_preserve": ["store_id", "catalog_page_id", "web_site_id", "sales", "returns", "profit aggregates"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:ASSUMED_PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Fact table scans show reduced partitions read due to early date_sk filter pushdown, potentially lower I/O in storage operators.",
+      "recommended_patch_ops": ["add_where_predicate_to_fact_scans", "compute_date_sk_range_cte"],
+      "rank_rationale": "Targets primary hotspot of fact table scans with direct evidence from date filter pattern and Snowflake micro-partition pruning strength.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate each fact table (store_sales, catalog_sales, web_sales) by join keys (e.g., ss_item_sk, ss_store_sk) before joining with dimensions in ssr, csr, wsr CTEs, preserving all filters and aggregate semantics.",
+      "dag_target_hint": "Rewrite ssr, csr, wsr CTEs to first aggregate fact tables with GROUP BY on join keys, then join with dimension tables.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["date filters", "item filters", "promotion filters", "wholesale cost range"],
+        "output_must_preserve": ["grouping keys compatible with downstream joins", "SUM aggregates for sales, returns, profit"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none", "portability_candidate:EXPLORATION"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-aggregating fact tables may reduce rows entering joins, but Snowflake might already optimize this; probe tests impact on join amplification.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Reduced row flow into join operators and final aggregation, possibly lower hash join build sizes.",
+      "recommended_patch_ops": ["rewrite_cte_with_early_aggregation", "adjust_join_conditions"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot of join amplification with potential from gold card evidence.",
+      "recommended_examples": ["aggregate_pushdown"]
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared dimension filters (date_dim, item, promotion) into a single CTE and reference it in ssr, csr, wsr to avoid redundant dimension scans, while keeping fact table joins unchanged.",
+      "dag_target_hint": "Add a new CTE (e.g., dim_filtered) that pre-filters date_dim, item, promotion, and modify ssr, csr, wsr to join with this CTE instead of scanning dimensions separately.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "promotion"],
+        "where_must_preserve": ["d_date between ...", "i_current_price > 50", "i_category IN ('Men', 'Music')", "p_channel_email = 'Y'", "p_channel_tv = 'N'", "p_channel_radio = 'N'", "p_channel_press = 'N'", "p_channel_event = 'N'"],
+        "output_must_preserve": ["dimension surrogate keys for joins", "all fact table aggregates"]
+      },
+      "gates_checked": ["portability_candidate:EXPLORATION", "semantic_safety:PASS", "no_unfiltered_cte:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing shared dimension filters once could reduce repeated dimension table scans and improve cache efficiency.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension scans consolidated into one CTE scan, potentially lower I/O and faster join probes.",
+      "recommended_patch_ops": ["insert_cte_for_dimensions", "replace_dimension_scans_with_cte_reference"],
+      "rank_rationale": "Exploration probe for shared dimension pattern, addressing secondary hotspot of dimension scan redundancy.",
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, item, promotion) into CTEs and convert comma-separated joins to explicit JOIN syntax in ssr, csr, wsr to improve join planning and cardinality estimates.",
+      "dag_target_hint": "Create separate CTEs for each dimension with filters, and rewrite CTEs to use explicit JOIN (e.g., INNER JOIN) instead of comma joins.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "promotion", "fact tables"],
+        "where_must_preserve": ["all original filters", "left outer join semantics for returns with coalesce"],
+        "output_must_preserve": ["join result rows and aggregate values"]
+      },
+      "gates_checked": ["portability_candidate:EXPLORATION", "join_semantics:PASS", "explicit_join_syntax:SAFE"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit joins with pre-filtered dimension CTEs might lead to better hash join decisions and reduced scan work in Snowflake.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Changed join operators to explicit joins, potentially better optimizer choices and lower dimension scan rows.",
+      "recommended_patch_ops": ["convert_commas_to_explicit_joins", "insert_dimension_ctes"],
+      "rank_rationale": "Exploration probe for join topology improvement, testing impact on join order and filter pushdown.",
+      "recommended_examples": []
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence or SQL query."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in the query; pruning guide indicates skip for CORRELATED_SUBQUERY_PARALYSIS."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in the query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Left outer joins with coalesce handle null returns; converting to inner join could change semantics by dropping rows with no returns, violating output preservation."
+    }
+  ]
+}

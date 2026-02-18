@@ -49,6 +49,7 @@ class CandidateGenerator:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         analyze_fn: Optional[Callable[[str], str]] = None,
+        enable_reasoning: bool = None,
     ):
         """Initialize generator.
 
@@ -56,10 +57,12 @@ class CandidateGenerator:
             provider: LLM provider (anthropic, openai, deepseek, etc.)
             model: Model name to use
             analyze_fn: Optional custom LLM function (overrides provider/model)
+            enable_reasoning: Explicit reasoning mode control forwarded to LLM client.
         """
         self.provider = provider
         self.model = model
         self._analyze_fn = analyze_fn
+        self._enable_reasoning = enable_reasoning
         self._llm_client = None
 
     def _get_llm_client(self):
@@ -70,6 +73,7 @@ class CandidateGenerator:
                 self._llm_client = create_llm_client(
                     provider=self.provider,
                     model=self.model,
+                    enable_reasoning=self._enable_reasoning,
                 )
             except ImportError:
                 logger.warning("qt_shared.llm not available")

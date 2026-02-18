@@ -1,0 +1,255 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The largest I/O hotspot is a full scan of CATALOG_SALES (54721/54922 parts, 920GB) without date_sk predicate pushdown, missing micro-partition pruning. A secondary hotspot is CATALOG_RETURNS scan (4759/4759 parts, 82.5GB) also without date_sk pushdown. The plan shows a left join converted to inner join by filter, but explicit conversion may improve join ordering. Early dimension filtering and aggregation pushdown are exploration paths to reduce join input sizes.",
+    "reasoning_trace": [
+      "CATALOG_SALES scan dominates I/O (920GB) with no date_sk range predicate, indicating PREDICATE_TRANSITIVITY_FAILURE.",
+      "CATALOG_RETURNS scan is secondary (82.5GB) also without date_sk pushdown.",
+      "Left join to catalog_returns has filter cr_reason_sk=40, making it effectively inner; explicit conversion may help optimizer.",
+      "Aggregation occurs after joining with item and date_dim but before warehouse join, leaving room for pushdown exploration.",
+      "Dimension tables (warehouse, item, date_dim) are small and already pruned (parts=1/1 or 2/2)."
+    ],
+    "cost_spine": ["TableScan(CATALOG_SALES)", "TableScan(CATALOG_RETURNS)", "InnerJoin(cs↔cr)", "InnerJoin(item↔cs)", "InnerJoin(date_dim↔cs)", "Aggregate(before warehouse)", "Aggregate(after warehouse)", "SortWithLimit"],
+    "hotspots": [
+      {
+        "op": "TableScan(CATALOG_SALES)",
+        "why": "largest fact-table scan without date_sk pushdown",
+        "evidence": "parts=54721/54922 bytes=920184101376"
+      },
+      {
+        "op": "TableScan(CATALOG_RETURNS)",
+        "why": "secondary fact-table scan without date_sk pushdown",
+        "evidence": "parts=4759/4759 bytes=82532796416"
+      },
+      {
+        "op": "Aggregate(before warehouse)",
+        "why": "aggregation after item/date join but before warehouse join; could be pushed earlier",
+        "evidence": "group by [IFF(date_bucket), i_item_id, cs_warehouse_sk]"
+      }
+    ],
+    "do_not_do": [
+      "avoid wrapping date_sk or filter columns in functions to preserve micro-partition pruning",
+      "do not materialize EXISTS/IN subqueries (none present)",
+      "avoid unfiltered large CTEs"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk BETWEEN derived from date_dim filter into CATALOG_SALES and CATALOG_RETURNS scans via explicit join syntax to enable micro-partition pruning.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["catalog_sales cs", "date_dim d"],
+        "where_must_preserve": ["d.d_date between '2002-01-21' and '2002-03-22'", "cs.cs_sold_date_sk = d.d_date_sk", "cs.cs_wholesale_cost between 68 and 87"],
+        "output_must_preserve": ["all original output columns, group by keys, and case-when logic"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "TableScan(CATALOG_SALES) shows reduced partitions scanned; predicate appears as cs_sold_date_sk BETWEEN ...",
+      "recommended_patch_ops": ["add_date_sk_range_cte", "replace_join_condition", "modify_where_clause"],
+      "rank_rationale": "Primary hotspot coverage; direct micro-partition pruning opportunity.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert LEFT JOIN catalog_returns to INNER JOIN because WHERE cr_reason_sk=40 eliminates NULL rows, preserving semantics and potentially improving join order.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["catalog_sales cs", "catalog_returns cr"],
+        "where_must_preserve": ["cr.cr_reason_sk = 40", "cs.cs_item_sk = cr.cr_item_sk", "cs.cs_order_number = cr.cr_order_number"],
+        "output_must_preserve": ["coalesce(cr_refunded_cash,0) in case expressions and all output columns"]
+      },
+      "gates_checked": ["LEFT_JOIN_RIGHT_FILTER:PASS", "NULL_DEPENDENT_LOGIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Left Join becomes Inner Join in plan; join filter may be reordered.",
+      "recommended_patch_ops": ["replace_left_join_with_inner", "adjust_where_clause"],
+      "rank_rationale": "Secondary hotspot; join conversion may reduce build side and improve join ordering.",
+      "recommended_examples": ["inner_join_conversion"],
+      "gold_example_id": "inner_join_conversion"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales and catalog_returns by (cs_item_sk, cs_sold_date_sk, cs_warehouse_sk) before joining with item and date_dim, then join dimensions and aggregate by w_state and i_item_id.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["catalog_sales cs", "catalog_returns cr", "item i", "date_dim d"],
+        "where_must_preserve": ["i.i_category='Shoes'", "i.i_manager_id between 42 and 81", "d.d_date between '2002-01-21' and '2002-03-22'", "cr.cr_reason_sk=40"],
+        "output_must_preserve": ["sum(case when d_date < '2002-02-20' then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_before", "sum(case when d_date >= '2002-02-20' then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_after"]
+      },
+      "gates_checked": ["AGGREGATE_BELOW_JOIN_BLINDNESS:PASS", "agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregation after item/date join may be moved before those joins by grouping on foreign keys, reducing rows before dimension joins.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Aggregate node appears earlier in plan before joins with item and date_dim; join input rows reduced.",
+      "recommended_patch_ops": ["insert_cte_pre_aggregate", "replace_from_with_cte", "adjust_group_by_keys"],
+      "rank_rationale": "Exploration targeting secondary hotspot (aggregate placement); potential to reduce join input volume.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter dimension tables (item, date_dim, warehouse) into CTEs before joining with catalog_sales to reduce probe side of join.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["item i", "date_dim d", "warehouse w"],
+        "where_must_preserve": ["i.i_category='Shoes'", "i.i_manager_id between 42 and 81", "d.d_date between '2002-01-21' and '2002-03-22'", "cs.cs_wholesale_cost between 68 and 87"],
+        "output_must_preserve": ["all original join conditions and output columns"]
+      },
+      "gates_checked": ["CROSS_CTE_PREDICATE_BLINDNESS:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Dimension filters are selective; pre-filtering may reduce hash table size and improve join performance.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension scans become tiny CTE scans; join order may shift to start with filtered dimensions.",
+      "recommended_patch_ops": ["insert_cte_for_dimension", "replace_from_with_cte", "preserve_join_conditions"],
+      "rank_rationale": "Exploration for dimension filtering; small dimension tables but may improve join planning.",
+      "recommended_examples": ["early_filter"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create CTEs for filtered item, date_dim, and warehouse, then join them together before joining with catalog_sales to create a small composite dimension keyset.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["item i", "date_dim d", "warehouse w"],
+        "where_must_preserve": ["i.i_category='Shoes'", "i.i_manager_id between 42 and 81", "d.d_date between '2002-01-21' and '2002-03-22'"],
+        "output_must_preserve": ["all original join conditions and output columns"]
+      },
+      "gates_checked": ["CROSS_CTE_PREDICATE_BLINDNESS:PASS", "MAX_2_CHAINS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combining filtered dimensions into a single CTE may allow the optimizer to build a single small hash table for all dimension keys.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Multiple dimension scans replaced by a single CTE scan; join tree simplified.",
+      "recommended_patch_ops": ["insert_cte_combined_dimensions", "replace_from_with_cte", "preserve_join_conditions"],
+      "rank_rationale": "Exploration for multi-dimension prefetch; may improve join cardinality estimates.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Build a CTE chain: filter item, date_dim, warehouse; join them into a keyset; then join keyset with catalog_sales and catalog_returns.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["item i", "date_dim d", "warehouse w", "catalog_sales cs", "catalog_returns cr"],
+        "where_must_preserve": ["i.i_category='Shoes'", "i.i_manager_id between 42 and 81", "d.d_date between '2002-01-21' and '2002-03-22'", "cs.cs_wholesale_cost between 68 and 87", "cr.cr_reason_sk=40"],
+        "output_must_preserve": ["all original join conditions and output columns"]
+      },
+      "gates_checked": ["CROSS_CTE_PREDICATE_BLINDNESS:PASS", "MAX_2_CHAINS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged join pipeline may force a join order that reduces fact table rows early.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Fact table scan appears after dimension joins in plan; scan rows reduced.",
+      "recommended_patch_ops": ["insert_cte_staged_joins", "replace_from_with_cte_chain", "preserve_join_conditions"],
+      "rank_rationale": "Exploration for staged join pipeline; may reduce fact scan volume through early dimension filtering.",
+      "recommended_examples": ["prefetch_fact_join"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit JOIN syntax and isolate date_dim filter into a CTE to create a small hash table for date_sk join.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["date_dim d"],
+        "where_must_preserve": ["d.d_date between '2002-01-21' and '2002-03-22'"],
+        "output_must_preserve": ["all original join conditions and output columns"]
+      },
+      "gates_checked": ["COMMA_JOIN_WEAKNESS:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may improve join order flexibility; date_dim CTE may improve predicate pushdown.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Comma joins become explicit INNER JOINs; date_dim scan becomes a CTE scan.",
+      "recommended_patch_ops": ["insert_date_cte", "replace_comma_with_explicit_join", "preserve_join_conditions"],
+      "rank_rationale": "Exploration for explicit join syntax; Snowflake may already optimize, but CTE isolation could help.",
+      "recommended_examples": ["date_cte_explicit_join"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Isolate each dimension table (item, date_dim, warehouse) into separate CTEs with filters applied, then join with fact tables.",
+      "dag_target_hint": "final_select",
+      "node_contract": {
+        "from_must_include": ["item i", "date_dim d", "warehouse w"],
+        "where_must_preserve": ["i.i_category='Shoes'", "i.i_manager_id between 42 and 81", "d.d_date between '2002-01-21' and '2002-03-22'"],
+        "output_must_preserve": ["all original join conditions and output columns"]
+      },
+      "gates_checked": ["CROSS_CTE_PREDICATE_BLINDNESS:PASS", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Separate CTEs may allow Snowflake to materialize small dimension hash tables separately, improving join performance.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Dimension scans become separate CTE scans; join order may change.",
+      "recommended_patch_ops": ["insert_cte_for_each_dimension", "replace_from_with_ctes", "preserve_join_conditions"],
+      "rank_rationale": "Exploration for dimension isolation; similar to early_filter but with separate CTEs.",
+      "recommended_examples": ["dimension_cte_isolate"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "No UNION ALL in query; transform requires UNION ALL branches."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated subquery patterns in query."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "No self-join patterns in query."
+    }
+  ]
+}

@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a parallel nested‑loop join between store_returns and store_sales, driven by a small date_dim (d2) filter. The BETWEEN condition on d1 is a non‑equi join that cannot be pushed into the comma‑join graph, causing repeated index scans on store_sales (rows=1 each) but with high outer‑row amplification (37k loops). The Gather Merge shows severe cardinality mis‑estimation (est=1, act=82k), indicating the planner cannot model the join‑filter interaction.",
+    "reasoning_trace": [
+      "Primary hotspot: Nested Loop (rows=37529) joining d2→store_returns→store_sales, with 37k index‑only scans on store_sales.",
+      "Secondary hotspot: Gather Merge (rows=81513, time=17.4s) with massive under‑estimation (q‑error >80k).",
+      "Non‑equi join: d1.d_date BETWEEN (d2.d_date - interval '120 day') AND d2.d_date is applied late after the fact‑table join.",
+      "Comma‑join syntax prevents predicate push‑back across the date‑dimension aliases, leaving the BETWEEN as a post‑join filter."
+    ],
+    "cost_spine": ["Gather Merge", "Nested Loop (d2→store_returns→store_sales)", "Nested Loop (store)", "Nested Loop (d1)"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (d2→store_returns→store_sales)",
+        "why": "37k index‑only scans on store_sales, each row=1 but high loop count",
+        "evidence": "rows=37529, time=1536ms, inner Index Only Scan on store_sales rows=1 loops=37529"
+      },
+      {
+        "op": "Gather Merge",
+        "why": "Severe cardinality mis‑estimation (est=1, act=82k) and largest time contributor",
+        "evidence": "rows=81513, time=17449ms, q‑error >80k"
+      },
+      {
+        "op": "Nested Loop (d1)",
+        "why": "Non‑equi join applied late, after fact‑table join, causing repeated single‑row index scans",
+        "evidence": "rows=27171, time=5738ms, inner Index Scan on date_dim d1 rows=1 loops=27171"
+      }
+    ],
+    "do_not_do": [
+      "Do not split same‑column OR to UNION ALL (PostgreSQL BitmapOr is optimal).",
+      "Do not materialize EXISTS paths (no EXISTS in query).",
+      "Do not duplicate large CTE bodies (avoid CTE_MATERIALIZATION_FENCE risk).",
+      "Avoid transforms that break parallelism (Gather Merge is already parallel)."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Isolate d2 filter into a CTE, convert comma joins to explicit JOIN syntax, and push the d1 BETWEEN condition into the join with store_sales as a date_sk range.",
+      "dag_target_hint": "Replace final_select FROM clause with explicit JOINs and a d2 CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year=1999", "d2.d_moy=7", "ss_ticket_number=sr_ticket_number", "ss_item_sk=sr_item_sk", "ss_customer_sk=sr_customer_sk", "ss_store_sk=s_store_sk", "ss_sold_date_sk=d1.d_date_sk", "sr_returned_date_sk=d2.d_date_sk"],
+        "output_must_preserve": ["All original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Explicit JOINs allow predicate push‑back; d2 CTE becomes a tiny hash table; BETWEEN becomes a date_sk range join, reducing nested‑loop amplification.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: addresses comma‑join weakness and non‑equi join blindness directly.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered d2 and d1 date ranges into CTEs, then join store_sales and store_returns with explicit date_sk BETWEEN conditions before joining store.",
+      "dag_target_hint": "Create two CTEs for d2 and d1 date ranges, rewrite final_select to join fact tables with date_sk BETWEEN.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store"],
+        "where_must_preserve": ["d2.d_year=1999", "d2.d_moy=7", "ss_ticket_number=sr_ticket_number", "ss_item_sk=sr_item_sk", "ss_customer_sk=sr_customer_sk", "ss_store_sk=s_store_sk"],
+        "output_must_preserve": ["All original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Fact tables are filtered by date_sk range before joining, reducing rows entering the nested loops; d1 and d2 become tiny materialized CTEs.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Secondary hotspot: targets non‑equi join input blindness and reduces rows before the expensive nested loop.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Prefilter both date_dim aliases and store into CTEs, then join the fact tables with explicit JOIN syntax, pushing all dimension filters early.",
+      "dag_target_hint": "Create CTEs for d2, d1, and store, then join store_sales and store_returns with these pre‑filtered dimension keys.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns"],
+        "where_must_preserve": ["d2.d_year=1999", "d2.d_moy=7", "ss_ticket_number=sr_ticket_number", "ss_item_sk=sr_item_sk", "ss_customer_sk=sr_customer_sk", "ss_store_sk=s_store_sk"],
+        "output_must_preserve": ["All original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Multi‑dimension prefetch may compound selectivity and improve cardinality estimates for the Gather Merge.",
+      "confidence": 0.65,
+      "expected_explain_delta": "All dimension filters are applied before fact‑table joins, reducing input rows and improving parallel‑slice estimates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: tests whether prefetching all dimensions improves the Gather Merge cardinality estimation.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate store_sales and store_returns by store_sk and date keys before joining dimensions, computing the conditional sums in a later stage.",
+      "dag_target_hint": "Create a CTE that joins store_sales and store_returns, groups by store_sk, ss_sold_date_sk, sr_returned_date_sk, and computes the case expressions, then join with store and date dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns"],
+        "where_must_preserve": ["ss_ticket_number=sr_ticket_number", "ss_item_sk=sr_item_sk", "ss_customer_sk=sr_customer_sk"],
+        "output_must_preserve": ["All original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregation pushdown may reduce the row count before the nested loops, but the conditional sums depend on date dimensions, so partial pre‑aggregation is required.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Fact‑table rows are reduced by early grouping, lowering the loop count for the store and date dimension joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration: tests whether partial pre‑aggregation can reduce the amplification in the nested loops.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr is optimal for indexed OR."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated subquery in query; gap CORRELATED_SUBQUERY_PARALYSIS not present."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self‑join of the same table with different filters; date_dim aliases are joined with different predicates but not in a self‑join pattern."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subquery in query; gap CORRELATED_SUBQUERY_PARALYSIS not present."
+    }
+  ]
+}

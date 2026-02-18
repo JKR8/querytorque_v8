@@ -1,0 +1,163 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan's dominant hotspot is a Nested Loop (est=1,928, act=56K) with severe cardinality underestimation, likely caused by OR predicates on different columns (ss_sales_price, ss_net_profit) blocking efficient index usage. Secondary hotspots are large Hash Joins and Index Scans on store_sales and date_dim. The comma-join syntax may prevent optimal join reordering and predicate pushdown.",
+    "reasoning_trace": [
+      "Nested Loop shows worst q-error (est=1,928, act=56K) and consumes 2.5s, indicating a cardinality estimation failure.",
+      "OR predicates on ss_sales_price and ss_net_profit are on different columns; plan shows no BitmapOr, suggesting index usage is blocked.",
+      "Comma-join syntax present; PostgreSQL's optimizer may not reorder joins as effectively as explicit JOINs.",
+      "Large Hash Join (rows=6,265, time=2.3s) and Index Only Scan on store_sales (rows=461, time=18ms) are secondary bottlenecks."
+    ],
+    "cost_spine": ["Nested Loop", "Hash Join", "Index Only Scan on store_sales", "Index Only Scan on date_dim"],
+    "hotspots": [
+      {
+        "op": "Nested Loop",
+        "why": "Severe cardinality underestimation (est=1,928, act=56K) driving 2.5s runtime.",
+        "evidence": "rows=56045 time=2249.948ms, q-error direction=UNDER_EST"
+      },
+      {
+        "op": "Hash Join",
+        "why": "Large row flow (6,265 rows) before final filtering, consuming 2.3s.",
+        "evidence": "rows=6265 time=2258.724ms"
+      },
+      {
+        "op": "Index Only Scan on store_sales",
+        "why": "Fact table scan with 461 rows per date_dim row; total rows=56K.",
+        "evidence": "rows=461 time=18.387ms (per loop), loops=122"
+      }
+    ],
+    "do_not_do": [
+      "Do not split same-column OR predicates into UNION ALL (guardrail G_PG_OR_INDEX_PROTECTED).",
+      "Avoid duplicating heavy CTE bodies (guardrail G_PG_CTE_DUPLICATION_STOP).",
+      "Do not materialize EXISTS paths (guardrail G_PG_EXISTS_PROTECTED).",
+      "Avoid unfiltered large CTEs."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR conditions on different columns (ss_sales_price, ss_net_profit) into UNION ALL branches, each with focused predicates to enable index usage.",
+      "dag_target_hint": "Replace final_select WHERE clause with UNION ALL of three branches, preserving all joins and filters per branch.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["d_year=2001", "s_store_sk=ss_store_sk", "ss_sold_date_sk=d_date_sk", "ca_country='United States'", "all original OR branch predicates"],
+        "output_must_preserve": ["MIN(ss_quantity)", "MIN(ss_ext_sales_price)", "MIN(ss_ext_wholesale_cost) (twice)"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:PASS (OR on different columns)", "no_or_to_union:PASS", "multiplicity_guard_required:PASS (UNION ALL preserves rows)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "OR filter replaced with UNION ALL; each branch may use index scans on ss_sales_price or ss_net_profit, reducing nested loop rows.",
+      "recommended_patch_ops": ["replace_where_with_union", "ensure_union_branch_symmetry"],
+      "rank_rationale": "Targets primary hotspot — OR predicates likely cause cardinality misestimation and block index usage.",
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and isolate date_dim filter into a CTE to create a tiny hash table for better join planning.",
+      "dag_target_hint": "Wrap date_dim filter in a CTE, then rewrite final_select with explicit JOIN ON syntax.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["d_year=2001", "all original join predicates and filters"],
+        "output_must_preserve": ["All output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS (single fact table store_sales)", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Explicit JOINs enable better join reordering; date_dim CTE reduces build side of hash join.",
+      "recommended_patch_ops": ["insert_cte_date_filter", "replace_comma_with_explicit_join"],
+      "rank_rationale": "Addresses comma-join weakness and secondary hotspot; gold example shows 2.28x speedup.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter small dimension tables (store, household_demographics, customer_demographics, customer_address) into CTEs before joining with store_sales to reduce fact table probe rows.",
+      "dag_target_hint": "Create CTEs for each dimension with their respective filters, then join them with store_sales and date_dim.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["All original dimension filters (cd_marital_status, hd_dep_count, ca_state, etc.)", "d_year=2001"],
+        "output_must_preserve": ["All output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS (each dimension CTE used once)", "G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering dimensions may reduce rows entering the large Hash Join and Nested Loop, addressing secondary hotspots.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension CTEs become tiny hash tables; fact table joins see fewer rows, reducing Hash Join and Nested Loop work.",
+      "recommended_patch_ops": ["insert_cte_per_dimension", "replace_from_with_cte_joins"],
+      "rank_rationale": "Exploration — targets secondary hotspots via early filtering; previous attempt with similar transform failed, but this is a different shape.",
+      "recommended_examples": []
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered store_sales and date_dim join into a CTE to avoid repeated scans and improve cardinality estimates for downstream joins.",
+      "dag_target_hint": "Create a CTE for store_sales joined with date_dim and filtered by d_year=2001, then join with dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year=2001", "ss_sold_date_sk=d_date_sk"],
+        "output_must_preserve": ["ss_store_sk", "ss_hdemo_sk", "ss_cdemo_sk", "ss_addr_sk", "ss_sales_price", "ss_net_profit", "ss_quantity", "ss_ext_sales_price", "ss_ext_wholesale_cost"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS (CTE used once)", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the fact-date join may provide better statistics for the optimizer, improving join order and reducing nested loop misestimation.",
+      "confidence": 0.50,
+      "expected_explain_delta": "CTE materializes fact-date join, providing stable row count for downstream joins; may change join order and reduce nested loop rows.",
+      "recommended_patch_ops": ["insert_cte_fact_date", "replace_from_with_cte"],
+      "rank_rationale": "Exploration — addresses cardinality estimation issue in Nested Loop via materialization; family E is underrepresented.",
+      "recommended_examples": []
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Previous attempt with this transform failed; avoid repeating failed strategies."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN in query; transform not applicable."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY in query; transform not applicable."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT in query; transform not applicable."
+    }
+  ]
+}

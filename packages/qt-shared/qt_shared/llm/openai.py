@@ -16,7 +16,13 @@ class OpenAIClient:
     Also supports OpenAI-compatible APIs (OpenRouter, etc.) via base_url.
     """
 
-    def __init__(self, api_key: str, model: str = "gpt-4o", base_url: str = None):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4o",
+        base_url: str = None,
+        enable_reasoning: bool = None,
+    ):
         """Initialize OpenAI client.
 
         Args:
@@ -26,12 +32,17 @@ class OpenAIClient:
                 - gpt-4o-mini
                 - gpt-4-turbo
             base_url: Optional base URL for OpenAI-compatible APIs (e.g., OpenRouter)
+            enable_reasoning: Explicit reasoning mode control.
+                None = auto-detect from model name (current default).
+                True = force reasoning on.
+                False = force reasoning off.
         """
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
+        self.enable_reasoning = enable_reasoning
         self.last_usage: dict = {}
-        logger.info("Initialized OpenAIClient with model=%s, base_url=%s", model, base_url)
+        logger.info("Initialized OpenAIClient with model=%s, base_url=%s, reasoning=%s", model, base_url, enable_reasoning)
 
     def analyze(self, prompt: str) -> str:
         """Send prompt to OpenAI and return response."""
@@ -68,12 +79,19 @@ class OpenAIClient:
                 "timeout": timeout_s,
             }
 
-            # OpenRouter DeepSeek-V3.2 thinking mode:
-            # enable reasoning explicitly so analyst/sniper calls use the
-            # thinking path by default. Effort can be overridden via env.
-            model_l = (self.model or "").lower()
-            base_url_l = (self.base_url or "").lower()
-            if "openrouter.ai" in base_url_l and "deepseek/deepseek-v3.2" in model_l:
+            # Reasoning mode: explicit config flag > auto-detect from model name.
+            # enable_reasoning=True  → force on
+            # enable_reasoning=False → force off
+            # enable_reasoning=None  → auto-detect (deepseek-v3.2 on OpenRouter)
+            use_reasoning = self.enable_reasoning
+            if use_reasoning is None:
+                model_l = (self.model or "").lower()
+                base_url_l = (self.base_url or "").lower()
+                use_reasoning = (
+                    "openrouter.ai" in base_url_l
+                    and "deepseek/deepseek-v3.2" in model_l
+                )
+            if use_reasoning:
                 effort = os.environ.get("QT_OPENROUTER_REASONING_EFFORT", "high").strip().lower()
                 extra_body = {"reasoning": {"enabled": True}}
                 if effort in {"xhigh", "high", "medium", "low", "minimal", "none"}:

@@ -26,6 +26,7 @@ class FleetWSServer:
         initial_data: List[Dict[str, Any]],
         pause_event: Optional[threading.Event] = None,
         benchmark_dir: Optional[Path] = None,
+        run_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.event_bus = event_bus
         self.triage_gate = triage_gate
@@ -33,6 +34,7 @@ class FleetWSServer:
         self.html_path = html_path
         self.initial_data = initial_data
         self.benchmark_dir = benchmark_dir
+        self.run_context: Dict[str, Any] = dict(run_context or {})
         self.runtime_config: Dict[str, Any] = {}
         self._clients: List[Any] = []  # WebSocket connections
 
@@ -115,11 +117,25 @@ class FleetWSServer:
                 "type": "triage_data",
                 "data": {"queries": self.initial_data},
             })
+            if self.run_context:
+                await websocket.send_json({
+                    "type": "run_context",
+                    "data": dict(self.run_context),
+                })
             self.event_bus.emit(
                 EventType.EVENT_LOG,
                 scope="fleet",
                 target="Fleet",
-                msg=f"Sent triage_data payload ({len(self.initial_data)} queries).",
+                msg=(
+                    "Sent triage_data payload "
+                    f"({len(self.initial_data)} queries)"
+                    + (
+                        f" for {self.run_context.get('benchmark_name', '')}"
+                        if self.run_context
+                        else ""
+                    )
+                    + "."
+                ),
                 level="system",
             )
 
@@ -602,6 +618,7 @@ def run_server_in_thread(
     pause_event: Optional[threading.Event] = None,
     port: int = 8765,
     benchmark_dir: Optional[Path] = None,
+    run_context: Optional[Dict[str, Any]] = None,
 ) -> threading.Thread:
     """Launch the WebSocket server as a daemon thread. Returns the thread."""
     import uvicorn
@@ -613,6 +630,7 @@ def run_server_in_thread(
         initial_data=initial_data,
         pause_event=pause_event,
         benchmark_dir=benchmark_dir,
+        run_context=run_context,
     )
     app = server.get_app()
 

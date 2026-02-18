@@ -2132,11 +2132,15 @@ body {
     <span class="header-title">Fleet Command Centre</span>
   </div>
   <div class="header-meta">
-    <span>duckdb_tpcds</span>
+    <span id="header-benchmark-name">unknown_benchmark</span>
     <span>·</span>
-    <span>DuckDB</span>
+    <span id="header-engine-name">Unknown Engine</span>
     <span>·</span>
-    <span>20 queries</span>
+    <span id="header-query-count">0 queries</span>
+    <span>·</span>
+    <span id="header-run-id" style="font-family:var(--mono);color:var(--t3)">run: n/a</span>
+    <span>·</span>
+    <span id="header-mode" style="font-family:var(--mono);color:var(--t3)">mode: beam</span>
     <span>·</span>
     <span id="header-status-wrap">
       <span class="status-indicator triage" id="header-status">
@@ -2284,6 +2288,9 @@ body {
   <div class="actions">
     <button class="btn-primary" id="btn-approve" onclick="approveAndDeploy()">
       Approve &amp; Deploy
+    </button>
+    <button class="btn-secondary" id="btn-demo-run" onclick="runUiDemo()">
+      Run UI Demo
     </button>
     <button class="btn-secondary" onclick="exportPlan()">
       Export Plan
@@ -2483,6 +2490,15 @@ body {
     </div>
     <div class="config-body">
       <div class="config-grid">
+        <div class="cfg-field">
+          <label for="cfg-engine-profile">Engine Profile</label>
+          <select id="cfg-engine-profile" onchange="onEngineProfileChanged()">
+            <option value="duckdb">DuckDB</option>
+            <option value="postgresql">PostgreSQL</option>
+            <option value="snowflake">Snowflake</option>
+            <option value="databricks">Databricks</option>
+          </select>
+        </div>
         <div class="cfg-field">
           <label for="cfg-db-dsn">Database DSN / Path</label>
           <input id="cfg-db-dsn" type="text" placeholder="postgresql://user@host/db or /path/to.duckdb">
@@ -2794,7 +2810,9 @@ const QUERIES = (() => {
 })();
 
 const CONFIG_STORAGE_KEY = 'fleet_c2_run_config_v1';
+const ENGINE_PROFILES = ['duckdb', 'postgresql', 'snowflake', 'databricks'];
 const DEFAULT_RUN_CONFIG = {
+  engine_profile: 'duckdb',
   db_dsn: '',
   benchmark_dir: '',
   source_mode: 'local',
@@ -2803,22 +2821,72 @@ const DEFAULT_RUN_CONFIG = {
   git_branch: 'main',
   explain_policy: 'explain',
   use_blackboard_history: true,
+  engine_setups: {},
 };
+
+function defaultEngineSetups() {
+  const setups = {};
+  for (const engine of ENGINE_PROFILES) {
+    setups[engine] = {
+      db_dsn: '',
+      benchmark_dir: '',
+      explain_policy: 'explain',
+    };
+  }
+  return setups;
+}
+
+function normalizeRunConfig(input) {
+  const cfg = { ...DEFAULT_RUN_CONFIG, ...(input || {}) };
+  const profile = ENGINE_PROFILES.includes(cfg.engine_profile) ? cfg.engine_profile : 'duckdb';
+  const setups = defaultEngineSetups();
+  if (cfg.engine_setups && typeof cfg.engine_setups === 'object') {
+    for (const engine of ENGINE_PROFILES) {
+      const src = cfg.engine_setups[engine];
+      if (src && typeof src === 'object') {
+        setups[engine] = {
+          db_dsn: String(src.db_dsn || '').trim(),
+          benchmark_dir: String(src.benchmark_dir || '').trim(),
+          explain_policy: String(src.explain_policy || 'explain').trim() || 'explain',
+        };
+      }
+    }
+  }
+  // Backfill from legacy flat fields.
+  if (!setups[profile].db_dsn && cfg.db_dsn) setups[profile].db_dsn = String(cfg.db_dsn).trim();
+  if (!setups[profile].benchmark_dir && cfg.benchmark_dir) setups[profile].benchmark_dir = String(cfg.benchmark_dir).trim();
+  if (!setups[profile].explain_policy && cfg.explain_policy) setups[profile].explain_policy = String(cfg.explain_policy).trim();
+  return {
+    ...cfg,
+    engine_profile: profile,
+    engine_setups: setups,
+    db_dsn: setups[profile].db_dsn,
+    benchmark_dir: setups[profile].benchmark_dir,
+    explain_policy: setups[profile].explain_policy || 'explain',
+    use_blackboard_history: cfg.use_blackboard_history !== false,
+  };
+}
 
 function loadRunConfig() {
   try {
     const raw = localStorage.getItem(CONFIG_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_RUN_CONFIG };
+    if (!raw) return normalizeRunConfig(DEFAULT_RUN_CONFIG);
     const parsed = JSON.parse(raw);
-    const merged = { ...DEFAULT_RUN_CONFIG, ...(parsed || {}) };
-    merged.use_blackboard_history = merged.use_blackboard_history !== false;
-    return merged;
+    return normalizeRunConfig(parsed);
   } catch (e) {
-    return { ...DEFAULT_RUN_CONFIG };
+    return normalizeRunConfig(DEFAULT_RUN_CONFIG);
   }
 }
 
 let runConfig = loadRunConfig();
+let activeRunContext = {
+  run_id: '',
+  benchmark_name: '',
+  engine: '',
+  query_count: QUERIES.length,
+  mode_summary: 'beam',
+  fleet_concurrency: 4,
+};
 
 if (IS_DEMO) {
   const badge = document.getElementById('demo-badge');
@@ -2950,8 +3018,17 @@ function handleServerMessage(msg) {
   if (type === 'triage_data') {
     // Initial triage data (sent on WS connect)
     // QUERIES already populated from injected data
+    setRunContext({ query_count: QUERIES.length });
     renderTriageTable();
     updateTriageStats();
+  }
+
+  else if (type === 'run_context') {
+    setRunContext(data);
+    const bench = data.benchmark_name || 'benchmark';
+    const engine = titleCaseEngine(data.engine || runConfig.engine_profile);
+    const modeTxt = data.mode_summary ? ` · ${data.mode_summary}` : '';
+    addEvent('Fleet', `Connected to ${bench} (${engine}) run ${data.run_id || 'n/a'}${modeTxt}`, 'system');
   }
 
   else if (type === 'event_log') {
@@ -2987,14 +3064,17 @@ function handleServerMessage(msg) {
       if (wIdx >= 0 && !workerState.includes(qid)) {
         workerState[wIdx] = qid;
         workerTimers[wIdx] = 0;
-        apiCalls += 4;
         addEvent(`W${wIdx + 1}`, `Assigned ${qid}`, 'assign');
+      }
+      runningQueryIds.add(qid);
+      if (!Number.isFinite(Number(queryStartClockById[qid]))) {
+        queryStartClockById[qid] = clockSeconds;
       }
 
       const phase = data.phase ? String(data.phase) : '';
       if (phase && queryPhaseById[qid] !== phase) {
         queryPhaseById[qid] = phase;
-        addEvent(qid, `Phase: ${phase}`, 'system');
+        addEvent(qid, `Phase: ${humanizePhase(phase)}`, 'system');
       }
     }
     renderExecTable();
@@ -3012,12 +3092,17 @@ function handleServerMessage(msg) {
 
     const status = data.status || 'NEUTRAL';
     const speedupVal = Number(data.speedup);
+    const nApiCallsVal = Number(data.n_api_calls);
     completedSet[qid] = {
       status,
       speedup: Number.isFinite(speedupVal) ? speedupVal : 1.0,
       transform: data.transform || '',
       elapsed_s: clockSeconds,
     };
+    if (Number.isFinite(nApiCallsVal) && nApiCallsVal >= 0) {
+      queryApiCallsById[qid] = nApiCallsVal;
+      recomputeApiCallsFromBackend();
+    }
     appendResultEntry({
       query_id: qid,
       status,
@@ -3036,10 +3121,13 @@ function handleServerMessage(msg) {
       workerTimers[wIdx] = 0;
       addEvent(`W${wIdx + 1}`, `Freed (${qid} complete)`, 'system');
     }
+    runningQueryIds.delete(qid);
+    queryPhaseById[qid] = 'done';
 
     const speedTxt = Number.isFinite(speedupVal) ? ` ${speedupVal.toFixed(2)}x` : '';
     const transformTxt = data.transform ? ` (${data.transform})` : '';
-    addEvent(qid, `${status}${speedTxt}${transformTxt}`, String(status).toLowerCase());
+    const apiTxt = Number.isFinite(nApiCallsVal) && nApiCallsVal > 0 ? ` · ${Math.round(nApiCallsVal)} calls` : '';
+    addEvent(qid, `${status}${speedTxt}${transformTxt}${apiTxt}`, String(status).toLowerCase());
     renderExecTable();
     renderWorkers();
     renderQueue();
@@ -3076,8 +3164,13 @@ function handleServerMessage(msg) {
             source: 'fleet_done',
           });
         }
+        runningQueryIds.delete(r.query_id);
+        if (Number.isFinite(Number(r.n_api_calls)) && Number(r.n_api_calls) >= 0) {
+          queryApiCallsById[r.query_id] = Number(r.n_api_calls);
+        }
       }
     }
+    recomputeApiCallsFromBackend();
     updateResultsView();
     setTimeout(showDone, 500);
   }
@@ -3148,6 +3241,11 @@ let execSortDir = 1;
 let awaitingServerStart = false;
 let pendingApprovePlan = null;
 let queryPhaseById = {};
+let queryApiCallsById = {};
+let queryStartClockById = {};
+let runningQueryIds = new Set();
+let currentRunMode = 'live'; // live | demo
+let demoPlanById = {};
 
 // Execution state
 let execQueries = [];    // queries being executed (non-SKIP, non-excluded)
@@ -3182,6 +3280,68 @@ let editorSteps = [];
 
 // ── Helpers ─────────────────────────────────────────────────
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function titleCaseEngine(engine) {
+  const e = String(engine || '').trim().toLowerCase();
+  if (!e) return 'Unknown Engine';
+  if (e === 'postgres' || e === 'postgresql') return 'PostgreSQL';
+  if (e === 'duckdb') return 'DuckDB';
+  if (e === 'snowflake') return 'Snowflake';
+  if (e === 'databricks') return 'Databricks';
+  return e.charAt(0).toUpperCase() + e.slice(1);
+}
+
+function humanizePhase(phase) {
+  const p = String(phase || '').trim().toLowerCase();
+  if (!p) return 'running';
+  if (p === 'analyst') return 'analyst';
+  if (p === 'workers') return 'worker fanout';
+  if (p === 'benchmark') return 'validation/benchmark';
+  if (p === 'snipe') return 'compiler/snipe';
+  if (p === 'starting') return 'starting';
+  if (p === 'done') return 'done';
+  if (p === 'error') return 'error';
+  return p;
+}
+
+function applyRunContextToHeader() {
+  const benchmarkEl = document.getElementById('header-benchmark-name');
+  const engineEl = document.getElementById('header-engine-name');
+  const countEl = document.getElementById('header-query-count');
+  const runIdEl = document.getElementById('header-run-id');
+  const modeEl = document.getElementById('header-mode');
+  if (benchmarkEl) benchmarkEl.textContent = activeRunContext.benchmark_name || 'unknown_benchmark';
+  if (engineEl) engineEl.textContent = titleCaseEngine(activeRunContext.engine || runConfig.engine_profile);
+  const qCount = Number(activeRunContext.query_count || 0) || QUERIES.length;
+  if (countEl) countEl.textContent = `${qCount} quer${qCount === 1 ? 'y' : 'ies'}`;
+  if (runIdEl) runIdEl.textContent = `run: ${activeRunContext.run_id || 'n/a'}`;
+  if (modeEl) modeEl.textContent = `mode: ${activeRunContext.mode_summary || 'beam'}`;
+}
+
+function setRunContext(ctx) {
+  if (!ctx || typeof ctx !== 'object') return;
+  const benchmarkRaw = String(ctx.benchmark_name || activeRunContext.benchmark_name || '');
+  const benchmarkParts = benchmarkRaw.split(/[\\/]/).filter(Boolean);
+  const benchmarkName = benchmarkParts.length ? benchmarkParts[benchmarkParts.length - 1] : benchmarkRaw;
+  activeRunContext = {
+    ...activeRunContext,
+    run_id: String(ctx.run_id || activeRunContext.run_id || ''),
+    benchmark_name: benchmarkName,
+    engine: String(ctx.engine || activeRunContext.engine || ''),
+    query_count: Number(ctx.query_count || activeRunContext.query_count || QUERIES.length) || QUERIES.length,
+    mode_summary: String(ctx.mode_summary || activeRunContext.mode_summary || 'beam'),
+    fleet_concurrency: Number(ctx.fleet_concurrency || activeRunContext.fleet_concurrency || 4) || 4,
+  };
+  applyRunContextToHeader();
+}
+
+function recomputeApiCallsFromBackend() {
+  if (!isLiveBackendMode()) return;
+  apiCalls = Object.values(queryApiCallsById).reduce((sum, val) => {
+    const n = Number(val);
+    return sum + (Number.isFinite(n) ? n : 0);
+  }, 0);
+}
 
 function fmtMs(ms) {
   if (ms < 0) return '--';
@@ -3706,13 +3866,18 @@ function renderExecTable() {
 
   let rows = execQueries.map(q => {
     const r = completedSet[q.id];
+    const isRunning = runningQueryIds.has(q.id);
     const wIdx = workerState.indexOf(q.id);
+    const startClock = Number(queryStartClockById[q.id]);
+    const elapsedClock = Number.isFinite(startClock)
+      ? Math.max(0, clockSeconds - startClock)
+      : (wIdx >= 0 ? workerTimers[wIdx] : null);
     return {
       ...q,
-      exec_status: r ? r.status : (wIdx >= 0 ? 'RUNNING' : 'QUEUED'),
+      exec_status: r ? r.status : (isRunning ? 'RUNNING' : 'QUEUED'),
       exec_speedup: r ? r.speedup : null,
-      exec_phase: r ? 'Done' : (wIdx >= 0 ? phases[Math.floor(Math.random() * 4)] : '--'),
-      exec_elapsed: r ? r.elapsed_s : (wIdx >= 0 ? workerTimers[wIdx] : null),
+      exec_phase: r ? 'done' : (queryPhaseById[q.id] || (isRunning ? 'starting' : '--')),
+      exec_elapsed: r ? r.elapsed_s : (isRunning ? elapsedClock : null),
       worker_id: wIdx >= 0 ? wIdx + 1 : null,
     };
   });
@@ -3720,8 +3885,8 @@ function renderExecTable() {
   // Stable phase assignment
   rows.forEach(r => {
     if (r.exec_status === 'RUNNING') {
-      if (!r._phase) r._phase = phases[Math.min(Math.floor((r.exec_elapsed || 0) / 8), 3)];
-      r.exec_phase = r._phase;
+      const tracked = queryPhaseById[r.id];
+      if (tracked) r.exec_phase = tracked;
     }
   });
 
@@ -3748,8 +3913,8 @@ function renderExecTable() {
     const isOpen = openDetails.has(r.id);
 
     const phaseText = r.exec_status === 'RUNNING'
-      ? phases[Math.min(Math.floor((r.exec_elapsed || 0) / 8), 3)]
-      : (r.exec_status === 'QUEUED' ? '--' : 'Done');
+      ? humanizePhase(r.exec_phase)
+      : (r.exec_status === 'QUEUED' ? '--' : 'done');
 
     tr.innerHTML = `
       <td class="mono" style="font-weight:500;cursor:pointer" onclick="toggleDetail('${r.id}')"><span class="detail-toggle ${isOpen ? 'open' : ''}">\u25B6</span> ${esc(r.id)}</td>
@@ -3787,7 +3952,7 @@ function renderWorkers() {
     if (qid) {
       card.className = 'worker-card active';
       dot.className = 'status-dot green pulse';
-      const phase = phases[Math.min(Math.floor(workerTimers[i] / 8), 3)];
+      const phase = humanizePhase(queryPhaseById[qid] || 'starting');
       info.innerHTML = `<span class="query-ref">${esc(qid)}</span> <span class="phase-ref">${phase}</span>`;
       time.textContent = fmtTime(workerTimers[i]);
     } else {
@@ -3805,7 +3970,7 @@ function renderQueue() {
   list.innerHTML = '';
 
   // Derive pending queue from actual state: queries not completed and not on a worker
-  const activeSet = new Set(workerState.filter(Boolean));
+  const activeSet = new Set(Array.from(runningQueryIds));
   const pending = execQueries
     .filter(q => !completedSet[q.id] && !activeSet.has(q.id))
     .map(q => q.id);
@@ -3839,9 +4004,9 @@ function renderQueue() {
 function updateExecStats() {
   const done = Object.keys(completedSet).length;
   const total = execQueries.length;
-  const active = workerState.filter(w => w !== null).length;
+  const active = runningQueryIds.size;
   // Compute queued from actual state: total minus completed minus active
-  const queued = total - done - active;
+  const queued = Math.max(0, total - done - active);
   const wins = Object.values(completedSet).filter(r => r.status === 'WIN').length;
   const improved = Object.values(completedSet).filter(r => r.status === 'IMPROVED').length;
   const neutral = Object.values(completedSet).filter(r => r.status === 'NEUTRAL').length;
@@ -3895,12 +4060,16 @@ function summarizeInboundMessage(msg) {
     const count = Array.isArray(data.queries) ? data.queries.length : 0;
     return `Received triage_data (${count} queries).`;
   }
+  if (type === 'run_context') {
+    return `run_context ${data.benchmark_name || '?'} engine=${data.engine || '?'} run=${data.run_id || '?'}`;
+  }
   if (type === 'query_update') {
     return `query_update ${data.query_id || '?'} phase=${data.phase || data.status || 'unknown'}`;
   }
   if (type === 'query_complete') {
     const speedTxt = Number.isFinite(Number(data.speedup)) ? ` ${Number(data.speedup).toFixed(2)}x` : '';
-    return `query_complete ${data.query_id || '?'} status=${data.status || '?'}${speedTxt}`;
+    const callsTxt = Number.isFinite(Number(data.n_api_calls)) ? ` calls=${Number(data.n_api_calls)}` : '';
+    return `query_complete ${data.query_id || '?'} status=${data.status || '?'}${speedTxt}${callsTxt}`;
   }
   if (type === 'event_log') {
     return `${data.scope || 'fleet'} event: ${data.target || 'system'} ${data.msg || ''}`.trim();
@@ -3984,6 +4153,7 @@ function sanitizeBackendPayload(payload) {
     return {
       type: 'config_update',
       config: {
+        engine_profile: cfg.engine_profile || '',
         source_mode: cfg.source_mode || 'local',
         benchmark_dir: cfg.benchmark_dir || '',
         local_path: cfg.local_path || '',
@@ -4001,6 +4171,7 @@ function sanitizeBackendPayload(payload) {
       type: 'test_connection',
       target: payload.target || '',
       config: {
+        engine_profile: cfg.engine_profile || '',
         source_mode: cfg.source_mode || 'local',
         benchmark_dir: cfg.benchmark_dir || '',
         local_path: cfg.local_path || '',
@@ -4157,16 +4328,65 @@ function setConfigTestPending(target, pending) {
 }
 
 function collectConfigFromForm() {
+  const engineProfile = (document.getElementById('cfg-engine-profile').value || 'duckdb').trim();
+  const dbDsn = (document.getElementById('cfg-db-dsn').value || '').trim();
+  const benchmarkDir = (document.getElementById('cfg-benchmark-dir').value || '').trim();
+  const explainPolicy = (document.getElementById('cfg-explain-policy').value || 'explain').trim();
+  const setups = defaultEngineSetups();
+  if (runConfig.engine_setups && typeof runConfig.engine_setups === 'object') {
+    for (const engine of ENGINE_PROFILES) {
+      const src = runConfig.engine_setups[engine];
+      if (src && typeof src === 'object') {
+        setups[engine] = {
+          db_dsn: String(src.db_dsn || '').trim(),
+          benchmark_dir: String(src.benchmark_dir || '').trim(),
+          explain_policy: String(src.explain_policy || 'explain').trim() || 'explain',
+        };
+      }
+    }
+  }
+  setups[engineProfile] = {
+    db_dsn: dbDsn,
+    benchmark_dir: benchmarkDir,
+    explain_policy: explainPolicy,
+  };
   return {
-    db_dsn: (document.getElementById('cfg-db-dsn').value || '').trim(),
-    benchmark_dir: (document.getElementById('cfg-benchmark-dir').value || '').trim(),
+    engine_profile: engineProfile,
+    engine_setups: setups,
+    db_dsn: dbDsn,
+    benchmark_dir: benchmarkDir,
     source_mode: (document.getElementById('cfg-source-mode').value || 'local').trim(),
     local_path: (document.getElementById('cfg-local-path').value || '').trim(),
     git_url: (document.getElementById('cfg-git-url').value || '').trim(),
     git_branch: (document.getElementById('cfg-git-branch').value || 'main').trim(),
-    explain_policy: (document.getElementById('cfg-explain-policy').value || 'explain').trim(),
+    explain_policy: explainPolicy,
     use_blackboard_history: !!(document.getElementById('cfg-use-blackboard').checked),
   };
+}
+
+function applyEngineProfileToForm(profileKey) {
+  const engine = ENGINE_PROFILES.includes(profileKey) ? profileKey : 'duckdb';
+  const setups = (runConfig && runConfig.engine_setups) || {};
+  const setup = setups[engine] || {};
+  document.getElementById('cfg-db-dsn').value = setup.db_dsn || '';
+  document.getElementById('cfg-benchmark-dir').value = setup.benchmark_dir || '';
+  document.getElementById('cfg-explain-policy').value = setup.explain_policy || runConfig.explain_policy || 'explain';
+}
+
+function onEngineProfileChanged() {
+  const selected = (document.getElementById('cfg-engine-profile').value || 'duckdb').trim();
+  // Persist edits from previous profile before switching.
+  const prior = runConfig.engine_profile || 'duckdb';
+  if (!runConfig.engine_setups || typeof runConfig.engine_setups !== 'object') {
+    runConfig.engine_setups = defaultEngineSetups();
+  }
+  runConfig.engine_setups[prior] = {
+    db_dsn: (document.getElementById('cfg-db-dsn').value || '').trim(),
+    benchmark_dir: (document.getElementById('cfg-benchmark-dir').value || '').trim(),
+    explain_policy: (document.getElementById('cfg-explain-policy').value || 'explain').trim(),
+  };
+  runConfig.engine_profile = selected;
+  applyEngineProfileToForm(selected);
 }
 
 function toggleConfigSourceMode() {
@@ -4177,13 +4397,13 @@ function toggleConfigSourceMode() {
 
 function openConfigModal() {
   const modal = document.getElementById('config-modal');
-  document.getElementById('cfg-db-dsn').value = runConfig.db_dsn || '';
-  document.getElementById('cfg-benchmark-dir').value = runConfig.benchmark_dir || '';
+  runConfig = normalizeRunConfig(runConfig);
+  document.getElementById('cfg-engine-profile').value = runConfig.engine_profile || 'duckdb';
+  applyEngineProfileToForm(runConfig.engine_profile || 'duckdb');
   document.getElementById('cfg-source-mode').value = runConfig.source_mode || 'local';
   document.getElementById('cfg-local-path').value = runConfig.local_path || '';
   document.getElementById('cfg-git-url').value = runConfig.git_url || '';
   document.getElementById('cfg-git-branch').value = runConfig.git_branch || 'main';
-  document.getElementById('cfg-explain-policy').value = runConfig.explain_policy || 'explain';
   document.getElementById('cfg-use-blackboard').checked = runConfig.use_blackboard_history !== false;
   setConfigTestPending('db', false);
   setConfigTestPending('llm', false);
@@ -4224,7 +4444,7 @@ function testConfigConnection(target) {
 }
 
 function saveConfigSettings() {
-  runConfig = collectConfigFromForm();
+  runConfig = normalizeRunConfig(collectConfigFromForm());
 
   try {
     localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(runConfig));
@@ -4288,8 +4508,43 @@ function sendWsMessage(payload, source = 'fleet') {
 
 // ── Simulation Engine ───────────────────────────────────────
 function approveAndDeploy() {
+  approveAndDeployWithMode('auto');
+}
+
+function runUiDemo() {
+  approveAndDeployWithMode('demo');
+}
+
+function buildDemoPlan(queries) {
+  // Deterministic status coverage for UI verification.
+  const statuses = ['WIN', 'IMPROVED', 'NEUTRAL', 'REGRESSION', 'ERROR'];
+  const speedMap = {
+    WIN: 1.62,
+    IMPROVED: 1.13,
+    NEUTRAL: 1.00,
+    REGRESSION: 0.86,
+    ERROR: null,
+  };
+  const plan = {};
+  for (let i = 0; i < queries.length; i++) {
+    const q = queries[i];
+    const status = statuses[i % statuses.length];
+    const speedup = speedMap[status];
+    plan[q.id] = {
+      status,
+      speedup,
+      transform: q.transform || q.out_transform || '',
+    };
+  }
+  return plan;
+}
+
+function approveAndDeployWithMode(mode = 'auto') {
   // Build execution list
   execQueries = QUERIES.filter(q => q.bucket !== 'SKIP' && !excludedIds.has(q.id));
+  const runLive = isLiveBackendMode() && mode !== 'demo';
+  currentRunMode = runLive ? 'live' : 'demo';
+  demoPlanById = currentRunMode === 'demo' ? buildDemoPlan(execQueries) : {};
   // Lock execution/results numbers to exactly what user saw in triage.
   const triageSavingsEl = document.getElementById('triage-savings');
   const triageWorkloadEl = document.getElementById('triage-workload-cost');
@@ -4317,6 +4572,9 @@ function approveAndDeploy() {
   workerTimers = [0, 0, 0, 0];
   clockSeconds = 0;
   apiCalls = 0;
+  queryApiCallsById = {};
+  queryStartClockById = {};
+  runningQueryIds = new Set();
   isPaused = false;
   eventEntries = [];
   resultEntries = [];
@@ -4325,6 +4583,10 @@ function approveAndDeploy() {
   pendingApprovePlan = null;
   pendingConfigSync = null;
 
+  const fleetWorkers = Math.max(
+    1,
+    Number(activeRunContext.fleet_concurrency || workerState.length) || workerState.length,
+  );
   const planPayload = {
     excluded: Array.from(excludedIds),
     overrides: execQueries.map(q => ({ id: q.id, iters: q.iters })),
@@ -4332,19 +4594,19 @@ function approveAndDeploy() {
   };
 
   clearBackendConsole(false);
-  pushBackendLog(`Run start requested (${execQueries.length} queries, 4 workers).`, {
+  pushBackendLog(`Run start requested (${execQueries.length} queries, ${fleetWorkers} workers).`, {
     level: 'system',
     lane: 'SYS',
     source: 'fleet',
     payload: {
       selected_queries: execQueries.length,
       excluded_queries: excludedIds.size,
-      mode: isLiveBackendMode() ? 'live' : 'demo',
+      mode: currentRunMode,
     },
   });
 
   // Send approval via WebSocket in live mode.
-  if (isLiveBackendMode()) {
+  if (runLive) {
     if (isWsReady()) {
       sendWsMessage({ type: 'approve', plan: planPayload }, 'fleet');
     } else {
@@ -4370,10 +4632,13 @@ function approveAndDeploy() {
 
   // Clear log
   document.getElementById('event-log').innerHTML = '';
-  addEvent('Fleet', `Started (${execQueries.length} queries, 4 workers)`, 'system');
-  if (isLiveBackendMode()) {
+  addEvent('Fleet', `Started (${execQueries.length} queries, ${fleetWorkers} workers)`, 'system');
+  if (runLive) {
     if (awaitingServerStart) addEvent('Fleet', 'WebSocket not ready. Approval queued; reconnecting...', 'system');
     else addEvent('Fleet', 'Approval sent to backend. Waiting for first worker assignment...', 'system');
+  } else {
+    addEvent('Fleet', 'UI demo run started (local simulation, backend untouched).', 'system');
+    setRunContext({ mode_summary: 'beam demo' });
   }
 
   // Start clock
@@ -4390,7 +4655,7 @@ function approveAndDeploy() {
   }, 1000);
 
   // Simulation: only run fake completions in demo mode.
-  if (!isLiveBackendMode()) {
+  if (!runLive) {
     for (let i = 0; i < 4; i++) assignWorker(i);
     scheduleNextCompletion();
   }
@@ -4403,15 +4668,22 @@ function approveAndDeploy() {
 
 function assignWorker(workerIdx) {
   if (queueOrder.length === 0) {
+    const prevQid = workerState[workerIdx];
+    if (prevQid) runningQueryIds.delete(prevQid);
     workerState[workerIdx] = null;
     workerTimers[workerIdx] = 0;
     return;
   }
 
   const qid = queueOrder.shift();
+  const prevQid = workerState[workerIdx];
+  if (prevQid) runningQueryIds.delete(prevQid);
   workerState[workerIdx] = qid;
   workerTimers[workerIdx] = 0;
   apiCalls += 4;
+  runningQueryIds.add(qid);
+  queryStartClockById[qid] = clockSeconds;
+  queryPhaseById[qid] = 'workers';
 
   addEvent(`W${workerIdx + 1}`, `Assigned ${qid}`, 'assign');
   renderQueue();
@@ -4425,31 +4697,41 @@ function completeQuery(workerIdx) {
   const q = QUERIES.find(q => q.id === qid);
   if (!q) return;
 
-  const status = q.outcome || 'NEUTRAL';
-  const speedup = q.speedup || 1.0;
+  const demoEntry = demoPlanById[qid] || null;
+  const status = demoEntry ? demoEntry.status : (q.outcome || 'NEUTRAL');
+  const speedup = demoEntry
+    ? (Number.isFinite(Number(demoEntry.speedup)) ? Number(demoEntry.speedup) : null)
+    : (q.speedup || 1.0);
   const elapsed = workerTimers[workerIdx];
+  queryPhaseById[qid] = 'done';
+  runningQueryIds.delete(qid);
+  const transformName = demoEntry ? (demoEntry.transform || '') : (q.out_transform || '');
 
   completedSet[qid] = {
     status,
-    speedup,
-    transform: q.out_transform,
+    speedup: Number.isFinite(Number(speedup)) ? Number(speedup) : 1.0,
+    transform: transformName,
     elapsed_s: elapsed,
   };
   appendResultEntry({
     query_id: qid,
     status,
-    speedup,
-    transform: q.out_transform || '',
+    speedup: Number.isFinite(Number(speedup)) ? Number(speedup) : null,
+    transform: transformName,
     source: 'simulation',
   });
 
   // Log event
   let msg = '';
-  if (status === 'WIN') msg = `WIN ${speedup.toFixed(2)}x (${q.out_transform})`;
-  else if (status === 'IMPROVED') msg = `IMPROVED ${speedup.toFixed(2)}x (${q.out_transform})`;
-  else if (status === 'NEUTRAL') msg = `NEUTRAL ${speedup.toFixed(2)}x`;
-  else if (status === 'REGRESSION') msg = `REGRESSION ${speedup.toFixed(2)}x`;
-  else msg = status;
+  if ((status === 'WIN' || status === 'IMPROVED') && Number.isFinite(Number(speedup))) {
+    msg = `${status} ${Number(speedup).toFixed(2)}x${transformName ? ` (${transformName})` : ''}`;
+  } else if ((status === 'NEUTRAL' || status === 'REGRESSION') && Number.isFinite(Number(speedup))) {
+    msg = `${status} ${Number(speedup).toFixed(2)}x`;
+  } else if (status === 'ERROR') {
+    msg = 'ERROR (simulated validation failure)';
+  } else {
+    msg = status;
+  }
 
   addEvent(qid, msg, status.toLowerCase());
   addEvent(`W${workerIdx + 1}`, `Freed`, 'system');
@@ -4485,6 +4767,12 @@ function scheduleNextCompletion() {
     for (const wi of busyWorkers) {
       if (workerTimers[wi] > workerTimers[pick]) pick = wi;
     }
+    const activeQid = workerState[pick];
+    if (activeQid && queryPhaseById[activeQid] !== 'benchmark') {
+      queryPhaseById[activeQid] = 'benchmark';
+      renderWorkers();
+      renderExecTable();
+    }
 
     completeQuery(pick);
   }, delay);
@@ -4498,13 +4786,17 @@ function togglePause() {
     btn.textContent = 'Resume';
     setHeaderStatus('paused');
     addEvent('Fleet', 'Paused', 'system');
-    sendWsMessage({ type: 'pause' }, 'fleet');
+    if (currentRunMode === 'live') {
+      sendWsMessage({ type: 'pause' }, 'fleet');
+    }
   } else {
     state = 'running';
     btn.textContent = 'Pause All';
     setHeaderStatus('running');
     addEvent('Fleet', 'Resumed', 'system');
-    sendWsMessage({ type: 'resume' }, 'fleet');
+    if (currentRunMode === 'live') {
+      sendWsMessage({ type: 'resume' }, 'fleet');
+    }
   }
 }
 
@@ -5319,6 +5611,13 @@ function editorResetRewrite() {
 }
 
 // ── Init ────────────────────────────────────────────────────
+setRunContext({
+  benchmark_name: runConfig.benchmark_dir || activeRunContext.benchmark_name || 'benchmark',
+  engine: runConfig.engine_profile || activeRunContext.engine || '',
+  query_count: QUERIES.length,
+  mode_summary: 'beam',
+  fleet_concurrency: 4,
+});
 renderTriageTable();
 updateTriageStats();
 populateEditorDropdown();

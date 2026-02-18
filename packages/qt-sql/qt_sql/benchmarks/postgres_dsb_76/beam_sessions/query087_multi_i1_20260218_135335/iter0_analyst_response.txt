@@ -1,0 +1,177 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three independent fact-table scans (store_sales, catalog_sales, web_sales) each perform nested loops with date_dim and customer, consuming ~9.4 seconds total. The EXCEPT set operation forces full distinct materialization of each branch, but the result is empty (0 rows). The plan uses comma joins, which may block predicate pushdown and optimal join ordering.",
+    "reasoning_trace": [
+      "Three parallel branches dominate runtime: store_sales (3730 ms), catalog_sales (3699 ms), web_sales (1961 ms).",
+      "Each branch uses nested loops: seq scan on date_dim (182 rows) → index scan on fact table → index scan on customer.",
+      "EXCEPT operation requires full distinct materialization of each branch, but final result is 0 rows.",
+      "Plan shows comma joins (implicit joins) which may limit optimizer's ability to reorder or push predicates.",
+      "No correlated subqueries, aggregates, or OR predicates present in the SQL."
+    ],
+    "cost_spine": ["SetOp", "Append", "Unique", "Gather Merge", "Sort", "Nested Loop", "Index Scan on store_sales/catalog_sales/web_sales", "Seq Scan on date_dim"],
+    "hotspots": [
+      {
+        "op": "Index Scan on store_sales",
+        "why": "largest fact table scan by time",
+        "evidence": "time=3730 ms, rows=0 (est mismatch)"
+      },
+      {
+        "op": "Index Scan on catalog_sales",
+        "why": "second largest fact table scan",
+        "evidence": "time=3699 ms, rows=0 (est mismatch)"
+      },
+      {
+        "op": "Index Scan on web_sales",
+        "why": "third fact table scan",
+        "evidence": "time=1961 ms, rows=0 (est mismatch)"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union transform (no OR predicate in query)",
+      "avoid decorrelation transforms (no correlated subqueries)",
+      "avoid shared_dimension_multi_channel and multi_dimension_prefetch (previous attempts failed)",
+      "avoid materialize_cte without proven reuse (previous attempts failed)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim rows into a CTE, then rewrite each branch with explicit INNER JOIN syntax (instead of comma joins) joining fact table to date_cte and customer.",
+      "dag_target_hint": "Replace final_select SQL with CTE for date_dim and explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1214 and 1214+11", "c_birth_year BETWEEN 1955 AND 1961", "list_price between 242 and 271", "wholesale_cost BETWEEN 35 AND 45"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "EXCEPT semantics unchanged"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins become explicit hash joins; date_dim scan appears once as a CTE; nested loops may shift to hash joins with smaller build side.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Targets primary hotspot (fact scans) by improving join planning and predicate pushdown via explicit joins and pre-filtered date dimension.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create two CTEs: one for filtered date_dim rows, one for filtered customer rows (c_birth_year). Then join each fact table to both CTEs with explicit INNER JOIN syntax.",
+      "dag_target_hint": "Replace final_select SQL with two dimension CTEs and explicit JOINs in each branch.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1214 and 1214+11", "c_birth_year BETWEEN 1955 AND 1961", "list_price between 242 and 271", "wholesale_cost BETWEEN 35 AND 45"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "EXCEPT semantics unchanged"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Both dimension tables become tiny hash tables; fact table scans probe two small CTEs; nested loops may convert to hash joins with even smaller build sides.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Extends p01 by also pre-filtering customer dimension, potentially further reducing fact table probe rows.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Rewrite EXCEPT operations using NOT EXISTS anti-joins, keeping DISTINCT only on the first branch and using correlated subqueries for the other two branches.",
+      "dag_target_hint": "Replace final_select SQL with a single SELECT DISTINCT from store_sales branch and two NOT EXISTS subqueries referencing catalog_sales and web_sales branches.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1214 and 1214+11", "c_birth_year BETWEEN 1955 AND 1961", "ss_list_price between 242 and 271", "ss_wholesale_cost BETWEEN 35 AND 45"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "EXCEPT semantics unchanged"]
+      },
+      "gates_checked": ["G_PG_EXISTS_PROTECTED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The EXCEPT forces full materialization of three large distinct sets, but the result is empty. Converting to NOT EXISTS may allow early-stop semi-join behavior and avoid computing full distinct sets for the second and third branches.",
+      "confidence": 0.60,
+      "expected_explain_delta": "SetOp and Append disappear; plan becomes a single branch with two anti-joins (likely Hash Anti Join or Nested Loop Anti Join).",
+      "recommended_patch_ops": ["replace_set_operation", "replace_where_predicate"],
+      "rank_rationale": "Exploration targeting set operation overhead; if NOT EXISTS can use efficient anti-joins, may avoid materializing catalog_sales and web_sales distinct sets.",
+      "recommended_examples": ["pg_intersect_to_exists"],
+      "gold_example_id": "pg_intersect_to_exists"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the common date_dim and customer filtered join into a CTE, then derive the three channel-specific fact joins from that CTE using UNION ALL to avoid repeated dimension scans.",
+      "dag_target_hint": "Replace final_select SQL with a CTE that joins date_dim and customer once, then left join each fact table separately, coalescing results.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1214 and 1214+11", "c_birth_year BETWEEN 1955 AND 1961", "list_price between 242 and 271", "wholesale_cost BETWEEN 35 AND 45"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "EXCEPT semantics unchanged"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The three branches scan date_dim and customer independently. Materializing the filtered dimension join once may reduce redundant work, though CTE materialization could introduce fencing.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Three separate date_dim and customer scans become one materialized CTE scan; fact table joins may become hash joins with the pre-joined dimension CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Exploration targeting repeated dimension scans; reuse may outweigh CTE materialization cost.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "Previous attempt failed (speedup 0.00x)."
+    },
+    {
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "reason": "Previous attempt failed (speedup 0.00x)."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "Previous attempts failed (speedup 0.00x)."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregation in query (only DISTINCT)."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Portability candidate for Snowflake; not native to PostgreSQL and no evidence of predicate transitivity failure."
+    }
+  ]
+}

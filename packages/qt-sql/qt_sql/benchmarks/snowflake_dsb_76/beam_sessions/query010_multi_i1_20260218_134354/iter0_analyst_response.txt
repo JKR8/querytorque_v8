@@ -1,0 +1,170 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Fact tables (store_sales, catalog_sales, web_sales) are scanned fully (1.25TB, 0.92TB, 0.46TB) because date filters on date_dim are not pushed down to fact scans, causing predicate transitivity failure. The OR condition between web_sales and catalog_sales is implemented with two LeftOuterJoins and a Filter, which may be suboptimal.",
+    "reasoning_trace": [
+      "STORE_SALES scan: parts=72718, bytes=1251924090880 (1.25TB) with no date_sk pruning.",
+      "CATALOG_SALES scan: parts=54922, bytes=923617475584 (0.92TB) with no date_sk pruning.",
+      "WEB_SALES scan: parts=27579, bytes=461041485824 (0.46TB) with no date_sk pruning.",
+      "OR condition implemented as LeftOuterJoin + LeftOuterJoin + Filter, not as UNION ALL or optimized semi-join."
+    ],
+    "cost_spine": ["TableScan (STORE_SALES)", "TableScan (CATALOG_SALES)", "TableScan (WEB_SALES)", "LeftOuterJoin", "LeftOuterJoin", "Filter"],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest fact scan without date_sk pushdown",
+        "evidence": "parts=72718, bytes=1251924090880"
+      },
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "second largest fact scan without date_sk pushdown",
+        "evidence": "parts=54922, bytes=923617475584"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "third largest fact scan without date_sk pushdown",
+        "evidence": "parts=27579, bytes=461041485824"
+      },
+      {
+        "op": "Filter (OR condition)",
+        "why": "OR of two EXISTS implemented as two LeftOuterJoins and Filter, may block optimization",
+        "evidence": "Node 1.27: Filter expr=(CATALOG_SALES.CS_SHIP_CUSTOMER_SK IS NOT NULL) OR (WEB_SALES.WS_BILL_CUSTOMER_SK IS NOT NULL)"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing EXISTS subqueries into broad CTEs (Snowflake guard G_SF_EXISTS_PROTECTED)",
+      "avoid wrapping date_sk column in functions (Snowflake guard G_SF_FILTER_FUNCTION_WRAP)",
+      "avoid destructive shape rewrites that remove effective join filters"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add date_sk BETWEEN derived from date_dim filter (d_year=1999, d_moy between 8 and 11) to each fact table (store_sales, catalog_sales, web_sales) in the WHERE clause, preserving existing join conditions.",
+      "dag_target_hint": "Modify final_select WHERE clause to add sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_year=1999 AND d_moy BETWEEN 8 AND 11) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_year=1999 AND d_moy BETWEEN 8 AND 11) for each fact table.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 1999", "d_moy between 8 and 11", "i_category in ('Children','Electronics','Music')", "i_manager_id between 66 and 75", "ss_sales_price/ss_list_price BETWEEN 0.2 AND 0.3", "ws_sales_price/ws_list_price BETWEEN 0.2 AND 0.3", "cs_sales_price/cs_list_price BETWEEN 0.2 AND 0.3"],
+        "output_must_preserve": ["All grouping columns and counts"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Fact table scans show reduced partitions (micro-partition pruning) and lower bytes scanned.",
+      "recommended_patch_ops": ["add_where_predicate", "derive_date_sk_range"],
+      "rank_rationale": "Targets primary hotspot — largest fact scans without date_sk pushdown.",
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Rewrite OR condition between web_sales and catalog_sales EXISTS as UNION ALL of two separate EXISTS subqueries, each with its own SELECT 1, wrapped in a single EXISTS.",
+      "dag_target_hint": "Replace the OR branch in final_select WHERE clause with EXISTS (SELECT 1 FROM web_sales ... UNION ALL SELECT 1 FROM catalog_sales ...).",
+      "node_contract": {
+        "from_must_include": ["web_sales", "catalog_sales", "date_dim", "item"],
+        "where_must_preserve": ["d_year = 1999", "d_moy between 8 and 11", "i_category in ('Children','Electronics','Music')", "i_manager_id between 66 and 75", "ws_sales_price/ws_list_price BETWEEN 0.2 AND 0.3", "cs_sales_price/cs_list_price BETWEEN 0.2 AND 0.3"],
+        "output_must_preserve": ["All grouping columns and counts"]
+      },
+      "gates_checked": ["G_SF_EXISTS_PROTECTED:PASS", "G_SF_UNION_BRANCH_LIMIT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "OR condition implemented as LeftOuterJoin+Filter may block semi-join optimization; UNION ALL inside EXISTS may enable better plan shape.",
+      "confidence": 0.55,
+      "expected_explain_delta": "LeftOuterJoin nodes replaced with a single SemiJoin over UnionAll, reducing join work.",
+      "recommended_patch_ops": ["replace_where_predicate", "wrap_union_all_in_exists"],
+      "rank_rationale": "Exploration — targets secondary hotspot (OR condition) with portability candidate transform.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Create a CTE for filtered date_dim (d_year=1999, d_moy between 8 and 11) and join it to each fact table (store_sales, catalog_sales, web_sales) to avoid repeated scans of date_dim.",
+      "dag_target_hint": "Insert CTE date_range AS (SELECT d_date_sk FROM date_dim WHERE d_year=1999 AND d_moy BETWEEN 8 AND 11) and replace each date_dim join with join to date_range CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["d_year = 1999", "d_moy between 8 and 11"],
+        "output_must_preserve": ["All grouping columns and counts"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_LOW_BASELINE_SKIP_HEAVY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Repeated date_dim scans (parts=1/1) are tiny, but CTE materialization may improve join planning and reduce redundant work.",
+      "confidence": 0.45,
+      "expected_explain_delta": "Multiple date_dim scans replaced with single CTE scan; join filters may propagate better.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — targets secondary dimension scans, underrepresented family A.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Extract shared dimension filters (date_dim, item) into CTEs, decorrelate EXISTS checks by pre-materializing customer keys from each fact table that satisfy filters, then join via UNION.",
+      "dag_target_hint": "Create CTEs for filtered date_dim, filtered item, and pre-aggregated fact keys; replace EXISTS subqueries with joins to pre-materialized key sets.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "store_sales", "web_sales", "catalog_sales"],
+        "where_must_preserve": ["d_year = 1999", "d_moy between 8 and 11", "i_category in ('Children','Electronics','Music')", "i_manager_id between 66 and 75", "price ratio filters"],
+        "output_must_preserve": ["All grouping columns and counts"]
+      },
+      "gates_checked": ["G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Correlated EXISTS already decorrelated by Snowflake, but pre-materializing keys may reduce repeated fact scans and improve join order.",
+      "confidence": 0.40,
+      "expected_explain_delta": "SemiJoin nodes replaced with inner joins to pre-materialized key CTEs; fact scans may consolidate.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — targets multiple EXISTS with shared filters, family B underrepresented.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in query; only EXISTS subqueries already decorrelated."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregation after large join that could be pushed down; aggregations are already near fact scans."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated subquery pattern that is not already optimized; fact scans are distinct."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN followed by WHERE filter on right table that eliminates NULLs."
+    }
+  ]
+}

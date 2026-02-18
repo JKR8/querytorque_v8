@@ -302,6 +302,7 @@ class ProbeSpec:
     phase: Optional[int] = None
     exploration: bool = False
     exploration_hypothesis: str = ""
+    rank_rationale: str = ""
 
 
 @dataclass
@@ -641,7 +642,7 @@ def build_beam_analyst_prompt(
         + dynamic_sections
     )
 
-# ── Beam Worker Prompt (qwen) ─────────────────────────────────────────────────
+# ── Beam Worker Prompt ────────────────────────────────────────────────────────
 
 def build_beam_worker_prompt(
     original_sql: str,
@@ -1057,6 +1058,7 @@ def parse_analyst_response(response: str) -> Optional[ScoutResult]:
                 ),
                 exploration=bool(p.get("exploration", False)),
                 exploration_hypothesis=str(p.get("exploration_hypothesis", "")),
+                rank_rationale=str(p.get("rank_rationale", "")),
             )
         )
 

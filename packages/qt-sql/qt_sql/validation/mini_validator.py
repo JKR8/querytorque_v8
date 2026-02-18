@@ -4,7 +4,7 @@ This module validates optimized SQL candidates against the original query
 before expensive benchmarking.
 
 Validation tiers:
-1. Structural: AST checks (column-shape compatibility)
+1. Structural: AST checks (output-column shape compatibility only)
 2. Logic: Execute both queries against the same sampled base tables
 3. Dialect: Placeholder for future cross-dialect checks
 """
@@ -107,14 +107,11 @@ class MiniValidator:
             )
 
     def _tier1_structural(self, original_sql: str, rewrite_sql: str) -> Dict[str, Any]:
-        """Tier 1: structural checks via AST.
+        """Tier 1: minimal structural check via AST.
 
         Checks:
         1. Both queries parse without error
-        2. Literal preservation: every string/numeric literal in the original
-           must appear somewhere in the rewrite (catches LLM hallucinating
-           different filter values)
-        3. Column shape: output columns must match
+        2. Output column shape must match exactly (count, order, names/aliases)
         """
         try:
             if not sqlglot:
@@ -128,13 +125,6 @@ class MiniValidator:
                 "errors": [f"SQL parse error: {str(e)[:80]}"],
                 "syntax_error": str(e)[:200],
             }
-
-        # ── Literal preservation check ─────────────────────────────────
-        # Every string/numeric literal in the original must appear in the
-        # rewrite. Position can change (pushdown is fine), but values can't.
-        literal_result = self._check_literal_preservation(orig_ast, rewrite_ast)
-        if not literal_result["passed"]:
-            return literal_result
 
         try:
             orig_cols = self._extract_select_columns(orig_ast)

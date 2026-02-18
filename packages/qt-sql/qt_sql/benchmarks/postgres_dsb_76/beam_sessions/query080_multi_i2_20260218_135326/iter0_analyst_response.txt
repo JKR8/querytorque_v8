@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three independent channel CTEs perform repeated scans of date_dim, promotion, and item with identical filters, missing shared dimension materialization. Comma-join syntax may block optimal join order and predicate pushdown, causing nested loops with index scans on large fact tables.",
+    "reasoning_trace": [
+      "Plan shows three parallel branches (ssr, csr, wsr) each scanning date_dim, promotion, item separately.",
+      "Each branch uses comma-join syntax; PostgreSQL's comma-join weakness may limit join reordering.",
+      "Fact table scans (store_sales, catalog_sales, web_sales) are index scans but nested loops with dimension filters may be suboptimal.",
+      "No correlated subqueries, set operations, or non-equi joins present."
+    ],
+    "cost_spine": ["Nested Loop", "Hash Join", "Nested Loop", "Index Scan on store_sales/catalog_sales/web_sales"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (store_sales branch)",
+        "why": "Repeated dimension scans and comma-join may cause suboptimal join order",
+        "evidence": "rows=5432 time=68.401ms"
+      },
+      {
+        "op": "Nested Loop (catalog_sales branch)",
+        "why": "Similar pattern, second largest time contributor",
+        "evidence": "rows=10428 time=101.979ms"
+      },
+      {
+        "op": "Nested Loop (web_sales branch)",
+        "why": "Third branch with same dimension scan pattern",
+        "evidence": "rows=9748 time=169.052ms"
+      }
+    ],
+    "do_not_do": [
+      "Avoid OR-to-UNION transforms (PostgreSQL uses BitmapOr for indexed OR)",
+      "Do not materialize EXISTS paths (none present)",
+      "Avoid duplicating heavy CTE bodies",
+      "Do not convert LEFT JOIN to INNER JOIN (returns logic requires LEFT)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create CTEs for shared selective dimensions (date_dim, promotion, item) with filters, then join explicitly with each fact table using explicit JOIN syntax.",
+      "dag_target_hint": "Replace comma joins in ssr, csr, wsr CTEs with explicit INNER JOINs on pre-filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "promotion", "item"],
+        "where_must_preserve": ["d_date between '1999-10-21' and '1999-10-21' + interval '30 day'", "i_current_price > 50", "i_category IN ('Men', 'Music')", "p_channel_email = 'Y'", "p_channel_tv = 'N'", "p_channel_radio = 'N'", "p_channel_press = 'N'", "p_channel_event = 'N'"],
+        "output_must_preserve": ["All original columns and aggregates per channel"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins become explicit hash joins; dimension scans reduce to one each; nested loops may become hash joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Primary hotspot: addresses comma-join weakness and repeated dimension scans across all three branches.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared dimension filters (date_dim, promotion, item) into a single CTE materialized once, referenced by all three channel CTEs.",
+      "dag_target_hint": "Add a shared_dim CTE before ssr/csr/wsr, then join each fact table to this CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "promotion", "item"],
+        "where_must_preserve": ["d_date between '1999-10-21' and '1999-10-21' + interval '30 day'", "i_current_price > 50", "i_category IN ('Men', 'Music')", "p_channel_email = 'Y'", "p_channel_tv = 'N'", "p_channel_radio = 'N'", "p_channel_press = 'N'", "p_channel_event = 'N'"],
+        "output_must_preserve": ["All dimension keys needed for joins"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing shared dimensions once may reduce total I/O and improve cache locality across channels.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Three separate dimension scans become one scan each; fact table joins probe a materialized CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: targets secondary hotspot of repeated dimension scans; family A underrepresented.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered fact+dimension result for each channel once, then compute aggregates and left join returns from the same materialization.",
+      "dag_target_hint": "Create a CTE for each channel that joins fact, date_dim, promotion, item, store/catalog_page/web_site, then left join returns and aggregate.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "promotion", "item", "store"],
+        "where_must_preserve": ["d_date between '1999-10-21' and '1999-10-21' + interval '30 day'", "i_current_price > 50", "i_category IN ('Men', 'Music')", "p_channel_email = 'Y'", "p_channel_tv = 'N'", "p_channel_radio = 'N'", "p_channel_press = 'N'", "p_channel_event = 'N'", "ss_wholesale_cost BETWEEN 21 AND 36"],
+        "output_must_preserve": ["All columns needed for returns join and aggregation"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Nested loops may flatten; single materialization per channel reduces repeated work.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Secondary hotspot: materialization may improve join planning and reduce repeated scans.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate each fact table by join key (item_sk, promo_sk, date_sk) before joining with dimensions, then join returns and compute final aggregates.",
+      "dag_target_hint": "Modify each channel CTE to first aggregate fact table by join keys and filtered columns, then join dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 21 AND 36"],
+        "output_must_preserve": ["Grouping keys compatible with dimension joins (item_sk, promo_sk, date_sk) and aggregated columns"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregating fact tables early may reduce rows flowing into joins, especially for large fact tables.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Fact table scan outputs fewer rows; downstream joins have smaller input.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: family C underrepresented; targets fact table scan volume reduction.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot; PostgreSQL uses BitmapOr for indexed OR."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in plan."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "LEFT JOINs are required for returns logic; converting to INNER would change semantics."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join predicates present."
+    }
+  ]
+}

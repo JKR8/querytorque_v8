@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # ── Paths ───────────────────────────────────────────────────────────
 SAMPLES_DIR = Path(__file__).resolve().parent
+ARCHIVE_SAMPLES_DIR = SAMPLES_DIR.parent / "archive" / "samples"
 QT_SQL_DIR = SAMPLES_DIR.parent.parent           # qt_sql/
 BENCHMARK_DIR = QT_SQL_DIR / "benchmarks" / "duckdb_tpcds"
 CONSTRAINTS_DIR = QT_SQL_DIR / "constraints"
@@ -33,7 +34,10 @@ PROJECT_ROOT = QT_SQL_DIR.parent.parent.parent    # QueryTorque_V8/
 
 def get_output_dir(version: str) -> Path:
     """Return versioned output directory, creating it if needed."""
-    d = SAMPLES_DIR / version
+    if str(version).strip().upper() == "V3":
+        d = SAMPLES_DIR / "V3"
+    else:
+        d = ARCHIVE_SAMPLES_DIR / version
     d.mkdir(parents=True, exist_ok=True)
     return d
 

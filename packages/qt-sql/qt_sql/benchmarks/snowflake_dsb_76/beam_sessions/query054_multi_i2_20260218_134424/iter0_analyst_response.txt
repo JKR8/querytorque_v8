@@ -1,0 +1,272 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 2,
+    "probe_count": 8,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows massive fact-table scans (STORE_SALES 1.2TB, CATALOG_SALES 920GB, WEB_SALES 461GB) without early date‑key range pushdown, causing full micro‑partition reads. Late filters on date_dim and item appear after union‑all branches, missing partition pruning. Multiple aggregations on the same fact tables suggest single‑pass consolidation opportunities.",
+    "reasoning_trace": [
+      "STORE_SALES scan is 1.2TB with no date_sk BETWEEN predicate; filter applied via JoinFilter after scan.",
+      "CATALOG_SALES and WEB_SALES scans are 1.4TB combined; date filter is on date_dim after union, not pushed into each branch.",
+      "Plan shows repeated aggregations on same fact keys (C_CUSTOMER_SK, SS_SOLD_DATE_SK) with similar filters.",
+      "Dimension tables (date_dim, item) are scanned multiple times with identical filters (d_moy=5, d_year=1998; i_category='Home', i_class='curtains/drapes')."
+    ],
+    "cost_spine": [
+      "TableScan (STORE_SALES)",
+      "TableScan (CATALOG_SALES)",
+      "TableScan (WEB_SALES)",
+      "UnionAll",
+      "Aggregate (group by C_CUSTOMER_SK)",
+      "InnerJoin (date_dim = fact tables)"
+    ],
+    "hotspots": [
+      {
+        "op": "TableScan (STORE_SALES)",
+        "why": "largest fact scan without date_sk range pushdown; filter applied late via JoinFilter",
+        "evidence": "parts=70412/72718 bytes=1212628258304"
+      },
+      {
+        "op": "TableScan (CATALOG_SALES)",
+        "why": "second‑largest fact scan; date filter not pushed into branch",
+        "evidence": "parts=54721/54922 bytes=920184101376"
+      },
+      {
+        "op": "TableScan (WEB_SALES)",
+        "why": "third‑largest fact scan; same missing date‑key pushdown",
+        "evidence": "parts=27574/27579 bytes=460956759040"
+      },
+      {
+        "op": "Aggregate (group by C_CUSTOMER_SK)",
+        "why": "multiple aggregation stages on same keys; could be consolidated into single pass",
+        "evidence": "nodes 3.3, 3.4, 3.8, 3.10, 3.14, 3.16, 3.17, 3.19, 3.21, 3.24, 3.26, 3.29"
+      }
+    ],
+    "do_not_do": [
+      "do not materialize EXISTS/NOT EXISTS into broad CTE branches (Snowflake already optimizes semi‑joins)",
+      "do not wrap date_sk or sold_date_sk in functions; preserve micro‑partition pruning",
+      "do not split OR to UNION ALL without evidence of blocked index usage (no OR hotspot in plan)",
+      "do not introduce unfiltered large CTEs that increase scan volume"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk BETWEEN range derived from date_dim filter (d_moy=5, d_year=1998) into each UNION ALL branch of catalog_sales and web_sales in my_customers CTE.",
+      "dag_target_hint": "Modify my_customers CTE: add sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_moy=5 AND d_year=1998) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_moy=5 AND d_year=1998) to each branch filter.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["i_category = 'Home'", "i_class = 'curtains/drapes'", "c_birth_year BETWEEN 1942 AND 1955", "wholesale_cost BETWEEN 70 AND 100"],
+        "output_must_preserve": ["distinct c_customer_sk, c_current_addr_sk"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "TableScan (CATALOG_SALES) and TableScan (WEB_SALES) show reduced parts scanned due to micro‑partition pruning.",
+      "recommended_patch_ops": ["add_predicate_to_union_branch", "add_cte_for_date_range"],
+      "recommended_examples": ["sf_sk_pushdown_union_all"],
+      "rank_rationale": "Targets secondary hotspot with highest I/O volume after store_sales; native Snowflake transform with strong evidence.",
+      "gold_example_id": "sf_sk_pushdown_union_all"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Push date_sk BETWEEN range derived from date_dim filter (d_month_seq between subqueries) into store_sales scan in my_revenue CTE.",
+      "dag_target_hint": "Modify my_revenue CTE: add ss_sold_date_sk BETWEEN (SELECT MIN(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN subquery1 AND subquery2) AND (SELECT MAX(d_date_sk) FROM date_dim WHERE d_month_seq BETWEEN subquery1 AND subquery2).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 70 AND 100", "s_state IN list", "ca_county = s_county", "ca_state = s_state"],
+        "output_must_preserve": ["c_customer_sk", "sum(ss_ext_sales_price) as revenue"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "TableScan (STORE_SALES) shows reduced parts scanned; JoinFilter on date_sk may disappear.",
+      "recommended_patch_ops": ["add_predicate_to_fact_scan", "add_cte_for_date_range"],
+      "recommended_examples": ["sf_sk_pushdown_3fact"],
+      "rank_rationale": "Targets primary hotspot (largest fact scan); native Snowflake transform with direct evidence.",
+      "gold_example_id": "sf_sk_pushdown_3fact"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate store_sales by ss_customer_sk, ss_sold_date_sk before joining with date_dim and other dimensions in my_revenue CTE.",
+      "dag_target_hint": "Replace store_sales scan in my_revenue with a CTE that groups by ss_customer_sk, ss_sold_date_sk and sums ss_ext_sales_price, preserving filters on ss_wholesale_cost.",
+      "node_contract": {
+        "from_must_include": ["store_sales"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 70 AND 100"],
+        "output_must_preserve": ["ss_customer_sk", "ss_sold_date_sk", "sum(ss_ext_sales_price) as revenue_agg"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Aggregate nodes 3.8, 3.4, 3.3 collapse into earlier grouping; rows into join reduce.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": ["aggregate_pushdown"],
+      "rank_rationale": "Targets aggregation hotspot; reduces rows flowing into multiple join and aggregate stages.",
+      "gold_example_id": "aggregate_pushdown"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate multiple aggregations on catalog_sales/web_sales in my_customers into a single CTE that computes distinct customer_sk, item_sk, sold_date_sk with all filters applied once.",
+      "dag_target_hint": "Replace the union‑all subquery in my_customers with a CTE that scans catalog_sales and web_sales once, applying date, item, and wholesale_cost filters, and outputs distinct customer_sk, item_sk, sold_date_sk.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_category = 'Home'", "i_class = 'curtains/drapes'", "d_moy = 5", "d_year = 1998", "wholesale_cost BETWEEN 70 AND 100"],
+        "output_must_preserve": ["distinct customer_sk, item_sk, sold_date_sk"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Multiple aggregation stages (nodes 3.19, 3.24, 3.29) on the same union‑all data suggest single‑pass consolidation could reduce repeated work.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Aggregate nodes 3.19, 3.24, 3.29 merge into one; union‑all branches scanned once.",
+      "recommended_patch_ops": ["insert_cte", "replace_subquery"],
+      "recommended_examples": ["single_pass_aggregation"],
+      "rank_rationale": "Exploration targeting repeated aggregation on union‑all; may reduce scan and aggregation overhead.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p05",
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "target": "Materialize filtered date_dim rows for d_moy=5, d_year=1998 into a CTE and reuse it in my_customers and my_revenue CTEs to avoid repeated scans.",
+      "dag_target_hint": "Create CTE filtered_date as SELECT d_date_sk, d_month_seq FROM date_dim WHERE d_moy=5 AND d_year=1998; reference it in both my_customers and my_revenue.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_moy = 5", "d_year = 1998"],
+        "output_must_preserve": ["d_date_sk", "d_month_seq"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS", "G_SF_FILTER_FUNCTION_WRAP:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Multiple date_dim scans with identical filters (nodes 1.5, 2.5, 3.7, 3.23) may be consolidated into a single materialized CTE, reducing repeated I/O.",
+      "confidence": 0.60,
+      "expected_explain_delta": "TableScan (DATE_DIM) nodes reduce from 4 to 1; CTE scan appears with small row count.",
+      "recommended_patch_ops": ["insert_cte", "replace_table_references"],
+      "recommended_examples": ["date_cte_isolate"],
+      "rank_rationale": "Exploration targeting repeated dimension scans; portability candidate with plausible benefit.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p06",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the my_customers CTE to avoid recomputation of its complex union‑all and joins when referenced in my_revenue.",
+      "dag_target_hint": "Add MATERIALIZED keyword to my_customers CTE definition (or ensure Snowflake materializes it) to compute once.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "item", "date_dim", "customer"],
+        "where_must_preserve": ["i_category = 'Home'", "i_class = 'curtains/drapes'", "d_moy = 5", "d_year = 1998", "wholesale_cost BETWEEN 70 AND 100", "c_birth_year BETWEEN 1942 AND 1955"],
+        "output_must_preserve": ["c_customer_sk", "c_current_addr_sk"]
+      },
+      "gates_checked": ["G_SF_CTE_REUSE_RULE:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "my_customers is referenced once, but its subplan is complex; materializing may allow better join ordering or reduce repeated sub‑plan execution.",
+      "confidence": 0.55,
+      "expected_explain_delta": "my_customers sub‑tree appears as a separate materialized node; may change join order in my_revenue.",
+      "recommended_patch_ops": ["add_materialized_keyword"],
+      "recommended_examples": ["materialize_cte"],
+      "rank_rationale": "Exploration targeting CTE materialization; low risk, may improve plan shape.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p07",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma‑separated joins in my_customers and my_revenue to explicit INNER JOIN syntax to improve optimizer join‑order flexibility.",
+      "dag_target_hint": "Rewrite my_customers FROM clause as item JOIN (catalog_sales UNION ALL web_sales) ON item_sk = i_item_sk JOIN date_dim ON sold_date_sk = d_date_sk JOIN customer ON customer_sk = c_customer_sk.",
+      "node_contract": {
+        "from_must_include": ["item", "catalog_sales", "web_sales", "date_dim", "customer"],
+        "where_must_preserve": ["i_category = 'Home'", "i_class = 'curtains/drapes'", "d_moy = 5", "d_year = 1998", "wholesale_cost BETWEEN 70 AND 100", "c_birth_year BETWEEN 1942 AND 1955"],
+        "output_must_preserve": ["c_customer_sk", "c_current_addr_sk"]
+      },
+      "gates_checked": ["join_multiplicity_safe:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit JOIN syntax may help Snowflake's cost‑based join reorderer choose better order, especially with filtered dimensions.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Join order may change; join filters may become regular join predicates.",
+      "recommended_patch_ops": ["replace_comma_joins_with_inner_join"],
+      "recommended_examples": ["inner_join_conversion"],
+      "rank_rationale": "Exploration targeting join topology; low confidence but safe.",
+      "gold_example_id": "inner_join_conversion"
+    },
+    {
+      "probe_id": "p08",
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "target": "Consolidate catalog_sales and web_sales scans into a single scan with a channel discriminator column, then aggregate with conditional sums per channel.",
+      "dag_target_hint": "Replace union‑all in my_customers with a single CTE that uses CASE WHEN source='catalog' THEN cs_wholesale_cost ELSE ws_wholesale_cost END, etc., and group by customer_sk, item_sk, sold_date_sk, channel.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales"],
+        "where_must_preserve": ["wholesale_cost BETWEEN 70 AND 100"],
+        "output_must_preserve": ["customer_sk", "item_sk", "sold_date_sk"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Union‑all of two large fact tables may be transformed into a single scan with channel‑aware aggregation, reducing scan overhead.",
+      "confidence": 0.45,
+      "expected_explain_delta": "UnionAll node disappears; single TableScan with extra projection; aggregate nodes adjust.",
+      "recommended_patch_ops": ["insert_cte", "replace_union_with_case"],
+      "recommended_examples": ["channel_bitmap_aggregation"],
+      "rank_rationale": "Exploration targeting union‑all consolidation; high risk but high reward if scan reduction occurs.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries; date range subqueries are already decorrelated in plan."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subqueries requiring decorrelation."
+    },
+    {
+      "transform_id": "rollup_to_union_windowing",
+      "family": "D",
+      "reason": "No GROUP BY ROLLUP in query."
+    },
+    {
+      "transform_id": "union_cte_split",
+      "family": "D",
+      "reason": "No repeated scans of same CTE with different filters."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Engine is Snowflake, not PostgreSQL; transform is engine‑specific."
+    }
+  ]
+}

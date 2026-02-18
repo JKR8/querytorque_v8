@@ -1,0 +1,155 @@
+{
+  "dispatch": {
+    "dialect": "snowflake",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The execution plan shows repeated full scans of the large WEB_SALES table due to a correlated scalar subquery, leading to high I/O cost. Decorrelating the subquery should eliminate per-row rescans, and additional pushdown of date key ranges may improve micro-partition pruning.",
+    "reasoning_trace": [
+      "Correlated scalar aggregate subquery on ws_ext_discount_amt causes inner query to execute per outer row, evident in plan nodes [1.3]-[1.5] and [1.14]-[1.24].",
+      "WEB_SALES is scanned twice with large byte volume (461041485824 bytes each, parts=27579/27579), dominating I/O.",
+      "DATE_DIM and ITEM scans are small (bytes=2138624 and 23811584) and already pruned (parts=1/1 and 2/2), indicating low hotspot potential."
+    ],
+    "cost_spine": ["TableScan WEB_SALES", "InnerJoin WEB_SALES and DATE_DIM", "Aggregate with group keys"],
+    "hotspots": [
+      {
+        "op": "TableScan WEB_SALES",
+        "why": "repeated scans for correlated subquery",
+        "evidence": "parts=27579/27579 bytes=461041485824, scanned twice in plan nodes [1.13] and [1.24]"
+      },
+      {
+        "op": "Filter with correlated subquery",
+        "why": "causes repeated execution and large intermediate aggregates",
+        "evidence": "plan nodes [1.3]-[1.5] show nested aggregates for subquery handling"
+      }
+    ],
+    "do_not_do": [
+      "avoid materializing scalar subqueries without decorrelation to prevent per-row rescans",
+      "avoid adding unnecessary CTEs that may inline in Snowflake without materialization benefit",
+      "do not wrap date_sk or filter keys in functions to preserve micro-partition pruning",
+      "avoid targeting dimension tables (ITEM, DATE_DIM) with negligible scan volume (<1% of total I/O)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "target": "Decompose correlated scalar subquery into CTEs: compute average ws_ext_discount_amt per item key once, then join threshold in main filter, preserving all original filters and joins.",
+      "dag_target_hint": "Replace correlated subquery in final_select with CTE joins for threshold computation.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 or i_category IN ('Men', 'Shoes', 'Sports')", "d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY sum(ws_ext_discount_amt)", "LIMIT 100"]
+      },
+      "gates_checked": ["G_SF_CORR_SCALAR_REQUIRED:PASS", "G_SF_CORR_SIMPLE_EXISTS_SKIP:PASS", "G_SF_CORR_FACT_CONTEXT:PASS", "G_SF_CORR_SEMANTIC_KEYS:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "Correlated subquery branch replaced with CTE scan, eliminating repeated WEB_SALES scans and reducing aggregate work.",
+      "recommended_patch_ops": ["insert_cte_for_avg_threshold", "replace_where_predicate_with_join"],
+      "rank_rationale": "Targets primary hotspot with direct evidence of correlated subquery driving high I/O.",
+      "recommended_examples": ["sf_inline_decorrelate"],
+      "gold_example_id": "sf_inline_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "target": "Add explicit date_sk BETWEEN predicate derived from date_dim filter to WEB_SALES scans to enhance micro-partition pruning, without altering join semantics.",
+      "dag_target_hint": "Modify filter conditions in TableScan WEB_SALES nodes to include ws_sold_date_sk range.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "date_dim"],
+        "where_must_preserve": ["d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["all original columns and join keys"]
+      },
+      "gates_checked": ["G_SF_SK_DATE_FILTER_REQUIRED:PASS", "G_SF_SK_SCAN_PRESSURE:PASS", "G_SF_SK_COMPUTE_BOUND_SKIP:PASS", "G_SF_SK_RANGE_SEMANTICS:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pushing date key range might improve partition pruning despite existing filters, targeting secondary I/O reduction.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Reduced partitions scanned in WEB_SALES due to added date_sk predicate.",
+      "recommended_patch_ops": ["add_predicate_to_scan"],
+      "rank_rationale": "Exploration targeting potential partition pruning improvement on fact table scans.",
+      "recommended_examples": ["sf_sk_pushdown_3fact"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate WEB_SALES by ws_item_sk to compute sum and count of ws_ext_discount_amt before joining with ITEM and DATE_DIM, reducing row flow into main joins.",
+      "dag_target_hint": "Change aggregate node in final_select to use pre-aggregated CTE instead of raw scans.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "item", "date_dim"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 or i_category IN ('Men', 'Shoes', 'Sports')", "d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) aggregation semantics", "grouping key compatibility with item key"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none", "no_or_to_union:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early aggregation might reduce data volume before joins, even after decorrelation, targeting secondary aggregate hotspot.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Aggregate operator moves earlier in plan, reducing input rows to joins and subsequent aggregates.",
+      "recommended_patch_ops": ["insert_cte_with_pre_aggregation", "replace_from_with_cte"],
+      "rank_rationale": "Exploration for early aggregation to address secondary aggregate volume, with plausible but ambiguous evidence.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split OR condition on ITEM (i_manufact_id range OR i_category IN) into UNION ALL branches to allow separate filter application, preserving all other joins and filters.",
+      "dag_target_hint": "Modify ITEM filter branch in final_select to use UNION ALL over two branches.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996", "i_category IN ('Men', 'Shoes', 'Sports')", "all other non-OR conditions"],
+        "output_must_preserve": ["item key and category for joins", "no row multiplication"]
+      },
+      "gates_checked": ["cross_column_or_decomposition:PASS", "multiplicity_guard_required:PASS", "low_scan_volume:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "OR decomposition on small dimension might improve filter efficiency despite low I/O impact, testing set operation family.",
+      "confidence": 0.40,
+      "expected_explain_delta": "OR filter replaced with UNION ALL, potentially enabling more focused scans on ITEM.",
+      "recommended_patch_ops": ["split_or_to_union_all", "adjust_join_for_union"],
+      "rank_rationale": "Exploration on small dimension OR condition, low expected impact but adds family diversity.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Dimension scans (DATE_DIM, ITEM) are negligible (<1% of total I/O) and already pruned, per anti-padding guard."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "Not native for Snowflake (engines=duckdb), and CTEs tend to inline in Snowflake, reducing materialization benefit."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "Native sf_inline_decorrelate is preferred for Snowflake with higher confidence and direct evidence match."
+    },
+    {
+      "transform_id": "sf_shared_scan_decorrelate",
+      "family": "B",
+      "reason": "Similar mechanism to sf_inline_decorrelate, but sf_inline_decorrelate is selected as primary probe for diversity and gold example fit."
+    }
+  ]
+}
