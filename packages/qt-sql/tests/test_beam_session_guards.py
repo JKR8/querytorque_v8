@@ -78,7 +78,10 @@ def test_equivalence_failure_blocks_benchmark_and_marks_patch_error(
     assert patch.semantic_passed is False
     assert patch.status == "ERROR"
     assert patch.apply_error is not None
-    assert "Equivalence check unavailable" in patch.apply_error
+    assert (
+        "Equivalence check unavailable" in patch.apply_error
+        or "Synthetic semantic check failed" in patch.apply_error
+    )
 
 
 def test_synthetic_failure_blocks_db_equivalence_and_benchmark(
@@ -263,6 +266,98 @@ def test_worker_retry_revalidates_tier1_failure(
     assert patch.status == "WIN"
 
 
+def test_worker_retry_retries_parse_apply_failures_without_initial_sql(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+
+    patch = AppliedPatch(
+        patch_id="p02",
+        family="A",
+        transform="early_filter",
+        relevance_score=0.7,
+        output_sql=None,
+        apply_error="Failed to parse/apply worker output",
+        worker_prompt="BASE WORKER PROMPT",
+        worker_response='{"tree":{"root_node_id":"final_select","nodes":[]}}',
+        status="FAIL",
+    )
+
+    def fake_apply(_response, _script_ir, _dialect_enum):
+        return "SELECT 42 AS x"
+
+    def fake_validate(patches, db_path, session_dir, shot):
+        for p in patches:
+            if p.output_sql == "SELECT 42 AS x":
+                p.semantic_passed = True
+                p.status = "WIN"
+                p.speedup = 1.1
+
+    monkeypatch.setattr(session, "_apply_beam_worker_response", fake_apply)
+    monkeypatch.setattr(session, "_validate_and_benchmark_patches", fake_validate)
+    monkeypatch.setattr(session, "_save_to_disk", lambda *args, **kwargs: None)
+
+    retry_calls = session._retry_tier1_worker_failures(
+        patches=[patch],
+        worker_call_fn=lambda prompt: '{"plan_id":"p02","steps":[]}',
+        build_retry_prompt_fn=build_beam_worker_retry_prompt,
+        script_ir=None,
+        dialect_enum=None,
+        db_path=":memory:",
+        session_dir=tmp_path,
+        shot=0,
+    )
+
+    assert retry_calls == 1
+    assert patch.output_sql == "SELECT 42 AS x"
+    assert patch.semantic_passed is True
+    assert patch.status == "WIN"
+
+
+def test_worker_retry_gate_classifies_parse_and_tier1_failures() -> None:
+    tier1 = AppliedPatch(
+        patch_id="p01",
+        family="B",
+        transform="decorrelate",
+        relevance_score=0.8,
+        output_sql="SELECT * FROM t",
+        apply_error="Tier-1: missing alias x in FROM",
+        status="FAIL",
+    )
+    parse_apply = AppliedPatch(
+        patch_id="p02",
+        family="B",
+        transform="decorrelate",
+        relevance_score=0.8,
+        apply_error="Failed to parse/apply tree plan: Missing `tree` object",
+        status="FAIL",
+    )
+    non_retry = AppliedPatch(
+        patch_id="p03",
+        family="B",
+        transform="decorrelate",
+        relevance_score=0.8,
+        output_sql="SELECT * FROM t",
+        apply_error="Row count: orig=10, patch=12",
+        status="FAIL",
+    )
+    execution_fail = AppliedPatch(
+        patch_id="p04",
+        family="B",
+        transform="decorrelate",
+        relevance_score=0.8,
+        output_sql="SELECT * FROM t",
+        apply_error="Execution: SQL compilation error: invalid identifier 'X'",
+        status="ERROR",
+    )
+
+    assert BeamSession._worker_retry_gate_name(tier1) == "tier1_structural"
+    assert BeamSession._worker_retry_gate_name(parse_apply) == "parse_apply_failure"
+    assert BeamSession._worker_retry_gate_name(non_retry) == "semantic_failure"
+    assert BeamSession._worker_retry_gate_name(execution_fail) == "execution_failure"
+
+
 def test_run_always_routes_to_beam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -271,21 +366,11 @@ def test_run_always_routes_to_beam(
     assert session.run() == "beam"
 
 
-def test_probe_hardness_prefers_decorrelation_family() -> None:
-    p_a = SimpleNamespace(family="A", transform_id="early_filter", confidence=0.99)
-    p_b = SimpleNamespace(family="B", transform_id="decorrelate", confidence=0.70)
-
-    score_a = BeamSession._probe_hardness_score(p_a)
-    score_b = BeamSession._probe_hardness_score(p_b)
-
-    assert score_b > score_a
-
-
-def test_worker_lane_suffix_contracts_are_distinct() -> None:
-    qwen_text = BeamSession._worker_lane_suffix("qwen")
-    reasoner_text = BeamSession._worker_lane_suffix("reasoner")
-    assert "Stay within ONE family strategy" in qwen_text
-    assert "may combine families" in reasoner_text
+def test_worker_lane_suffix_is_scout() -> None:
+    scout_text = BeamSession._worker_lane_suffix()
+    assert "Scout Lane" in scout_text
+    assert "Stay within ONE family strategy" in scout_text
+    assert "status to 'failed'" in scout_text
 
 
 def test_editor_strike_uses_single_worker_call(
@@ -444,93 +529,192 @@ def test_pipeline_require_llm_config_requires_provider_and_model(tmp_path: Path)
         pipeline._require_llm_config(context="test")
 
 
-def test_apply_dag_worker_response_requires_single_changed_node() -> None:
+def test_apply_tree_worker_response_allows_multiple_changed_nodes() -> None:
     session = _make_session()
-    base_dag = {
-        "order": ["n1", "final_select"],
-        "final_node_id": "final_select",
+    base_tree = {
+        "root_node_id": "final_select",
         "nodes": [
-            {"node_id": "n1", "sql": "SELECT 1 AS a"},
-            {"node_id": "final_select", "sql": "SELECT a FROM n1"},
+            {
+                "node_id": "final_select",
+                "parent_node_id": None,
+                "sources": ["n1"],
+                "outputs": ["a"],
+                "sql": "SELECT a FROM n1",
+            },
+            {
+                "node_id": "n1",
+                "parent_node_id": "final_select",
+                "sources": [],
+                "outputs": ["a"],
+                "sql": "SELECT 1 AS a",
+            },
         ],
     }
 
     valid = json.dumps(
         {
             "probe_id": "p01",
-            "dag": {
-                "order": ["n1", "final_select"],
+            "tree": {
+                "root_node_id": "final_select",
                 "nodes": [
-                    {"node_id": "n1", "changed": True, "sql": "SELECT 2 AS a"},
-                    {"node_id": "final_select", "changed": False},
+                    {
+                        "node_id": "final_select",
+                        "parent_node_id": None,
+                        "sources": ["n1"],
+                        "outputs": ["a"],
+                        "changed": False,
+                    },
+                    {
+                        "node_id": "n1",
+                        "parent_node_id": "final_select",
+                        "sources": [],
+                        "outputs": ["a"],
+                        "changed": True,
+                        "sql": "SELECT 2 AS a",
+                    },
                 ],
             },
         }
     )
-    invalid = json.dumps(
+    multi_changed = json.dumps(
         {
             "probe_id": "p01",
-            "dag": {
-                "order": ["n1", "final_select"],
+            "tree": {
+                "root_node_id": "final_select",
                 "nodes": [
-                    {"node_id": "n1", "changed": True, "sql": "SELECT 2 AS a"},
-                    {"node_id": "final_select", "changed": True, "sql": "SELECT a FROM n1"},
+                    {
+                        "node_id": "final_select",
+                        "parent_node_id": None,
+                        "sources": ["n1"],
+                        "outputs": ["a"],
+                        "changed": True,
+                        "sql": "SELECT a FROM n1",
+                    },
+                    {
+                        "node_id": "n1",
+                        "parent_node_id": "final_select",
+                        "sources": [],
+                        "outputs": ["a"],
+                        "changed": True,
+                        "sql": "SELECT 2 AS a",
+                    },
+                ],
+            },
+        }
+    )
+    syntax_invalid = json.dumps(
+        {
+            "probe_id": "p01",
+            "tree": {
+                "root_node_id": "final_select",
+                "nodes": [
+                    {
+                        "node_id": "final_select",
+                        "parent_node_id": None,
+                        "sources": ["n1"],
+                        "outputs": ["a"],
+                        "changed": True,
+                        "sql": "SELECT ( FROM n1",
+                    },
+                    {
+                        "node_id": "n1",
+                        "parent_node_id": "final_select",
+                        "sources": [],
+                        "outputs": ["a"],
+                        "changed": True,
+                        "sql": "SELECT 2 AS a",
+                    },
                 ],
             },
         }
     )
 
-    assert session._apply_dag_worker_response(valid, base_dag) is not None
-    assert session._apply_dag_worker_response(invalid, base_dag) is None
+    assert session._apply_tree_worker_response(valid, base_tree) is not None
+    assert session._apply_tree_worker_response(multi_changed, base_tree) is not None
+    assert session._apply_tree_worker_response(syntax_invalid, base_tree) is None
 
 
-def test_compiler_dag_shape_accepts_single_object_or_array() -> None:
+def test_compiler_tree_shape_accepts_single_object_or_array() -> None:
     session = _make_session()
 
     as_object = json.dumps(
         {
             "plan_id": "s1",
-            "dag": {"order": ["final_select"], "nodes": [{"node_id": "final_select", "changed": True, "sql": "SELECT 1"}]},
+            "tree": {
+                "root_node_id": "final_select",
+                "nodes": [
+                    {
+                        "node_id": "final_select",
+                        "parent_node_id": None,
+                        "sources": [],
+                        "outputs": ["x"],
+                        "changed": True,
+                        "sql": "SELECT 1 AS x",
+                    }
+                ],
+            },
         }
     )
     as_array = json.dumps(
         [
             {
                 "plan_id": "s1",
-                "dag": {"order": ["final_select"], "nodes": [{"node_id": "final_select", "changed": True, "sql": "SELECT 1"}]},
+                "tree": {
+                    "root_node_id": "final_select",
+                    "nodes": [
+                        {
+                            "node_id": "final_select",
+                            "parent_node_id": None,
+                            "sources": [],
+                            "outputs": ["x"],
+                            "changed": True,
+                            "sql": "SELECT 1 AS x",
+                        }
+                    ],
+                },
             }
         ]
     )
 
-    assert session._is_compiler_tier0_shape_failure(as_object, dag_mode=True) is False
-    assert session._is_compiler_tier0_shape_failure(as_array, dag_mode=True) is False
+    assert session._is_compiler_tier0_shape_failure(as_object, tree_mode=True) is False
+    assert session._is_compiler_tier0_shape_failure(as_array, tree_mode=True) is False
 
 
-def test_beam_edit_mode_defaults_to_dag_but_allows_patchplan_override() -> None:
+def test_beam_edit_mode_defaults_to_tree_but_allows_patchplan_override() -> None:
     session = _make_session()
-    assert session._beam_edit_mode() == "dag"
+    assert session._beam_edit_mode() == "tree"
 
     session.pipeline.config.beam_edit_mode = "patchplan"
     assert session._beam_edit_mode() == "patchplan"
 
 
-def test_apply_dag_compiler_response_accepts_single_plan_object() -> None:
+def test_apply_tree_compiler_response_accepts_single_plan_object() -> None:
     session = _make_session()
-    base_dag = {
-        "order": ["final_select"],
-        "final_node_id": "final_select",
-        "nodes": [{"node_id": "final_select", "sql": "SELECT 1"}],
+    base_tree = {
+        "root_node_id": "final_select",
+        "nodes": [
+            {
+                "node_id": "final_select",
+                "parent_node_id": None,
+                "sources": [],
+                "outputs": ["x"],
+                "sql": "SELECT 1 AS x",
+            }
+        ],
     }
     response = json.dumps(
         {
             "plan_id": "snipe_p1",
             "family": "B",
-            "transform": "dag_rewrite",
-            "dag": {
-                "order": ["final_select"],
+            "transform": "tree_rewrite",
+            "tree": {
+                "root_node_id": "final_select",
                 "nodes": [
                     {
                         "node_id": "final_select",
+                        "parent_node_id": None,
+                        "sources": [],
+                        "outputs": ["x"],
                         "changed": True,
                         "sql": "SELECT 3 AS x",
                     }
@@ -539,14 +723,14 @@ def test_apply_dag_compiler_response_accepts_single_plan_object() -> None:
         }
     )
 
-    patches = session._apply_dag_compiler_response(response, base_dag, prefix="s1")
+    patches = session._apply_tree_compiler_response(response, base_tree, prefix="s1")
     assert len(patches) == 1
     assert patches[0].patch_id == "snipe_p1"
     assert patches[0].status == "applied"
     assert "SELECT 3 AS x" in (patches[0].output_sql or "")
 
 
-def test_run_beam_dag_mode_executes_without_api_calls(
+def test_run_beam_tree_mode_executes_without_api_calls(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -554,7 +738,7 @@ def test_run_beam_dag_mode_executes_without_api_calls(
     session.pipeline.provider = "openrouter"
     session.pipeline.model = "qwen/qwen3-coder"
     session.pipeline.benchmark_dir = tmp_path
-    session.pipeline.config.beam_edit_mode = "dag"
+    session.pipeline.config.beam_edit_mode = "tree"
     session.pipeline.config.wide_max_probes = 1
     session.pipeline.config.wide_worker_parallelism = 1
     session.pipeline.config.snipe_rounds = 0
@@ -616,13 +800,16 @@ def test_run_beam_dag_mode_executes_without_api_calls(
             "probe_id": "p01",
             "transform_id": "decorrelate",
             "family": "B",
-            "dag": {
-                "order": ["final_select"],
+            "tree": {
+                "root_node_id": "final_select",
                 "nodes": [
                     {
                         "node_id": "final_select",
+                        "parent_node_id": None,
+                        "sources": [],
+                        "outputs": ["x"],
                         "changed": True,
-                        "sql": "SELECT 2",
+                        "sql": "SELECT 2 AS x",
                     }
                 ],
             },
@@ -647,7 +834,7 @@ def test_run_beam_dag_mode_executes_without_api_calls(
     assert result.n_api_calls == 2
     assert len(prompts_seen) >= 2
     worker_prompt = prompts_seen[1]
-    assert "### Current DAG Node Map" in worker_prompt
-    assert "## Runtime Override: DAG Mode (Takes Precedence)" in worker_prompt
-    assert worker_prompt.count("## Base DAG Spec") == 1
+    assert "### Current TREE Node Map" in worker_prompt
+    assert "## Runtime Override: TREE Mode (Takes Precedence)" in worker_prompt
+    assert worker_prompt.count("## Base Tree Spec") == 1
     assert "Expected shape:" not in worker_prompt

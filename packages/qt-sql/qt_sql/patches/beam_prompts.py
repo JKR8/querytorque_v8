@@ -46,6 +46,188 @@ def _load_prompt_template(filename: str) -> str:
         return ""
 
 
+def _render_runtime_template(template: str, dialect: str) -> str:
+    """Resolve runtime dialect placeholders/tokens in static templates."""
+    if not template:
+        return ""
+    resolved = normalize_dialect(dialect) or str(dialect or "").strip() or "unknown"
+    return (
+        template
+        .replace("<target_dialect>", resolved)
+        .replace("`target_dialect`", f"`{resolved}`")
+    )
+
+
+def _extract_tree_outputs(sql_text: str, dialect: str) -> List[str]:
+    """Extract projected output column names from a SQL fragment."""
+    if not sql_text:
+        return []
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except Exception:
+        return []
+    try:
+        ast = sqlglot.parse_one(sql_text, dialect=dialect)
+        selects = []
+        if hasattr(ast, "selects") and ast.selects:
+            selects = list(ast.selects)
+        elif isinstance(ast, exp.Select):
+            selects = list(ast.expressions)
+        out: List[str] = []
+        for e in selects:
+            alias = getattr(e, "alias_or_name", None) or getattr(e, "output_name", None)
+            if alias:
+                out.append(str(alias))
+            else:
+                out.append((e.sql(dialect=dialect) or "").strip())
+        return out
+    except Exception:
+        return []
+
+
+def _extract_tree_sources(sql_text: str, known_nodes: List[str], dialect: str) -> List[str]:
+    """Extract table/node sources referenced by a SQL fragment."""
+    if not sql_text:
+        return []
+    known = {str(x).lower(): str(x) for x in known_nodes if str(x).strip()}
+    out: List[str] = []
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        ast = sqlglot.parse_one(sql_text, dialect=dialect)
+        for table in ast.find_all(exp.Table):
+            name = str(table.name or "").strip()
+            if not name:
+                continue
+            key = name.lower()
+            canonical = known.get(key, name)
+            if canonical not in out:
+                out.append(canonical)
+    except Exception:
+        return []
+    return out
+
+
+def build_base_tree_prompt(sql_text: str, dialect: str) -> str:
+    """Build and render a lightweight base tree spec from query SQL."""
+    if not sql_text:
+        return "(not provided)"
+    sql_text = sql_text.strip().rstrip(";")
+
+    try:
+        import sqlglot
+
+        ast = sqlglot.parse_one(sql_text, dialect=dialect)
+    except Exception:
+        ast = None
+
+    tree: Dict[str, Any] = {
+        "root_node_id": "final_select",
+        "nodes": [
+            {
+                "node_id": "final_select",
+                "parent_node_id": None,
+                "sources": [],
+                "outputs": _extract_tree_outputs(sql_text, dialect),
+                "sql": sql_text,
+            }
+        ],
+    }
+
+    if ast is not None:
+        with_expr = ast.args.get("with")
+        if with_expr is not None and getattr(with_expr, "expressions", None):
+            ctes = list(with_expr.expressions or [])
+            cte_ids: List[str] = []
+            for idx, cte in enumerate(ctes, start=1):
+                name = str(cte.alias_or_name or f"cte_{idx}")
+                if name in cte_ids:
+                    name = f"{name}_{idx}"
+                cte_ids.append(name)
+
+            nodes: List[Dict[str, Any]] = []
+            cte_sources: Dict[str, List[str]] = {}
+            for idx, cte in enumerate(ctes):
+                node_id = cte_ids[idx]
+                cte_sql = (cte.this.sql(dialect=dialect) or "").strip().rstrip(";")
+                sources = _extract_tree_sources(cte_sql, cte_ids, dialect)
+                cte_sources[node_id] = sources
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "parent_node_id": "final_select",
+                        "sources": sources,
+                        "outputs": _extract_tree_outputs(cte_sql, dialect),
+                        "sql": cte_sql,
+                    }
+                )
+
+            final_ast = ast.copy()
+            final_ast.set("with", None)
+            final_sql = (final_ast.sql(dialect=dialect) or sql_text).strip().rstrip(";")
+            final_sources = _extract_tree_sources(final_sql, cte_ids, dialect)
+
+            consumers: Dict[str, List[str]] = {nid: [] for nid in cte_ids}
+            for upstream in cte_ids:
+                for downstream in cte_ids:
+                    if upstream != downstream and upstream in cte_sources.get(downstream, []):
+                        consumers[upstream].append(downstream)
+                if upstream in final_sources:
+                    consumers[upstream].append("final_select")
+
+            parent_by_node: Dict[str, str] = {}
+            for nid in cte_ids:
+                options = consumers.get(nid, [])
+                if "final_select" in options:
+                    parent_by_node[nid] = "final_select"
+                elif options:
+                    parent_by_node[nid] = sorted(options)[0]
+                else:
+                    parent_by_node[nid] = "final_select"
+
+            for node in nodes:
+                node_id = str(node.get("node_id", "")).strip()
+                if node_id in parent_by_node:
+                    node["parent_node_id"] = parent_by_node[node_id]
+
+            nodes.append(
+                {
+                    "node_id": "final_select",
+                    "parent_node_id": None,
+                    "sources": final_sources,
+                    "outputs": _extract_tree_outputs(final_sql, dialect),
+                    "sql": final_sql,
+                }
+            )
+            tree = {
+                "root_node_id": "final_select",
+                "nodes": nodes,
+            }
+
+    lines = [
+        "## Base Tree Spec",
+        "Use this as the authoritative node tree for rewrite proposals.",
+        "",
+    ]
+    for node in tree.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("node_id", "")).strip()
+        parent = node.get("parent_node_id")
+        sources = node.get("sources") or []
+        outs = node.get("outputs") or []
+        lines.append(f"node: {node_id}")
+        lines.append(f"  parent_node_id: {parent}")
+        lines.append(f"  sources: {sources}")
+        lines.append(f"  outputs: {outs}")
+        lines.append("  sql: OMITTED")
+        lines.append("")
+    lines.append(f"root_node_id: {tree.get('root_node_id', 'final_select')}")
+    return "\n".join(lines)
+
+
 @lru_cache(maxsize=1)
 def _load_transform_index() -> Dict[str, Dict[str, Any]]:
     """Load transform catalog indexed by transform id."""
@@ -250,15 +432,15 @@ def _format_gold_tree_hint(gold_tree_example: Dict[str, Any]) -> List[str]:
         and n.get("changed") is True
         and str(n.get("node_id", "")).strip()
     ]
-    final_node = str(tree.get("final_node_id", "")).strip() or "final_select"
+    root_node = str(tree.get("root_node_id", "")).strip() or "final_select"
 
     lines.extend([
         "### Gold TREE Pattern Reference",
-        f"- `plan_id`: `{gold_tree_example.get('plan_id', 'gold_dag')}`",
-        f"- `final_node_id`: `{final_node}`",
+        f"- `plan_id`: `{gold_tree_example.get('plan_id', 'gold_tree')}`",
+        f"- `root_node_id`: `{root_node}`",
     ])
     if node_ids:
-        lines.append("- `order`: " + ", ".join(f"`{n}`" for n in (tree.get("order") or node_ids)[:10]))
+        lines.append("- `nodes`: " + ", ".join(f"`{n}`" for n in node_ids[:10]))
     if changed_nodes:
         lines.append(
             "- `changed_nodes`: " + ", ".join(f"`{n}`" for n in changed_nodes[:6])
@@ -346,16 +528,16 @@ def _format_gold_overview_section(
             continue
         ex_id = str(ex.get("id") or "unknown")
         speedup = str(ex.get("verified_speedup") or "n/a")
-        dag_example = ex.get("dag_example") or ex.get("tree")
-        dag_payload = None
-        if isinstance(dag_example, dict):
-            if isinstance(dag_example.get("tree"), dict):
-                dag_payload = dag_example.get("tree")
-            elif isinstance(dag_example.get("nodes"), list):
-                dag_payload = dag_example
+        tree_example = ex.get("tree_example")
+        tree_payload = None
+        if isinstance(tree_example, dict):
+            if isinstance(tree_example.get("tree"), dict):
+                tree_payload = tree_example.get("tree")
+            elif isinstance(tree_example.get("nodes"), list):
+                tree_payload = tree_example
         changed_nodes: List[str] = []
-        if isinstance(dag_payload, dict):
-            nodes = dag_payload.get("nodes") or []
+        if isinstance(tree_payload, dict):
+            nodes = tree_payload.get("nodes") or []
             if isinstance(nodes, list):
                 changed_nodes = [
                     str(n.get("node_id", "")).strip()
@@ -393,10 +575,12 @@ def build_beam_analyst_prompt(
     iteration_history: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build analyst prompt from beam_analyst_v3 template + dynamic tail."""
-    template = _load_prompt_template("beam_analyst_v3.txt")
+    template = _render_runtime_template(
+        _load_prompt_template("beam_analyst_v3.txt"), dialect
+    )
     stars = max(1, min(3, int(importance_stars or 1)))
     star_label = "*" * stars
-    _ = ir_node_map  # Backward-compatible arg; TREE map is the structural source.
+    effective_tree_map = current_tree_map or "(not provided)"
 
     dynamic_sections = [
         f"## Query ID\n{query_id}",
@@ -407,6 +591,12 @@ def build_beam_analyst_prompt(
             "- if static examples conflict, follow runtime dialect behavior"
         ),
         (
+            "## Runtime Worker Lane Policy\n"
+            "- all probes are executed by scout workers\n"
+            "- rank probes by expected impact\n"
+            "- make probes coverage-oriented across distinct families/transforms/phases"
+        ),
+        (
             "## Query Importance\n"
             f"- importance_stars: {stars}\n"
             f"- importance_label: {star_label}\n"
@@ -414,7 +604,7 @@ def build_beam_analyst_prompt(
         ),
         f"## Original SQL\n```sql\n{original_sql}\n```",
         f"## Execution Plan\n```\n{explain_text}\n```",
-        f"## Current TREE Node Map\n```\n{current_tree_map or '(not provided)'}\n```",
+        f"## Current TREE Node Map\n```\n{effective_tree_map}\n```",
         _build_transform_catalog_section(dialect),
     ]
     qerror_section = _format_qerror_section(qerror_analysis)
@@ -432,7 +622,8 @@ def build_beam_analyst_prompt(
         dynamic_sections.append(f"## Engine-Specific Knowledge\n{engine_knowledge}")
     if intelligence_brief:
         dynamic_sections.append(
-            "## Additional Intelligence\n"
+            "## Additional Intelligence (Pre-screening Context)\n"
+            "AST/pathology pre-screening results for this query; use them to validate transform applicability against engine gates.\n\n"
             f"{intelligence_brief}"
         )
 
@@ -467,16 +658,14 @@ def build_beam_worker_prompt(
     qerror_analysis: Optional[Any] = None,
     engine_knowledge: str = "",
     do_not_do: Optional[List[str]] = None,
-    worker_lane: str = "qwen",
+    worker_lane: str = "scout",
 ) -> str:
-    """Build worker prompt from lane template + dynamic tail."""
-    lane = str(worker_lane or "qwen").strip().lower()
-    template_name = (
-        "beam_reasoning_worker_v1.txt"
-        if lane == "reasoner"
-        else "beam_worker_v3.txt"
+    """Build worker prompt from beam_worker_v3 template + dynamic tail."""
+    lane = str(worker_lane or "scout").strip().lower()
+    template = _render_runtime_template(
+        _load_prompt_template("beam_worker_v3.txt"), dialect
     )
-    template = _load_prompt_template(template_name)
+    effective_tree_map = current_tree_map or "(not provided)"
     lines = [
         f"## Shared Analyst Hypothesis\n{hypothesis or '(none)'}",
         (
@@ -572,11 +761,8 @@ def build_beam_worker_prompt(
         )
     lines.extend(
         [
-            "### Current IR Node Map\n",
-            f"```\n{ir_node_map}\n```",
-            "",
             "### Current TREE Node Map\n",
-            f"```\n{current_tree_map or '(not provided)'}\n```",
+            f"```\n{effective_tree_map}\n```",
             "",
         ]
     )
@@ -622,6 +808,7 @@ def build_beam_editor_strike_prompt(
     original_sql: str,
     explain_text: str,
     ir_node_map: str,
+    current_tree_map: str = "",
     transform_id: str,
     dialect: str = "postgres",
     schema_context: str = "",
@@ -631,7 +818,9 @@ def build_beam_editor_strike_prompt(
     This path intentionally avoids analyst overhead and injects one
     explicit transform target for the worker model.
     """
-    template = _load_prompt_template("beam_strike_worker_v1.txt")
+    template = _render_runtime_template(
+        _load_prompt_template("beam_strike_worker_v1.txt"), dialect
+    )
     tid = (transform_id or "").strip()
     if not tid:
         tid = "auto"
@@ -645,8 +834,7 @@ def build_beam_editor_strike_prompt(
         "- objective: one candidate rewrite using the selected transform",
         f"## Original SQL\n```sql\n{original_sql}\n```",
         f"## Execution Plan\n```\n{explain_text}\n```",
-        IR_SCHEMA_REFERENCE,
-        f"## IR Structure + Anchor Hashes\n```\n{ir_node_map}\n```",
+        f"## Current TREE Node Map\n```\n{current_tree_map or '(not provided)'}\n```",
         _build_transform_recipe_section(tid),
     ]
 
@@ -682,14 +870,14 @@ def build_beam_worker_retry_prompt(
 ) -> str:
     """Append structured gate-failure feedback for one worker retry."""
     mode = str(output_mode or "tree").strip().lower()
-    dag_mode = mode != "patchplan"
+    tree_mode = mode != "patchplan"
     parts = [
         worker_prompt,
         "",
         "## RETRY — Gate failure feedback (attempt 2/2)",
         (
             "Your previous rewrite failed validation. Return a corrected TREE JSON object only."
-            if dag_mode
+            if tree_mode
             else "Your previous patch failed validation. Return a corrected PatchPlan JSON only."
         ),
         "First character must be `{` and output must contain no markdown/prose.",
@@ -734,12 +922,12 @@ def build_beam_worker_retry_prompt(
             "Fix only what caused the gate failure while preserving transform intent and semantics.",
             (
                 "Output ONLY valid TREE JSON."
-                if dag_mode
+                if tree_mode
                 else "Output ONLY valid PatchPlan JSON."
             ),
             (
                 "Do not emit PatchPlan `steps`/`payload` fields in TREE mode."
-                if dag_mode
+                if tree_mode
                 else "Never emit payload.sql; use payload.sql_fragment where SQL fragments are required."
             ),
         ]

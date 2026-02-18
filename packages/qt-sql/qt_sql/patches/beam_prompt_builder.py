@@ -39,6 +39,18 @@ def _load_prompt_template(filename: str) -> str:
         return ""
 
 
+def _render_runtime_template(template: str, dialect: str) -> str:
+    """Resolve runtime dialect placeholders/tokens in static templates."""
+    if not template:
+        return ""
+    resolved = normalize_dialect(dialect) or str(dialect or "").strip() or "unknown"
+    return (
+        template
+        .replace("<target_dialect>", resolved)
+        .replace("`target_dialect`", f"`{resolved}`")
+    )
+
+
 # ── Family Descriptions ────────────────────────────────────────────────────
 
 FAMILY_DESCRIPTIONS = {
@@ -175,8 +187,8 @@ def _format_qerror_section(
     return f"{heading}\n{qerror_text}"
 
 
-def _format_worker_dag_evidence(strike_results: List[Dict[str, Any]]) -> str:
-    """Build compact DAG evidence cards from worker outputs."""
+def _format_worker_tree_evidence(strike_results: List[Dict[str, Any]]) -> str:
+    """Build compact tree evidence cards from worker outputs."""
     lines: List[str] = []
     for s in strike_results:
         if not isinstance(s, dict):
@@ -185,21 +197,20 @@ def _format_worker_dag_evidence(strike_results: List[Dict[str, Any]]) -> str:
         transform_id = str(s.get("transform_id", "?"))
         status = str(s.get("status", "?"))
 
-        dag_payload = None
+        tree_payload = None
         raw_plan = s.get("raw_plan")
         if isinstance(raw_plan, dict):
-            if isinstance(raw_plan.get("dag"), dict):
-                dag_payload = raw_plan.get("dag")
+            if isinstance(raw_plan.get("tree"), dict):
+                tree_payload = raw_plan.get("tree")
             elif isinstance(raw_plan.get("nodes"), list):
-                dag_payload = raw_plan
-        if dag_payload is None and isinstance(s.get("dag"), dict):
-            dag_payload = s.get("dag")
-        if not isinstance(dag_payload, dict):
+                tree_payload = raw_plan
+        if tree_payload is None and isinstance(s.get("tree"), dict):
+            tree_payload = s.get("tree")
+        if not isinstance(tree_payload, dict):
             continue
 
-        order = dag_payload.get("order") or []
-        nodes = dag_payload.get("nodes") or []
-        final_node = str(dag_payload.get("final_node_id", "")).strip() or "(missing)"
+        nodes = tree_payload.get("nodes") or []
+        root_node = str(tree_payload.get("root_node_id", "")).strip() or "(missing)"
         changed_nodes: List[str] = []
         if isinstance(nodes, list):
             changed_nodes = [
@@ -209,19 +220,24 @@ def _format_worker_dag_evidence(strike_results: List[Dict[str, Any]]) -> str:
                 and n.get("changed") is True
                 and str(n.get("node_id", "")).strip()
             ]
-        order_text = ", ".join(f"`{str(n)}`" for n in order[:8]) if isinstance(order, list) and order else "(none)"
+        node_ids = [
+            str(n.get("node_id", "")).strip()
+            for n in nodes
+            if isinstance(n, dict) and str(n.get("node_id", "")).strip()
+        ]
+        nodes_text = ", ".join(f"`{n}`" for n in node_ids[:8]) if node_ids else "(none)"
         changed_text = ", ".join(f"`{n}`" for n in changed_nodes[:4]) if changed_nodes else "(none)"
         lines.extend(
             [
                 f"### {probe_id}: {transform_id} ({status})",
-                f"- final_node_id: `{final_node}`",
-                f"- order: {order_text}",
+                f"- root_node_id: `{root_node}`",
+                f"- nodes: {nodes_text}",
                 f"- changed_nodes: {changed_text}",
             ]
         )
     if not lines:
         return ""
-    return "## Worker DAG Evidence\n\n" + "\n".join(lines)
+    return "## Worker Tree Evidence\n\n" + "\n".join(lines)
 
 
 # ── Build Individual Family Sections ───────────────────────────────────────
@@ -229,15 +245,15 @@ def _format_worker_dag_evidence(strike_results: List[Dict[str, Any]]) -> str:
 def format_family_section(
     family_id: str,
     gold_example: Dict[str, Any],
-    include_dag_examples: bool = True,
+    include_tree_examples: bool = True,
     analyst_only: bool = False,
 ) -> str:
     """Format a single family section with description + gold example.
 
     Args:
         family_id: Family letter (A-F).
-        gold_example: Gold example dict with original_sql, optimized_sql, ir_*, dag_example.
-        include_dag_examples: If False, omit DAG-shape hints.
+        gold_example: Gold example dict with original_sql, optimized_sql, ir_*, tree_example.
+        include_tree_examples: If False, omit tree-shape hints.
         analyst_only: If True, only emit family description + example ID.
             The analyst picks strategies; workers get the full examples.
     """
@@ -291,13 +307,17 @@ def format_family_section(
     if analyst_only:
         return "\n".join(lines)
 
-    if include_dag_examples:
-        dag_example = gold_example.get("dag_example") or gold_example.get("dag")
-        dag_payload = None
-        if isinstance(dag_example, dict):
-            dag_payload = dag_example.get("dag") if isinstance(dag_example.get("dag"), dict) else dag_example
-        if isinstance(dag_payload, dict):
-            nodes = dag_payload.get("nodes") or []
+    if include_tree_examples:
+        tree_example = gold_example.get("tree_example")
+        tree_payload = None
+        if isinstance(tree_example, dict):
+            tree_payload = (
+                tree_example.get("tree")
+                if isinstance(tree_example.get("tree"), dict)
+                else tree_example
+            )
+        if isinstance(tree_payload, dict):
+            nodes = tree_payload.get("nodes") or []
             if isinstance(nodes, list):
                 changed_nodes = [
                     str(n.get("node_id", "")).strip()
@@ -308,11 +328,11 @@ def format_family_section(
                 ]
                 if changed_nodes:
                     lines.append(
-                        f"**DAG shape**: changed nodes {', '.join(f'`{n}`' for n in changed_nodes[:4])}"
+                        f"**Tree shape**: changed nodes {', '.join(f'`{n}`' for n in changed_nodes[:4])}"
                     )
-                final_node = str(dag_payload.get("final_node_id", "")).strip()
-                if final_node:
-                    lines.append(f"**Final node**: `{final_node}`")
+                root_node = str(tree_payload.get("root_node_id", "")).strip()
+                if root_node:
+                    lines.append(f"**Root node**: `{root_node}`")
 
     return "\n".join(lines)
 
@@ -359,9 +379,25 @@ def _load_engine_intelligence(dialect: str) -> Optional[str]:
     # Primary source of truth: full dialect knowledge markdown.
     exploit_md = load_exploit_algorithm(dialect_norm)
     if isinstance(exploit_md, str) and exploit_md.strip():
+        exploit_md_lines = exploit_md.splitlines()
+        cleaned_lines: List[str] = []
+        in_metadata = False
+        for line in exploit_md_lines:
+            stripped = line.strip().lower()
+            if not in_metadata and stripped == "## metadata":
+                in_metadata = True
+                continue
+            if in_metadata:
+                if line.startswith("## "):
+                    in_metadata = False
+                else:
+                    continue
+            if not in_metadata:
+                cleaned_lines.append(line)
+        exploit_md_clean = "\n".join(cleaned_lines).strip()
         return (
             f"## Dialect Intelligence ({dialect_norm.upper()})\n\n"
-            + exploit_md.strip()
+            + exploit_md_clean
         )
 
     # Fallback: emit full engine profile JSON if markdown is unavailable.
@@ -474,7 +510,7 @@ def _build_prompt_body(
     all_5_examples: Dict[str, Dict[str, Any]],
     dialect: str,
     role_text: str,
-    include_dag_examples: bool = True,
+    include_tree_examples: bool = True,
     intelligence_brief: str = "",
     phase_a_items: Optional[List[str]] = None,
     phase_b_items: Optional[List[str]] = None,
@@ -534,14 +570,11 @@ def _build_prompt_body(
         f
         for f in all_family_ids
         if f in all_5_examples
-        and (
-            all_5_examples[f].get("dag_example")
-            or all_5_examples[f].get("dag")
-        )
+        and all_5_examples[f].get("tree_example")
     ]
     n_families = len(families_with_plans)
 
-    analyst_only = not include_dag_examples
+    analyst_only = not include_tree_examples
     family_intro = (
         f"{n_families}/6 families have validated gold examples on this dialect. "
         "Treat these as priors, not hard rules.\n\n"
@@ -551,9 +584,9 @@ def _build_prompt_body(
 
     for family_id in all_family_ids:
         ex = all_5_examples.get(family_id)
-        if ex and (ex.get("dag_example") or ex.get("dag")):
+        if ex and ex.get("tree_example"):
             static.append(format_family_section(
-                family_id, ex, include_dag_examples, analyst_only=analyst_only,
+                family_id, ex, include_tree_examples, analyst_only=analyst_only,
             ))
             static.append("")
         else:
@@ -571,15 +604,6 @@ def _build_prompt_body(
 
     # ── Execution Plan ─────────────────────────────────────────────
     dynamic.append(f"### Execution Plan\n\n```\n{explain_text}\n```")
-
-    # ── IR Structure ───────────────────────────────────────────────
-    dynamic.append(f"""### IR Structure (for patch targeting)
-
-```
-{ir_node_map}
-```
-
-**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.""")
 
     # ── Detected Patterns (per-query intelligence) ─────────────────
     if intelligence_brief:
@@ -603,6 +627,7 @@ def build_beam_compiler_prompt(
     strike_results: List[Dict[str, Any]],
     intelligence_brief: str = "",
     importance_stars: int = 2,
+    current_tree_map: str = "",
     schema_context: str = "",
     engine_knowledge: str = "",
     dispatch_hypothesis: str = "",
@@ -611,7 +636,9 @@ def build_beam_compiler_prompt(
     qerror_analysis: Optional[Any] = None,
 ) -> str:
     """Build compiler prompt from beam_compiler_v3 template + dynamic tail."""
-    template = _load_prompt_template("beam_compiler_v3.txt")
+    template = _render_runtime_template(
+        _load_prompt_template("beam_compiler_v3.txt"), dialect
+    )
     stars = max(1, min(3, int(importance_stars or 1)))
     star_label = "*" * stars
 
@@ -630,7 +657,7 @@ def build_beam_compiler_prompt(
         ),
         f"## Original SQL\n```sql\n{original_sql}\n```",
         f"## Original Plan\n```\n{explain_text}\n```",
-        f"## IR Structure + Anchor Hashes\n```\n{ir_node_map}\n```",
+        f"## Current TREE Node Map\n```\n{current_tree_map or '(not provided)'}\n```",
     ]
     if schema_context:
         dynamic.append(f"## Schema / Index / Stats Context\n{schema_context}")
@@ -645,7 +672,11 @@ def build_beam_compiler_prompt(
     if equivalence_tier:
         dynamic.append(f"## Equivalence Tier\n- {equivalence_tier}")
     if intelligence_brief:
-        dynamic.append(f"## Additional Intelligence\n{intelligence_brief}")
+        dynamic.append(
+            "## Additional Intelligence (Pre-screening Context)\n"
+            "AST/pathology pre-screening results for this query; use them to validate transform applicability against engine gates.\n\n"
+            f"{intelligence_brief}"
+        )
     qerror_section = _format_qerror_section(qerror_analysis)
     if qerror_section:
         dynamic.append(qerror_section)
@@ -662,8 +693,8 @@ def build_beam_compiler_prompt(
     # BDA table for all probes (primary evidence surface).
     bda_lines = [
         "## BDA Table (all probes)\n",
-        "| Probe | Transform | Family | Status | Failure Category | Speedup | Top EXPLAIN Nodes | Model Description | SQL Patch | Error/Notes |",
-        "|-------|-----------|--------|--------|------------------|---------|-------------------|-------------------|-----------|-------------|",
+        "| Probe | Transform | Family | Status | Failure Category | Speedup | Top EXPLAIN Nodes | Model Description | SQL Patch | Failure Reason | Partial Work | Error/Notes |",
+        "|-------|-----------|--------|--------|------------------|---------|-------------------|-------------------|-----------|----------------|--------------|-------------|",
     ]
     for s in strike_results:
         speedup = s.get("speedup")
@@ -675,12 +706,20 @@ def build_beam_compiler_prompt(
         )
         description = _safe_md_cell(s.get("description") or "")
         sql_ref = _safe_md_cell(s.get("probe_id")) if s.get("sql") else "-"
+        failure_reason = _safe_md_cell(s.get("failure_reason") or "")
+        partial_work_raw = s.get("partial_work")
+        if isinstance(partial_work_raw, dict) and partial_work_raw:
+            partial_work_str = _safe_md_cell(
+                json.dumps(partial_work_raw, separators=(",", ":"))
+            )
+        else:
+            partial_work_str = "-"
         bda_lines.append(
             f"| {_safe_md_cell(s.get('probe_id', '?'))} | "
                 f"{_safe_md_cell(s.get('transform_id', '?'))} | "
                 f"{_safe_md_cell(s.get('family', '?'))} | "
                 f"{_safe_md_cell(s.get('status', '?'))} | "
-                f"{failure_category} | {speedup_str} | {top_nodes} | {description} | {sql_ref} | {error_str} |"
+                f"{failure_category} | {speedup_str} | {top_nodes} | {description} | {sql_ref} | {failure_reason} | {partial_work_str} | {error_str} |"
         )
     dynamic.append("\n".join(bda_lines))
 
@@ -697,9 +736,9 @@ def build_beam_compiler_prompt(
                 f"```sql\n{s.get('sql', '').strip()}\n```\n"
             )
         dynamic.append("\n".join(sql_sections))
-    dag_evidence = _format_worker_dag_evidence(strike_results)
-    if dag_evidence:
-        dynamic.append(dag_evidence)
+    tree_evidence = _format_worker_tree_evidence(strike_results)
+    if tree_evidence:
+        dynamic.append(tree_evidence)
 
     if template:
         return f"{template}\n\n" + "\n\n".join(dynamic)
@@ -707,7 +746,7 @@ def build_beam_compiler_prompt(
     return "\n\n".join(
         [
             "## Role",
-            "You are a Principal SQL Optimization Reviewer. Output one DAG object or a JSON array with exactly two DAG objects.",
+            "You are a Principal SQL Optimization Reviewer. Output one tree object or a JSON array with exactly two tree objects.",
             "## Cache Boundary",
             "Everything below is query-specific input.",
         ]
@@ -1179,7 +1218,7 @@ def append_shot_results(
             "If only one pathway is defensible, return a single plan.",
             "",
             "Output policy:",
-            "- Output one DAG object, or a JSON array with exactly two DAG objects.",
+            "- Output one tree object, or a JSON array with one to four tree objects.",
             "- Follow the compiler contract in the base prompt.",
         ]
     )
