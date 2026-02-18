@@ -279,8 +279,7 @@ def benchmark_query_patches(
                     patch.patch_ms = result.avg_ms
                     patch.speedup = result.speedup
                     patch.status = classify(result.speedup)
-                    if orig_count is not None:
-                        patch.correctness_verified = True
+                    patch.correctness_verified = result.correctness_verified
 
                     logger.info(
                         f"[{query_id}]   result: orig={orig_ms:.1f}ms, "

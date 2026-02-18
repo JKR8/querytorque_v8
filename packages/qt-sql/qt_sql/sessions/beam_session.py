@@ -1672,6 +1672,9 @@ class BeamSession(OptimizationSession):
             return
 
         dialect = self.dialect
+        explain_timeout = int(
+            getattr(self.pipeline.config, "timeout_seconds", 300) * 1000
+        )
 
         def _collect_explain(executor, sql):
             """Collect EXPLAIN on existing executor, return compact text.
@@ -1687,7 +1690,8 @@ class BeamSession(OptimizationSession):
                 # Try JSON format first (structured plan with timing)
                 try:
                     rows = executor.execute(
-                        f"EXPLAIN (ANALYZE, FORMAT JSON) {explain_sql}"
+                        f"EXPLAIN (ANALYZE, FORMAT JSON) {explain_sql}",
+                        timeout_ms=explain_timeout,
                     )
                     if rows and isinstance(rows, list):
                         for row in rows:
@@ -1709,7 +1713,10 @@ class BeamSession(OptimizationSession):
             if not explain_result["plan_json"]:
                 # Text fallback (PG/SF/DuckDB without JSON)
                 try:
-                    rows = executor.execute(f"EXPLAIN ANALYZE {explain_sql}")
+                    rows = executor.execute(
+                        f"EXPLAIN ANALYZE {explain_sql}",
+                        timeout_ms=explain_timeout,
+                    )
                     if rows and isinstance(rows, list):
                         if isinstance(rows[0], dict):
                             lines = [str(v) for row in rows for v in row.values()]
