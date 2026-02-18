@@ -1,6 +1,8 @@
 """SQL Validation module for QueryTorque SQL.
 
-Kept components:
+Components:
+- benchmark: Unified benchmark (ONE connection per query, fail-fast)
+- sample_checker: DuckDB TABLESAMPLE equivalence for timeout recovery
 - EquivalenceChecker: Row count, checksum, and value comparison
 - SQLDiffer: SQL diff utilities for retry prompt enrichment
 - schemas: Validation result types
@@ -25,6 +27,16 @@ from .equivalence_checker import (
 from .sql_differ import (
     SQLDiffer,
 )
+from .benchmark import (
+    BenchmarkSummary,
+    CandidateResult,
+    benchmark_query_patches,
+    _timed_runs,
+)
+from .sample_checker import (
+    SampleCheckResult,
+    SampleChecker,
+)
 
 __all__ = [
     # Schemas
@@ -43,4 +55,12 @@ __all__ = [
     "ValueComparisonResult",
     # SQL differ
     "SQLDiffer",
+    # Benchmark
+    "BenchmarkSummary",
+    "CandidateResult",
+    "benchmark_query_patches",
+    "_timed_runs",
+    # Sample checker
+    "SampleCheckResult",
+    "SampleChecker",
 ]

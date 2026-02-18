@@ -410,10 +410,11 @@ class WaveRunner:
         bench_sem = threading.Semaphore(self.db_slots)
 
         def _benchmark_query(qid: str, state: QueryState, patches: list) -> None:
+            # Semaphore owned by wave_runner — ensures at most db_slots
+            # concurrent connections. benchmark_query_patches opens exactly
+            # ONE connection internally.
+            bench_sem.acquire()
             try:
-                # Use the existing benchmark infrastructure which handles
-                # baseline caching, correctness checks, and timing
-                state.session.benchmark_sem = bench_sem
                 shot = 0 if probe else 1
                 state.session.run_benchmark_patches(
                     patches, state.ctx.db_path,
@@ -446,6 +447,8 @@ class WaveRunner:
                     done[0] += 1
                     p.status = "ERROR"
                     p.apply_error = str(e)
+            finally:
+                bench_sem.release()
 
         # Run benchmarks with db_slots concurrency at the query level
         max_concurrent = min(self.db_slots, len(active))

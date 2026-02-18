@@ -498,7 +498,7 @@ class BeamSession(OptimizationSession):
             if patch.semantic_passed:
                 if self.on_phase_change:
                     self.on_phase_change(phase="benchmark", iteration=0)
-                self._benchmark_validated_patches([patch], db_path)
+                self.run_benchmark_patches([patch], db_path)
 
         explains = (
             {patch.patch_id: patch.explain_text}
@@ -1398,40 +1398,6 @@ class BeamSession(OptimizationSession):
 
         return "semantic_violation"
 
-    def _benchmark_validated_patches(
-        self,
-        patches: List[AppliedPatch],
-        db_path: str,
-    ) -> None:
-        """Benchmark already-validated patches in one batch, then collect EXPLAIN."""
-        from contextlib import nullcontext
-        from ..execution.database_utils import run_explain_analyze
-
-        benchmark_slots = max(
-            1,
-            int(getattr(self.pipeline.config, "benchmark_slots", 8) or 8),
-        )
-        sem_passed = [p for p in patches if p.output_sql and p.semantic_passed]
-        if sem_passed:
-            if benchmark_slots > 1 and len(sem_passed) > 1:
-                self._parallel_benchmark(sem_passed, db_path, benchmark_slots)
-            else:
-                self._sequential_benchmark(sem_passed, db_path)
-
-        # ── EXPLAIN collection (post-benchmark evidence) ──────────────
-        for p in sem_passed:
-            if p.output_sql:
-                if self.benchmark_sem:
-                    self.benchmark_sem.acquire()
-                try:
-                    exp_data = run_explain_analyze(db_path, p.output_sql)
-                    p.explain_text = self._render_explain_compact(exp_data, self.dialect)
-                except Exception as e:
-                    logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
-                finally:
-                    if self.benchmark_sem:
-                        self.benchmark_sem.release()
-
     # ── BEAM Phase Methods (for wave mode) ──────────────────────────────
 
     def prepare_context(self, resume_session_dir: Optional[Path] = None) -> "BeamContext":
@@ -1693,8 +1659,35 @@ class BeamSession(OptimizationSession):
 
     def run_benchmark_patches(self, patches: List["AppliedPatch"], db_path: str,
                               session_dir: Optional[Path] = None, shot: int = 0) -> None:
-        """Benchmark already-validated patches. Modifies in-place."""
-        self._benchmark_validated_patches(patches, db_path)
+        """Benchmark already-validated patches. Modifies in-place.
+
+        Uses unified benchmark: ONE connection per query, sequential
+        per-candidate, fail-fast correctness on run 1.
+        """
+        from ..validation.benchmark import benchmark_query_patches
+
+        sem_passed = [p for p in patches if p.output_sql and p.semantic_passed]
+        if not sem_passed:
+            return
+
+        benchmark_query_patches(
+            patches=sem_passed,
+            original_sql=self.original_sql,
+            db_path=db_path,
+            query_id=self.query_id,
+            baseline_runs=max(
+                1, int(getattr(self.pipeline.config, "beam_baseline_runs", 3) or 3)),
+            candidate_runs=max(
+                1, int(getattr(self.pipeline.config, "beam_candidate_runs", 3) or 3)),
+            winner_runs=max(
+                1, int(getattr(self.pipeline.config, "beam_winner_runs", 3) or 3)),
+            known_timeout=self._is_known_timeout(),
+            timeout_seconds=getattr(self.pipeline.config, "timeout_seconds", 300),
+            collect_explain=True,
+            classify_speedup_fn=self._classify_speedup,
+            render_explain_fn=lambda text: text,  # raw text, compact rendering done elsewhere
+            dialect=self.dialect,
+        )
 
     def run_compiler_phase(self, ctx: "BeamContext", patches: List["AppliedPatch"],
                            scout_result: Any) -> Tuple[List["AppliedPatch"], int]:
@@ -2872,463 +2865,6 @@ class BeamSession(OptimizationSession):
                 pool.shutdown(wait=True)
             else:
                 pool.shutdown(wait=False, cancel_futures=True)
-
-    def _sequential_benchmark(
-        self, patches: List[AppliedPatch], db_path: str
-    ) -> None:
-        """Sequential benchmark (3-run: warmup + average of 2 measured runs).
-
-        Correctness gate: row count + checksum must match original.
-        """
-        from ..execution.factory import create_executor_from_dsn
-        from ..validate import _timed_runs_pg
-        from ..validation.equivalence_checker import EquivalenceChecker
-
-        baseline_runs = max(
-            1,
-            int(getattr(self.pipeline.config, "beam_baseline_runs", 3) or 3),
-        )
-        candidate_runs = max(
-            1,
-            int(getattr(self.pipeline.config, "beam_candidate_runs", 3) or 3),
-        )
-        winner_runs = max(
-            candidate_runs,
-            int(getattr(self.pipeline.config, "beam_winner_runs", 3) or 3),
-        )
-        checker = EquivalenceChecker()
-
-        logger.info(
-            f"[{self.query_id}] Sequential benchmark: "
-            f"{len(patches)} patches, baseline={baseline_runs}x, "
-            f"candidate={candidate_runs}x, winner={winner_runs}x"
-        )
-
-        try:
-            if self.benchmark_sem:
-                self.benchmark_sem.acquire()
-            try:
-                self._sequential_benchmark_inner(
-                    patches, db_path, baseline_runs, candidate_runs, winner_runs, checker
-                )
-            finally:
-                if self.benchmark_sem:
-                    self.benchmark_sem.release()
-        except Exception as e:
-            logger.warning(f"Sequential benchmark failed: {e}")
-
-    def _sequential_benchmark_inner(
-        self,
-        patches: List,
-        db_path: str,
-        baseline_runs: int,
-        candidate_runs: int,
-        winner_runs: int,
-        checker,
-    ) -> None:
-        from ..execution.factory import create_executor_from_dsn
-        from ..validate import _timed_runs_pg
-
-        with create_executor_from_dsn(db_path) as executor:
-            # ── Baseline: skip if R-Bot marked TIMEOUT ─────────────
-            known_timeout = self._is_known_timeout()
-            if known_timeout:
-                timeout_s = getattr(
-                    self.pipeline.config, "timeout_seconds", 300
-                )
-                orig_ms = float(timeout_s * 1000)
-                orig_count = None  # type: ignore[assignment]
-                orig_checksum = None
-                logger.info(
-                    f"[{self.query_id}] Baseline: SKIPPED "
-                    f"(known R-Bot timeout, using {orig_ms:.0f}ms)"
-                )
-            else:
-                # Measure original and capture rows for correctness.
-                logger.info(
-                    f"[{self.query_id}] Baseline: {baseline_runs}x..."
-                )
-                orig_ms, orig_rows, orig_times = _timed_runs_pg(
-                    executor, self.original_sql, runs=baseline_runs,
-                    capture_rows=True,
-                )
-                orig_count = len(orig_rows) if orig_rows else 0
-                orig_checksum = None
-                if orig_rows:
-                    try:
-                        orig_checksum = checker.compute_checksum(orig_rows)
-                    except Exception:
-                        pass
-                logger.info(
-                    f"[{self.query_id}] Baseline: {orig_ms:.1f}ms "
-                    f"({orig_count} rows, checksum={orig_checksum}) "
-                    f"[{', '.join(f'{t:.0f}' for t in orig_times)}]"
-                )
-
-            # Current best valid candidate speedup in this shot.
-            current_winner_speedup = float("-inf")
-
-            def _mark_correctness_failure(
-                patch: AppliedPatch,
-                patch_count: int,
-                patch_rows: List[Any],
-            ) -> bool:
-                # ── Correctness gate: skip if baseline was a timeout ──
-                if orig_count is None:
-                    # No baseline rows — correctness_verified stays False
-                    return False
-                # ── Correctness gate: row count + checksum ──
-                if patch_count != orig_count:
-                    patch.speedup = 0.0
-                    patch.status = "FAIL"
-                    patch.correctness_verified = False
-                    patch.apply_error = (
-                        f"Row count mismatch: original={orig_count}, "
-                        f"patch={patch_count}"
-                    )
-                    logger.warning(
-                        f"[{self.query_id}]   FAIL: {patch.patch_id}: "
-                        f"{patch.apply_error}"
-                    )
-                    return True
-
-                if orig_checksum and patch_rows:
-                    try:
-                        patch_checksum = checker.compute_checksum(patch_rows)
-                        if patch_checksum != orig_checksum:
-                            patch.speedup = 0.0
-                            patch.status = "FAIL"
-                            patch.correctness_verified = False
-                            patch.apply_error = (
-                                f"Checksum mismatch: original={orig_checksum}, "
-                                f"patch={patch_checksum}"
-                            )
-                            logger.warning(
-                                f"[{self.query_id}]   FAIL: {patch.patch_id}: "
-                                f"{patch.apply_error}"
-                            )
-                            return True
-                    except Exception:
-                        # Checksum compute failed — do not block.
-                        pass
-
-                return False
-
-            for idx, p in enumerate(patches):
-                logger.info(
-                    f"[{self.query_id}] Benchmark {idx + 1}/{len(patches)}: "
-                    f"{p.patch_id} ({p.family}/{p.transform})"
-                )
-                try:
-                    patch_ms, patch_rows, patch_times = _timed_runs_pg(
-                        executor,
-                        p.output_sql,
-                        runs=candidate_runs,
-                        capture_rows=True,
-                    )
-                    patch_count = len(patch_rows) if patch_rows else 0
-
-                    if _mark_correctness_failure(p, patch_count, patch_rows):
-                        continue
-
-                    # Correctness gate passed (or skipped for timeout)
-                    if orig_count is not None:
-                        p.correctness_verified = True
-
-                    p.original_ms = orig_ms
-                    p.patch_ms = patch_ms
-                    p.speedup = orig_ms / patch_ms if patch_ms > 0 else 1.0
-                    p.status = self._classify_speedup(p.speedup)
-
-                    logger.info(
-                        f"[{self.query_id}]   result: orig={orig_ms:.1f}ms, "
-                        f"patch={patch_ms:.1f}ms, speedup={p.speedup:.2f}x "
-                        f"({p.status}, {patch_count} rows) "
-                        f"[{', '.join(f'{t:.0f}' for t in patch_times)}]"
-                    )
-
-                    # If this candidate becomes the current winner, confirm with
-                    # a fuller timing pass (e.g., 3x) for stability.
-                    if (
-                        winner_runs > candidate_runs
-                        and p.speedup > current_winner_speedup
-                    ):
-                        logger.info(
-                            f"[{self.query_id}]   winner confirm: {p.patch_id} "
-                            f"{candidate_runs}x→{winner_runs}x"
-                        )
-                        win_ms, win_rows, win_times = _timed_runs_pg(
-                            executor,
-                            p.output_sql,
-                            runs=winner_runs,
-                            capture_rows=True,
-                        )
-                        win_count = len(win_rows) if win_rows else 0
-
-                        if _mark_correctness_failure(p, win_count, win_rows):
-                            continue
-
-                        p.patch_ms = win_ms
-                        p.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
-                        p.status = self._classify_speedup(p.speedup)
-
-                        logger.info(
-                            f"[{self.query_id}]   winner confirmed: "
-                            f"patch={win_ms:.1f}ms, speedup={p.speedup:.2f}x "
-                            f"({p.status}, {win_count} rows) "
-                            f"[{', '.join(f'{t:.0f}' for t in win_times)}]"
-                        )
-
-                    if p.speedup is not None and p.speedup > current_winner_speedup:
-                        current_winner_speedup = p.speedup
-                except Exception as e:
-                    p.speedup = 0.0
-                    p.status = "ERROR"
-                    p.apply_error = str(e)
-                    logger.warning(
-                        f"[{self.query_id}]   ERROR: {p.patch_id}: {e}"
-                    )
-
-    def _parallel_benchmark(
-        self,
-        patches: List[AppliedPatch],
-        db_path: str,
-        max_workers: int,
-    ) -> None:
-        """Parallel benchmark for candidate patches (shared baseline, per-patch lanes)."""
-        from ..execution.factory import create_executor_from_dsn
-        from ..validate import _timed_runs_pg
-        from ..validation.equivalence_checker import EquivalenceChecker
-
-        baseline_runs = max(
-            1,
-            int(getattr(self.pipeline.config, "beam_baseline_runs", 3) or 3),
-        )
-        candidate_runs = max(
-            1,
-            int(getattr(self.pipeline.config, "beam_candidate_runs", 3) or 3),
-        )
-        winner_runs = max(
-            candidate_runs,
-            int(getattr(self.pipeline.config, "beam_winner_runs", 3) or 3),
-        )
-        checker = EquivalenceChecker()
-
-        logger.info(
-            f"[{self.query_id}] Parallel benchmark: "
-            f"{len(patches)} patches, workers={max_workers}, "
-            f"baseline={baseline_runs}x, candidate={candidate_runs}x, "
-            f"winner={winner_runs}x"
-        )
-
-        bench_sem = self.benchmark_sem
-        known_timeout = self._is_known_timeout()
-        if known_timeout:
-            timeout_s = getattr(
-                self.pipeline.config, "timeout_seconds", 300
-            )
-            orig_ms = float(timeout_s * 1000)
-            orig_count = None  # type: ignore[assignment]
-            orig_checksum = None
-            logger.info(
-                f"[{self.query_id}] Baseline: SKIPPED "
-                f"(known R-Bot timeout, using {orig_ms:.0f}ms)"
-            )
-        else:
-            try:
-                if bench_sem:
-                    bench_sem.acquire()
-                try:
-                    with create_executor_from_dsn(db_path) as executor:
-                        orig_ms, orig_rows, orig_times = _timed_runs_pg(
-                            executor, self.original_sql, runs=baseline_runs, capture_rows=True
-                        )
-                finally:
-                    if bench_sem:
-                        bench_sem.release()
-                orig_count = len(orig_rows) if orig_rows else 0
-                orig_checksum = None
-                if orig_rows:
-                    try:
-                        orig_checksum = checker.compute_checksum(orig_rows)
-                    except Exception:
-                        pass
-                logger.info(
-                    f"[{self.query_id}] Baseline: {orig_ms:.1f}ms "
-                    f"({orig_count} rows, checksum={orig_checksum}) "
-                    f"[{', '.join(f'{t:.0f}' for t in orig_times)}]"
-                )
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Parallel benchmark baseline failed: {e}")
-                return
-
-        def _benchmark_one(patch: AppliedPatch) -> Tuple[AppliedPatch, Dict[str, Any]]:
-            try:
-                if bench_sem:
-                    bench_sem.acquire()
-                try:
-                    return _benchmark_one_inner(patch)
-                finally:
-                    if bench_sem:
-                        bench_sem.release()
-            except Exception as e:
-                return (patch, {"ok": False, "error": str(e), "status": "ERROR"})
-
-        def _benchmark_one_inner(patch: AppliedPatch) -> Tuple[AppliedPatch, Dict[str, Any]]:
-            try:
-                with create_executor_from_dsn(db_path) as executor:
-                    patch_ms, patch_rows, patch_times = _timed_runs_pg(
-                        executor,
-                        patch.output_sql or "",
-                        runs=candidate_runs,
-                        capture_rows=True,
-                    )
-                patch_count = len(patch_rows) if patch_rows else 0
-
-                # Skip correctness gate when baseline was a known timeout
-                if orig_count is not None:
-                    if patch_count != orig_count:
-                        return (
-                            patch,
-                            {
-                                "ok": False,
-                                "error": (
-                                    f"Row count mismatch: original={orig_count}, "
-                                    f"patch={patch_count}"
-                                ),
-                            },
-                        )
-
-                    if orig_checksum and patch_rows:
-                        try:
-                            patch_checksum = checker.compute_checksum(patch_rows)
-                            if patch_checksum != orig_checksum:
-                                return (
-                                    patch,
-                                    {
-                                        "ok": False,
-                                        "error": (
-                                            f"Checksum mismatch: original={orig_checksum}, "
-                                            f"patch={patch_checksum}"
-                                        ),
-                                    },
-                                )
-                        except Exception:
-                            pass
-
-                speedup = orig_ms / patch_ms if patch_ms > 0 else 1.0
-                return (
-                    patch,
-                    {
-                        "ok": True,
-                        "patch_ms": patch_ms,
-                        "speedup": speedup,
-                        "patch_count": patch_count,
-                        "patch_times": patch_times,
-                        "correctness_verified": orig_count is not None,
-                    },
-                )
-            except Exception as e:
-                return (patch, {"ok": False, "error": str(e), "status": "ERROR"})
-
-        workers = max(1, min(int(max_workers or 1), len(patches)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_benchmark_one, p): p for p in patches}
-            for future in as_completed(futures):
-                patch = futures[future]
-                try:
-                    patch, result = future.result()
-                except Exception as e:
-                    patch.speedup = 0.0
-                    patch.status = "ERROR"
-                    patch.apply_error = str(e)
-                    logger.warning(f"[{self.query_id}]   ERROR: {patch.patch_id}: {e}")
-                    continue
-
-                if not result.get("ok", False):
-                    patch.speedup = 0.0
-                    patch.status = str(result.get("status") or "FAIL")
-                    patch.apply_error = str(result.get("error") or "Benchmark failure")
-                    logger.warning(
-                        f"[{self.query_id}]   {patch.status}: {patch.patch_id}: {patch.apply_error}"
-                    )
-                    continue
-
-                patch.original_ms = orig_ms
-                patch.patch_ms = float(result["patch_ms"])
-                patch.speedup = float(result["speedup"])
-                patch.status = self._classify_speedup(patch.speedup)
-                patch.correctness_verified = bool(result.get("correctness_verified", False))
-                patch_count = int(result.get("patch_count", 0))
-                patch_times = result.get("patch_times") or []
-                logger.info(
-                    f"[{self.query_id}]   result: {patch.patch_id} "
-                    f"orig={orig_ms:.1f}ms, patch={patch.patch_ms:.1f}ms, "
-                    f"speedup={patch.speedup:.2f}x ({patch.status}, {patch_count} rows) "
-                    f"[{', '.join(f'{t:.0f}' for t in patch_times)}]"
-                )
-
-        if winner_runs > candidate_runs:
-            candidates = [
-                p
-                for p in patches
-                if p.speedup is not None and p.speedup > 0 and p.output_sql
-            ]
-            if candidates:
-                best = max(candidates, key=lambda p: p.speedup or 0.0)
-                if bench_sem:
-                    bench_sem.acquire()
-                try:
-                    with create_executor_from_dsn(db_path) as executor:
-                        win_ms, win_rows, win_times = _timed_runs_pg(
-                            executor,
-                            best.output_sql or "",
-                            runs=winner_runs,
-                            capture_rows=True,
-                        )
-                    win_count = len(win_rows) if win_rows else 0
-                    correctness_failed = False
-                    if orig_count is not None:
-                        if win_count != orig_count:
-                            best.speedup = 0.0
-                            best.status = "FAIL"
-                            best.apply_error = (
-                                f"Row count mismatch: original={orig_count}, patch={win_count}"
-                            )
-                            correctness_failed = True
-                        elif orig_checksum and win_rows:
-                            try:
-                                win_checksum = checker.compute_checksum(win_rows)
-                                if win_checksum != orig_checksum:
-                                    best.speedup = 0.0
-                                    best.status = "FAIL"
-                                    best.apply_error = (
-                                        f"Checksum mismatch: original={orig_checksum}, "
-                                        f"patch={win_checksum}"
-                                    )
-                                    correctness_failed = True
-                            except Exception:
-                                pass
-                    if not correctness_failed:
-                        best.patch_ms = win_ms
-                        best.speedup = orig_ms / win_ms if win_ms > 0 else 1.0
-                        best.status = self._classify_speedup(best.speedup)
-                        if orig_count is not None:
-                            best.correctness_verified = True
-                    logger.info(
-                        f"[{self.query_id}] winner confirm: {best.patch_id} "
-                        f"patch={best.patch_ms or 0:.1f}ms, "
-                        f"speedup={best.speedup or 0:.2f}x "
-                        f"({best.status}, {win_count} rows) "
-                        f"[{', '.join(f'{t:.0f}' for t in win_times)}]"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"[{self.query_id}] winner confirm failed for {best.patch_id}: {e}"
-                    )
-                finally:
-                    if bench_sem:
-                        bench_sem.release()
 
     def _serialize_iteration(self, it: PatchIterationResult) -> dict:
         """Serialize iteration result for SessionResult.iterations."""
