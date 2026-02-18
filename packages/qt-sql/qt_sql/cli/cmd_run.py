@@ -430,6 +430,7 @@ def run(
             results=results,
             errors=errors,
             console=console,
+            resume=resume,
         )
     else:
         _run_serial(
@@ -449,6 +450,7 @@ def run(
             console=console,
             orchestrator=orchestrator,
             patch_mode=True,
+            resume=resume,
         )
 
     elapsed = time.time() - t0
@@ -546,6 +548,7 @@ def _run_serial(
     console,
     orchestrator=None,
     patch_mode=False,
+    resume=False,
 ) -> None:
     """Original serial execution: each query end-to-end."""
     for i, qid in enumerate(query_ids, 1):
@@ -559,7 +562,24 @@ def _run_serial(
             continue
 
         sql = sql_path.read_text().strip()
-        console.print(f"  [{i}/{len(query_ids)}] {qid} ...", end=" ")
+
+        # ── Resume: find existing session dir with partial work ───
+        resume_dir = None
+        if resume:
+            from ..sessions.beam_session import BeamSession
+            resume_dir = BeamSession.find_resumable_session_dir(
+                bench_dir, qid
+            )
+            if resume_dir:
+                console.print(
+                    f"  [{i}/{len(query_ids)}] {qid} [yellow]resuming[/yellow] "
+                    f"from {resume_dir.name} ...",
+                    end=" ",
+                )
+            else:
+                console.print(f"  [{i}/{len(query_ids)}] {qid} ...", end=" ")
+        else:
+            console.print(f"  [{i}/{len(query_ids)}] {qid} ...", end=" ")
 
         try:
             result = pipeline.run_optimization_session(
@@ -571,6 +591,7 @@ def _run_serial(
                 mode=mode_enum,
                 orchestrator=orchestrator,
                 patch=patch_mode,
+                resume_dir=resume_dir,
             )
 
             _save_query_result(result, qid, out, checkpoint_path, completed_ids, results)
@@ -616,6 +637,7 @@ def _run_patch_parallel(
     results,
     errors,
     console,
+    resume=False,
 ) -> None:
     """Parallel patch mode: LLM phases concurrent, benchmark in bounded parallel lanes.
 
@@ -658,6 +680,18 @@ def _run_patch_parallel(
 
     t0 = time.time()
 
+    # ── Resume: pre-compute resume dirs for all work items ──────
+    resume_dirs: dict[str, Path | None] = {}
+    if resume:
+        from ..sessions.beam_session import BeamSession
+        for qid, _ in work_items:
+            resume_dirs[qid] = BeamSession.find_resumable_session_dir(
+                bench_dir, qid
+            )
+        n_resumable = sum(1 for v in resume_dirs.values() if v)
+        if n_resumable:
+            console.print(f"  Resume: {n_resumable} sessions with partial work")
+
     def _run_one(qid_sql):
         qid, sql = qid_sql
         if launch_interval_s > 0:
@@ -676,6 +710,7 @@ def _run_patch_parallel(
             mode=OptimizationMode.BEAM,
             patch=True,
             benchmark_lock=benchmark_gate,
+            resume_dir=resume_dirs.get(qid) if resume else None,
         )
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:

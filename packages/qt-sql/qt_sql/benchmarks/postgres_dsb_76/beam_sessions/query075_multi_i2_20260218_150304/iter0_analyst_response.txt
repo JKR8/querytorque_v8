@@ -1,0 +1,129 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three sequential scans on item table (13424 rows each) and large sequential scans on returns tables dominate runtime. UNION deduplication adds overhead despite disjoint channels. Late application of selective dimension filters prevents early row reduction.",
+    "reasoning_trace": [
+      "Item table scanned three times (1200 ms each) with same filter i_category='Children'.",
+      "Returns tables (store_returns 260k rows, catalog_returns 119k rows, web_returns 154k rows) scanned sequentially without index on reason_sk.",
+      "UNION requires deduplication aggregate (26340 ms) though channels are disjoint.",
+      "No correlated subqueries or nested loops; joins are hash joins and index scans."
+    ],
+    "cost_spine": ["Seq Scan store_returns", "Seq Scan item", "Hash Join", "Index Scan store_sales", "Index Only Scan date_dim", "Append", "Aggregate (deduplicate)", "Aggregate (group by)"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_returns",
+        "why": "large sequential scan without index on reason_sk",
+        "evidence": "rows=260757 time=5859ms"
+      },
+      {
+        "op": "Seq Scan on item",
+        "why": "repeated three times with same filter",
+        "evidence": "rows=13424 time=1200ms each, total 3600ms"
+      },
+      {
+        "op": "Aggregate (for UNION deduplication)",
+        "why": "expensive deduplication step",
+        "evidence": "rows=20290 time=26340ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid same-column OR to UNION ALL (BitmapOr is optimal)",
+      "avoid materializing EXISTS subqueries (semi-join already optimal)",
+      "avoid duplicating heavy CTE bodies (guard G_PG_CTE_DUPLICATION_STOP)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre-filter item table on i_category='Children' into a CTE and join it in each UNION branch to avoid three sequential scans.",
+      "dag_target_hint": "Replace each item scan in UNION branches with CTE reference.",
+      "node_contract": {
+        "from_must_include": ["item i"],
+        "where_must_preserve": ["i.i_category='Children'"],
+        "output_must_preserve": ["i.i_item_sk", "i.i_brand_id", "i.i_class_id", "i.i_category_id", "i.i_manufact_id"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_STOP:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Three Seq Scan on item become one CTE scan; rows into hash joins reduce.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot — repeated item scans waste 3600 ms.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert LEFT JOIN between sales and returns to INNER JOIN because WHERE clause on returns column filters out NULL rows.",
+      "dag_target_hint": "Change LEFT JOIN to INNER JOIN in each UNION branch.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales cs", "catalog_returns cr"],
+        "where_must_preserve": ["cr_reason_sk in (8,18,20,23,41)"],
+        "output_must_preserve": ["All original columns and NULL handling in sales_cnt/sales_amt expressions"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Planner may reorder joins more freely, reducing hash join input sizes.",
+      "recommended_patch_ops": ["replace_join_type"],
+      "rank_rationale": "Addresses secondary hotspot — LEFT JOIN semantics block join reordering.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push returns filter (reason_sk in list) into a CTE to allow early reduction before joining with item and sales.",
+      "dag_target_hint": "Wrap each returns table scan with a filtered CTE.",
+      "node_contract": {
+        "from_must_include": ["store_returns sr"],
+        "where_must_preserve": ["sr_reason_sk in (8,18,20,23,41)"],
+        "output_must_preserve": ["sr_item_sk", "sr_return_quantity", "sr_return_amt"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_STOP:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "CTE materialization may enable better join order or parallelization despite filter already applied in scan.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Returns scans become CTE scans; planner may choose different join order.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — tests if CTE fencing improves join planning for large returns tables.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared dimension filters (item category, date range) into a single CTE referenced by all three UNION branches to avoid redundant dimension work.",
+      "dag_target_hint": "Create a CTE with filtered item and date_dim keys, then join with sales and returns.",
+      "node_contract": {
+        "from_must_include": ["item i", "date_dim d"],
+        "where_must_preserve": ["i.i_category='Children'", "d.d_year in (1998,1999)"],
+        "output_must_preserve": ["i.i_item_sk", "d.d_date_sk", "i.i_brand_id", "i.i_class_id", "i.i_category_id", "i.i_manufact_id", "d.d_year"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_STOP:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Consolidating dimension filters may reduce repeated

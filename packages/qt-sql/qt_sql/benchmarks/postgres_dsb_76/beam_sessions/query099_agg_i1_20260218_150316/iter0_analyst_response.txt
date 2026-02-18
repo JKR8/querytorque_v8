@@ -1,0 +1,156 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Nested loops amplify a large fact-table index scan (catalog_sales) 5856× due to comma-join rigidity and late selectivity. Converting to explicit joins with pre‑filtered dimension CTEs should enable hash joins and reduce probe iterations. Secondary hotspot: Sort amplifies 18× due to cardinality misestimation.",
+    "reasoning_trace": [
+      "Nested Loop drives 5856 index scans on catalog_sales (244×3×2×4 combos).",
+      "Comma‑join syntax prevents optimizer from reordering joins or using hash joins.",
+      "Sort node shows severe cardinality misestimation (est=41, act=767, q‑error=18.7×).",
+      "Dimension tables are already tiny (call_center=3, warehouse=2, ship_mode=4)."
+    ],
+    "cost_spine": ["Nested Loop", "Nested Loop", "Nested Loop", "Nested Loop", "Index Scan on catalog_sales", "Sort", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Index Scan on catalog_sales",
+        "why": "repeated 5856× due to nested‑loop amplification from comma‑join rigidity",
+        "evidence": "rows=0 per loop, time=0.15 ms per loop, total ~878 ms"
+      },
+      {
+        "op": "Sort",
+        "why": "cardinality misestimation (est=41, act=767) causes spill risk and extra work",
+        "evidence": "q‑error=18.7×, time=900.635 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union (no OR predicate in plan)",
+      "avoid decorrelate (no correlated subqueries)",
+      "avoid aggregate_pushdown (group‑by includes dimension columns)",
+      "avoid duplicating heavy CTE bodies (G_PG_CTE_DUPLICATION_BLOCK)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and isolate date_dim filter into a CTE to create a tiny hash table for the fact‑table probe.",
+      "dag_target_hint": "Change final_select FROM clause to explicit JOINs and add date_cte.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "warehouse", "ship_mode", "call_center", "date_dim"],
+        "where_must_preserve": ["d_month_seq between 1192 and 1192+23", "cs_list_price between 86 and 115", "sm_type = 'EXPRESS'", "cc_class = 'small'", "w_gmt_offset = -5"],
+        "output_must_preserve": ["all original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop replaced by Hash Join; date_dim scan becomes CTE scan; catalog_sales index scan count drops dramatically.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: directly attacks comma‑join rigidity that drives 5856 index scans.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre‑filter all selective dimensions (date_dim, call_center, warehouse, ship_mode) into separate CTEs, then join them with catalog_sales using explicit JOIN syntax.",
+      "dag_target_hint": "Replace final_select FROM with CTE references and explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "warehouse_cte", "ship_mode_cte", "call_center_cte", "date_cte"],
+        "where_must_preserve": ["cs_list_price between 86 and 115"],
+        "output_must_preserve": ["all original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Multiple tiny CTE scans replace dimension table scans; planner picks hash joins; catalog_sales index scan count drops.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Secondary hotspot: addresses cardinality misestimation by providing stable small dimension sets.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Pre‑filter all selective dimensions into a single CTE that joins them together, then join that CTE with catalog_sales. (Portability candidate from DuckDB; test on PostgreSQL.)",
+      "dag_target_hint": "Create a combined_dimensions CTE with all dimension keys, then join with catalog_sales.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "combined_dimensions_cte"],
+        "where_must_preserve": ["cs_list_price between 86 and 115"],
+        "output_must_preserve": ["all original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combining dimension filters into one CTE may improve join‑order flexibility and reduce planner search space.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single CTE scan replaces multiple dimension scans; planner may choose different join order.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: tests portability of DuckDB pattern; secondary hotspot coverage.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Stage‑reduce: first CTE filters date_dim, second CTE joins filtered date keys with catalog_sales, third CTE joins remaining dimensions. (Portability candidate from DuckDB.)",
+      "dag_target_hint": "Create a chain of CTEs: date_cte → fact_date_cte → final join with other dimensions.",
+      "node_contract": {
+        "from_must_include": ["fact_date_cte", "warehouse", "ship_mode", "call_center"],
+        "where_must_preserve": ["cs_list_price between 86 and 115", "sm_type = 'EXPRESS'", "cc_class = 'small'", "w_gmt_offset = -5"],
+        "output_must_preserve": ["all original output columns, GROUP BY keys, ORDER BY, LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction may shrink fact‑table probe set before joining other dimensions, reducing nested‑loop amplification.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Catalog_sales scan moves earlier; nested loops may become hash joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: tests alternative staging shape; secondary hotspot coverage.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in SQL or plan evidence."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Group‑by includes dimension columns (sm_type, cc_name, substring(w_warehouse_name)), cannot push below joins."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "No repeated scans or reusable sub‑expressions in plan."
+    }
+  ]
+}

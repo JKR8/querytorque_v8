@@ -3070,6 +3070,7 @@ class SyntheticValidator:
         optimized_sql: str,
         target_rows: int = 100,
         witness_mode: str = "single",
+        force_seed_first: bool = True,
     ) -> Dict[str, Any]:
         """Validate that optimized SQL produces same results as original.
 
@@ -3083,6 +3084,8 @@ class SyntheticValidator:
             target_rows: Number of synthetic rows per table (default 100).
             witness_mode: ``"single"`` (default) for current behavior, or
                 ``"multi"`` to also test clone + boundary-fail witnesses.
+            force_seed_first: If True (default), use deterministic AST-driven
+                force-seed before falling back to random data generation.
 
         Returns:
             Dict with keys:
@@ -3232,6 +3235,46 @@ class SyntheticValidator:
             self._create_indexes(merged_tables, orig_exec)
             self._create_indexes(merged_tables, opt_exec)
 
+            if force_seed_first:
+                # Late import to avoid circular dependency (build_dsb76 imports us).
+                from .build_dsb76_synthetic_db import (
+                    _force_seed_for_query,
+                    _tables_in_anti_patterns,
+                )
+
+                qctx = {
+                    "tables": merged_tables,
+                    "filter_values": filter_values,
+                    "fk_relationships": fk_relationships,
+                    "sql_duckdb": orig_exec,
+                }
+                anti_tables = _tables_in_anti_patterns(orig_exec)
+                seeded = False
+                for attempt in range(1, 7):
+                    try:
+                        _force_seed_for_query(
+                            self.conn,
+                            qctx,
+                            merged_tables,
+                            fk_relationships,
+                            seed_variant=attempt,
+                            seed_rows=1,
+                            skip_tables=anti_tables,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        probe = self.conn.execute(f"SELECT 1 FROM ({orig_exec}) _p LIMIT 1").fetchall()
+                        if len(probe) >= 1:
+                            seeded = True
+                            break
+                    except Exception:
+                        pass
+
+                if seeded:
+                    return
+
+            # Fallback: random data generation.
             generator = SyntheticDataGenerator(self.conn, all_schemas=merged_tables)
             generator.filter_literal_values = filter_values
 

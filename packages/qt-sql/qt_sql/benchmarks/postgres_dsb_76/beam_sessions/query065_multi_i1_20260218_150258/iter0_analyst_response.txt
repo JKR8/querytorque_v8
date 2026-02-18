@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Two identical nested-loop scans of store_sales and date_dim (145k rows each) dominate runtime, consuming ~2.5s and ~2.0s. The plan repeats the same fact-dimension join twice due to separate subqueries (sb and sc). Consolidating scans into a single pass and pushing filters earlier should cut total I/O by half.",
+    "reasoning_trace": [
+      "Nested Loop (rows=145949, time=1392ms) appears twice with identical Index Only Scans on date_dim and store_sales.",
+      "Aggregate after each nested loop amplifies rows (est=742 vs act=1) indicating late reduction.",
+      "Merge Join between sb and sc subqueries processes the same store_sales data twice.",
+      "No correlated subqueries or set operations present; primary opportunity is scan consolidation."
+    ],
+    "cost_spine": ["Nested Loop", "Aggregate", "Merge Join", "Nested Loop", "Aggregate", "Merge Join", "Nested Loop"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (sb subquery)",
+        "why": "repeated scan of store_sales and date_dim with same filters",
+        "evidence": "rows=145949 time=1392ms"
+      },
+      {
+        "op": "Nested Loop (sc subquery)",
+        "why": "identical repeated scan of same tables",
+        "evidence": "rows=145949 time=1055ms"
+      },
+      {
+        "op": "Aggregate (sb subquery)",
+        "why": "late aggregation after large join, estimation error (est=742, act=1)",
+        "evidence": "rows_in=145949 rows_out=1 time=2548ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR to UNION ALL splits (PostgreSQL BitmapOr handles indexed OR)",
+      "avoid duplicating heavy CTE bodies",
+      "avoid materializing EXISTS paths (none present)",
+      "do not repeat failed transforms: shared_dimension_multi_channel, early_filter, date_cte_explicit_join, aggregate_pushdown"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Consolidate the two identical store_sales+date_dim scans into a single CTE that computes both revenue per (store,item) and average revenue per store, then derive sb and sc from that CTE.",
+      "dag_target_hint": "Replace sb and sc subqueries with references to a new consolidated CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_month_seq between 1195 and 1195+11", "ss_sales_price / ss_list_price BETWEEN 38*0.01 AND 48*0.01"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue per store+item", "average revenue per store"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "no_or_to_union:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Two Nested Loop nodes merge into one; Aggregate nodes shift earlier; total scan rows drop from ~292k to ~146k.",
+      "recommended_patch_ops": ["insert_cte", "replace_subquery", "replace_subquery"],
+      "rank_rationale": "Primary hotspot — eliminates duplicate fact-table scans, highest expected impact.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered date_dim rows and pre-join with store_sales in a CTE, then compute both aggregates from the reduced set before the non-equi join (revenue <= 0.1 * ave).",
+      "dag_target_hint": "Insert a CTE that joins date_dim and store_sales with all filters, then compute sb and sc aggregates from that CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_month_seq between 1195 and 1195+11", "ss_sales_price / ss_list_price BETWEEN 38*0.01 AND 48*0.01"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue sum", "average per store"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Single Nested Loop scan; Materialized CTE reduces rows before non-equi join; Merge Join input shrinks.",
+      "recommended_patch_ops": ["insert_cte", "replace_subquery", "replace_subquery"],
+      "rank_rationale": "Secondary hotspot — addresses non-equi join input blindness and reduces scan duplication.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter store and date_dim into separate CTEs, then join with store_sales in a single pass, computing both aggregates in the same CTE using conditional aggregation.",
+      "dag_target_hint": "Create CTEs for filtered store and date_dim, then a fact CTE that joins both and computes revenue per store+item and average per store via CASE/SUM.",
+      "node_contract": {
+        "from_must_include": ["store", "date_dim", "store_sales"],
+        "where_must_preserve": ["s_state in ('IA','IL','NC')", "d_month_seq between 1195 and 1195+11", "ss_sales_price / ss_list_price BETWEEN 38*0.01 AND 48*0.01"],
+        "output_must_preserve": ["s_store_sk", "ss_item_sk", "revenue per store+item", "average per store"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join conversion with prefetched dimension CTEs may improve cardinality estimates and reduce nested-loop rescanning.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Comma joins become explicit INNER JOINs; dimension CTEs are tiny hash tables; single store_sales scan with early dimension filters.",
+      "recommended_patch_ops": ["insert_cte", "insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — targets join topology and predicate pushback, underrepresented family F.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push store and date_dim filters into CTEs, then join with store_sales once, computing both aggregates in a single pass. Use MATERIALIZED hint to prevent inlining and force early reduction.",
+      "dag_target_hint": "Create MATERIALIZED CTEs for filtered store and date_dim, then a fact CTE that joins both and computes revenue and average.",
+      "node_contract": {
+        "from_must_include": ["store", "date_dim", "store_sales"],
+        "where_must_preserve": ["s_state in ('IA','IL','NC')", "d_month_seq between 1195 and 1195+11", "ss_sales_price / ss_list_price BETWEEN 38*0.01 AND 48*0.01"],
+        "output_must_preserve": ["ss_store_sk", "ss_item_sk", "revenue per store+item", "average per store"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:SKIP_PATHOLOGY", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materialized CTEs may force early filter application and reduce rows before the expensive aggregates, even without correlation.",
+      "confidence": 0.55,
+      "expected_explain_delta": "CTE materialization fences prevent predicate pushdown but may reduce repeated scans; single store_sales scan.",
+      "recommended_patch_ops": ["insert_cte", "insert_cte", "replace_from", "add_materialized_hint"],
+      "rank_rationale": "Exploration — tests CTE materialization impact on scan consolidation, family B underrepresented.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": "early_filter_decorrelate"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar subquery present in SQL; transform mismatch."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Previous attempt failed; no clear evidence of aggregation below join blindness in plan."
+    },
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "reason": "Previous attempt failed; plan already uses index scans on date_dim."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "Previous attempt failed; no multi-channel pattern in query."
+    },
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Previous attempt failed; dimension tables already small and indexed."
+    }
+  ]
+}

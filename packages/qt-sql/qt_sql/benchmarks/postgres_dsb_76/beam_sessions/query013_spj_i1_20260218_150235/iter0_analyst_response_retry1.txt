@@ -1,0 +1,182 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows large nested loop amplification from 122 date_dim rows to 56045 store_sales rows before applying selective dimension filters. OR predicates likely block efficient index usage on store_sales. The primary hotspot is the Nested Loop join between date_dim and store_sales, which scans 461 store_sales rows per date row due to missing predicate pushdown from the OR branches. Secondary hotspot is the Hash Join with household_demographics and store which processes 6247 rows.",
+    "reasoning_trace": [
+      "Nested Loop amplifies 122 date_dim rows to 56045 store_sales rows (461 rows per loop).",
+      "OR predicates on ss_sales_price and ss_net_profit likely prevent index usage on store_sales columns.",
+      "Plan shows no bitmap scans, suggesting OR decomposition may unlock index paths.",
+      "No correlated subqueries present, ruling out family B transforms.",
+      "Aggregation is final scalar min, no grouping, ruling out family C transforms.",
+      "Previous attempts with dimension CTE isolation and explicit join conversion failed (0.00x)."
+    ],
+    "cost_spine": [
+      "Aggregate",
+      "Gather",
+      "Aggregate",
+      "Nested Loop (customer_demographics)",
+      "Nested Loop (customer_address)",
+      "Hash Join (household_demographics)",
+      "Hash Join (store)",
+      "Nested Loop (store_sales)"
+    ],
+    "hotspots": [
+      {
+        "op": "Nested Loop (date_dim → store_sales)",
+        "why": "Row amplification of 460x per outer row due to missing predicate pushdown from OR branches",
+        "evidence": "rows=56045, time=2249.948ms"
+      },
+      {
+        "op": "Hash Join (household_demographics + store)",
+        "why": "Processes 6247 rows before final nested loops",
+        "evidence": "rows=6247, time=2273.033ms"
+      }
+    ],
+    "do_not_do": [
+      "Do not repeat dimension_cte_isolate, date_cte_explicit_join, inner_join_conversion, or dimension_prefetch_star (previous attempts failed)",
+      "Avoid splitting same-column indexed OR predicates (respect G_PG_OR_INDEX_PROTECTED)",
+      "Avoid materializing CTEs without reuse benefit",
+      "Do not introduce correlated subquery decorrelation where none exists"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Decompose OR predicates into UNION ALL branches, each branch containing one OR clause's conditions, to enable per-branch index usage on store_sales columns.",
+      "dag_target_hint": "Replace final_select WHERE clause with UNION ALL of three branches for household/customer demographics ORs, each with full address ORs preserved.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["MIN(ss_quantity)", "MIN(ss_ext_sales_price)", "MIN(ss_ext_wholesale_cost) (twice)"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:PASS", "no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop replaced by BitmapOr or per-branch index scans; reduced rows from store_sales early.",
+      "recommended_patch_ops": ["split_or_to_union_all", "preserve_aggregate_wrapper"],
+      "rank_rationale": "Directly targets primary hotspot by enabling predicate pushdown and index usage on store_sales OR columns.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter household_demographics, customer_demographics, and customer_address into CTEs with their respective OR clause filters before joining to store_sales, creating small hash tables for early join reduction.",
+      "dag_target_hint": "Create CTEs for filtered hd, cd, ca dimensions; join them with store_sales via explicit JOIN ON syntax.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["All original output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering dimensions may reduce hash join build side size and enable better join ordering.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Hash Join rows reduced; dimension scans become CTE scans with fewer rows.",
+      "recommended_patch_ops": ["insert_cte_hd", "insert_cte_cd", "insert_cte_ca", "replace_from_with_explicit_join"],
+      "rank_rationale": "Targets secondary hotspot (hash join) and explores family A, underrepresented in previous attempts.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered store_sales rows (with date_dim join) and filtered dimensions into separate CTEs, then join CTEs explicitly to reduce nested loop input size.",
+      "dag_target_hint": "Create fact_cte joining store_sales and date_dim; create dimension CTEs; join CTEs with explicit JOIN syntax.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "ss_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["All original output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing fact and dimension subsets may help PostgreSQL cost model choose better join order and avoid nested loop amplification.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Nested Loop replaced by hash joins between small materialized CTEs.",
+      "recommended_patch_ops": ["insert_cte_fact", "insert_cte_dims", "replace_from_with_cte_joins"],
+      "rank_rationale": "Exploration targeting join topology and CTE materialization to influence planner decisions.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit INNER JOIN syntax while preserving all join predicates in ON clauses.",
+      "dag_target_hint": "Change FROM clause to explicit JOINs with ON conditions for all equi-joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["All original WHERE predicates except equi-joins moved to ON"],
+        "output_must_preserve": ["All original output columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_EXPLICIT_JOIN_STYLE:PASS", "G_PG_COMMA_JOIN_PRESENT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Join order may change; planner may choose different join algorithms or order.",
+      "recommended_patch_ops": ["replace_comma_with_inner_join", "move_equi_predicates_to_on"],
+      "rank_rationale": "Addresses comma join weakness pattern; low-risk syntactic change with potential planner benefit.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Previous attempt failed (0.00x speedup); plan shows dimension scans already selective."
+    },
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "reason": "Previous attempt failed (0.00x speedup); date_dim scan is already index-only and selective."
+    },
+    {
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "reason": "Previous attempt failed (0.00x speedup); similar to dimension_cte_isolate."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific to Snowflake; not applicable to PostgreSQL."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in query."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Query uses scalar aggregates, no GROUP BY to push down."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    }
+  ]
+}

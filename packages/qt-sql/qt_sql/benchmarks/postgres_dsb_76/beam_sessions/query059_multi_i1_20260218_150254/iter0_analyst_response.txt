@@ -1,0 +1,160 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The CTE wss scans the entire store_sales table (28.8M rows) and aggregates before applying selective date_dim filters, causing 20+ seconds of unnecessary I/O. Pushing date filters into the CTE via separate materialized CTEs per date range should reduce fact scan volume by ~24x (two 12-month ranges vs full table).",
+    "reasoning_trace": [
+      "Seq Scan on store_sales in wss CTE takes 20251 ms and reads 2.34M rows (full table scan).",
+      "Outer query filters date_dim.d_month_seq to two 12-month ranges (1187-1198 and 1199-1210) but these filters are applied after the CTE aggregation.",
+      "Plan shows two separate CTE scans (wss and wss_1) with identical logic, indicating repeated work.",
+      "Hash Join in y branch (25113 ms) dominates runtime after the initial scan."
+    ],
+    "cost_spine": ["Seq Scan on store_sales", "Nested Loop (wss CTE)", "Hash Join (y branch)", "Hash Join (x branch)", "Sort", "Limit"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_sales",
+        "why": "full table scan without date pruning",
+        "evidence": "rows=2342989 time=20251.452ms"
+      },
+      {
+        "op": "Hash Join (y branch)",
+        "why": "large aggregated CTE joined with filtered date_dim",
+        "evidence": "rows=1184 time=25113.772ms"
+      },
+      {
+        "op": "Hash Join (x branch)",
+        "why": "secondary aggregated CTE join",
+        "evidence": "rows=1464 time=6243.147ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union on same-column OR (PostgreSQL uses BitmapOr)",
+      "avoid materializing EXISTS paths (PostgreSQL semi-join optimization)",
+      "do not duplicate heavy CTE bodies (CTE_MATERIALIZATION_FENCE guard)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Replace the single wss CTE with two materialized CTEs (wss_y, wss_x) that embed the respective date_dim.d_month_seq filters (1187-1198 and 1199-1210) directly in their definitions, joining store_sales only with rows from the required date ranges.",
+      "dag_target_hint": "Replace wss node with two CTE definitions, then adjust final_select to reference wss_y and wss_x.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 57 * 0.01 AND 77 * 0.01", "s_state in ('AR','CO','IA','IL','NC','NY','PA','TX')"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Seq Scan on store_sales replaced by two filtered scans, each with reduced rows; CTE scans become smaller; Hash Join input rows drop significantly.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot — eliminates full store_sales scan by pushing date filters into CTE definitions.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter store and date_dim into materialized CTEs before joining with store_sales in the wss CTE, and convert comma joins to explicit JOIN syntax to improve cardinality estimates.",
+      "dag_target_hint": "Add store_filtered and date_filtered_y/date_filtered_x CTEs; rewrite wss CTE to join these explicitly.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 57 * 0.01 AND 77 * 0.01", "s_state in ('AR','CO','IA','IL','NC','NY','PA','TX')", "d_month_seq ranges"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Explicit joins with tiny dimension CTEs; planner chooses better join order; store_sales scan filtered by pre‑computed date keys.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Addresses secondary hotspot — improves join planning and reduces fact scan via prefetched dimension keys.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the base wss CTE once with all data, then create two derived CTEs that filter by the respective date ranges via join with date_dim, avoiding recomputation of the full aggregation.",
+      "dag_target_hint": "Change wss to MATERIALIZED, add wss_y and wss_x as filtered versions joining the materialized wss with date_dim.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 57 * 0.01 AND 77 * 0.01"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the base aggregation once may be cheaper than two full scans if the date filters are not highly selective, but reuse benefit must outweigh materialization cost.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Single materialized CTE scan followed by two small joins; eliminates repeated store_sales scan but adds materialization overhead.",
+      "recommended_patch_ops": ["add_materialized_keyword", "insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — tests whether materialization reuse beats filtered scans, targeting the repeated‑scan pattern.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate store_sales by week and store within each date range before joining with date_dim and store, reducing rows early in the pipeline.",
+      "dag_target_hint": "Create two CTEs that aggregate store_sales filtered by date range, then join with date_dim and store for final weekday sums.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["d_date_sk = ss_sold_date_sk", "ss_sales_price / ss_list_price BETWEEN 57 * 0.01 AND 77 * 0.01"],
+        "output_must_preserve": ["d_week_seq", "ss_store_sk", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregating before joining dimension tables may reduce rows flowing into the expensive CASE expressions and final join.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Aggregate node moves below join; fewer rows enter the CASE aggregation and subsequent joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_group_by"],
+      "rank_rationale": "Exploration — targets aggregation‑after‑join pattern; may reduce compute in the wss CTE.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan; PostgreSQL uses BitmapOr for indexed OR."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries; AST match missing AGG_AVG and correlation evidence."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN followed by WHERE filter on right table in query."
+    }
+  ]
+}

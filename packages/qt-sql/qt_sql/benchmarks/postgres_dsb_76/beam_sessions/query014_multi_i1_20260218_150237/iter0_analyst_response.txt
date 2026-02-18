@@ -1,0 +1,148 @@
+{  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query suffers from high materialization cost due to INTERSECT operations in the cross_items CTE, leading to poor cardinality estimates and inefficient nested loops in the final join. Converting INTERSECT to EXISTS can reduce intermediate sets, and improving join syntax with explicit joins may enhance planner decisions.",
+    "reasoning_trace": [
+      "INTERSECT operations in cross_items CTE show high time (7110 ms) and row amplification (384091 rows).",
+      "Nested loop in final part has severe estimation error (est=9, act=273K) and dominates runtime (51118 ms).",
+      "Comma-join patterns in CTEs may prevent optimal join ordering, as seen in the plan with multiple date_dim scans."
+    ],
+    "cost_spine": ["SetOp", "Nested Loop", "Hash Join", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "SetOp",
+        "why": "INTERSECT materializes large intermediate sets in cross_items CTE",
+        "evidence": "rows=384091 time=7110.679 ms"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "severe underestimation leads to inefficient join in final query",
+        "evidence": "est=9 act=273K time=51118.972 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION split (no OR predicates in query)",
+      "avoid materializing simple EXISTS paths (protect semi-joins)",
+      "avoid duplicating CTE bodies (prevent optimization fences)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT operations in cross_items CTE with EXISTS subqueries to avoid full materialization, while preserving all filters on item, date_dim, and fact tables.",
+      "dag_target_hint": "Modify cross_items CTE definition to use EXISTS instead of INTERSECT.",
+      "node_contract": {
+        "from_must_include": ["item", "store_sales", "catalog_sales", "web_sales", "date_dim"],
+        "where_must_preserve": ["i_category IN ('Electronics', 'Jewelry', 'Men')", "i_manager_id BETWEEN 91 and 100", "ss_wholesale_cost BETWEEN 35 AND 55", "cs_wholesale_cost BETWEEN 35 AND 55", "ws_wholesale_cost BETWEEN 35 AND 55", "d_year between 1999 AND 1999 + 2"],
+        "output_must_preserve": ["ss_item_sk"]
+      },
+      "gates_checked": ["INTERSECT_PRESENT:PASS", "no_or_to_union:PASS", "setop_semantic_safe:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "SetOp replaced with semi-joins, reducing materialization and row counts in cross_items CTE.",
+      "recommended_patch_ops": ["replace_set_operation", "modify_cte_definition"],
+      "recommended_examples": ["pg_intersect_to_exists"],
+      "rank_rationale": "Targets primary hotspot — INTERSECT operations drive high materialization cost and poor estimates.",
+      "gold_example_id": "pg_intersect_to_exists"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins in CTEs (e.g., in cross_items and avg_sales) to explicit INNER JOIN syntax to improve planner estimates and join ordering.",
+      "dag_target_hint": "Change FROM clauses in CTEs from comma-separated to explicit JOIN with ON conditions.",
+      "node_contract": {
+        "from_must_include": ["item", "date_dim", "store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["All original join predicates and filters"],
+        "output_must_preserve": ["All original output columns and aliases"]
+      },
+      "gates_checked": ["comma_join_present:PASS", "explicit_join_safe:PASS", "join_predicate_preservation:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Comma joins replaced with explicit INNER JOIN, enabling better hash join planning and cardinality estimation.",
+      "recommended_patch_ops": ["replace_from_clause", "add_join_conditions"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Addresses join syntax weakness that may block optimizer from optimal join orders.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by item key (i_brand_id, i_class_id, i_category_id) before joining with item and date_dim in the final this_year and last_year subqueries.",
+      "dag_target_hint": "Modify final_select subqueries to include pre-aggregated CTEs for store_sales.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "date_dim"],
+        "where_must_preserve": ["d_week_seq filters", "i_category IN ('Electronics', 'Jewelry', 'Men')", "ss_wholesale_cost BETWEEN 35 AND 55"],
+        "output_must_preserve": ["Grouping keys compatibility with final projection and HAVING clause on average_sales"]
+      },
+      "gates_checked": ["agg_after_join:PASS", "key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregation pushdown may reduce input rows to the dominant nested loop, addressing secondary aggregation hotspot.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Aggregate moved earlier in the plan, reducing rows fed into joins and potentially lowering nested loop cost.",
+      "recommended_patch_ops": ["insert_cte", "modify_group_by"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration — targets aggregation hotspot to reduce join amplification in final query.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Apply early filtering on dimension tables (date_dim, item) in CTEs and decorrelate any subqueries to reduce row flow, focusing on avg_sales and cross_items CTEs.",
+      "dag_target_hint": "Change CTE definitions to push filters earlier and materialize small dimension sets.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["d_year filters", "i_category and i_manager_id filters", "cost BETWEEN predicates"],
+        "output_must_preserve": ["All original aggregates and keys"]
+      },
+      "gates_checked": ["early_filter_possible:PASS", "decorrelation_needed:CAUTION", "cte_reuse_benefit:CHECK"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering on date_dim and item may reduce fact table scans, and decorrelation could optimize subquery execution in avg_sales.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Filters applied earlier in CTEs, reducing scan volumes and potential decorrelation of subqueries to avoid per-row execution.",
+      "recommended_patch_ops": ["modify_cte_filters", "add_materialized_cte"],
+      "recommended_examples": ["early_filter_decorrelate"],
+      "rank_rationale": "Exploration — tests predicate pushdown and subquery optimization for underrepresented family B.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence; PostgreSQL's BitmapOr handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "Previous attempts showed limited success (speedup 1.02x), and engine guards caution against unnecessary CTE materialization fences."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "AST pre-screening indicates ALREADY_DECORRELATED; no strong evidence of correlated subquery paralysis in current plan."
+    }
+  ]
+}

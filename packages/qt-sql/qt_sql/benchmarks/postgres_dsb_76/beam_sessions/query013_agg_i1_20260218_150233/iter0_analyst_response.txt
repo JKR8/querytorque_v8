@@ -1,0 +1,159 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows a large nested-loop join amplifying a fact-table scan (store_sales) due to comma-join style and complex OR predicates that block efficient filter pushdown. Cardinality estimation is poor (est=1,928 vs act=56K), causing the planner to under-provision the nested loop. The primary bottleneck is the comma-join shape preventing early selectivity propagation; secondary hotspots are the OR conditions on customer_demographics and customer_address that may block index usage.",
+    "reasoning_trace": [
+      "Largest I/O is the store_sales index scan (461 rows) but nested-loop amplification multiplies work.",
+      "Comma-join style with predicates in WHERE blocks predicate pushdown and join reordering.",
+      "OR conditions on multiple columns (cd_marital_status, cd_education_status, ss_sales_price, hd_dep_count, ca_state, ss_net_profit) may prevent bitmap index scans.",
+      "Cardinality estimation error at nested loop (est=1,928, act=56K) indicates planner misjudges selectivity of OR branches.",
+      "No correlated subqueries present, so Family B (decorrelation) is not applicable."
+    ],
+    "cost_spine": ["Nested Loop", "Hash Join", "Hash Join", "Index Only Scan store_sales", "Index Only Scan date_dim", "Seq Scan household_demographics", "Seq Scan store", "Index Scan customer_address", "Index Scan customer_demographics"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (rows=28, time=7897.891ms)",
+        "why": "Amplifies fact-table rows through nested loops; largest runtime contributor.",
+        "evidence": "Rows out=28, time=7897ms; upstream hash join outputs 6247 rows, nested loop multiplies by customer_address and customer_demographics scans."
+      },
+      {
+        "op": "Hash Join (rows=6247, time=6817.757ms)",
+        "why": "Joins filtered store_sales with household_demographics and store; second largest runtime.",
+        "evidence": "Rows out=6247, time=6817ms; inputs are date_dim+store_sales (56045 rows) and household_demographics (1440 rows)."
+      },
+      {
+        "op": "OR predicate clusters on customer_demographics and customer_address",
+        "why": "Complex OR conditions may block index usage and cause poor cardinality estimates.",
+        "evidence": "Index scans on customer_address and customer_demographics return 0 rows; OR conditions involve multiple columns per table."
+      }
+    ],
+    "do_not_do": [
+      "Do not split same-column OR predicates into UNION ALL (respects G_PG_OR_INDEX_PROTECTED).",
+      "Do not materialize EXISTS paths (no EXISTS in query).",
+      "Avoid duplicating large CTE bodies (respects G_PG_CTE_DUPLICATION_BLOCK)."
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and pre-filter date_dim into a CTE, creating a tiny hash table for the fact-table probe.",
+      "dag_target_hint": "Change final_select FROM clause to use explicit JOINs and wrap date_dim filter in a CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk", "ss_hdemo_sk=hd_demo_sk", "cd_demo_sk = ss_cdemo_sk", "ss_addr_sk = ca_address_sk", "all OR predicate clusters"],
+        "output_must_preserve": ["AVG(ss_quantity)", "AVG(ss_ext_sales_price)", "AVG(ss_ext_wholesale_cost)", "SUM(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins replaced with explicit JOINs; date_dim filter pushed into a CTE; nested loop may become hash join with smaller build side.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot (comma-join weakness) with a native PostgreSQL gold example showing 2.28x speedup.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, household_demographics, store, customer_demographics, customer_address) into separate CTEs, then join them with store_sales using explicit JOINs.",
+      "dag_target_hint": "Wrap each dimension filter in a CTE, then join CTEs with store_sales in final_select.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "cd_marital_status IN ('M','U','S')", "cd_education_status IN ('2 yr Degree','College','Unknown')", "hd_dep_count IN (3,1)", "ca_country = 'United States'", "ca_state IN ('CO','NC','TX','AR','NY','IA','IL')", "ss_sales_price BETWEEN clauses", "ss_net_profit BETWEEN clauses"],
+        "output_must_preserve": ["AVG(ss_quantity)", "AVG(ss_ext_sales_price)", "AVG(ss_ext_wholesale_cost)", "SUM(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Multiple dimension CTEs materialize small hash tables; fact-table scan reduces due to early join with filtered dimensions; nested loops may disappear.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot with a native PostgreSQL gold example showing 3.32x speedup; addresses comma-join and predicate pushdown.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the three OR branches on customer_demographics/household_demographics and the three OR branches on customer_address into separate UNION ALL subqueries, each with a single set of conditions.",
+      "dag_target_hint": "Replace the WHERE clause OR clusters with a UNION ALL of three branches, each with explicit AND conditions.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk", "ss_hdemo_sk=hd_demo_sk", "cd_demo_sk = ss_cdemo_sk", "ss_addr_sk = ca_address_sk", "each OR branch's exact conditions"],
+        "output_must_preserve": ["AVG(ss_quantity)", "AVG(ss_ext_sales_price)", "AVG(ss_ext_wholesale_cost)", "SUM(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:PASS (OR on different columns)", "multiplicity_guard_required:PASS (UNION ALL preserves row count)"],
+      "exploration": true,
+      "exploration_hypothesis": "OR conditions on different columns may block bitmap index scans; splitting into UNION ALL may allow per-branch index usage and better cardinality estimates.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Plan shows UNION ALL with three branches; each branch may use different index access paths; nested loops may be replaced by hash joins.",
+      "recommended_patch_ops": ["replace_where_predicate", "wrap_in_union_all"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot (OR predicate complexity) to test if split improves cardinality estimation and index usage.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "target": "Create a CTE that joins store_sales with filtered date_dim, household_demographics, and store, then join the result with filtered customer_demographics and customer_address.",
+      "dag_target_hint": "Insert a CTE that pre-joins store_sales with date_dim, household_demographics, and store; then join that CTE with customer_demographics and customer_address in final_select.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store", "customer_demographics", "household_demographics", "customer_address", "date_dim"],
+        "where_must_preserve": ["d_year = 2001", "all OR predicate clusters", "join conditions"],
+        "output_must_preserve": ["AVG(ss_quantity)", "AVG(ss_ext_sales_price)", "AVG(ss_ext_wholesale_cost)", "SUM(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS (CTE reused across OR branches)"],
+      "exploration": true,
+      "exploration_hypothesis": "Staging the fact-table join with highly selective dimensions first may reduce rows before applying complex OR filters on customer_demographics and customer_address.",
+      "confidence": 0.70,
+      "expected_explain_delta": "CTE materializes reduced fact-table rows; subsequent joins with customer_demographics and customer_address become cheaper.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration probe targeting primary hotspot via staged join pipeline; may reduce nested-loop amplification.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "reason": "Previous optimization attempt failed (speedup 1.02x); avoid repeating."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in query."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY; aggregation is a single-row result after joins."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join pattern in query."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join predicates in query."
+    }
+  ]
+}

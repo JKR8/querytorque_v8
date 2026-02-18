@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a large Hash Join (2.6s) building a 110k-row hash table from store_returns, then performing a Nested Loop with catalog_sales that scans zero rows per outer iteration. The comma-join syntax and late application of selective date_dim filters on d2/d3 may prevent optimal join reordering and predicate pushdown, leading to oversized intermediate results.",
+    "reasoning_trace": [
+      "Primary hotspot: Hash Join (rows=14290, time=2576ms) building hash from Nested Loop (rows=109862, time=1467ms) scanning store_returns 3582 rows per date_dim d2 row.",
+      "Secondary hotspot: Nested Loop with catalog_sales (rows=0 time=0.114ms per outer row) indicates planner misestimates cardinality (Gather Merge est=1, act=42K) leading to inefficient probe.",
+      "Structural signal: Comma-join syntax with WHERE clause join predicates; date_dim d2/d3 filters are selective (31 rows) but applied late in the plan after large fact-table scans.",
+      "No correlated subqueries present; no nested loops on large inner scans; no set operations; no repeated scans of same table."
+    ],
+    "cost_spine": ["Hash Join", "Nested Loop (store_returns side)", "Gather Merge", "Sort", "Nested Loop (catalog_sales probe)"],
+    "hotspots": [
+      {
+        "op": "Hash Join",
+        "why": "builds large hash table from store_returns side (110k rows) before joining with store_sales",
+        "evidence": "rows=14290 time=2576ms"
+      },
+      {
+        "op": "Nested Loop (store_returns side)",
+        "why": "scans store_returns 3582 rows per date_dim d2 row (31 rows), amplifying to 109k rows",
+        "evidence": "rows=109862 time=1467ms"
+      },
+      {
+        "op": "Gather Merge",
+        "why": "cardinality misestimation (est=1, act=42K) indicates planner cannot correctly size parallel workers",
+        "evidence": "est=1 act=42316 q-error=42K"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION splits (PostgreSQL uses BitmapOr for indexed OR)",
+      "avoid materializing EXISTS paths (no EXISTS in query)",
+      "do not duplicate large CTE bodies",
+      "avoid decorrelation transforms (no correlated subqueries)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Replace comma joins with explicit INNER JOIN syntax and pre-filter date_dim d1, d2, d3 into separate CTEs to create tiny hash tables for the optimizer.",
+      "dag_target_hint": "Change final_select FROM clause and add three date CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales", "date_dim d1", "date_dim d2", "date_dim d3", "store", "item"],
+        "where_must_preserve": ["d1.d_moy = 3", "d1.d_year = 1999", "d2.d_moy between 3 and 5", "d2.d_year = 1999", "d3.d_moy between 3 and 5", "d3.d_year = 1999", "all join predicates"],
+        "output_must_preserve": ["i_item_id", "i_item_desc", "s_store_id", "s_store_name", "MAX aggregates", "GROUP BY and ORDER BY columns"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Hash Join replaced by smaller hash tables from date CTEs; Nested Loop on catalog_sales may disappear; Gather Merge cardinality estimate improves.",
+      "recommended_patch_ops": ["insert_cte_d1", "insert_cte_d2", "insert_cte_d3", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Targets primary hotspot — comma-join weakness prevents optimal join ordering and predicate pushdown.",
+      "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all three date_dim tables and store/item into CTEs, then join fact tables against these pre‑materialized tiny dimension sets using explicit JOIN syntax.",
+      "dag_target_hint": "Change final_select FROM clause and add five dimension CTEs (d1, d2, d3, store, item).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales", "date_dim d1", "date_dim d2", "date_dim d3", "store", "item"],
+        "where_must_preserve": ["all original WHERE predicates"],
+        "output_must_preserve": ["all output columns, GROUP BY, ORDER BY, LIMIT"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Dimension scans become CTE scans; hash tables built from CTEs; fact‑table join order may change; Gather Merge cardinality estimate improves.",
+      "recommended_patch_ops": ["insert_cte_d1", "insert_cte_d2", "insert_cte_d3", "insert_cte_store", "insert_cte_item", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Secondary hotspot — dimension prefetch may reduce fact‑table scan amplification and improve join ordering.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "target": "Create separate CTEs for each date_dim alias (d1, d2, d3) with their respective filters, then join fact tables directly to these CTEs.",
+      "dag_target_hint": "Add three date CTEs and rewrite FROM clause to reference them.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["all original date filters and join predicates"],
+        "output_must_preserve": ["all output columns, grouping, ordering"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Isolating date filters into CTEs may allow better predicate pushdown into fact‑table scans and reduce rows flowing into the Hash Join.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Date‑dim scans become CTE scans; fact‑table index scans may use pushed date‑sk filters; hash‑join input rows reduced.",
+      "recommended_patch_ops": ["insert_cte_d1", "insert_cte_d2", "insert_cte_d3", "replace_from"],
+      "rank_rationale": "Exploration — targets same comma‑join weakness as p01 but with a different mechanism (CTE isolation).",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate store_sales, store_returns, catalog_sales by (ss_item_sk, ss_customer_sk, ss_ticket_number, ss_store_sk) before joining with dimensions, then compute final MAX aggregates after joins.",
+      "dag_target_hint": "Add three fact‑aggregate CTEs and rewrite final SELECT to join aggregated results.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "catalog_sales", "date_dim d1", "date_dim d2", "date_dim d3", "store", "item"],
+        "where_must_preserve": ["all original date filters and join predicates"],
+        "output_must_preserve": ["final MAX aggregates per channel, GROUP BY item/store columns"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregating fact tables early may drastically reduce rows flowing into the Hash Join and subsequent Nested Loop, though join‑key compatibility must be preserved.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Hash Join inputs shrink from 100k+ rows to thousands; Gather Merge may disappear; overall row amplification reduced.",
+      "recommended_patch_ops": ["insert_cte_ss_agg", "insert_cte_sr_agg", "insert_cte_cs_agg", "replace_from"],
+      "rank_rationale": "Exploration — targets primary hotspot by reducing hash‑join input cardinality via early aggregation.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already optimizes indexed OR."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; plan shows no nested loops with correlated execution."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Snowflake-specific transform; runtime dialect is PostgreSQL."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self‑join patterns in query; each fact table appears only once."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "Query does not scan same fact table multiple times with different filters."
+    }
+  ]
+}

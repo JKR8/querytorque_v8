@@ -1,0 +1,154 @@
+{  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary bottleneck is the cs_ui CTE (Hash Join + Aggregate) scanning 1.5M rows from catalog_sales and 719k rows from catalog_returns, consuming 22 seconds. Secondary hotspot is a chain of nested loops (est=1, act=7,425) due to comma-join pattern and late filter application on dimension tables.",
+    "reasoning_trace": [
+      "Hash Join (catalog_sales ⋈ catalog_returns) time=22196 ms dominates plan.",
+      "Nested Loop misestimate (est=1, act=7,425) indicates cardinality blow-up from comma-join pattern.",
+      "Plan shows repeated index scans on dimension tables (date_dim, customer, etc.) after large fact scan.",
+      "No correlated subqueries present; no OR predicates blocking index usage."
+    ],
+    "cost_spine": ["Hash Join (catalog_sales ⋈ catalog_returns)", "Aggregate (cs_ui)", "Merge Join (item ⋈ cs_ui)", "Nested Loop chain (store_returns, store_sales, dimensions)"],
+    "hotspots": [
+      {
+        "op": "Hash Join (catalog_sales ⋈ catalog_returns)",
+        "why": "Sequential scans of two large fact tables (814k + 719k rows) before aggregation.",
+        "evidence": "rows=121974 time=22196ms"
+      },
+      {
+        "op": "Nested Loop (est=1, act=7,425)",
+        "why": "Cardinality misestimate leads to nested-loop chain; comma-join prevents optimal join order.",
+        "evidence": "est=1 act=7425 time=35109ms"
+      }
+    ],
+    "do_not_do": [
+      "Do not split same-column OR to UNION ALL (BitmapOr already optimal).",
+      "Do not materialize EXISTS paths (semi-join already optimal).",
+      "Do not duplicate heavy CTE bodies (avoid CTE_MATERIALIZATION_FENCE risk)."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and pre-filter date_dim tables (d1, d2, d3) into separate CTEs with selective predicates before joining to store_sales.",
+      "dag_target_hint": "Replace cross_sales FROM clause with explicit JOINs and add date-filter CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["ss_sold_date_sk = d1.d_date_sk", "c_first_sales_date_sk = d2.d_date_sk", "c_first_shipto_date_sk = d3.d_date_sk"],
+        "output_must_preserve": ["All original grouping columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Nested Loop misestimate reduced; explicit joins allow better cardinality estimates and hash join planning.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets secondary hotspot (nested-loop blow-up) with proven gold example and addresses COMMA_JOIN_WEAKNESS gap.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimension tables (item, customer, promotion, customer_demographics, household_demographics, customer_address, income_band) into separate CTEs before joining to store_sales, and convert comma joins to explicit JOIN syntax.",
+      "dag_target_hint": "Replace cross_sales FROM clause with explicit JOINs and add dimension-filter CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "item", "customer", "promotion", "customer_demographics cd1", "customer_demographics cd2", "household_demographics hd1", "household_demographics hd2", "customer_address ad1", "customer_address ad2", "income_band ib1", "income_band ib2"],
+        "where_must_preserve": ["i_current_price between 26 and 26 + 10", "p_channel_email = 'N'", "p_channel_tv = 'Y'", "p_channel_radio = 'N'", "ad2.ca_state in ('IA','IL','TX')", "cd1.cd_marital_status in ('M', 'M', 'U')", "cd1.cd_education_status in ('Unknown', 'Advanced Degree', 'College')", "cd2.cd_marital_status in ('M', 'M', 'U')", "cd2.cd_education_status in ('Unknown', 'Advanced Degree', 'College')"],
+        "output_must_preserve": ["All original grouping columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Previous attempt failed; but gold example shows 3.32x speedup. Re-attempt with explicit join conversion and pre-filtering to reduce nested-loop input.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Dimension scans become tiny hash tables; nested loops replaced by hash joins; cardinality estimates improve.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — broader dimension pre-filtering may reduce fact-table probe rows more than date-only CTEs.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales and catalog_returns by (cs_item_sk, cs_order_number) and (cr_item_sk, cr_order_number) respectively before joining, then aggregate by cs_item_sk and apply HAVING filter.",
+      "dag_target_hint": "Replace cs_ui CTE definition with two pre-aggregation CTEs and a final join+aggregate.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 35 AND 55", "cs_item_sk = cr_item_sk", "cs_order_number = cr_order_number"],
+        "output_must_preserve": ["cs_item_sk", "sale", "refund", "HAVING condition on sale > 2*refund"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Primary hotspot may benefit from reducing join input by pre-aggregating fact tables on join keys before the large hash join.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Hash Join input rows reduced; aggregate work shifted earlier.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_group_by"],
+      "rank_rationale": "Exploration — targets primary hotspot (cs_ui) with aggregation pushdown, but join key complexity adds risk.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Force materialization of cs_ui CTE with MATERIALIZED keyword and ensure cross_sales CTE is also materialized to avoid repeated computation in final self-join.",
+      "dag_target_hint": "Add MATERIALIZED keyword to cs_ui and cross_sales CTE definitions.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 35 AND 55", "cs_item_sk = cr_item_sk", "cs_order_number = cr_order_number"],
+        "output_must_preserve": ["cs_item_sk", "sale", "refund", "HAVING condition"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit materialization may improve plan stability and prevent unwanted inlining, especially for the self-join on cross_sales.",
+      "confidence": 0.48,
+      "expected_explain_delta": "CTE scans become materialized; may reduce repeated work but could add overhead.",
+      "recommended_patch_ops": ["add_keyword_materialized"],
+      "rank_rationale": "Exploration — low-risk materialization guard; addresses CTE_MATERIALIZATION_FENCE gap.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan; PostgreSQL BitmapOr already optimal for indexed OR."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific transform for Snowflake; not applicable to PostgreSQL runtime."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    }
+  ]
+}

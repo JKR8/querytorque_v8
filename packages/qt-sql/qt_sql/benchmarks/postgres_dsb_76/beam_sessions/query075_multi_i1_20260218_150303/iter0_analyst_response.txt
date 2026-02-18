@@ -1,0 +1,153 @@
+{  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query suffers from repeated sequential scans on the item table and large scans on returns tables due to late application of d_year filters and lack of materialization reuse. Pushing filters early and sharing dimension scans can reduce I/O and nested loop amplification.",
+    "reasoning_trace": [
+      "Item table is scanned three times with the same filter i_category='Home', indicating opportunity for materialization reuse.",
+      "Returns tables (store_returns, catalog_returns, web_returns) are scanned sequentially without early filtering on d_year, which is applied only in the final WHERE clause after CTE materialization.",
+      "Nested loops cause repeated index scans on sales tables, but the dominant cost is upstream sequential scans and repeated dimension scans."
+    ],
+    "cost_spine": ["Seq Scan on store_returns", "Hash Join", "Nested Loop", "Aggregate", "CTE Scan"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_returns",
+        "why": "large sequential scan without early d_year filter",
+        "evidence": "time=7472.105 ms, rows=172653"
+      },
+      {
+        "op": "Seq Scan on item (repeated)",
+        "why": "same dimension scanned three times with identical filter",
+        "evidence": "three scans each ~700 ms, total ~2100 ms"
+      },
+      {
+        "op": "Late d_year filter in CTE",
+        "why": "d_year filter applied after CTE materialization, computing all years unnecessarily",
+        "evidence": "CTE all_sales groups by d_year without filter, final WHERE filters d_year=1999 and 1998"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union split on PostgreSQL due to BitmapOr strength",
+      "avoid duplicating heavy CTE bodies without reuse benefit",
+      "avoid materializing EXISTS paths already optimized as semi-joins"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered item table (i_category='Home') into a CTE and reference it in each UNION branch to avoid three sequential scans.",
+      "dag_target_hint": "Change all_sales node to include a CTE for item_filtered and replace item scans with CTE references.",
+      "node_contract": {
+        "from_must_include": ["item"],
+        "where_must_preserve": ["i_category='Home'"],
+        "output_must_preserve": ["i_item_sk", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id"]
+      },
+      "gates_checked": ["no_or_to_union:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Reduce three Seq Scan on item to one Seq Scan and CTE Scan, lowering total scan time.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Targets primary secondary hotspot — repeated item scans account for significant I/O.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": "multi_dimension_prefetch"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Push d_year filter (d_year in (1998,1999)) into the CTE all_sales definition and convert comma joins to explicit JOIN syntax for better optimizer planning.",
+      "dag_target_hint": "Modify all_sales node to add WHERE d_year in (1998,1999) and use explicit JOIN ON clauses.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year in (1998,1999)"],
+        "output_must_preserve": ["d_year", "join semantics with sales and returns tables"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Introduce early filter on date_dim, reduce rows in CTE computation, and improve join order via explicit syntax.",
+      "recommended_patch_ops": ["insert_cte", "replace_where", "replace_from"],
+      "rank_rationale": "Addresses late d_year filter hotspot — reduces unnecessary computation across all years.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate sales and returns data by item_sk and date_sk in each UNION branch before the final GROUP BY to reduce rows flowing into UNION and aggregation.",
+      "dag_target_hint": "Change the subqueries in all_sales to include GROUP BY cs_item_sk, cs_sold_date_sk (and similarly for other channels) with early SUMs.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "catalog_returns", "store_sales", "store_returns", "web_sales", "web_returns"],
+        "where_must_preserve": ["i_category='Home'", "sales_price/list_price BETWEEN", "reason_sk in (7,25,26,52,69)"],
+        "output_must_preserve": ["aggregated sales_cnt and sales_amt for later grouping"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-aggregation might reduce the volume of data in UNION and final aggregate, but could increase complexity if key compatibility is not maintained.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Introduce early HashAggregate nodes in each branch, reducing rows input to Append and final Aggregate.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — targets aggregate amplification after UNION, with potential for high impact but moderate evidence.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all dimension tables (item and date_dim) into CTEs with their respective filters, then join with fact tables using explicit syntax to create small hash tables and improve cardinality estimates.",
+      "dag_target_hint": "Change all_sales node to include CTEs for filtered_item and filtered_date, and rewrite joins explicitly.",
+      "node_contract": {
+        "from_must_include": ["item", "date_dim"],
+        "where_must_preserve": ["i_category='Home'", "d_year in (1998,1999)"],
+        "output_must_preserve": ["dimension keys for joins and grouping"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering dimensions might improve join planning and reduce nested loop work, especially for date_dim joins.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Replace Seq Scans on dimensions with CTE Scans, potentially changing join order and reducing nested loop iterations.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — secondary hotspot coverage with underrepresented family F, testing join topology improvements.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; plan evidence shows no OR blocking index usage."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Previous attempt failed; engine knowledge suggests PostgreSQL handles inner join reordering well, and LEFT JOIN with filter may not benefit."
+    }
+  ]
+}

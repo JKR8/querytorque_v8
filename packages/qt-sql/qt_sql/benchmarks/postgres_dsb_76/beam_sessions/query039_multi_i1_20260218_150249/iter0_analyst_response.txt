@@ -1,0 +1,195 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The plan materializes the full CTE for all d_moy before filtering, causing a massive parallel hash join and group aggregate (98710 rows) that is then filtered down to 5767 rows. The dominant hotspot is the Parallel Seq Scan on inventory (6.9M rows per worker) filtered late, and the nested loop with warehouse amplifies work 10x. Early filtering on d_moy and converting comma joins to explicit joins can reduce input volume before the expensive aggregation.",
+    "reasoning_trace": [
+      "Parallel Seq Scan on inventory scans 6.9M rows per worker with a filter on inv_quantity_on_hand, but selectivity is late.",
+      "Nested Loop with warehouse multiplies work: 10 loops, each processing 98710 rows from the materialized join.",
+      "GroupAggregate processes 98710 rows, outputs 5767 rows after HAVING filter, but the filter on d_moy is applied after aggregation in the outer query.",
+      "CTE is materialized once then filtered twice (d_moy=2, d_moy=3), but the CTE definition groups by d_moy without filtering it."
+    ],
+    "cost_spine": [
+      "Parallel Seq Scan on inventory",
+      "Parallel Hash Join (inventory, item)",
+      "Hash Join (with date_dim)",
+      "Nested Loop (with warehouse)",
+      "GroupAggregate",
+      "Filter (HAVING)",
+      "Merge Join (self-join)"
+    ],
+    "hotspots": [
+      {
+        "op": "Parallel Seq Scan on inventory",
+        "why": "largest I/O volume (6.9M rows per worker) with late filter",
+        "evidence": "rows=6993448 loops=3, time=1622.334ms"
+      },
+      {
+        "op": "Nested Loop (warehouse join)",
+        "why": "amplifies materialized join result 10x",
+        "evidence": "loops=10, rows=98710 each loop, time=200.244ms per loop"
+      },
+      {
+        "op": "GroupAggregate",
+        "why": "processes 98710 rows, outputs only 5767 rows after HAVING",
+        "evidence": "rows_in=98710 rows_out=5767, time=2098.256ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR to UNION ALL (no OR predicate in plan)",
+      "avoid duplicating the entire CTE body (large 5-table join)",
+      "keep EXISTS protection (no EXISTS in query)",
+      "do not split indexed OR (no indexed OR present)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and add filter d_moy IN (2,3) to the CTE's WHERE clause to prune before aggregation.",
+      "dag_target_hint": "Change inv node SQL: replace comma joins with explicit JOIN ON and add d_moy predicate.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": [
+          "inv_item_sk = i_item_sk",
+          "inv_warehouse_sk = w_warehouse_sk",
+          "inv_date_sk = d_date_sk",
+          "d_year = 2002",
+          "i_category IN ('Jewelry', 'Men')",
+          "i_manager_id BETWEEN 81 and 100",
+          "inv_quantity_on_hand between 0 and 200"
+        ],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop with warehouse becomes Hash Join; Parallel Seq Scan rows drop due to early d_moy filter; GroupAggregate input rows reduce.",
+      "recommended_patch_ops": ["replace_from", "add_where_predicate"],
+      "rank_rationale": "Targets primary hotspot (inventory scan) by pushing d_moy filter early and fixes comma join weakness.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Split the CTE into two separate CTEs, inv2 and inv3, each filtering d_moy=2 and d_moy=3 respectively in their definitions, then join them.",
+      "dag_target_hint": "Replace inv CTE with inv2 CTE (d_moy=2) and inv3 CTE (d_moy=3), adjust final_select to join these CTEs.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": [
+          "inv_item_sk = i_item_sk",
+          "inv_warehouse_sk = w_warehouse_sk",
+          "inv_date_sk = d_date_sk",
+          "d_year = 2002",
+          "i_category IN ('Jewelry', 'Men')",
+          "i_manager_id BETWEEN 81 and 100",
+          "inv_quantity_on_hand between 0 and 200"
+        ],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "CTE materialization size reduces per month; outer filter on d_moy disappears; Merge Join input rows drop.",
+      "recommended_patch_ops": ["split_cte", "replace_from"],
+      "rank_rationale": "Addresses secondary hotspot (GroupAggregate) by computing aggregates only for needed months, reducing CTE materialization size.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate inventory by inv_item_sk, inv_warehouse_sk, inv_date_sk (sum, count, sum of squares) before joining with dimensions, then compute stddev and avg after joins.",
+      "dag_target_hint": "Insert a new CTE before inv that groups inventory, then join with item, warehouse, date_dim and compute final aggregates.",
+      "node_contract": {
+        "from_must_include": ["inventory"],
+        "where_must_preserve": ["inv_quantity_on_hand between 0 and 200"],
+        "output_must_preserve": ["inv_item_sk", "inv_warehouse_sk", "inv_date_sk", "aggregate statistics for stddev and avg"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:stddev_samp,avg"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-aggregating inventory may reduce rows before joining dimensions, but may increase complexity if join cardinality explodes.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Parallel Hash Join input rows reduce; GroupAggregate becomes simpler scalar aggregates.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting secondary hotspot (GroupAggregate) by pushing aggregation down, but risk of increased join cost.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter item, warehouse, date_dim into separate CTEs with selective predicates, then join with inventory in a star pattern.",
+      "dag_target_hint": "Add CTEs for filtered item, warehouse, date_dim, then join them with inventory in explicit JOIN order.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": [
+          "d_year = 2002",
+          "i_category IN ('Jewelry', 'Men')",
+          "i_manager_id BETWEEN 81 and 100",
+          "inv_quantity_on_hand between 0 and 200"
+        ],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Creating small dimension CTEs may enable better hash join planning and reduce inventory scan via early key filtering.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Parallel Seq Scan rows drop due to dimension key pushdown; Nested Loop eliminated; Hash Joins with tiny dimension CTEs.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting comma join weakness and inventory scan by prefetching dimension keys.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in plan evidence; PostgreSQL BitmapOr handles indexed OR well."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subquery in query; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific to Snowflake; not native for PostgreSQL."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Similar to p02 but less targeted; p02 uses native PostgreSQL transform."
+    },
+    {
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "reason": "Non-native (duckdb); using pg_self_join_decomposition instead."
+    }
+  ]
+}

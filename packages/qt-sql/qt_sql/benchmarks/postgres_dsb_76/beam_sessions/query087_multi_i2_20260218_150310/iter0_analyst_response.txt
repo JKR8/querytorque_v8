@@ -1,0 +1,194 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary bottleneck is repeated scans of the same dimension tables (date_dim, customer) across three independent EXCEPT branches, each driving a large nested loop join. Estimated cardinality mismatches (actual 1426 vs estimated 13) indicate planner underestimation in Subquery Scan nodes. This leads to poor join ordering and unnecessary nested loops. The pattern is a classic cross-CTE predicate blindness scenario where the optimizer cannot share pre-filtered dimension results across branches.",
+    "reasoning_trace": [
+      "Three sequential scans on date_dim (182 rows each) and three index scans on customer via nested loops.",
+      "Nested Loop with store_sales branch dominates runtime (~9.3s of total ~11.9s).",
+      "Cardinality estimation error: Subquery Scan estimated 13 rows, actual 1426 rows (q-error ~110x).",
+      "EXCEPT operation forces materialization of three independent subqueries before set difference.",
+      "Each branch repeats identical dimension filters (d_month_seq, c_birth_year)."
+    ],
+    "cost_spine": [
+      "SetOp (EXCEPT)",
+      "Append",
+      "Subquery Scan (*SELECT* 1) -> Unique -> Gather Merge -> Nested Loop -> Seq Scan date_dim -> Index Only Scan store_sales -> Index Scan customer",
+      "Subquery Scan (*SELECT* 2) -> Unique -> Gather Merge -> Nested Loop -> Seq Scan date_dim_1 -> Index Scan catalog_sales -> Index Scan customer_1",
+      "Subquery Scan (*SELECT* 3) -> Unique -> Gather Merge -> Nested Loop -> Seq Scan date_dim_2 -> Index Scan web_sales -> Index Scan customer_2"
+    ],
+    "hotspots": [
+      {
+        "op": "Nested Loop (store_sales branch)",
+        "why": "largest runtime contributor (9286ms), repeated dimension scans and index lookups",
+        "evidence": "time=9286ms, rows=27680 inner loops per date_dim row"
+      },
+      {
+        "op": "Subquery Scan (*SELECT* 3)",
+        "why": "significant cardinality estimation mismatch drives poor planning",
+        "evidence": "est=13 rows, act=1426 rows, q-error ~110x"
+      },
+      {
+        "op": "SetOp",
+        "why": "forces full materialization of three large intermediate results before deduplication",
+        "evidence": "rows=7948 fed into SetOp, time=11946ms before final aggregate"
+      }
+    ],
+    "do_not_do": [
+      "Do not convert OR to UNION ALL (PostgreSQL's BitmapOr handles indexed OR efficiently).",
+      "Do not duplicate large CTE bodies (G_PG_CTE_DUPLICATION_BLOCK).",
+      "Do not replace EXISTS with materialization when semi-join already optimized.",
+      "Avoid unfiltered CTEs that materialize entire fact tables."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract common date_dim and customer filters into two CTEs (filtered_dates, filtered_customers) and reference them in all three EXCEPT branches to eliminate redundant scans.",
+      "dag_target_hint": "Replace three independent date_dim/customer scans with references to pre-filtered CTEs in final_select.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer", "store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["d_month_seq between 1213 and 1213+11", "c_birth_year BETWEEN 1968 AND 1974", "price/wholesale_cost range predicates"],
+        "output_must_preserve": ["c_last_name", "c_first_name", "d_date", "EXCEPT semantics across three branches"]
+      },
+      "gates_checked": [
+        "G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS",
+        "G_PG_CTE_REUSE_REQUIRED:PASS",
+        "G_PG_CROSS_CTE_SETOP_RISK:WARN"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Three sequential scans on date_dim reduced to one; three customer index scans reduced to one; nested loop inner loops reduced.",
+      "recommended_patch_ops": ["insert_cte_filtered_dates", "insert_cte_filtered_customers", "replace_from_in_branches"],
+      "rank_rationale": "Directly attacks primary hotspot by eliminating 6 redundant dimension scans, highest expected impact.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Rewrite EXCEPT operations to NOT EXISTS correlated subqueries, allowing semi-join optimization and early elimination of rows.",
+      "dag_target_hint": "Replace EXCEPT with NOT EXISTS in final_select, correlating on (c_last_name, c_first_name, d_date).",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["All original dimension and fact filters"],
+        "output_must_preserve": ["count(*)", "no duplicate rows from original EXCEPT semantics"]
+      },
+      "gates_checked": [
+        "G_PG_EXISTS_PROTECTED:PASS",
+        "G_PG_CTE_EXISTS_INTERSECT_RISK:WARN",
+        "multiplicity_guard_required:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "EXCEPT forces full materialization and sorting; NOT EXISTS may allow pipeline semi-join with early stop per row.",
+      "confidence": 0.65,
+      "expected_explain_delta": "SetOp and Append replaced by Nested Loop Anti Join; Unique operators may disappear.",
+      "recommended_patch_ops": ["replace_setop_with_not_exists", "adjust_correlation_conditions"],
+      "rank_rationale": "Targets secondary hotspot (SetOp materialization) with gold example precedent (pg_intersect_to_exists 1.78x).",
+      "recommended_examples": ["pg_intersect_to_exists"],
+      "gold_example_id": "pg_intersect_to_exists"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim once as a CTE and convert comma joins to explicit JOIN syntax to give planner better cardinality estimates.",
+      "dag_target_hint": "Change final_select FROM clause to use explicit JOINs with filtered_dates CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "store_sales", "catalog_sales", "web_sales", "customer"],
+        "where_must_preserve": ["d_month_seq between 1213 and 1213+11", "price/wholesale_cost range predicates", "c_birth_year filter"],
+        "output_must_preserve": ["All output columns and EXCEPT structure"]
+      },
+      "gates_checked": [
+        "G_PG_EXPLICIT_JOIN_STYLE:PASS",
+        "G_PG_COMMA_JOIN_PRESENT:PASS",
+        "G_PG_COMMA_FACT_FANOUT:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Comma joins become explicit hash joins; single date_dim CTE scan replaces three; better cardinality estimates.",
+      "recommended_patch_ops": ["insert_cte_filtered_dates", "replace_comma_with_explicit_join"],
+      "rank_rationale": "Attacks comma-join weakness and dimension scan redundancy; gold example shows 2.28x speedup.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "single_pass_aggregation",
+      "family": "C",
+      "target": "Consolidate three independent fact table scans into a single scan with conditional logic, then compute set difference via aggregation.",
+      "dag_target_hint": "Replace three EXCEPT branches with a single CTE that unions all sales with a channel flag, then aggregate to simulate EXCEPT.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "customer"],
+        "where_must_preserve": ["All original filters on date, price, cost, birth year"],
+        "output_must_preserve": ["Final count(*) identical to original EXCEPT logic"]
+      },
+      "gates_checked": [
+        "agg_key_compatibility:PASS",
+        "G_PG_CTE_DUPLICATION_BLOCK:PASS",
+        "semantic_equivalence_check:REQUIRED"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Single pass over fact tables could reduce I/O and join work, but EXCEPT semantics must be preserved exactly via conditional aggregation.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Three separate nested loop branches replaced by one large union-all scan with conditional aggregation.",
+      "recommended_patch_ops": ["consolidate_fact_scans_to_union_all", "aggregate_with_case_for_set_diff"],
+      "rank_rationale": "Exploration targeting redundant fact table I/O; high risk but potential for large reduction in nested loops.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in plan; PostgreSQL BitmapOr handles indexed OR efficiently (G_PG_OR_INDEX_PROTECTED)."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL; plan shows no nested loops from correlation."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregation before join in plan; query uses DISTINCT but not GROUP BY aggregates."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Previous attempt failed (speedup 0.00x); CTE duplication risk for this multi-branch pattern."
+    },
+    {
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "reason": "Previous attempt failed (speedup 0.00x); likely over-decomposition for this scale."
+    },
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Previous attempt failed (speedup 0.00x); predicate already applied at scan level."
+    }
+  ]
+}

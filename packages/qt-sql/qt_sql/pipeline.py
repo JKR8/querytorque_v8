@@ -869,6 +869,7 @@ class Pipeline:
         patch: bool = False,
         benchmark_lock=None,
         on_phase_change=None,
+        resume_dir=None,
     ) -> SessionResult:
         """Run optimization session in BEAM mode.
 
@@ -904,6 +905,7 @@ class Pipeline:
             max_iterations=effective_max_iterations,
             patch=True,
             benchmark_lock=benchmark_lock,
+            resume_dir=resume_dir,
         )
 
         if on_phase_change:

@@ -1,0 +1,182 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Nested loop plan with severe cardinality underestimation (est=3, act=348) at the primary fact-table join indicates predicate blindness on OR conditions. The large I/O (web_sales index scan) and multiple dimension joins suggest benefit from early dimension filtering and explicit join syntax to improve selectivity propagation and join ordering.",
+    "reasoning_trace": [
+      "Cost spine shows nested loops dominate runtime (2496ms), with a severe cardinality miss at the web_sales ↔ web_returns loop.",
+      "Complex OR predicates on customer_demographics and customer_address likely prevent accurate selectivity estimates, causing poor join order.",
+      "Plan uses index scans on all dimensions, but comma-join syntax may block join reordering optimization.",
+      "No correlated subqueries, set operations, or repeated table scans present, pruning families B, D, and some E transforms."
+    ],
+    "cost_spine": [
+      "Nested Loop (web_sales ↔ web_returns)",
+      "Nested Loop (+ customer_address)",
+      "Nested Loop (+ customer_demographics cd1)",
+      "Sort → Aggregate → Sort → Limit"
+    ],
+    "hotspots": [
+      {
+        "op": "Nested Loop (web_sales ↔ web_returns)",
+        "why": "primary fact-table join with severe cardinality misestimate (est=3, act=348), driving nested loop amplification",
+        "evidence": "rows=10294 time=2142ms, estimation q-error > 100x"
+      },
+      {
+        "op": "Nested Loop (+ customer_address)",
+        "why": "secondary dimension join with OR predicate complexity, filtering applied late after large nested loop",
+        "evidence": "rows=2031 time=2317ms"
+      }
+    ],
+    "do_not_do": [
+      "Do not split same-column OR predicates into UNION ALL (postgres BitmapOr is optimal).",
+      "Avoid materializing CTEs that duplicate large fact-table scans.",
+      "Do not decorrelate (no correlated subqueries present)."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, cd1, cd2, customer_address, reason, web_page) into CTEs with MATERIALIZED, then join fact tables (web_sales, web_returns) via explicit INNER JOIN syntax.",
+      "dag_target_hint": "Replace comma-joined FROM clause with explicit JOINs and move dimension filters into CTE definitions.",
+      "node_contract": {
+        "from_must_include": ["web_sales", "web_returns", "date_dim", "customer_demographics cd1", "customer_demographics cd2", "customer_address", "reason", "web_page"],
+        "where_must_preserve": ["d_year = 2002", "cd1.cd_marital_status IN ('S','M','U')", "cd1.cd_education_status IN ('Primary','Secondary','2 yr Degree')", "ca_country = 'United States'", "ca_state IN state lists", "ws_sales_price BETWEEN ranges", "ws_net_profit BETWEEN ranges"],
+        "output_must_preserve": ["substring(r_reason_desc,1,20)", "AVG(ws_quantity)", "AVG(wr_refunded_cash)", "AVG(wr_fee)", "GROUP BY r_reason_desc", "ORDER BY substring, AVGs", "LIMIT 100"]
+      },
+      "gates_checked": [
+        "G_PG_COMMA_JOIN_PRESENT:PASS",
+        "G_PG_COMMA_FACT_FANOUT:PASS",
+        "G_PG_COMMA_SEMANTIC:PASS",
+        "G_PG_CTE_DUPLICATION_STOP:PASS",
+        "G_PG_OR_INDEX_PROTECTED:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested loops replaced by hash joins; dimension CTEs materialize first; cardinality estimates improve; early filter push reduces web_sales rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Primary probe targeting comma-join weakness and dimension pre-filtering, directly addresses cardinality misestimation.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate date_dim filter into a MATERIALIZED CTE, convert comma joins to explicit INNER JOINs, and join fact tables with date keys first.",
+      "dag_target_hint": "Create date_filter CTE with d_date_sk, d_year=2002; rewrite FROM clause with explicit JOIN order starting with date_filter.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "web_sales", "web_returns"],
+        "where_must_preserve": ["d_year = 2002", "ws_sold_date_sk = d_date_sk"],
+        "output_must_preserve": ["All original columns and aggregates, same grouping and ordering."]
+      },
+      "gates_checked": [
+        "G_PG_COMMA_JOIN_PRESENT:PASS",
+        "G_PG_COMMA_FACT_FANOUT:PASS",
+        "G_PG_COMMA_SEMANTIC:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Date filter applied earliest; explicit join syntax enables better join reordering; reduced rows flowing into nested loops.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Secondary probe focusing on date-dimension isolation, a proven pattern for this dialect.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter customer_demographics and customer_address with their complex OR conditions into separate CTEs before joining to fact tables.",
+      "dag_target_hint": "Create cd_filter CTE for cd1/cd2 join conditions and ca_filter CTE for address OR conditions; join these filtered dimension keys to web_returns.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2", "customer_address", "web_returns"],
+        "where_must_preserve": ["All OR predicates on cd_marital_status, cd_education_status, ca_country, ca_state, ws_net_profit ranges."],
+        "output_must_preserve": ["Same join keys and predicate semantics."]
+      },
+      "gates_checked": [
+        "G_PG_CTE_REUSE_REQUIRED:PASS",
+        "G_PG_CTE_DUPLICATION_BLOCK:PASS",
+        "G_PG_OR_INDEX_PROTECTED:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Pre-filtering complex OR dimensions separately may improve selectivity estimates before the large nested loop, even though indexes are used.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Dimension CTEs reduce rows earlier; join cardinality estimates improve; nested loop depth may shrink.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot (customer_address OR predicates) with early filtering.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize filtered dimension joins into a single CTE to avoid repeated evaluation of OR predicates across nested loops.",
+      "dag_target_hint": "Create a CTE that joins cd1, cd2, customer_address, reason, web_page with their filters, then join with web_sales and web_returns.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd1", "customer_demographics cd2", "customer_address", "reason", "web_page"],
+        "where_must_preserve": ["All dimension filter predicates."],
+        "output_must_preserve": ["Surrogate keys for joining to fact tables."]
+      },
+      "gates_checked": [
+        "G_PG_CTE_REUSE_REQUIRED:PASS",
+        "G_PG_CTE_DUPLICATION_BLOCK:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the filtered dimension cluster once may reduce repeated predicate evaluation and improve join planning.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Single CTE scan replaces multiple dimension index scans; optimizer may choose hash joins over nested loops.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration probe testing materialization benefit for dimension cluster, underrepresented family E.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "PostgreSQL BitmapOr handles indexed OR efficiently; plan shows index scans already used. Guard G_PG_OR_INDEX_PROTECTED blocks this transform."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL; plan shows no correlated execution."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregate is final step after all joins; pushing down would require re-aggregation and is unlikely to help with nested loop amplification."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific transform for Snowflake; not applicable to PostgreSQL runtime dialect."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Only one date_dim filter (d_year=2002); no multiple date ranges to isolate."
+    }
+  ]
+}

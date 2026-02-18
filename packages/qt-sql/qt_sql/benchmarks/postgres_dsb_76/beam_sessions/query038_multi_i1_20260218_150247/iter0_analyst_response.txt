@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "INTERSECT operation forces full materialization and sorting of three large distinct result sets before intersection, consuming 9.5s total runtime. Each branch repeats identical dimension scans (date_dim 3×, customer 3×) with nested loops, but the primary bottleneck is the SetOp materialization. Replacing INTERSECT with EXISTS semi-joins could enable early-stop and avoid full sorts.",
+    "reasoning_trace": [
+      "SetOp (INTERSECT) consumes 9468ms, 95% of total runtime.",
+      "Each branch repeats identical date_dim scan (183 rows) and customer filter via nested loops.",
+      "Plan shows zero rows flowing through joins (estimation error) but actual runtime indicates materialization overhead.",
+      "No correlated subqueries present; all joins are equi-joins with selective filters."
+    ],
+    "cost_spine": ["SetOp", "Append", "Unique", "Sort", "Nested Loop", "Seq Scan date_dim"],
+    "hotspots": [
+      {
+        "op": "SetOp",
+        "why": "INTERSECT materializes three full distinct sets before intersection",
+        "evidence": "time=9468ms, rows=0"
+      },
+      {
+        "op": "Nested Loop (store_sales branch)",
+        "why": "slowest branch with repeated dimension scans",
+        "evidence": "time=4165ms, rows=0"
+      },
+      {
+        "op": "Seq Scan date_dim (three copies)",
+        "why": "redundant identical scans",
+        "evidence": "three scans each ~183 rows, total time ~422ms"
+      }
+    ],
+    "do_not_do": [
+      "or_to_union (no OR predicates in plan)",
+      "decorrelate (no correlated subqueries)",
+      "duplicate heavy CTE bodies (respect G_PG_CTE_DUPLICATION_BLOCK)",
+      "materialize simple EXISTS (protect semi-join paths)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "target": "Replace INTERSECT with EXISTS semi-joins: compute store_sales distinct set as base, then filter with EXISTS on catalog_sales and web_sales matching on (c_last_name, c_first_name, d_date). Preserve all original filters and DISTINCT semantics.",
+      "dag_target_hint": "Replace final_select INTERSECT structure with EXISTS subqueries in WHERE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1200 and 1211", "c_birth_month in (1,2,5,12)", "ss_list_price between 193 and 252", "ss_wholesale_cost between 35 and 55"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_EXISTS_PROTECTED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS", "DG_MIN_PATTERN_GATES:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "SetOp replaced by semi-joins; sorts and materializations removed; early-stop on first match per row.",
+      "recommended_patch_ops": ["replace_setop_with_exists", "preserve_distinct", "maintain_limit"],
+      "rank_rationale": "Targets primary hotspot (SetOp) with direct evidence and PostgreSQL semi-join strength.",
+      "recommended_examples": ["pg_intersect_to_exists"],
+      "gold_example_id": "pg_intersect_to_exists"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "multi_intersect_exists_cte",
+      "family": "D",
+      "target": "Create CTE for shared date_dim and customer filters, then use EXISTS semi-joins across channels. Materialize filtered date_dim and customer keys once, join with each sales table in separate EXISTS subqueries.",
+      "dag_target_hint": "Insert CTEs for date_range and filtered_customer, rewrite final_select with EXISTS referencing CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1200 and 1211", "c_birth_month in (1,2,5,12)", "price/cost filters per channel"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_EXISTS_PROTECTED:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combining shared dimension CTEs with EXISTS may reduce redundant scans while keeping semi-join benefits.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Three date_dim scans become one CTE scan; customer scans reduced; SetOp replaced by semi-joins.",
+      "recommended_patch_ops": ["insert_cte_date_range", "insert_cte_filtered_customer", "replace_setop_with_exists_cte"],
+      "rank_rationale": "Exploration targeting secondary hotspot (redundant dimension scans) while addressing primary SetOp.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim into a CTE, convert comma joins to explicit INNER JOIN syntax, and join once per sales channel. Keep INTERSECT structure but reduce date_dim rescans.",
+      "dag_target_hint": "Insert date_range CTE, replace comma joins with explicit JOIN ON syntax in each branch.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1200 and 1211", "c_birth_month in (1,2,5,12)", "price/cost filters"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "INTERSECT semantics", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Explicit joins may improve cardinality estimates; single date_dim CTE scan replaces three sequential scans.",
+      "recommended_patch_ops": ["insert_cte_date_range", "replace_comma_with_explicit_join"],
+      "rank_rationale": "Targets secondary hotspot (redundant date_dim scans) with PostgreSQL-native transform and explicit join strength.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the combined sales data (all three channels) with dimension filters in a single CTE, then compute distinct intersection via grouping. Use UNION ALL to combine channels, then group by (c_last_name, c_first_name, d_date) and filter HAVING COUNT(DISTINCT channel)=3.",
+      "dag_target_hint": "Replace entire INTERSECT structure with a single CTE that unions all channels, then group and filter.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "customer"],
+        "where_must_preserve": ["d_month_seq between 1200 and 1211", "c_birth_month in (1,2,5,12)", "price/cost filters per channel"],
+        "output_must_preserve": ["DISTINCT c_last_name, c_first_name, d_date", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Single-pass over each sales table with union may outperform three separate branches with materialization, but risks larger intermediate set.",
+      "confidence": 0.55,
+      "expected_explain_delta": "SetOp and multiple sorts replaced by single aggregate over union; date_dim and customer scanned once each.",
+      "recommended_patch_ops": ["insert_cte_unioned_sales", "replace_intersect_with_group_filter"],
+      "rank_rationale": "Exploration targeting both dimension reuse and SetOp elimination via alternative aggregation shape.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; plan shows no BitmapOr usage."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL; plan shows no correlated scans."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregation in query; only DISTINCT and INTERSECT."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "Previous attempt failed (speedup 0.00x); risk of CTE fence blocking INTERSECT optimization."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Portability candidate with low confidence; previous similar transforms failed."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Snowflake-specific; not applicable to PostgreSQL runtime."
+    }
+  ]
+}

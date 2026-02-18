@@ -2864,6 +2864,18 @@ def main() -> int:
         help="Optional benchmark patch pack for witness fallback (default: none).",
     )
     parser.add_argument(
+        "--random-base",
+        action="store_true",
+        default=False,
+        help="Populate random base data for all tables before per-query seeding (default: off).",
+    )
+    parser.add_argument(
+        "--random-fallback",
+        action="store_true",
+        default=False,
+        help="Enable random top-up as last resort after force-seed fails (default: off).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logs.",
@@ -2938,26 +2950,32 @@ def main() -> int:
         validator._create_indexes(global_tables, qctx["sql_duckdb"])
 
     generation_order = validator._get_table_generation_order(global_tables, global_fk)
-    generator = SyntheticDataGenerator(conn, all_schemas=global_tables)
-    generator.filter_literal_values = global_filters
 
-    for table_name in generation_order:
-        table_fk = global_fk.get(table_name, {})
-        row_count = args.fact_rows if table_fk else args.dim_rows
-        generator.generate_table_data(
-            table_name=table_name,
-            schema=global_tables[table_name],
-            row_count=row_count,
-            foreign_keys=table_fk,
-        )
-        validator._update_filter_matched_pks(generator, global_tables, [table_name], global_filters)
-        validator._reverse_propagate_parent_key_matches(
-            generator,
-            table_name,
-            global_tables,
-            global_fk,
-            global_filters,
-        )
+    # 2) Optional random base data (only with --random-base).
+    if args.random_base:
+        generator = SyntheticDataGenerator(conn, all_schemas=global_tables)
+        generator.filter_literal_values = global_filters
+
+        for table_name in generation_order:
+            table_fk = global_fk.get(table_name, {})
+            row_count = args.fact_rows if table_fk else args.dim_rows
+            generator.generate_table_data(
+                table_name=table_name,
+                schema=global_tables[table_name],
+                row_count=row_count,
+                foreign_keys=table_fk,
+            )
+            validator._update_filter_matched_pks(generator, global_tables, [table_name], global_filters)
+            validator._reverse_propagate_parent_key_matches(
+                generator,
+                table_name,
+                global_tables,
+                global_fk,
+                global_filters,
+            )
+        logger.info("Random base data populated for %d tables", len(generation_order))
+    else:
+        logger.info("Skipping random base data (use --random-base to enable)")
 
     # 3) Edge-case insertion from template.
     edge_template = _load_edge_template(edge_template_path)
@@ -2970,7 +2988,7 @@ def main() -> int:
     )
     logger.info("Inserted %d template edge rows", inserted_edge_rows)
 
-    # 4) Verify all queries return rows, with targeted top-up retries.
+    # 4) Per-query witness seeding: force-seed first, random as optional fallback.
     results: List[Dict[str, Any]] = []
     min_rows_required = max(1, int(args.min_query_rows))
     preferred_rows = max(min_rows_required, int(args.preferred_query_rows))
@@ -2994,41 +3012,8 @@ def main() -> int:
             "error": None,
         }
 
-        try:
-            rows = _count_query_rows(conn, sql_duckdb, args.query_timeout_s, probe_limit=probe_limit)
-            query_result["rows"] = rows
-            query_result["success"] = rows >= min_rows_required
-        except Exception as exc:
-            query_result["error"] = str(exc)
-            query_result["success"] = False
-
-        if not query_result["success"]:
-            for attempt in range(1, args.topup_retries + 1):
-                try:
-                    _top_up_for_query(
-                        conn=conn,
-                        validator=validator,
-                        qctx=qctx,
-                        global_tables=global_tables,
-                        fact_rows=args.topup_fact_rows,
-                        dim_rows=args.topup_dim_rows,
-                    )
-                    rows = _count_query_rows(conn, sql_duckdb, args.query_timeout_s, probe_limit=probe_limit)
-                    query_result["topup_attempts"] = attempt
-                    query_result["rows"] = rows
-                    if rows >= min_rows_required:
-                        query_result["success"] = True
-                        query_result["error"] = None
-                        break
-                except Exception as exc:
-                    query_result["topup_attempts"] = attempt
-                    query_result["error"] = str(exc)
-
-        if (
-            not query_result["success"]
-            and args.force_seed_on_zero
-            and qctx.get("tables")
-        ):
+        # Step A: Force-seed (primary — deterministic AST-driven witness insertion).
+        if qctx.get("tables"):
             anti_tables = _tables_in_anti_patterns(sql_duckdb)
             max_seed_attempts = max(1, int(args.force_seed_attempts))
             for seed_attempt in range(1, max_seed_attempts + 1):
@@ -3057,6 +3042,7 @@ def main() -> int:
                     query_result["forced_seed_attempts"] = seed_attempt
                     query_result["error"] = str(exc)
 
+        # Step B: Patch-pack recipe.
         if not query_result["success"] and patch_pack is not None:
             try:
                 recipe_applied = bool(patch_pack.apply_recipe(conn, qctx, global_tables))
@@ -3069,6 +3055,30 @@ def main() -> int:
             except Exception as exc:
                 query_result["error"] = str(exc)
 
+        # Step C: Optional random top-up (only with --random-fallback).
+        if not query_result["success"] and args.random_fallback:
+            for attempt in range(1, args.topup_retries + 1):
+                try:
+                    _top_up_for_query(
+                        conn=conn,
+                        validator=validator,
+                        qctx=qctx,
+                        global_tables=global_tables,
+                        fact_rows=args.topup_fact_rows,
+                        dim_rows=args.topup_dim_rows,
+                    )
+                    rows = _count_query_rows(conn, sql_duckdb, args.query_timeout_s, probe_limit=probe_limit)
+                    query_result["topup_attempts"] = attempt
+                    query_result["rows"] = rows
+                    if rows >= min_rows_required:
+                        query_result["success"] = True
+                        query_result["error"] = None
+                        break
+                except Exception as exc:
+                    query_result["topup_attempts"] = attempt
+                    query_result["error"] = str(exc)
+
+        # Step D: Unsat declaration.
         if not query_result["success"] and _is_obviously_unsat(qctx, global_tables):
             query_result["unsat_expected"] = True
             query_result["success"] = True
@@ -3078,10 +3088,11 @@ def main() -> int:
 
         results.append(query_result)
         logger.info(
-            "[%s] rows=%s success=%s topup=%d",
+            "[%s] rows=%s success=%s forced_seed=%s topup=%d",
             name,
             query_result["rows"],
             query_result["success"],
+            query_result["forced_seed"],
             query_result["topup_attempts"],
         )
 
@@ -3104,6 +3115,8 @@ def main() -> int:
         "reference_db": reference_db,
         "edge_template": str(edge_template_path),
         "patch_pack": patch_pack.name if patch_pack else "none",
+        "random_base": args.random_base,
+        "random_fallback": args.random_fallback,
     }
 
     payload = {

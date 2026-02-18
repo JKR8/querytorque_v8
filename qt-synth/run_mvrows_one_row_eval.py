@@ -111,17 +111,54 @@ def _seed_for_witness(
     count_timeout_s: int,
     seed_attempts: int,
     patch_pack: Optional[Any],
+    random_fallback: bool = False,
 ) -> Tuple[int, bool]:
+    """Seed witness rows using deterministic force-seed first, random as optional fallback.
+
+    Pipeline order:
+      1. Force-seed (deterministic AST-driven witness insertion)
+      2. Probe — if >= 1 row, done
+      3. Patch-pack recipe
+      4. Optional random top-up (only if random_fallback=True)
+      5. Unsat declaration
+    """
     sql = qctx["sql_duckdb"]
     rows_probe = 0
     unsat = False
 
-    try:
-        rows_probe = _count_query_rows(conn, sql, count_timeout_s, probe_limit=1)
-    except Exception:
-        rows_probe = 0
+    # 1) Force-seed: deterministic AST-driven witness insertion (primary).
+    anti_tables = _tables_in_anti_patterns(sql)
+    for attempt in range(1, seed_attempts + 1):
+        try:
+            _force_seed_for_query(
+                conn,
+                qctx,
+                global_tables,
+                fk_relationships,
+                seed_variant=attempt,
+                seed_rows=1,
+                skip_tables=anti_tables,
+            )
+        except Exception:
+            pass
+        try:
+            rows_probe = _count_query_rows(conn, sql, count_timeout_s, probe_limit=1)
+        except Exception:
+            rows_probe = 0
+        if rows_probe >= 1:
+            break
 
-    if rows_probe < 1:
+    # 2) Patch-pack recipe.
+    if rows_probe < 1 and patch_pack is not None:
+        try:
+            recipe_applied = bool(patch_pack.apply_recipe(conn, qctx, global_tables))
+            if recipe_applied:
+                rows_probe = _count_query_rows(conn, sql, count_timeout_s, probe_limit=1)
+        except Exception:
+            rows_probe = 0
+
+    # 3) Optional random top-up (last resort, only when explicitly enabled).
+    if rows_probe < 1 and random_fallback:
         try:
             _top_up_for_query(
                 conn=conn,
@@ -135,36 +172,7 @@ def _seed_for_witness(
         except Exception:
             rows_probe = 0
 
-    if rows_probe < 1:
-        anti_tables = _tables_in_anti_patterns(sql)
-        for attempt in range(1, seed_attempts + 1):
-            try:
-                _force_seed_for_query(
-                    conn,
-                    qctx,
-                    global_tables,
-                    fk_relationships,
-                    seed_variant=attempt,
-                    seed_rows=1,
-                    skip_tables=anti_tables,
-                )
-            except Exception:
-                pass
-            try:
-                rows_probe = _count_query_rows(conn, sql, count_timeout_s, probe_limit=1)
-            except Exception:
-                rows_probe = 0
-            if rows_probe >= 1:
-                break
-
-    if rows_probe < 1 and patch_pack is not None:
-        try:
-            recipe_applied = bool(patch_pack.apply_recipe(conn, qctx, global_tables))
-            if recipe_applied:
-                rows_probe = _count_query_rows(conn, sql, count_timeout_s, probe_limit=1)
-        except Exception:
-            rows_probe = 0
-
+    # 4) Unsat declaration.
     if rows_probe < 1:
         unsat = _is_obviously_unsat(qctx, global_tables)
 
@@ -180,6 +188,7 @@ def _run_eval(
     count_timeout_s: int,
     seed_attempts: int,
     patch_pack_name: str,
+    random_fallback: bool = False,
 ) -> Dict[str, Any]:
     truth = _load_truth_map(truth_file)
     validator = SyntheticValidator(reference_db=None, dialect="postgres")
@@ -246,6 +255,7 @@ def _run_eval(
             count_timeout_s=count_timeout_s,
             seed_attempts=seed_attempts,
             patch_pack=patch_pack,
+            random_fallback=random_fallback,
         )
 
         pred = "ERR"
@@ -355,6 +365,12 @@ def main() -> None:
         default="none",
         help="Optional benchmark patch pack (default: none).",
     )
+    parser.add_argument(
+        "--random-fallback",
+        action="store_true",
+        default=False,
+        help="Enable random data top-up as last resort after force-seed fails.",
+    )
     args = parser.parse_args()
 
     report = _run_eval(
@@ -365,6 +381,7 @@ def main() -> None:
         count_timeout_s=args.count_timeout_s,
         seed_attempts=args.seed_attempts,
         patch_pack_name=args.patch_pack,
+        random_fallback=args.random_fallback,
     )
     report["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
     report["config"] = {
@@ -375,6 +392,7 @@ def main() -> None:
         "count_timeout_s": args.count_timeout_s,
         "seed_attempts": args.seed_attempts,
         "patch_pack": args.patch_pack,
+        "random_fallback": args.random_fallback,
     }
 
     out_path = Path(args.output_file)

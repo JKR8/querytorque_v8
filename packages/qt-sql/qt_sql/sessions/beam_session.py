@@ -102,8 +102,9 @@ class BeamSession(OptimizationSession):
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     }
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, resume_dir: Optional[Path] = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.resume_dir = resume_dir
         self._llm_calls_lock = threading.Lock()
         self._llm_call_seq = 0
         self._api_call_costs: List[Dict[str, Any]] = []
@@ -146,6 +147,57 @@ class BeamSession(OptimizationSession):
             logger.warning(
                 f"[{self.query_id}] Invalid QT_LLM_PRICING_OVERRIDES_JSON: {e}"
             )
+
+    # ── Resume helpers ──────────────────────────────────────────────────
+
+    def _cached_response_path(
+        self, session_dir: Path, iteration: int, label: str
+    ) -> Path:
+        return session_dir / f"iter{iteration}_{label}.txt"
+
+    def _try_load_cached(
+        self, session_dir: Path, iteration: int, label: str
+    ) -> Optional[str]:
+        """Return cached LLM response from disk if resume_dir is set."""
+        if not self.resume_dir:
+            return None
+        fp = self._cached_response_path(session_dir, iteration, label)
+        if fp.exists():
+            content = fp.read_text(encoding="utf-8")
+            logger.info(
+                f"[{self.query_id}] Resume: loaded {label} from disk "
+                f"({len(content)} chars)"
+            )
+            return content
+        return None
+
+    @staticmethod
+    def find_resumable_session_dir(
+        benchmark_dir: Path, query_id: str
+    ) -> Optional[Path]:
+        """Find the latest beam session dir for a query that has partial work.
+
+        Returns None if no resumable session exists (either no session at all,
+        or the latest session already has a result file).
+        """
+        beam_dir = benchmark_dir / "beam_sessions"
+        if not beam_dir.exists():
+            return None
+        candidates = sorted(
+            beam_dir.glob(f"{query_id}_*"),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        for cand in candidates:
+            if not cand.is_dir():
+                continue
+            # Already complete → skip (no resume needed)
+            if (cand / "iter0_result.txt").exists():
+                continue
+            # Has at least analyst response → resumable
+            if (cand / "iter0_analyst_response.txt").exists():
+                return cand
+        return None
 
     def _reset_cost_tracking(self, session_dir: Path) -> None:
         with self._llm_calls_lock:
@@ -1499,7 +1551,13 @@ class BeamSession(OptimizationSession):
             else Dialect.POSTGRES
         )
 
-        session_dir = self._create_session_dir()
+        if self.resume_dir and self.resume_dir.is_dir():
+            session_dir = self.resume_dir
+            logger.info(
+                f"[{self.query_id}] Resuming from existing session: {session_dir}"
+            )
+        else:
+            session_dir = self._create_session_dir()
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
         beam_edit_mode = self._beam_edit_mode()
@@ -1587,35 +1645,46 @@ class BeamSession(OptimizationSession):
         analyst_prompt = analyst_prompt_base
         analyst_response = ""
         scout_result = None
-        for attempt in range(1, max_analyst_attempts + 1):
-            if attempt > 1:
-                analyst_prompt = (
-                    analyst_prompt_base
-                    + "\n\n## Retry Requirements\n"
-                    + "Your prior response was not parseable. Return ONLY valid JSON "
-                    + "with keys: dispatch, probes, dropped. No markdown fences."
-                )
-            analyst_response = analyst_call_fn(analyst_prompt)
-            total_api_calls += 1
-            prompt_label = (
-                "analyst_prompt"
-                if attempt == 1
-                else f"analyst_prompt_retry{attempt - 1}"
-            )
-            response_label = (
-                "analyst_response"
-                if attempt == 1
-                else f"analyst_response_retry{attempt - 1}"
-            )
-            self._save_to_disk(session_dir, 0, prompt_label, analyst_prompt)
-            self._save_to_disk(session_dir, 0, response_label, analyst_response)
+
+        # ── Resume: try loading analyst response from disk ────────────
+        cached_analyst = self._try_load_cached(
+            session_dir, 0, "analyst_response"
+        )
+        if cached_analyst:
+            analyst_response = cached_analyst
             scout_result = parse_analyst_response(analyst_response)
-            if scout_result and scout_result.probes:
-                break
-            logger.warning(
-                f"[{self.query_id}] Analyst parse failed (attempt "
-                f"{attempt}/{max_analyst_attempts})"
-            )
+
+        if not scout_result or not scout_result.probes:
+            # Normal path: call analyst LLM
+            for attempt in range(1, max_analyst_attempts + 1):
+                if attempt > 1:
+                    analyst_prompt = (
+                        analyst_prompt_base
+                        + "\n\n## Retry Requirements\n"
+                        + "Your prior response was not parseable. Return ONLY valid JSON "
+                        + "with keys: dispatch, probes, dropped. No markdown fences."
+                    )
+                analyst_response = analyst_call_fn(analyst_prompt)
+                total_api_calls += 1
+                prompt_label = (
+                    "analyst_prompt"
+                    if attempt == 1
+                    else f"analyst_prompt_retry{attempt - 1}"
+                )
+                response_label = (
+                    "analyst_response"
+                    if attempt == 1
+                    else f"analyst_response_retry{attempt - 1}"
+                )
+                self._save_to_disk(session_dir, 0, prompt_label, analyst_prompt)
+                self._save_to_disk(session_dir, 0, response_label, analyst_response)
+                scout_result = parse_analyst_response(analyst_response)
+                if scout_result and scout_result.probes:
+                    break
+                logger.warning(
+                    f"[{self.query_id}] Analyst parse failed (attempt "
+                    f"{attempt}/{max_analyst_attempts})"
+                )
 
         if not scout_result or not scout_result.probes:
             logger.warning(f"[{self.query_id}] Analyst returned no probes")
@@ -1732,6 +1801,7 @@ class BeamSession(OptimizationSession):
         )
 
         launch_interval_s = self._beam_api_launch_interval_seconds()
+        _cached_probe_ids: set = set()
         with ThreadPoolExecutor(max_workers=max(1, n_workers)) as pool:
             futures = {}
             for idx, (probe, lane, lane_call_fn, lane_model) in enumerate(lane_assignments):
@@ -1787,14 +1857,29 @@ class BeamSession(OptimizationSession):
                 probe_id = str(getattr(probe, "probe_id", ""))
                 if probe_id:
                     worker_call_fn_by_patch_id[probe_id] = lane_call_fn
-                future = pool.submit(lane_call_fn, worker_prompt)
+
+                # ── Resume: wrap LLM call to check disk first ─────────
+                def _worker_call_or_load(
+                    call_fn, prompt, pid=probe_id, sdir=session_dir
+                ):
+                    cached = self._try_load_cached(sdir, 0, f"worker_{pid}_response")
+                    if cached is not None:
+                        _cached_probe_ids.add(pid)
+                        return cached
+                    return call_fn(prompt)
+
+                future = pool.submit(
+                    _worker_call_or_load, lane_call_fn, worker_prompt,
+                )
                 futures[future] = (probe, worker_prompt, lane, lane_model)
                 if launch_interval_s > 0 and idx < (len(lane_assignments) - 1):
                     time.sleep(launch_interval_s)
 
             for future in as_completed(futures):
                 probe, w_prompt, lane, lane_model = futures[future]
-                total_api_calls += 1
+                was_cached = probe.probe_id in _cached_probe_ids
+                if not was_cached:
+                    total_api_calls += 1
                 try:
                     response = future.result()
                     self._save_to_disk(
@@ -2034,14 +2119,21 @@ class BeamSession(OptimizationSession):
                     + self._compiler_tree_mode_suffix(base_tree_prompt)
                 )
 
-            self._save_to_disk(
-                session_dir, 0, "compiler_shot1_prompt", compiler_shot1_prompt
+            # ── Resume: check for cached compiler shot 1 ─────────
+            cached_shot1 = self._try_load_cached(
+                session_dir, 0, "compiler_shot1_response"
             )
-            compiler_shot1_response = analyst_call_fn(compiler_shot1_prompt)
-            total_api_calls += 1
-            self._save_to_disk(
-                session_dir, 0, "compiler_shot1_response", compiler_shot1_response
-            )
+            if cached_shot1:
+                compiler_shot1_response = cached_shot1
+            else:
+                self._save_to_disk(
+                    session_dir, 0, "compiler_shot1_prompt", compiler_shot1_prompt
+                )
+                compiler_shot1_response = analyst_call_fn(compiler_shot1_prompt)
+                total_api_calls += 1
+                self._save_to_disk(
+                    session_dir, 0, "compiler_shot1_response", compiler_shot1_response
+                )
 
             if tree_mode:
                 shot1_compiler = self._apply_tree_compiler_response(
@@ -2107,14 +2199,21 @@ class BeamSession(OptimizationSession):
                         },
                     )
 
-                self._save_to_disk(
-                    session_dir, 0, "compiler_shot2_prompt", compiler_shot2_prompt
+                # ── Resume: check for cached compiler shot 2 ─────
+                cached_shot2 = self._try_load_cached(
+                    session_dir, 0, "compiler_shot2_response"
                 )
-                compiler_shot2_response = analyst_call_fn(compiler_shot2_prompt)
-                total_api_calls += 1
-                self._save_to_disk(
-                    session_dir, 0, "compiler_shot2_response", compiler_shot2_response
-                )
+                if cached_shot2:
+                    compiler_shot2_response = cached_shot2
+                else:
+                    self._save_to_disk(
+                        session_dir, 0, "compiler_shot2_prompt", compiler_shot2_prompt
+                    )
+                    compiler_shot2_response = analyst_call_fn(compiler_shot2_prompt)
+                    total_api_calls += 1
+                    self._save_to_disk(
+                        session_dir, 0, "compiler_shot2_response", compiler_shot2_response
+                    )
 
                 if tree_mode:
                     shot2_compiler = self._apply_tree_compiler_response(
@@ -2325,7 +2424,21 @@ class BeamSession(OptimizationSession):
                     (worker_call_fn_by_patch_id or {}).get(patch.patch_id)
                     or worker_call_fn
                 )
-                future = pool.submit(lane_call_fn, retry_prompt)
+
+                # ── Resume: wrap retry call to check disk first ───
+                def _retry_call_or_load(
+                    call_fn, prompt, pid=patch.patch_id, sdir=session_dir, sh=shot
+                ):
+                    cached = self._try_load_cached(
+                        sdir, sh, f"worker_{pid}_retry_response"
+                    )
+                    if cached is not None:
+                        return cached
+                    return call_fn(prompt)
+
+                future = pool.submit(
+                    _retry_call_or_load, lane_call_fn, retry_prompt
+                )
                 futures[future] = (patch, retry_prompt)
                 if launch_interval_s > 0 and idx < (len(retryable) - 1):
                     time.sleep(launch_interval_s)
