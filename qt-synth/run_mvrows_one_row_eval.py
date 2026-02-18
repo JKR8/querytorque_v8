@@ -37,6 +37,7 @@ from qt_sql.validation.build_dsb76_synthetic_db import (  # noqa: E402
     _build_query_context,
     _count_query_rows,
     _force_seed_for_query,
+    _insert_boundary_rows,
     _is_obviously_unsat,
     _merge_fk,
     _merge_filters,
@@ -136,7 +137,7 @@ def _seed_for_witness(
                 global_tables,
                 fk_relationships,
                 seed_variant=attempt,
-                seed_rows=1,
+                seed_rows=2,
                 skip_tables=anti_tables,
             )
         except Exception:
@@ -146,7 +147,26 @@ def _seed_for_witness(
         except Exception:
             rows_probe = 0
         if rows_probe >= 1:
+            # Guard: scalar aggregates (MIN/MAX/COUNT) always return 1 row
+            # of NULLs even on empty input — not actually seeded.
+            try:
+                actual = conn.execute(f"SELECT * FROM ({sql}) _chk LIMIT 1").fetchone()
+                if actual is not None and all(v is None for v in actual):
+                    rows_probe = 0
+                    continue
+            except Exception:
+                pass
             break
+
+    # 1b) Boundary rows: insert boundary-value rows for range predicates.
+    if rows_probe >= 1:
+        try:
+            _insert_boundary_rows(
+                conn, qctx, global_tables, fk_relationships,
+                seed_variant=attempt, skip_tables=anti_tables,
+            )
+        except Exception:
+            pass  # best-effort — valid witness row already seeded
 
     # 2) Patch-pack recipe.
     if rows_probe < 1 and patch_pack is not None:
@@ -296,11 +316,22 @@ def _run_eval(
     comparable = [r for r in records if r["pred"] in ("EQ", "NEQ") and isinstance(r["gt_sf100_eq"], bool)]
     one_row = [r for r in comparable if r["orig_rows"] == 1]
 
+    # Row-count distribution for seeding effectiveness analysis.
+    row_dist = {"0": 0, "1": 0, "2+": 0}
+    for r in records:
+        if r["orig_rows"] == 0:
+            row_dist["0"] += 1
+        elif r["orig_rows"] == 1:
+            row_dist["1"] += 1
+        else:
+            row_dist["2+"] += 1
+
     summary = {
         "total_records": len(records),
         "patch_pack": patch_pack.name if patch_pack else "none",
         "comparable_records": len(comparable),
         "one_row_records": len(one_row),
+        "row_count_distribution": row_dist,
         "comparable_metrics": asdict(_compute_metrics(comparable)),
         "one_row_metrics": asdict(_compute_metrics(one_row)),
         "one_row_missed_non_equivalent": [
@@ -398,6 +429,19 @@ def main() -> None:
     out_path = Path(args.output_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    # Per-query row counts.
+    print("\n--- Per-query seed results ---")
+    for r in report["results"]:
+        gt = "NEQ" if r["gt_sf100_eq"] is False else ("EQ" if r["gt_sf100_eq"] is True else "?")
+        print(
+            f"  {r['query']:30s}  orig_rows={r['orig_rows']:3d}  opt_rows={r['opt_rows']:3d}"
+            f"  pred={r['pred']:3s}  gt={gt}"
+        )
+
+    # Row-count distribution.
+    dist = report["summary"]["row_count_distribution"]
+    print(f"\nROW_DISTRIBUTION  0_rows={dist['0']}  1_row={dist['1']}  2+_rows={dist['2+']}")
 
     one_row = report["summary"]["one_row_metrics"]
     print(

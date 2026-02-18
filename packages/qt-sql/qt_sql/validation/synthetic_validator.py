@@ -3239,6 +3239,7 @@ class SyntheticValidator:
                 # Late import to avoid circular dependency (build_dsb76 imports us).
                 from .build_dsb76_synthetic_db import (
                     _force_seed_for_query,
+                    _insert_boundary_rows,
                     _tables_in_anti_patterns,
                 )
 
@@ -3258,7 +3259,7 @@ class SyntheticValidator:
                             merged_tables,
                             fk_relationships,
                             seed_variant=attempt,
-                            seed_rows=1,
+                            seed_rows=2,
                             skip_tables=anti_tables,
                         )
                     except Exception:
@@ -3266,12 +3267,30 @@ class SyntheticValidator:
                     try:
                         probe = self.conn.execute(f"SELECT 1 FROM ({orig_exec}) _p LIMIT 1").fetchall()
                         if len(probe) >= 1:
+                            # Guard: scalar aggregates (MIN/MAX/COUNT) always return 1 row
+                            # of NULLs even on empty input — not actually seeded.
+                            try:
+                                actual = self.conn.execute(
+                                    f"SELECT * FROM ({orig_exec}) _chk LIMIT 1"
+                                ).fetchone()
+                                if actual is not None and all(v is None for v in actual):
+                                    continue
+                            except Exception:
+                                pass
                             seeded = True
                             break
                     except Exception:
                         pass
 
                 if seeded:
+                    # Insert boundary rows for range predicates (best-effort).
+                    try:
+                        _insert_boundary_rows(
+                            self.conn, qctx, merged_tables, fk_relationships,
+                            seed_variant=attempt, skip_tables=anti_tables,
+                        )
+                    except Exception:
+                        pass  # boundary rows are best-effort — valid row already seeded
                     return
 
             # Fallback: random data generation.

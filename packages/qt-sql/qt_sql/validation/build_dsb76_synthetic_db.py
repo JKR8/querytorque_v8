@@ -966,13 +966,14 @@ def _is_key_like(col_name: str) -> bool:
 
 
 def _infer_required_rows(sql: str, default_rows: int) -> int:
-    """Minimum-viable row count from HAVING COUNT constraints only."""
+    """Minimum-viable row count from HAVING COUNT and HAVING > AVG constraints."""
     req = max(1, int(default_rows))
     try:
         ast = sqlglot.parse_one(sql, read="duckdb")
     except Exception:
         return req
 
+    # HAVING COUNT(x) > N  →  need N+1 rows
     for cmp in ast.find_all(sqlglot.exp.GT, sqlglot.exp.GTE, sqlglot.exp.EQ):
         lhs = cmp.args.get("this")
         rhs = cmp.args.get("expression")
@@ -990,6 +991,24 @@ def _infer_required_rows(sql: str, default_rows: int) -> int:
             req = max(req, target)
         else:  # EQ
             req = max(req, target)
+
+    # HAVING sum(...) > <subquery|scalar>  →  need 3 rows so the minority
+    # group's single row (highest variant value) exceeds the overall average.
+    # The RHS may reference a CTE that wraps AVG, so check broadly:
+    # any HAVING with an aggregate LHS compared to a subquery triggers this.
+    for having in ast.find_all(sqlglot.exp.Having):
+        for cmp in having.find_all(sqlglot.exp.GT, sqlglot.exp.GTE):
+            lhs = cmp.args.get("this")
+            rhs = cmp.args.get("expression")
+            if lhs is None or rhs is None:
+                continue
+            lhs_has_agg = bool(list(lhs.find_all(
+                sqlglot.exp.Sum, sqlglot.exp.Avg, sqlglot.exp.Count,
+            )))
+            rhs_is_subquery = bool(list(rhs.find_all(sqlglot.exp.Subquery)))
+            rhs_has_avg = bool(list(rhs.find_all(sqlglot.exp.Avg)))
+            if lhs_has_agg and (rhs_is_subquery or rhs_has_avg):
+                req = max(req, 3)
 
     return min(req, 1000)
 
@@ -1134,7 +1153,7 @@ def _anchor_value_for_type(
     return f"ANCHOR_KEY_{variant}" if key_like else f"ANCHOR_VAL_{variant}"
 
 
-def _from_filter_literal(raw: Any, canonical_type: str) -> Any:
+def _from_filter_literal(raw: Any, canonical_type: str, bound_index: int = 0) -> Any:
     if not isinstance(raw, str):
         return _coerce_edge_value(raw, canonical_type)
 
@@ -1143,8 +1162,9 @@ def _from_filter_literal(raw: Any, canonical_type: str) -> Any:
         return _smart_string_from_literal(txt)
 
     if txt.startswith("BETWEEN:"):
-        _, low, _ = txt.split(":", 2)
-        return _coerce_edge_value(low, canonical_type)
+        _, low, high = txt.split(":", 2)
+        val = high if bound_index >= 1 else low
+        return _coerce_edge_value(val, canonical_type)
 
     if ":" in txt and txt[0] in "><":
         op, rhs = txt.split(":", 1)
@@ -1174,6 +1194,87 @@ def _from_filter_literal(raw: Any, canonical_type: str) -> Any:
         return rhs
 
     return _coerce_edge_value(txt, canonical_type)
+
+
+def _boundary_values_from_filter(
+    raw: str, canonical_type: str
+) -> List[Tuple[Any, bool]]:
+    """Return boundary test values as (value, should_pass_filter) pairs.
+
+    For BETWEEN low AND high -> 4 values:
+      (low, True), (low - eps, False), (high, True), (high + eps, False)
+    For >= val -> 2 values: (val, True), (val - eps, False)
+    For >  val -> 2 values: (val + eps, True), (val, False)
+    For <= val -> 2 values: (val, True), (val + eps, False)
+    For <  val -> 2 values: (val - eps, True), (val, False)
+
+    Returns empty list for non-range predicates or unsupported types.
+    """
+    if not isinstance(raw, str):
+        return []
+    txt = raw.strip()
+    if canonical_type == "VARCHAR":
+        return []
+
+    def _nudge(base_val: Any, direction: int) -> Any:
+        """Shift *base_val* by +/-eps.  *direction* is +1 or -1."""
+        if canonical_type in ("INTEGER", "BIGINT"):
+            return int(float(base_val)) + direction
+        if canonical_type == "DECIMAL":
+            return float(base_val) + direction * 0.01
+        if canonical_type == "DATE":
+            try:
+                dt = datetime.strptime(str(base_val), "%Y-%m-%d")
+                return (dt + timedelta(days=direction)).strftime("%Y-%m-%d")
+            except Exception:
+                return base_val
+        if canonical_type == "TIMESTAMP":
+            try:
+                dt = datetime.strptime(str(base_val), "%Y-%m-%d %H:%M:%S")
+                return (dt + timedelta(seconds=direction)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return base_val
+        return base_val
+
+    if txt.startswith("BETWEEN:"):
+        parts = txt.split(":", 2)
+        if len(parts) < 3:
+            return []
+        low_raw, high_raw = parts[1], parts[2]
+        low = _coerce_edge_value(low_raw, canonical_type)
+        high = _coerce_edge_value(high_raw, canonical_type)
+        return [
+            (low, True),              # min valid (lower bound, inside)
+            (_nudge(low, -1), False),  # max invalid at lower bound (just below)
+            (high, True),             # max valid (upper bound, inside)
+            (_nudge(high, +1), False), # min invalid at upper bound (just above)
+        ]
+
+    if ":" in txt and txt[0] in "><":
+        op, rhs = txt.split(":", 1)
+        val = _coerce_edge_value(rhs, canonical_type)
+        if op == ">=":
+            return [
+                (val, True),              # boundary value (inclusive, passes)
+                (_nudge(val, -1), False),  # just below (fails)
+            ]
+        if op == ">":
+            return [
+                (_nudge(val, +1), True),   # just above (passes)
+                (val, False),              # boundary value (exclusive, fails)
+            ]
+        if op == "<=":
+            return [
+                (val, True),              # boundary value (inclusive, passes)
+                (_nudge(val, +1), False),  # just above (fails)
+            ]
+        if op == "<":
+            return [
+                (_nudge(val, -1), True),   # just below (passes)
+                (val, False),              # boundary value (exclusive, fails)
+            ]
+
+    return []
 
 
 def _tables_in_anti_patterns(sql: str) -> Set[str]:
@@ -1225,6 +1326,92 @@ def _tables_in_not_exists(sql: str) -> Set[str]:
     return _tables_in_anti_patterns(sql)
 
 
+def _extract_group_by_columns(sql: str) -> Set[Tuple[str, str]]:
+    """Return {(table, column)} pairs referenced in GROUP BY clauses.
+
+    Walks GROUP BY expressions (including inside functions like SUBSTRING)
+    and resolves table aliases to real table names.
+    """
+    result: Set[Tuple[str, str]] = set()
+    try:
+        ast = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:
+        return result
+    # Build alias→table map.
+    alias_map: Dict[str, str] = {}
+    for tbl in ast.find_all(sqlglot.exp.Table):
+        name = (tbl.name or "").lower()
+        alias = (tbl.alias or "").lower()
+        if alias:
+            alias_map[alias] = name
+        alias_map[name] = name
+    # Walk GROUP BY nodes and extract every Column reference inside them.
+    for group in ast.find_all(sqlglot.exp.Group):
+        for col in group.find_all(sqlglot.exp.Column):
+            col_name = (col.name or "").lower()
+            tbl_ref = (col.table or "").lower()
+            real_table = alias_map.get(tbl_ref, tbl_ref)
+            if real_table and col_name:
+                result.add((real_table, col_name))
+            elif col_name:
+                # No table qualifier — add for all known tables.
+                for t in set(alias_map.values()):
+                    result.add((t, col_name))
+    return result
+
+
+def _extract_scalar_subquery_self_refs(sql: str) -> Set[Tuple[str, str]]:
+    """Return {(table, column)} pairs used in ``col = (SELECT col FROM same_table ...)``.
+
+    These columns must be frozen across rows so the scalar subquery returns
+    exactly one value and rows with matching filter values get the same result.
+    """
+    result: Set[Tuple[str, str]] = set()
+    try:
+        ast = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:
+        return result
+    # Build alias→table map.
+    alias_map: Dict[str, str] = {}
+    for tbl in ast.find_all(sqlglot.exp.Table):
+        name = (tbl.name or "").lower()
+        alias = (tbl.alias or "").lower()
+        if alias:
+            alias_map[alias] = name
+        alias_map[name] = name
+
+    for eq in ast.find_all(sqlglot.exp.EQ):
+        lhs = eq.args.get("this")
+        rhs = eq.args.get("expression")
+        if lhs is None or rhs is None:
+            continue
+        # LHS is a Column, RHS contains a Subquery selecting the same column.
+        if not isinstance(lhs, sqlglot.exp.Column):
+            continue
+        subqueries = list(rhs.find_all(sqlglot.exp.Subquery))
+        if not subqueries:
+            continue
+        lhs_col = (lhs.name or "").lower()
+        lhs_tbl_raw = (lhs.table or "").lower()
+        lhs_tbl = alias_map.get(lhs_tbl_raw, lhs_tbl_raw)
+        for sq in subqueries:
+            sq_tables = {
+                alias_map.get((t.name or "").lower(), (t.name or "").lower())
+                for t in sq.find_all(sqlglot.exp.Table)
+            }
+            sq_cols = {(c.name or "").lower() for c in sq.find_all(sqlglot.exp.Column)}
+            if lhs_col not in sq_cols:
+                continue
+            if lhs_tbl and lhs_tbl in sq_tables:
+                result.add((lhs_tbl, lhs_col))
+            elif not lhs_tbl:
+                # Unqualified column — attribute to each subquery table.
+                for st in sq_tables:
+                    if st:
+                        result.add((st, lhs_col))
+    return result
+
+
 def _force_seed_for_query(
     conn: duckdb.DuckDBPyConnection,
     qctx: QueryContext,
@@ -1243,9 +1430,11 @@ def _force_seed_for_query(
     skip_tables = {t.lower() for t in (skip_tables or set())}
     # Minimum-viable objective: produce one witness row unless COUNT requires more.
     inferred_rows = _infer_required_rows(sql_source, 1)
-    n_rows = max(1, inferred_rows)
+    n_rows = max(seed_rows, inferred_rows)
     time_center = _detect_temporal_anchor(sql_source)
     base_variant = max(0, int(seed_variant))
+    group_by_cols = _extract_group_by_columns(sql_source)
+    scalar_self_ref_cols = _extract_scalar_subquery_self_refs(sql_source)
     join_comp_map, join_comp_members = _extract_join_components(sql_source, q_tables)
 
     # If one column in a join-component has a concrete filter literal, propagate that witness value
@@ -1292,6 +1481,29 @@ def _force_seed_for_query(
         fk_map = fk_relationships.get(table_name, {})
         table_filters = q_filters.get(table_name, {})
 
+        # Tier 1: Filter-equivalence classes — rows with identical filter
+        # values get the same variant for non-filter columns, so functional
+        # dependents (e.g. d_week_seq from d_year+d_moy+d_dom) stay consistent.
+        filter_cols_sorted = sorted(c for c in cols if table_filters.get(c))
+        row_equiv_variant: Dict[int, int] = {}
+        if filter_cols_sorted:
+            seen_fps: Dict[tuple, int] = {}
+            for ri in range(n_rows):
+                fp_parts = []
+                for fc in filter_cols_sorted:
+                    candidates = table_filters[fc]
+                    cand = candidates[ri % len(candidates)]
+                    fc_canon = _canonical_edge_type(schema["columns"][fc].get("type", ""))
+                    val = _from_filter_literal(cand, fc_canon, bound_index=ri)
+                    fp_parts.append((fc, val))
+                fp = tuple(fp_parts)
+                if fp not in seen_fps:
+                    seen_fps[fp] = ri
+                row_equiv_variant[ri] = seen_fps[fp]
+        else:
+            for ri in range(n_rows):
+                row_equiv_variant[ri] = 0
+
         rows_to_insert: List[Tuple[Any, ...]] = []
         for row_idx in range(n_rows):
             row_values: List[Any] = []
@@ -1299,7 +1511,19 @@ def _force_seed_for_query(
                 col_info = schema["columns"][col]
                 canonical = _canonical_edge_type(col_info.get("type", ""))
                 key_like = _is_key_like(col)
-                variant = base_variant + row_idx
+                # Variant selection priority:
+                #   Tier 2: scalar subquery self-ref → freeze to base_variant
+                #   GROUP BY columns → freeze to base_variant
+                #   Tier 1: filter-equivalence class → freeze within class
+                #   Default: base_variant + row_idx (full diversity)
+                in_group_by = (table_name.lower(), col.lower()) in group_by_cols
+                in_scalar_ref = (table_name.lower(), col.lower()) in scalar_self_ref_cols
+                if key_like:
+                    variant = base_variant + row_idx
+                elif in_scalar_ref or in_group_by:
+                    variant = base_variant
+                else:
+                    variant = base_variant + row_equiv_variant[row_idx]
 
                 super_val = super_values_by_col.get(col)
                 filter_candidates = table_filters.get(col, [])
@@ -1308,7 +1532,7 @@ def _force_seed_for_query(
                     value = _fit_numeric_to_column(super_val, col_info.get("type", ""), canonical)
                 elif filter_candidates:
                     cand = filter_candidates[row_idx % len(filter_candidates)]
-                    value = _from_filter_literal(cand, canonical)
+                    value = _from_filter_literal(cand, canonical, bound_index=row_idx)
                     value = _fit_numeric_to_column(value, col_info.get("type", ""), canonical)
                 elif comp_id is not None:
                     if comp_id in comp_fixed_values:
@@ -1359,7 +1583,159 @@ def _force_seed_for_query(
                 row_values.append(value)
             rows_to_insert.append(tuple(row_values))
 
+        # Deduplicate rows in the same filter-equivalence class to prevent
+        # scalar subqueries from returning multiple rows.  Only applies to
+        # dimension tables that have scalar subquery self-references.
+        # Duplicate rows' anchors are remapped to the representative's anchor
+        # so FK references from child tables still resolve correctly.
+        table_has_scalar_refs = any(
+            (table_name.lower(), c.lower()) in scalar_self_ref_cols for c in cols
+        )
+        if filter_cols_sorted and table_has_scalar_refs:
+            deduped_rows: List[Tuple[Any, ...]] = []
+            seen_repr: Set[int] = set()
+            for ri in range(len(rows_to_insert)):
+                repr_ri = row_equiv_variant[ri]
+                if repr_ri not in seen_repr:
+                    seen_repr.add(repr_ri)
+                    deduped_rows.append(rows_to_insert[ri])
+                else:
+                    # Remap this row's anchor to the representative's anchor.
+                    anchor_by_table[table_name][ri] = anchor_by_table[table_name][repr_ri]
+            rows_to_insert = deduped_rows
+
         _insert_rows(conn, table_name, cols, rows_to_insert)
+
+
+def _insert_boundary_rows(
+    conn: duckdb.DuckDBPyConnection,
+    qctx: QueryContext,
+    global_tables: Dict[str, Dict[str, Any]],
+    fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+    *,
+    seed_variant: int = 0,
+    skip_tables: Optional[Set[str]] = None,
+) -> int:
+    """Insert boundary-value rows for all range predicates in the query.
+
+    For each table/column with BETWEEN or comparison filters, inserts rows at
+    predicate boundaries (inclusive edge, exclusive edge) so that disagreement
+    between original and optimized queries on boundary handling is detectable.
+
+    Returns number of boundary rows inserted.  Skips columns that participate
+    in join components (changing join keys would break referential integrity).
+    """
+    q_tables = qctx["tables"]
+    q_filters = qctx["filter_values"]
+    q_fks = qctx["fk_relationships"]
+    sql_source = qctx.get("sql_duckdb", "")
+    skip_tables = {t.lower() for t in (skip_tables or set())}
+    base_variant = max(0, int(seed_variant))
+    join_comp_map, _ = _extract_join_components(sql_source, q_tables)
+
+    helper = SyntheticValidator(reference_db=None, dialect="duckdb")
+    order = helper._get_table_generation_order(q_tables, q_fks)
+
+    total_inserted = 0
+
+    for table_name in order:
+        if table_name.lower() in skip_tables:
+            continue
+        schema = global_tables.get(table_name)
+        if schema is None:
+            continue
+        cols = list(schema.get("columns", {}).keys())
+        if not cols:
+            continue
+
+        table_filters = q_filters.get(table_name, {})
+        pk_col = find_primary_key_column(table_name, cols)
+        fk_map = fk_relationships.get(table_name, {})
+
+        # Fallback PK: if find_primary_key_column returns None (common for fact tables
+        # like web_sales, catalog_sales, store_sales), use any non-join, non-FK,
+        # non-filter integer column as uniquifier.  For web_sales this finds
+        # ws_quantity — setting it to unique values makes boundary rows
+        # distinguishable in aggregations.
+        uniquifier_col = pk_col
+        if uniquifier_col is None:
+            join_cols = {c for (t, c) in join_comp_map if t == table_name}
+            fk_cols = {c.lower() for c in fk_map}
+            filter_cols = {c.lower() for c in table_filters}
+            for c in cols:
+                cl = c.lower()
+                if cl in join_cols or cl in fk_cols or cl in filter_cols:
+                    continue
+                ctype = _canonical_edge_type(schema["columns"][c].get("type", ""))
+                if ctype in ("INTEGER", "BIGINT"):
+                    uniquifier_col = c
+                    break
+
+        # Collect range-predicate columns that are NOT join columns.
+        range_cols: Dict[str, List[Tuple[Any, bool]]] = {}
+        for col, fvals in table_filters.items():
+            if join_comp_map.get((table_name, col)) is not None:
+                continue  # skip join columns
+            col_info = schema["columns"].get(col)
+            if col_info is None:
+                continue
+            canonical = _canonical_edge_type(col_info.get("type", ""))
+            for fv in fvals:
+                bvals = _boundary_values_from_filter(fv, canonical)
+                if bvals:
+                    range_cols.setdefault(col, []).extend(bvals)
+
+        if not range_cols:
+            continue
+
+        # Read an actual row from the table as the template.  This guarantees
+        # boundary rows share exact join-key values with the force-seed row that
+        # survived the multi-table JOINs (instead of rebuilding from priority
+        # logic, which can diverge).
+        try:
+            existing = conn.execute(f'SELECT * FROM "{table_name}"').fetchall()
+        except Exception:
+            existing = []
+        if not existing:
+            continue
+        template: Dict[str, Any] = dict(zip(cols, existing[-1]))
+
+        # For each boundary value, clone template row and override the target column.
+        # Use unique values on uniquifier_col to avoid row collisions with force-seed.
+        pk_offset = 800001 + base_variant * 100
+        boundary_rows: List[Tuple[Any, ...]] = []
+        for col, bval_pairs in range_cols.items():
+            col_info = schema["columns"][col]
+            canonical = _canonical_edge_type(col_info.get("type", ""))
+            for bval, _should_pass in bval_pairs:
+                # Skip boundary values that duplicate the template (force-seed) value.
+                template_val = template.get(col)
+                try:
+                    if template_val is not None and float(bval) == float(template_val):
+                        continue
+                except (TypeError, ValueError):
+                    if str(bval) == str(template_val):
+                        continue
+                row_vals: List[Any] = []
+                for c in cols:
+                    if c == col:
+                        fitted = _fit_numeric_to_column(bval, col_info.get("type", ""), canonical)
+                        row_vals.append(fitted)
+                    elif uniquifier_col and c == uniquifier_col:
+                        row_vals.append(pk_offset)
+                        pk_offset += 1
+                    else:
+                        row_vals.append(template[c])
+                boundary_rows.append(tuple(row_vals))
+
+        if boundary_rows:
+            try:
+                _insert_rows(conn, table_name, cols, boundary_rows)
+                total_inserted += len(boundary_rows)
+            except Exception:
+                pass  # best-effort — valid witness row already present
+
+    return total_inserted
 
 
 def _mv_insert_row(
