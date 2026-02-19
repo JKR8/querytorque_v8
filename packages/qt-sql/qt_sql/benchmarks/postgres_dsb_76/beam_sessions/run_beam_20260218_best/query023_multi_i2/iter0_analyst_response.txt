@@ -1,0 +1,159 @@
+{  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The query exhibits comma-join inefficiencies and repeated fact-table scans, leading to high aggregate times and hash join costs. Converting comma joins to explicit joins with pre-filtered dimension CTEs can reduce scan volume and improve join planning, while materializing shared scans may cut redundant work.",
+    "reasoning_trace": [
+      "Hash Join in final_select consumes 10754 ms due to large CTE inputs from repeated store_sales scans.",
+      "Nested loops in frequent_ss_items CTE with comma joins show poor selectivity propagation (time 1037 ms).",
+      "Aggregate in best_ss_customer CTE takes 9465 ms with cardinality over-estimation (est=1793, act=2).",
+      "Store_sales is scanned multiple times across CTEs with different filters, indicating redundancy."
+    ],
+    "cost_spine": ["Hash Join", "Aggregate", "Nested Loop", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Hash Join",
+        "why": "dominant runtime in final_select joining catalog_sales/web_sales with CTEs",
+        "evidence": "rows=0 time=10754.009 ms"
+      },
+      {
+        "op": "Aggregate",
+        "why": "high time in best_ss_customer CTE with store_sales scans",
+        "evidence": "rows=5504 time=9465.386 ms"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "inefficient comma joins in frequent_ss_items CTE",
+        "evidence": "rows=208254 time=1037.558 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid same-column OR to UNION ALL splits (PostgreSQL BitmapOr strength)",
+      "avoid materializing simple EXISTS paths (preserve semi-joins)",
+      "avoid duplicating heavy CTE bodies without reuse benefit"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-separated joins in frequent_ss_items CTE to explicit INNER JOINs and pre-filter date_dim into a materialized CTE for early selectivity, preserving all predicates.",
+      "dag_target_hint": "Change frequent_ss_items node SQL to use explicit JOIN syntax and add date_filter CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "item"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "ss_item_sk = i_item_sk", "d_year = 1999", "i_manager_id BETWEEN 44 AND 63", "i_category IN ('Men', 'Music', 'Sports')"],
+        "output_must_preserve": ["substring(i_item_desc,1,30) itemdesc", "i_item_sk item_sk", "d_date solddate", "count(*) cnt", "HAVING count(*) > 4"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Nested loops replaced with hash joins, reduced rows flowing into aggregate due to early date filter.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_syntax"],
+      "rank_rationale": "Targets primary hotspot — comma joins in frequent_ss_items drive nested loop amplification.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, item, customer) into materialized CTEs before fact-table joins in the final_select, using explicit JOIN syntax to improve cardinality estimates.",
+      "dag_target_hint": "Modify final_select node to reference pre-filtered dimension CTEs instead of raw tables.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "date_dim", "item", "customer"],
+        "where_must_preserve": ["d_year = 1999", "d_moy = 5", "cs_wholesale_cost BETWEEN 26 AND 36", "ws_wholesale_cost BETWEEN 26 AND 36", "IN subqueries on frequent_ss_items and best_ss_customer"],
+        "output_must_preserve": ["SUM(sales) with UNION ALL branches and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:CAUTION", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Hash join inputs shrink due to pre-filtered dimension CTEs, lowering I/O and join work.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Addresses secondary hotspot — final select hash join benefits from reduced dimension scan volume.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate store_sales by customer key in best_ss_customer CTE before joining with customer dimension, while preserving the HAVING filter on max_store_sales.",
+      "dag_target_hint": "Change best_ss_customer node SQL to aggregate store_sales early and join with filtered customer CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "customer"],
+        "where_must_preserve": ["c_birth_year BETWEEN 1987 AND 1993", "ss_customer_sk = c_customer_sk"],
+        "output_must_preserve": ["c_customer_sk", "sum(ss_quantity*ss_sales_price) ssales", "HAVING > (95/100.0) * max_store_sales"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none", "G_PG_CTE_REUSE_REQUIRED:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregate pushdown may reduce rows entering the final aggregate, leveraging early filtering from customer dimension.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Rows into best_ss_customer aggregate decrease, potentially lowering scan and join costs in the CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_group_by"],
+      "rank_rationale": "Exploration — targets aggregate hotspot with portability candidate transform, testing family C.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize a shared filtered store_sales CTE with common predicates (e.g., date range and wholesale cost) to avoid redundant scans across multiple CTEs, referenced by frequent_ss_items and best_ss_customer.",
+      "dag_target_hint": "Create new CTE for filtered store_sales and update frequent_ss_items and best_ss_customer nodes to use it.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_sold_date_sk = d_date_sk", "d_year = 1999", "ss_wholesale_cost BETWEEN 26 AND 36"],
+        "output_must_preserve": ["ss_item_sk", "ss_customer_sk", "ss_quantity", "ss_sales_price for downstream aggregates"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Repeated store_sales scans with overlapping filters can be consolidated into a single materialized CTE to reduce I/O and computation.",
+      "confidence": 0.40,
+      "expected_explain_delta": "Reduced number of store_sales scans, lower aggregate input rows, and faster CTE executions.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration — addresses repeated scan symptom with portability candidate, testing family E.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in SQL or plan evidence; PostgreSQL BitmapOr handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL; all subqueries are non-correlated IN lists from CTEs."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Previous attempt_1 failed with this transform; avoid repeating failed strategies."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join patterns in the query; transform requires same fact+dimension scan in self-join context."
+    }
+  ]
+}

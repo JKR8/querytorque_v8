@@ -1,0 +1,182 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The dominant bottleneck is a sequential scan on the large `customer` table (166,667 rows) due to comma-join semantics preventing optimal join-order flexibility. Secondary nested loops and late filters on small dimension tables compound the issue. Explicit join syntax and staged dimension pre-filtering via CTEs should reduce the large scan and improve hash join planning.",
+    "reasoning_trace": [
+      "Sequential scan on `customer` (rows=166667, time=490.726ms) is the largest I/O operation and dominates runtime.",
+      "Comma-join pattern present (6 tables in FROM) with join predicates in WHERE, triggering `COMMA_JOIN_WEAKNESS` gap.",
+      "Dimension tables (`customer_address`, `income_band`) are small and filtered early but cannot push predicates into the large customer scan due to join topology.",
+      "Nested loops on `household_demographics` and `customer_demographics` use index scans (rows=1 each), but repeated probing amplifies cost.",
+      "No correlated subqueries, aggregations, or set operations present; families B, C, D are not indicated."
+    ],
+    "cost_spine": ["Seq Scan on customer", "Hash Join", "Nested Loop", "Nested Loop", "Sort", "Gather Merge", "Limit"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on customer",
+        "why": "largest table scanned fully without predicate pushdown",
+        "evidence": "rows=166667, time=490.726ms"
+      },
+      {
+        "op": "Hash Join (customer ↔ customer_address)",
+        "why": "joins large fact table to filtered dimension via comma join, preventing early reduction",
+        "evidence": "time=695.661ms"
+      },
+      {
+        "op": "Nested Loop (household_demographics ↔ income_band)",
+        "why": "small but repeated index scans amplify cost",
+        "evidence": "rows=63, time=698.709ms"
+      }
+    ],
+    "do_not_do": [
+      "Avoid OR-to-UNION transforms (no OR predicate present, PostgreSQL BitmapOr already optimal).",
+      "Avoid decorrelation transforms (no correlated subqueries).",
+      "Avoid duplicating large CTE bodies; keep materialization small.",
+      "Do not convert explicit joins if already present after rewrite."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and pre-filter all selective dimensions (`customer_address`, `income_band`, `household_demographics`, `customer_demographics`) into MATERIALIZED CTEs, then join the reduced dimension keys to `customer` and `store_returns`.",
+      "dag_target_hint": "Replace final_select FROM clause with explicit JOINs on pre-filtered CTEs.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567 AND ib_upper_bound <= 23567 + 50000", "all equality join predicates"],
+        "output_must_preserve": ["c_customer_id as customer_id", "coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername", "ORDER BY c_customer_id", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Seq Scan on customer replaced by Hash Join with pre-filtered customer_address CTE; nested loops may shift to hash joins; overall row flow reduces.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: targets large customer scan via explicit join conversion and dimension prefetch, highest expected impact.",
+      "recommended_examples": ["pg_explicit_join_materialized", "pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_explicit_join_materialized"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered `customer_address` and `income_band` into CTEs, convert comma joins to explicit JOINs, and join `customer` early with the `customer_address` CTE to push city filter.",
+      "dag_target_hint": "Change final_select to use WITH cte_address, cte_income; rewrite FROM with explicit JOIN order (cte_address → customer → others).",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "income_band"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567 AND ib_upper_bound <= 23567 + 50000", "c_current_addr_sk = ca_address_sk", "ib_income_band_sk = hd_income_band_sk"],
+        "output_must_preserve": ["all original output columns and ordering"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Customer scan reduced via early hash join with tiny address CTE; nested loops may remain but with smaller probe sets.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Secondary hotspot: addresses large scan via dimension isolation and explicit joins, moderate risk.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter `customer_address`, `income_band`, `household_demographics`, and `customer_demographics` into separate CTEs, then join them with `customer` and `store_returns` using comma joins (original syntax) to test predicate pushdown alone.",
+      "dag_target_hint": "Insert CTEs before final_select; keep original FROM clause but reference CTE aliases.",
+      "node_contract": {
+        "from_must_include": ["customer", "customer_address", "customer_demographics", "household_demographics", "income_band", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567 AND ib_upper_bound <= 23567 + 50000", "all original join predicates"],
+        "output_must_preserve": ["exact output columns and order"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may push filters through CTE boundaries when CTEs are small and referenced multiple times, reducing customer scan without explicit join reorder.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Sequential scan on customer may remain but with reduced rows due to early hash join with address CTE; nested loops may shift to hash joins.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: tests CTE materialization and filter pushdown without explicit join syntax change.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the join of filtered dimensions (`customer_address`, `income_band`, `household_demographics`, `customer_demographics`) into a single CTE, then join once with `customer` and `store_returns` to avoid repeated dimension rescans.",
+      "dag_target_hint": "Create a CTE with all dimension keys filtered; replace original dimension tables in final_select with a single join to this CTE.",
+      "node_contract": {
+        "from_must_include": ["customer", "store_returns"],
+        "where_must_preserve": ["ca_city = 'Jackson'", "ib_lower_bound >= 23567 AND ib_upper_bound <= 23567 + 50000", "all original join predicates via CTE keys"],
+        "output_must_preserve": ["exact output columns and order"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Consolidating dimension joins into one materialized CTE may reduce nested-loop overhead and improve cardinality estimates.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Nested loops replaced by hash joins to consolidated dimension CTE; customer scan may still be full but with reduced join amplification.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: targets secondary hotspot (nested loops) via shared materialization, lower confidence.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan; PostgreSQL BitmapOr handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY or aggregation in query."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN present; all joins are inner-equijoins."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non-equi join present; range filter on income_band is not a join predicate."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Portability candidate for Snowflake; no date_dim table in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "reason": "Portability candidate for Snowflake; no UNION ALL in query."
+    }
+  ]
+}

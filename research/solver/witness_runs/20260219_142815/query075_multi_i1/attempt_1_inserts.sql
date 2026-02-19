@@ -1,0 +1,16 @@
+INSERT INTO catalog_returns (cr_reason_sk) VALUES (7);
+INSERT INTO catalog_returns (cr_reason_sk) VALUES (25);
+INSERT INTO catalog_sales (cs_list_price, cs_sales_price) VALUES (100.0, 40.0);
+INSERT INTO catalog_sales (cs_list_price, cs_sales_price) VALUES (200.0, 80.0);
+INSERT INTO date_dim (d_year) VALUES (1998);
+INSERT INTO date_dim (d_year) VALUES (1999);
+INSERT INTO item (i_brand_id, i_category, i_category_id, i_class_id, i_manufact_id) VALUES (1000, 'Home', 1, 1, 1);
+INSERT INTO item (i_brand_id, i_category, i_category_id, i_class_id, i_manufact_id) VALUES (1001, 'Home', 2, 2, 2);
+INSERT INTO store_returns (sr_reason_sk) VALUES (26);
+INSERT INTO store_returns (sr_reason_sk) VALUES (52);
+INSERT INTO store_sales (ss_list_price, ss_sales_price) VALUES (100.0, 40.0);
+INSERT INTO store_sales (ss_list_price, ss_sales_price) VALUES (200.0, 80.0);
+INSERT INTO web_returns (wr_reason_sk) VALUES (69);
+INSERT INTO web_returns (wr_reason_sk) VALUES (7);
+INSERT INTO web_sales (ws_list_price, ws_sales_price) VALUES (100.0, 40.0);
+INSERT INTO web_sales (ws_list_price, ws_sales_price) VALUES (200.0, 80.0);

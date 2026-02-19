@@ -1,0 +1,173 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Nested Loop amplifies 6,247 hash-join rows into 980 index scans on customer_address and customer_demographics because OR conditions block predicate pushdown and early join reordering. Converting comma joins to explicit INNER JOIN syntax and pre‑filtering dimensions into tiny CTEs should enable join‑order flexibility and reduce loop iterations.",
+    "reasoning_trace": [
+      "Primary hotspot is nested loop (980 rows, 2,568 ms) driven by hash‑join output of 6,247 rows.",
+      "Two Index Scans on customer_address and customer_demographics each return 0 rows, indicating high selectivity applied too late.",
+      "Comma‑join syntax and multi‑branch OR conditions prevent early filter pushdown and optimal join ordering.",
+      "No correlated subqueries, aggregation, or set operations present; focus on join topology and early filtering."
+    ],
+    "cost_spine": [
+      "Index Only Scan on date_dim",
+      "Nested Loop → Index Only Scan on store_sales",
+      "Hash Join → Seq Scan on household_demographics",
+      "Hash Join → Seq Scan on store",
+      "Nested Loop → Index Scan on customer_address",
+      "Nested Loop → Index Scan on customer_demographics",
+      "Aggregate"
+    ],
+    "hotspots": [
+      {
+        "op": "Nested Loop (customer_address)",
+        "why": "repeated index scans (6,247 loops) on highly selective dimension",
+        "evidence": "rows=980, time=2568.241 ms, index scan returns 0 rows per loop"
+      },
+      {
+        "op": "Hash Join (store_sales/date_dim ⋈ household_demographics/store)",
+        "why": "produces 6,247 rows that feed expensive nested loops",
+        "evidence": "rows=6247, time=2310.635 ms"
+      },
+      {
+        "op": "OR predicate groups",
+        "why": "complex OR conditions on customer_demographics and customer_address block early filter pushdown",
+        "evidence": "two multi‑branch OR groups prevent index‑only path for entire join tree"
+      }
+    ],
+    "do_not_do": [
+      "Avoid or_to_union because PostgreSQL BitmapOr handles same‑column OR efficiently (guard G_PG_OR_INDEX_PROTECTED).",
+      "Avoid duplicating large CTE bodies; pre‑filter dimensions only once.",
+      "Do not convert EXISTS or NOT EXISTS—none present in query."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOIN syntax and pre‑filter date_dim (d_year=2001) into a CTE, then join with store_sales using explicit JOIN ON clauses.",
+      "dag_target_hint": "Change final_select FROM clause and add date_filter CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "store", "household_demographics", "customer_demographics", "customer_address"],
+        "where_must_preserve": ["d_year = 2001", "s_store_sk = ss_store_sk", "ss_sold_date_sk = d_date_sk", "ss_hdemo_sk = hd_demo_sk", "cd_demo_sk = ss_cdemo_sk", "ss_addr_sk = ca_address_sk", "all OR branch predicates"],
+        "output_must_preserve": ["MIN(ss_quantity)", "MIN(ss_ext_sales_price)", "MIN(ss_ext_wholesale_cost)"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins become explicit INNER JOINs; date_dim filter moves into CTE; planner may reorder joins to push customer_address/customer_demographics earlier.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: comma‑join weakness blocks join reorder; explicit joins enable better cardinality estimation and earlier filter pushdown.",
+      "recommended_examples": ["pg_date_cte_explicit_join", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "target": "Pre‑filter customer_demographics and customer_address into separate CTEs embedding their OR‑branch predicates before joining to store_sales.",
+      "dag_target_hint": "Add cd_filter and ca_filter CTEs; replace original table references with CTEs in final_select.",
+      "node_contract": {
+        "from_must_include": ["customer_demographics cd", "customer_address ca"],
+        "where_must_preserve": ["cd_marital_status IN ('M','S','W')", "cd_education_status IN ('2 yr Degree','Primary')", "ca_country = 'United States'", "ca_state IN lists", "ss_sales_price BETWEEN ranges", "ss_net_profit BETWEEN ranges"],
+        "output_must_preserve": ["join keys cd_demo_sk, ca_address_sk", "all original output columns"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Customer_demographics and customer_address scans become tiny hash tables; nested‑loop iterations drop because filters are applied before join.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Secondary hotspot: dimension filters applied late; pre‑filtering reduces nested‑loop driver rows.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create CTEs for all dimension tables (date_dim, household_demographics, store, customer_demographics, customer_address) with their selective filters, then join them to store_sales in a single explicit‑join chain.",
+      "dag_target_hint": "Replace entire FROM clause with CTE‑based explicit joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "household_demographics", "store", "customer_demographics", "customer_address"],
+        "where_must_preserve": ["d_year=2001", "hd_dep_count IN (3,1)", "cd_marital_status IN ('M','S','W')", "cd_education_status IN ('2 yr Degree','Primary')", "ca_country='United States'", "ca_state IN lists", "ss_sales_price BETWEEN ranges", "ss_net_profit BETWEEN ranges"],
+        "output_must_preserve": ["all original output columns and aggregate functions"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Combined dimension prefetch may allow planner to pick optimal join order by providing tiny, pre‑filtered dimension sets early.",
+      "confidence": 0.65,
+      "expected_explain_delta": "All dimension scans become tiny hash tables; hash‑join build sides shrink; nested loops may disappear.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration—extends single‑dimension prefetch to all dimensions; may reduce hash‑join output further.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Apply early filter pushdown to household_demographics and store, and convert implicit join predicates to explicit JOIN ON clauses.",
+      "dag_target_hint": "Add hd_filter and store_filter CTEs; rewrite final_select with explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["household_demographics hd", "store s"],
+        "where_must_preserve": ["hd_dep_count IN (3,1)", "s_store_sk = ss_store_sk", "ss_hdemo_sk = hd_demo_sk"],
+        "output_must_preserve": ["join keys hd_demo_sk, s_store_sk"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:SKIP", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering of household_demographics and store may reduce hash‑join input size even though they are small tables.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Seq scans on household_demographics and store become tiny CTEs; hash‑join input rows drop.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration—targets secondary hotspot (hash‑join input) with underrepresented family B.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "Guard G_PG_OR_INDEX_PROTECTED blocks splitting same‑column OR predicates; PostgreSQL BitmapOr already handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar subquery present in SQL; plan shows no nested loops driven by correlated subqueries."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No GROUP BY or aggregation before final MIN; aggregate pushdown not applicable."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self‑join patterns present; CTE reuse benefit unlikely."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Transform is Snowflake‑specific (portability_candidate) and plan shows no predicate‑transitivity failure evidence."
+    }
+  ]
+}

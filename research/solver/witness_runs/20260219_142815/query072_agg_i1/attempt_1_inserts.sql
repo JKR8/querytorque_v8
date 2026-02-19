@@ -1,0 +1,17 @@
+INSERT INTO catalog_sales (cs_item_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk) VALUES (1000, 1000, 100, 40.0, 1000, 1000, 1000, 1001, NULL);
+INSERT INTO catalog_sales (cs_item_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk) VALUES (1001, 1001, 100, 45.0, 1001, 1001, 1002, 1003, 1000);
+INSERT INTO inventory (inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand) VALUES (1000, 1000, 1000, 50);
+INSERT INTO inventory (inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand) VALUES (1001, 1001, 1002, 50);
+INSERT INTO warehouse (w_warehouse_sk, w_warehouse_name) VALUES (1000, 'warehouse1');
+INSERT INTO warehouse (w_warehouse_sk, w_warehouse_name) VALUES (1001, 'warehouse2');
+INSERT INTO item (i_item_sk, i_category, i_item_desc) VALUES (1000, 'Children', 'desc1');
+INSERT INTO item (i_item_sk, i_category, i_item_desc) VALUES (1001, 'Jewelry', 'desc2');
+INSERT INTO customer_demographics (cd_demo_sk, cd_dep_count, cd_marital_status) VALUES (1000, 9, 'U');
+INSERT INTO customer_demographics (cd_demo_sk, cd_dep_count, cd_marital_status) VALUES (1001, 10, 'U');
+INSERT INTO household_demographics (hd_demo_sk, hd_buy_potential) VALUES (1000, '>10000');
+INSERT INTO household_demographics (hd_demo_sk, hd_buy_potential) VALUES (1001, '>10000');
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (1000, '1998-01-01', 1, 1998);
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (1001, '1998-01-10', 1, 1998);
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (1002, '1998-01-01', 2, 1998);
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (1003, '1998-01-10', 2, 1998);
+INSERT INTO promotion (p_promo_sk) VALUES (1000);

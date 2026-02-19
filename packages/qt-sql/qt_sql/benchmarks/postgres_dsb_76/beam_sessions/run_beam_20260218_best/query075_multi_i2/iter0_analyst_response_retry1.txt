@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgres",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The CTE all_sales acts as an optimization fence, forcing full sequential scans of three large returns tables (store_returns, catalog_returns, web_returns) and repeated nested‑loop index probes into fact tables before year filtering. Pushing year filters (1998,1999) into each UNION branch should prune fact‑table micro‑partitions early and reduce the hash‑join input volume by ~95%.",
+    "reasoning_trace": [
+      "Gather node shows 20,290 rows actual vs 3 estimated (6700x under‑estimation) indicating optimizer cannot propagate year filter through CTE boundary.",
+      "Three sequential scans on returns tables each >100k rows and >4 seconds dominate runtime (store_returns 5.9s, catalog_returns 4.0s, web_returns 6.4s).",
+      "Nested‑loop index scans on fact tables (store_sales, catalog_sales, web_sales) are repeated for each row from the hash join (30k, 21k, 19k iterations).",
+      "Date_dim scans are index‑only and cheap (0.002 ms each), already fully pruned; no late‑filter symptom there."
+    ],
+    "cost_spine": ["Seq Scan store_returns", "Hash Join", "Nested Loop", "Seq Scan catalog_returns", "Hash Join", "Nested Loop", "Seq Scan web_returns", "Hash Join", "Nested Loop", "Aggregate", "Sort", "Nested Loop CTE scans"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on web_returns",
+        "why": "largest I/O volume and time (154k rows, 6.4s)",
+        "evidence": "rows=154733 time=6388.375ms"
+      },
+      {
+        "op": "Seq Scan on store_returns",
+        "why": "second‑largest I/O (260k rows, 5.9s)",
+        "evidence": "rows=260757 time=5859.223ms"
+      },
+      {
+        "op": "Hash Join (store branch)",
+        "why": "amplifies rows for nested‑loop index probes (30k rows out)",
+        "evidence": "rows=30254 time=6332.928ms"
+      }
+    ],
+    "do_not_do": [
+      "Do not split OR predicates into UNION ALL (PostgreSQL uses BitmapOr for indexed OR).",
+      "Do not duplicate the entire UNION CTE body for each year (heavy CTE duplication blocker).",
+      "Do not materialize EXISTS paths (semi‑join already optimized).",
+      "Avoid converting left joins to inner joins unless NULL‑dependency is proven safe."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Add filter `d_year IN (1998, 1999)` to each UNION branch inside the all_sales CTE, directly after the date_dim join, before joining with returns tables. Preserve all existing predicates.",
+      "dag_target_hint": "Modify the three UNION subqueries inside the all_sales CTE definition.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["i_category='Children'", "sales_price/list_price BETWEEN 0.69 AND 0.89", "reason_sk IN (8,18,20,23,41)"],
+        "output_must_preserve": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "sales_cnt expression", "sales_amt expression"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Seq scans on returns tables shrink drastically because date filter prunes fact‑table rows before the left join; hash‑join input rows drop from 30k/21k/19k to ~1k each.",
+      "recommended_patch_ops": ["add_predicate_to_subquery", "preserve_left_join_semantics"],
+      "rank_rationale": "Targets primary I/O hotspot — full returns‑table scans are the largest time consumer.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "sf_sk_pushdown_union_all",
+      "family": "A",
+      "target": "Push date_sk range filter (derived from d_year IN (1998,1999)) into each UNION branch as an extra predicate on the fact‑table date key (cs_sold_date_sk, ss_sold_date_sk, ws_sold_date_sk) to enable partition pruning.",
+      "dag_target_hint": "Add a derived date_sk filter via a subquery or CTE that maps years to date_sk ranges, then push into each fact‑table join.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "catalog_sales/store_sales/web_sales"],
+        "where_must_preserve": ["i_category='Children'", "price ratio filter", "reason_sk filter"],
+        "output_must_preserve": ["all original output columns and aggregation logic"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_SCALE_GUARD:WARN", "portability_candidate:EXPLORATION"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL may not propagate date‑key filters through UNION CTE fences; explicit pushdown could enable earlier fact‑table pruning.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Index scans on fact tables become range scans with fewer rows; nested‑loop iterations drop.",
+      "recommended_patch_ops": ["insert_date_sk_cte", "add_fact_table_date_range_predicate"],
+      "rank_rationale": "Exploration — secondary hotspot (nested‑loop amplification) may respond to direct date‑key pruning.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Split the all_sales CTE into two separate CTEs (curr_year_sales, prev_year_sales) each with its own year filter (1999 and 1998) embedded directly in the UNION branches, then join them in the final SELECT.",
+      "dag_target_hint": "Replace the single all_sales CTE with two CTEs, each filtering d_year = 1999 or d_year = 1998.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "fact tables", "returns tables"],
+        "where_must_preserve": ["i_category='Children'", "price ratio filter", "reason_sk filter"],
+        "output_must_preserve": ["grouping columns and aggregate expressions", "final join conditions on brand/class/category/manufact"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:WARN", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Each CTE processes only one year, reducing intermediate aggregation size; final join becomes a hash join between two small materialized results.",
+      "recommended_patch_ops": ["split_cte_by_filter", "replace_final_join"],
+      "rank_rationale": "Addresses CTE optimization‑fence by embedding year filter inside each CTE, cutting aggregation work by half.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate each fact table (store_sales, catalog_sales, web_sales) by item_sk and sold_date_sk before joining with item and date_dim, then compute the sales_cnt/sales_amt expressions in a later stage.",
+      "dag_target_hint": "Insert a CTE that groups fact tables by item_sk, sold_date_sk and sums quantity/ext_sales_price, then join with returns and dimensions.",
+      "node_contract": {
+        "from_must_include": ["fact tables"],
+        "where_must_preserve": ["price ratio filter"],
+        "output_must_preserve": ["final aggregated columns and grouping keys"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "portability_candidate:EXPLORATION"],
+      "exploration": true,
+      "exploration_hypothesis": "Pre‑aggregating fact tables may reduce the rows flowing into the hash joins with returns tables, shrinking nested‑loop iterations.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Hash‑join rows drop because each (item_sk, date_sk) group is aggregated; returns‑table scans may still be large but joined with fewer rows.",
+      "recommended_patch_ops": ["insert_preaggregation_cte", "rewrite_union_branches"],
+      "rank_rationale": "Exploration — targets secondary hotspot (hash‑join amplification) by reducing fact‑table row count before expensive joins.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan; PostgreSQL uses BitmapOr for indexed OR, and splitting may regress."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in the query; plan shows no nested loops driven by correlation."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Left‑join NULL‑dependency not proven safe; condition on returns reason_sk may filter NULLs but requires semantic validation."
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Date_dim scans are already index‑only and negligible (<0.01% of total I/O); isolating them offers no measurable gain."
+    }
+  ]
+}

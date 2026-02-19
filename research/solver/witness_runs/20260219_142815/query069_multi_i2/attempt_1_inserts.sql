@@ -1,0 +1,11 @@
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_current_cdemo_sk) VALUES (1000, 2000, 3000);
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_current_cdemo_sk) VALUES (1001, 2001, 3001);
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2000, 'GA');
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2001, 'KY');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating) VALUES (3000, 'M', 'D', 'Primary', 500, 'Good');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating) VALUES (3001, 'F', 'W', 'College', 750, 'Excellent');
+INSERT INTO date_dim (d_date_sk, d_year, d_moy) VALUES (4000, 1999, 3);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy) VALUES (4001, 1999, 4);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy) VALUES (4002, 1999, 5);
+INSERT INTO store_sales (ss_customer_sk, ss_sold_date_sk, ss_list_price) VALUES (1000, 4000, 100.0);
+INSERT INTO store_sales (ss_customer_sk, ss_sold_date_sk, ss_list_price) VALUES (1001, 4001, 120.0);

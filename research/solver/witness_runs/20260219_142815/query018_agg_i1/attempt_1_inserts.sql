@@ -1,0 +1,12 @@
+INSERT INTO item (i_item_sk, i_item_id, i_category) VALUES (1000, 'SPORTS001', 'Sports');
+INSERT INTO item (i_item_sk, i_item_id, i_category) VALUES (1001, 'SPORTS002', 'Sports');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (2000, 1998);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (2001, 1998);
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_education_status) VALUES (3000, 'F', 'College');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_education_status) VALUES (3001, 'F', 'College');
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_birth_month, c_birth_year) VALUES (4000, 5000, 2, 1970);
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_birth_month, c_birth_year) VALUES (4001, 5001, 2, 1975);
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_state, ca_county) VALUES (5000, 'USA', 'AR', 'County1');
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_state, ca_county) VALUES (5001, 'USA', 'NY', 'County2');
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_bill_cdemo_sk, cs_bill_customer_sk, cs_wholesale_cost, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit) VALUES (1000, 2000, 3000, 4000, 42.0, 1, 50.0, 5.0, 45.0, 3.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_bill_cdemo_sk, cs_bill_customer_sk, cs_wholesale_cost, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit) VALUES (1001, 2001, 3001, 4001, 44.0, 2, 60.0, 6.0, 54.0, 4.0);

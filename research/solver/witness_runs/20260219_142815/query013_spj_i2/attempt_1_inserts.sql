@@ -1,0 +1,10 @@
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_state) VALUES (1000, 'United States', 'GA');
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_state) VALUES (1001, 'United States', 'SD');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_marital_status) VALUES (1000, '2 yr Degree', 'M');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_marital_status) VALUES (1001, 'Primary', 'S');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (1000, 2001);
+INSERT INTO household_demographics (hd_demo_sk, hd_dep_count) VALUES (1000, 3);
+INSERT INTO household_demographics (hd_demo_sk, hd_dep_count) VALUES (1001, 1);
+INSERT INTO store (s_store_sk) VALUES (1000);
+INSERT INTO store_sales (ss_addr_sk, ss_cdemo_sk, ss_ext_sales_price, ss_ext_wholesale_cost, ss_hdemo_sk, ss_net_profit, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_store_sk) VALUES (1000, 1000, 500.0, 300.0, 1000, 150.0, 10, 125.0, 1000, 1000);
+INSERT INTO store_sales (ss_addr_sk, ss_cdemo_sk, ss_ext_sales_price, ss_ext_wholesale_cost, ss_hdemo_sk, ss_net_profit, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_store_sk) VALUES (1001, 1001, 400.0, 250.0, 1001, 200.0, 5, 75.0, 1000, 1000);

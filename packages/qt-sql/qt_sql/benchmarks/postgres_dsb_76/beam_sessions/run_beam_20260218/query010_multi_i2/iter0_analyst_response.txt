@@ -1,0 +1,170 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Three correlated EXISTS subqueries drive nested loops with repeated scans of date_dim and item, causing 6.6s runtime. The primary hotspot is the store_sales branch (3.3s) with a parallel gather, but web_sales and catalog_sales branches run serially per customer. Decorrelation and dimension prefetching can replace per-row loops with set operations.",
+    "reasoning_trace": [
+      "Nested Loop for web_sales and catalog_sales branches shows Index Scan on customer per row (est=0 rows, act=1 and 803 rows).",
+      "date_dim scanned three times (41, 123, 41 rows) and item scanned three times via Index Scan.",
+      "Aggregate node (rows=1690, time=3312ms) is the store_sales branch, using parallel gather but still dominant.",
+      "Comma-join of customer, customer_address, customer_demographics may block join reordering."
+    ],
+    "cost_spine": ["Nested Loop", "Aggregate", "Gather", "Nested Loop", "Index Scan on customer"],
+    "hotspots": [
+      {
+        "op": "Aggregate (store_sales branch)",
+        "why": "parallel gather but still 50% of total runtime",
+        "evidence": "time=3312ms, rows=1690"
+      },
+      {
+        "op": "Nested Loop (web_sales and catalog_sales branches)",
+        "why": "correlated EXISTS forces per-customer nested loops with repeated dimension scans",
+        "evidence": "web_sales: rows=1 time=0.838ms; catalog_sales: rows=803 time=2086ms"
+      },
+      {
+        "op": "Comma-join of customer, customer_address, customer_demographics",
+        "why": "implicit join may limit optimizer's join ordering",
+        "evidence": "plan shows nested loop after EXISTS branches"
+      }
+    ],
+    "do_not_do": [
+      "avoid or_to_union on same-column OR (engine guard G_PG_OR_INDEX_PROTECTED)",
+      "avoid materializing EXISTS subqueries that are already semi-joins (engine guard G_PG_EXISTS_PROTECTED)",
+      "avoid duplicating heavy CTE bodies (engine guard G_PG_CTE_DUPLICATION_BLOCK)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "pg_shared_scan_decorrelate",
+      "family": "B",
+      "target": "Replace correlated EXISTS subqueries with a single CTE that pre-scans date_dim and item for the shared filters (d_year=1999, d_moy between 5 and 8, i_category in ('Children','Home','Women'), i_manager_id BETWEEN 91 and 100), then join with store_sales, web_sales, catalog_sales to compute distinct customer keys that satisfy each channel's price ratio condition.",
+      "dag_target_hint": "Change final_select WHERE clause and add CTEs for shared dimension scans and channel-specific customer key sets.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics"],
+        "where_must_preserve": ["ca_county in list", "c.c_birth_month in (4,5)", "cd_marital_status in ('U','S')", "cd_education_status in ('College','Secondary')", "cd_gender='M'"],
+        "output_must_preserve": ["All grouping columns and counts, ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested Loop for web_sales and catalog_sales replaced by hash joins on precomputed customer key sets; date_dim and item scanned once each.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate", "replace_from"],
+      "rank_rationale": "Targets primary hotspot — decorrelation of three correlated EXISTS branches that drive nested loops.",
+      "recommended_examples": ["pg_shared_scan_decorrelate"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter customer, customer_address, customer_demographics into separate CTEs with their selective predicates, then join them explicitly with INNER JOIN syntax, before joining with the decorrelated sales key sets.",
+      "dag_target_hint": "Change final_select FROM clause to explicit INNER JOINs and add CTEs for pre-filtered dimensions.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["All original dimension filters"],
+        "output_must_preserve": ["All original output columns and grouping keys"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Comma-join replaced by explicit inner joins; dimension CTEs create tiny hash tables for better join ordering.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Addresses secondary hotspot — comma-join may limit optimizer; explicit joins with pre-filtered dimensions improve cardinality estimates.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push date_dim and item filters into CTE definitions before materialization, and decorrelate each EXISTS by precomputing distinct customer keys per channel with the price ratio condition applied.",
+      "dag_target_hint": "Add CTEs for filtered date_dim and item, then CTEs for each sales channel with price ratio filter, then join customer to union of keys.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["All original dimension filters"],
+        "output_must_preserve": ["All grouping columns and counts"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Reduced nested loops; each channel CTE returns small key sets; date_dim and item scanned once per channel but with early filtering.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "rank_rationale": "Alternative decorrelation approach focusing on early filtering of dimensions, which may work if shared scan is too complex.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": "early_filter_decorrelate"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "target": "Extract shared date_dim and item filters into a single CTE, then create separate CTEs for store_sales, web_sales, catalog_sales that join with the shared dimension CTE and apply channel-specific price ratio filters, then union the customer keys and join back to main dimensions.",
+      "dag_target_hint": "Add shared dimension CTE and three channel CTEs, replace EXISTS with INNER JOIN to union of keys.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["All original dimension filters"],
+        "output_must_preserve": ["All grouping columns and counts"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Union of precomputed key sets may allow better parallelism and reduce repeated dimension scans compared to nested loops.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Nested loops replaced by hash joins to unioned key CTEs; date_dim and item scanned once in shared CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate", "replace_from"],
+      "rank_rationale": "Exploration — tests a union-based decorrelation shape that may improve parallelism for web_sales and catalog_sales branches.",
+      "recommended_examples": ["composite_decorrelate_union"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "Engine guard G_PG_OR_INDEX_PROTECTED blocks same-column OR to UNION; the OR is between two EXISTS on different tables, but risk of regression is high per registry."
+    },
+    {
+      "transform_id": "date_cte_isolate",
+      "family": "A",
+      "reason": "Previous attempt_1 failed; plan already uses Index Only Scan on date_dim with low time (11ms)."
+    },
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "reason": "Previous attempt_1 failed; gold example exists but may not apply due to already efficient date_dim scans."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "No LEFT JOIN in query; all joins are inner-equivalent."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific to Snowflake; not applicable to PostgreSQL runtime dialect."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    }
+  ]
+}

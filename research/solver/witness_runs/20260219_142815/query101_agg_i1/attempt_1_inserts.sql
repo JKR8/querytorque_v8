@@ -1,0 +1,13 @@
+INSERT INTO customer (c_customer_sk, c_first_name, c_last_name, c_current_addr_sk, c_current_hdemo_sk) VALUES (1000, 'John', 'Doe', 5000, 6000);
+INSERT INTO customer (c_customer_sk, c_first_name, c_last_name, c_current_addr_sk, c_current_hdemo_sk) VALUES (1001, 'Jane', 'Smith', 5001, 6000);
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (5000, 'AR');
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (5001, 'AR');
+INSERT INTO date_dim (d_date_sk, d_date, d_year) VALUES (3000, '1998-01-01', 1998);
+INSERT INTO household_demographics (hd_demo_sk, hd_buy_potential, hd_income_band_sk) VALUES (6000, '0-500', 7);
+INSERT INTO item (i_item_sk, i_category) VALUES (2000, 'Children');
+INSERT INTO store_returns (sr_ticket_number, sr_item_sk, sr_returned_date_sk) VALUES (4000, 2000, 3000);
+INSERT INTO store_returns (sr_ticket_number, sr_item_sk, sr_returned_date_sk) VALUES (4000, 2000, 3000);
+INSERT INTO store_sales (ss_ticket_number, ss_customer_sk, ss_item_sk, ss_list_price, ss_sales_price) VALUES (4000, 1000, 2000, 100.0, 40.0);
+INSERT INTO store_sales (ss_ticket_number, ss_customer_sk, ss_item_sk, ss_list_price, ss_sales_price) VALUES (4000, 1001, 2000, 100.0, 40.0);
+INSERT INTO web_sales (ws_bill_customer_sk, ws_item_sk, ws_sold_date_sk) VALUES (1000, 2000, 3000);
+INSERT INTO web_sales (ws_bill_customer_sk, ws_item_sk, ws_sold_date_sk) VALUES (1001, 2000, 3000);

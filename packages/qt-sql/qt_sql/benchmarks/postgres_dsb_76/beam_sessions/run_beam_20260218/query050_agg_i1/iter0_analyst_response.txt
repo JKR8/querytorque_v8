@@ -1,0 +1,172 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan is dominated by a Sort (6.3s) and Gather Merge (18.9s) processing 22k rows after nested-loop joins; the non-equi date-range join between d1 and d2 is performed as a correlated nested loop after the parallel merge, likely because comma-join syntax and late predicate application prevent join reordering. Isolating selective date filters into CTEs and converting to explicit joins may enable earlier reduction and better plan choice.",
+    "reasoning_trace": [
+      "Sort operator processes 22230 rows taking 6345 ms, Gather Merge 66690 rows taking 18897 ms.",
+      "Nested loop with d1 (index scan) runs after sort/gather, though each probe is fast, the join topology forces all rows through sort before d1 filter.",
+      "Comma-join syntax detected; PostgreSQL's optimizer may struggle to reorder joins across comma boundaries.",
+      "Non-equi join condition d1.d_date BETWEEN (d2.d_date - interval '120 day') AND d2.d_date depends on d2 values, causing correlated join late in plan.",
+      "Estimation error: Gather Merge estimated 1 row, actual 66690 rows (underestimation)."
+    ],
+    "cost_spine": ["Gather Merge", "Sort", "Nested Loop (d1 probe)", "Index Only Scan (store_returns)"],
+    "hotspots": [
+      {
+        "op": "Gather Merge",
+        "why": "parallel merge of sorted rows dominates runtime",
+        "evidence": "time=18897.154 ms, rows=66690"
+      },
+      {
+        "op": "Sort",
+        "why": "sorts 22k rows before final join",
+        "evidence": "time=6345.081 ms, rows=22230"
+      },
+      {
+        "op": "Nested Loop (d1 join)",
+        "why": "correlated non-equi join performed after sort, preventing early row reduction",
+        "evidence": "executed 66k times, though each probe is fast, join order may be suboptimal"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION splits (PostgreSQL uses BitmapOr for indexed OR)",
+      "do not materialize simple EXISTS paths (plan has no EXISTS)",
+      "do not duplicate heavy CTE bodies (respect CTE_MATERIALIZATION_FENCE guard)",
+      "avoid decorrelation transforms (no correlated subqueries in plan)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered d2 (year=2000, moy=8) and d1 (via date range relative to d2) into CTEs, then join to store_returns and store_sales with explicit JOIN syntax, ensuring non‑equi condition is pushed into d1 CTE definition.",
+      "dag_target_hint": "Replace FROM clause with CTE chain: filtered_d2, date_range_pairs, then fact joins.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year = 2000", "d2.d_moy = 8", "ss_ticket_number = sr_ticket_number", "ss_item_sk = sr_item_sk", "ss_customer_sk = sr_customer_sk", "ss_sold_date_sk = d1.d_date_sk", "sr_returned_date_sk = d2.d_date_sk", "ss_store_sk = s_store_sk", "d1.d_date BETWEEN (d2.d_date - INTERVAL '120 day') AND d2.d_date"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested loop with d1 disappears; date‑range join becomes hash/merge join earlier; Sort input rows reduce significantly.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Targets primary hotspot (non‑equi join) and comma‑join weakness; gold example shows 12.07x speedup.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Prefilter both date_dim instances into separate CTEs, convert comma joins to explicit JOINs, and join store_returns/store_sales to the prefetched date CTEs to reduce rows before the main aggregation.",
+      "dag_target_hint": "Change final_select FROM to use WITH filtered_d2 AS (...), filtered_d1 AS (...) then explicit INNER JOINs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year = 2000", "d2.d_moy = 8", "ss_ticket_number = sr_ticket_number", "ss_item_sk = sr_item_sk", "ss_customer_sk = sr_customer_sk", "ss_sold_date_sk = d1.d_date_sk", "sr_returned_date_sk = d2.d_date_sk", "ss_store_sk = s_store_sk", "d1.d_date BETWEEN (d2.d_date - INTERVAL '120 day') AND d2.d_date"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Explicit join syntax allows better reordering; date CTEs become small hash tables; Gather Merge input rows drop.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Addresses comma‑join weakness and secondary hotspot (sort); gold example shows 3.32x speedup.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate d2 filter into a CTE, convert comma joins to explicit INNER JOINs, and join d1 directly with the d2 CTE to resolve the correlated range condition early.",
+      "dag_target_hint": "Replace final_select FROM with WITH d2_filtered AS (...) then JOIN store_returns ON sr_returned_date_sk = d2.d_date_sk, etc.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year = 2000", "d2.d_moy = 8", "ss_ticket_number = sr_ticket_number", "ss_item_sk = sr_item_sk", "ss_customer_sk = sr_customer_sk", "ss_sold_date_sk = d1.d_date_sk", "sr_returned_date_sk = d2.d_date_sk", "ss_store_sk = s_store_sk", "d1.d_date BETWEEN (d2.d_date - INTERVAL '120 day') AND d2.d_date"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Explicit join order changes; d2 CTE reduces rows early; Sort may disappear or shrink.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "convert_comma_to_explicit_join"],
+      "rank_rationale": "Gold example shows 2.28x speedup; targets comma‑join weakness and late d1 join.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered fact‑date join into a CTE that computes the date‑diff buckets, then join to store and aggregate, avoiding repeated scans of the same fact‑date combination.",
+      "dag_target_hint": "Create a CTE that joins store_sales, store_returns, d1, d2 with all filters, then aggregate and join store.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "store", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d2.d_year = 2000", "d2.d_moy = 8", "ss_ticket_number = sr_ticket_number", "ss_item_sk = sr_item_sk", "ss_customer_sk = sr_customer_sk", "ss_sold_date_sk = d1.d_date_sk", "sr_returned_date_sk = d2.d_date_sk", "ss_store_sk = s_store_sk", "d1.d_date BETWEEN (d2.d_date - INTERVAL '120 day') AND d2.d_date"],
+        "output_must_preserve": ["All original output columns and aggregates", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the fact‑date join may allow PostgreSQL to choose a more efficient join order and reduce rows before the expensive sort, even though plan does not show repeated scans.",
+      "confidence": 0.55,
+      "expected_explain_delta": "CTE materialization fence may change join order; Sort may be eliminated or reduced.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration probe targeting CROSS_CTE_PREDICATE_BLINDNESS; uses PostgreSQL's CTE materialization to force early reduction.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Previous attempt failed; plan already filters d2 early via index scan."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation depends on date difference between two tables, cannot be pushed before joins."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot; PostgreSQL uses BitmapOr for indexed OR."
+    },
+    {
+      "transform_id": "explicit_join_materialized",
+      "family": "F",
+      "reason": "Previous attempt failed; similar to date_cte_explicit_join but without date isolation, likely less effective."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "Previous attempt failed; plan does not show repeated sub‑scans warranting materialization."
+    }
+  ]
+}

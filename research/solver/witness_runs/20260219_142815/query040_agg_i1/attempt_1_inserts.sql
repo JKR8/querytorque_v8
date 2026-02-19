@@ -1,0 +1,10 @@
+INSERT INTO warehouse (w_warehouse_sk, w_state) VALUES (1000, 'CA');
+INSERT INTO warehouse (w_warehouse_sk, w_state) VALUES (1001, 'NY');
+INSERT INTO item (i_item_sk, i_item_id, i_category, i_manager_id) VALUES (1000, 'item1', 'Jewelry', 70);
+INSERT INTO item (i_item_sk, i_item_id, i_category, i_manager_id) VALUES (1001, 'item2', 'Jewelry', 80);
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (1000, '2002-02-10');
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (1001, '2002-02-28');
+INSERT INTO catalog_sales (cs_item_sk, cs_sales_price, cs_sold_date_sk, cs_warehouse_sk, cs_wholesale_cost, cs_order_number, cs_warehouse_sk) VALUES (1000, 100.0, 1000, 1000, 50.0, 1, 1000);
+INSERT INTO catalog_sales (cs_item_sk, cs_sales_price, cs_sold_date_sk, cs_warehouse_sk, cs_wholesale_cost, cs_order_number, cs_warehouse_sk) VALUES (1001, 150.0, 1001, 1001, 55.0, 2, 1001);
+INSERT INTO catalog_returns (cr_reason_sk, cr_refunded_cash, cr_order_number, cr_item_sk) VALUES (33, 10.0, 1, 1000);
+INSERT INTO catalog_returns (cr_reason_sk, cr_refunded_cash, cr_order_number, cr_item_sk) VALUES (33, 20.0, 2, 1001);

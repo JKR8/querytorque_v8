@@ -1,0 +1,11 @@
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (1000, '2002-03-06');
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (1001, '2002-03-07');
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (1002, '2002-03-08');
+INSERT INTO item (i_item_sk, i_manufact_id, i_category) VALUES (1000, 600, 'Children');
+INSERT INTO item (i_item_sk, i_manufact_id, i_category) VALUES (1001, 700, 'Jewelry');
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1000, 1000, 20.0, 100.0, 40.0, 10.0);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1000, 1001, 25.0, 200.0, 80.0, 20.0);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1000, 1002, 30.0, 300.0, 120.0, 50.0);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1001, 1000, 18.0, 100.0, 40.0, 15.0);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1001, 1001, 22.0, 200.0, 80.0, 25.0);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1001, 1002, 35.0, 300.0, 120.0, 60.0);

@@ -3,6 +3,7 @@
 Components:
 - benchmark: Unified benchmark (ONE connection per query, fail-fast)
 - sample_checker: DuckDB TABLESAMPLE equivalence for timeout recovery
+- cross_engine_checker: Cross-engine semantic validation (Gate 1.5)
 - EquivalenceChecker: Row count, checksum, and value comparison
 - SQLDiffer: SQL diff utilities for retry prompt enrichment
 - schemas: Validation result types
@@ -37,6 +38,10 @@ from .sample_checker import (
     SampleCheckResult,
     SampleChecker,
 )
+from .cross_engine_checker import (
+    CrossCheckResult,
+    CrossEngineChecker,
+)
 
 __all__ = [
     # Schemas
@@ -63,4 +68,7 @@ __all__ = [
     # Sample checker
     "SampleCheckResult",
     "SampleChecker",
+    # Cross-engine checker
+    "CrossCheckResult",
+    "CrossEngineChecker",
 ]

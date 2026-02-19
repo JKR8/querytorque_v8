@@ -1,0 +1,9 @@
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (250.0, 3000, 2000, 1000);
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (250.0, 3000, 2000, 1000);
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (100.0, 3000, 2001, 1001);
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (200.0, 3000, 2001, 1001);
+INSERT INTO customer (c_current_addr_sk, c_customer_id, c_customer_sk, c_first_name, c_last_name, c_salutation) VALUES (2000, 'A0001', 1000, 'John', 'Doe', 'Mr.');
+INSERT INTO customer (c_current_addr_sk, c_customer_id, c_customer_sk, c_first_name, c_last_name, c_salutation) VALUES (2001, 'A0002', 1001, 'Jane', 'Smith', 'Ms.');
+INSERT INTO customer_address (ca_address_sk, ca_city, ca_country, ca_county, ca_gmt_offset, ca_location_type, ca_state, ca_street_name, ca_street_number, ca_street_type, ca_suite_number, ca_zip) VALUES (2000, 'Des Moines', 'USA', 'Polk', -6.0, 'apartment', 'IA', 'Main St', '123', 'St', 'A', '50309');
+INSERT INTO customer_address (ca_address_sk, ca_city, ca_country, ca_county, ca_gmt_offset, ca_location_type, ca_state, ca_street_name, ca_street_number, ca_street_type, ca_suite_number, ca_zip) VALUES (2001, 'Cedar Rapids', 'USA', 'Linn', -6.0, 'house', 'IA', 'Oak Ave', '456', 'Ave', NULL, '52401');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (3000, 2000);

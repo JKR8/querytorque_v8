@@ -1,0 +1,14 @@
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 'ORD1000', 1000, 0, 0.0);
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 'ORD1001', 1001, 0, 0.0);
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 'ORD1002', 1002, 0, 0.0);
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 'ORD1003', 1003, 0, 0.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1000, 2000, 'ORD1000', 10, 100.0, 80.0, 800.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1001, 2001, 'ORD1001', 8, 100.0, 80.0, 640.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1002, 2000, 'ORD1002', 10, 100.0, 80.0, 800.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1003, 2001, 'ORD1003', 8, 100.0, 80.0, 640.0);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (2000, 1998);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (2001, 1999);
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1000, 1000, 1000, 1000, 1000, 'Children');
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1001, 1000, 1000, 1000, 1000, 'Children');
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1002, 1001, 1001, 1001, 1001, 'Children');
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1003, 1001, 1001, 1001, 1001, 'Children');

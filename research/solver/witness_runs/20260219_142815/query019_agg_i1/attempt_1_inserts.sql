@@ -1,0 +1,12 @@
+INSERT INTO customer (c_customer_sk, c_birth_month, c_current_addr_sk) VALUES (1000, 1, 2000);
+INSERT INTO customer (c_customer_sk, c_birth_month, c_current_addr_sk) VALUES (1001, 1, 2001);
+INSERT INTO customer_address (ca_address_sk, ca_state, ca_zip) VALUES (2000, 'IL', '60601');
+INSERT INTO customer_address (ca_address_sk, ca_state, ca_zip) VALUES (2001, 'IL', '60602');
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (3000, 4, 2002);
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (3001, 4, 2002);
+INSERT INTO item (i_item_sk, i_brand, i_brand_id, i_category, i_manufact, i_manufact_id) VALUES (4000, 'BrandA', 1, 'Jewelry', 'ManufA', 10);
+INSERT INTO item (i_item_sk, i_brand, i_brand_id, i_category, i_manufact, i_manufact_id) VALUES (4001, 'BrandB', 2, 'Jewelry', 'ManufB', 11);
+INSERT INTO store (s_store_sk, s_zip) VALUES (5000, '60610');
+INSERT INTO store (s_store_sk, s_zip) VALUES (5001, '60611');
+INSERT INTO store_sales (ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_wholesale_cost, ss_ext_sales_price) VALUES (4000, 1000, 3000, 5000, 40, 100.0);
+INSERT INTO store_sales (ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_wholesale_cost, ss_ext_sales_price) VALUES (4001, 1001, 3001, 5001, 45, 150.0);

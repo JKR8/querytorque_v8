@@ -1,0 +1,13 @@
+INSERT INTO catalog_sales (cs_item_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk) VALUES (1000, 2000, 50, 40.0, 3000, 4000, 5000, 6000, NULL);
+INSERT INTO catalog_sales (cs_item_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk) VALUES (1001, 2001, 60, 45.0, 3000, 4000, 5000, 6001, NULL);
+INSERT INTO inventory (inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand) VALUES (1000, 7000, 8000, 30);
+INSERT INTO inventory (inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand) VALUES (1001, 7000, 8000, 40);
+INSERT INTO warehouse (w_warehouse_sk, w_warehouse_name) VALUES (7000, 'Warehouse A');
+INSERT INTO item (i_item_sk, i_item_desc, i_category) VALUES (1000, 'Toy Car', 'Children');
+INSERT INTO item (i_item_sk, i_item_desc, i_category) VALUES (1001, 'Gold Ring', 'Jewelry');
+INSERT INTO customer_demographics (cd_demo_sk, cd_dep_count, cd_marital_status) VALUES (3000, 10, 'U');
+INSERT INTO household_demographics (hd_demo_sk, hd_buy_potential) VALUES (4000, '>10000');
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (5000, '1998-01-05', 1, 1998);
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (6000, '1998-01-09', 1, 1998);
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (6001, '1998-01-10', 1, 1998);
+INSERT INTO date_dim (d_date_sk, d_date, d_week_seq, d_year) VALUES (8000, '1998-01-05', 1, 1998);

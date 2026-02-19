@@ -1,0 +1,166 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows a correlated scalar aggregate subquery (SubPlan 1) re-executing per outer row (136x), driving nested loops inside the subplan and a late filter after the main hash join. The main hash join builds a large item hash table (46k rows) and probes with a filtered web_sales scan (17k rows), but the correlated filter reduces output to only 136 rows. Decorrelation should replace per-row execution with a single precomputed join, and early dimension filtering may reduce hash table sizes.",
+    "reasoning_trace": [
+      "SubPlan 1 is a correlated scalar aggregate (avg) that runs for each row of the hash join output (rows=136).",
+      "The subplan contains a nested loop between web_sales_1 and date_dim_1, with an index scan on web_sales_1 (Bitmap Heap Scan) and date_dim_1 (Index Scan).",
+      "Main hash join between web_sales and item scans 46k items and 17k web_sales rows, but only 136 rows pass the join condition and the subplan filter.",
+      "Comma-join syntax may prevent optimal join ordering; explicit joins with pre-filtered CTEs could improve selectivity propagation."
+    ],
+    "cost_spine": ["Hash Join", "Nested Loop (Parallel Seq Scan date_dim → Index Scan web_sales)", "Seq Scan item", "SubPlan (Aggregate → Nested Loop (Bitmap Heap Scan web_sales → Index Scan date_dim))"],
+    "hotspots": [
+      {
+        "op": "SubPlan 1 (correlated scalar aggregate)",
+        "why": "re-executed per outer row (136 times); nested loop inside subplan scans web_sales and date_dim repeatedly",
+        "evidence": "SubPlan appears as a Join Filter after Hash Join; subplan cost per execution ~1221 units; total subplan cost dominates plan"
+      },
+      {
+        "op": "Hash Join (web_sales ↔ item)",
+        "why": "build side is 46k rows (filtered item), probe side is 17k rows; only 136 rows pass the join condition and subplan filter",
+        "evidence": "Hash Cond: web_sales.ws_item_sk = item.i_item_sk; rows=136 after filter"
+      },
+      {
+        "op": "Seq Scan on item",
+        "why": "full table scan with OR filter (i_manufact_id OR i_category) returns 46k rows; no index usage shown",
+        "evidence": "rows=46599; Filter: (((i_manufact_id >= 797) AND (i_manufact_id <= 996)) OR (i_category = ANY ('{Men,Shoes,Sports}'::bpchar[])))"
+      }
+    ],
+    "do_not_do": [
+      "avoid splitting OR on same column into UNION ALL (PostgreSQL BitmapOr is already optimal)",
+      "do not materialize EXISTS paths (none present)",
+      "avoid duplicating large CTE bodies",
+      "do not force join order beyond explicit join conversion"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Replace correlated scalar subquery (SubPlan 1) with a MATERIALIZED CTE that precomputes per-item average discount for the filtered date range and wholesale cost, then join it as a non-correlated filter. Keep all existing predicates.",
+      "dag_target_hint": "Replace SubPlan 1 with a CTE (item_avg_discount) that computes 1.3 * avg(ws_ext_discount_amt) per i_item_sk, filtered by date range, wholesale cost, and price ratio. Then join item_avg_discount in the main query's WHERE clause.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws", "item i", "date_dim d"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 OR i_category IN ('Men','Shoes','Sports')", "d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55", "ws_ext_discount_amt > (SELECT ...)"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.9,
+      "expected_explain_delta": "SubPlan 1 disappears; replaced by a single Aggregate CTE and a Hash Join with item_avg_discount CTE; nested loop inside subplan eliminated.",
+      "recommended_patch_ops": ["insert_cte", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot — correlated subquery re-execution is the dominant cost driver.",
+      "recommended_examples": ["pg_shared_scan_decorrelate", "inline_decorrelate_materialized"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Extract filtered date_dim into a MATERIALIZED CTE, convert comma joins to explicit INNER JOINs, and place the CTE early in the join order to reduce row flow.",
+      "dag_target_hint": "Create CTE filtered_dates as SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN ...; then join web_sales ON ws_sold_date_sk = filtered_dates.d_date_sk, item ON i_item_sk = ws_item_sk.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws", "item i", "date_dim d"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 OR i_category IN ('Men','Shoes','Sports')", "d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55", "ws_ext_discount_amt > (SELECT ...)"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.7,
+      "expected_explain_delta": "Parallel Seq Scan on date_dim replaced by CTE scan; explicit join syntax may improve join order choices; date filter applied once in CTE.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_type"],
+      "rank_rationale": "Addresses secondary hotspot — comma join may hinder predicate pushdown; explicit joins with tiny date CTE can reduce build side of hash join.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter both date_dim and item into separate MATERIALIZED CTEs, then join with web_sales using explicit INNER JOINs. This isolates selective dimension filters early.",
+      "dag_target_hint": "Create CTE filtered_dates as above; CTE filtered_items as SELECT i_item_sk FROM item WHERE (i_manufact_id BETWEEN 797 and 996 OR i_category IN ('Men','Shoes','Sports')). Then join web_sales with both CTEs.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws", "item i", "date_dim d"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 OR i_category IN ('Men','Shoes','Sports')", "d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55", "ws_ext_discount_amt > (SELECT ...)"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Isolating both dimensions into CTEs may further reduce hash table sizes and improve join order flexibility, though item CTE may still be large (46k rows).",
+      "confidence": 0.6,
+      "expected_explain_delta": "Seq Scan on item replaced by CTE scan; hash join build side may become smaller if filtered_items CTE is materialized early.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_type"],
+      "rank_rationale": "Exploration — extends probe p02 by also pre-filtering item, targeting the item seq scan hotspot.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "or_to_union",
+      "family": "D",
+      "target": "Split the OR condition on item into two UNION branches (manufacturer range and category IN list) to allow separate index scans, then deduplicate with UNION (not UNION ALL) to preserve semantics.",
+      "dag_target_hint": "Replace item scan with (SELECT i_item_sk FROM item WHERE i_manufact_id BETWEEN 797 AND 996) UNION (SELECT i_item_sk FROM item WHERE i_category IN ('Men','Shoes','Sports')).",
+      "node_contract": {
+        "from_must_include": ["web_sales ws", "item i", "date_dim d"],
+        "where_must_preserve": ["i_manufact_id BETWEEN 797 and 996 OR i_category IN ('Men','Shoes','Sports')", "d_date between '1999-01-29' and cast('1999-01-29' as date) + interval '90 day'", "ws_wholesale_cost BETWEEN 35 AND 55", "ws_ext_discount_amt > (SELECT ...)"],
+        "output_must_preserve": ["sum(ws_ext_discount_amt) as \"Excess Discount Amount\"", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_OR_INDEX_PROTECTED:CAUTION", "DG_BLOCKER_POLICY:SKIP_PATHOLOGY if indexed OR present; plan shows seq scan, so attempt allowed as exploration"],
+      "exploration": true,
+      "exploration_hypothesis": "The OR condition may prevent index usage; splitting into UNION may enable bitmap index scans on i_manufact_id and i_category separately, but note guardrail against same-column OR split.",
+      "confidence": 0.4,
+      "expected_explain_delta": "Seq Scan on item replaced by two index scans with BitmapOr or UNION; hash join build side may become faster.",
+      "recommended_patch_ops": ["replace_from_subquery", "replace_where_predicate"],
+      "rank_rationale": "Exploration — targets item seq scan hotspot but risky due to PostgreSQL's BitmapOr strength; low confidence.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "Similar to inline_decorrelate_materialized but less tailored for PostgreSQL's MATERIALIZED CTE pattern; prefer native inline_decorrelate_materialized."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No self-join pattern in query; missing GROUP_BY signal."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "Similar to dimension_prefetch_star but more complex; prefetch_star is simpler and aligns with gold example."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "Portability candidate for Snowflake; PostgreSQL native inline_decorrelate_materialized is preferred."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "No UNION ALL branches; not applicable to this query."
+    }
+  ]
+}

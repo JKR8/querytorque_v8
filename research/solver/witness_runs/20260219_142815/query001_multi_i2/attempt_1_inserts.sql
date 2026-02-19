@@ -1,0 +1,16 @@
+INSERT INTO customer (c_customer_sk, c_customer_id, c_birth_month, c_birth_year, c_current_cdemo_sk) VALUES (2000, 'CUST0001', 4, 1990, 5000);
+INSERT INTO customer (c_customer_sk, c_customer_id, c_birth_month, c_birth_year, c_current_cdemo_sk) VALUES (2001, 'CUST0002', 4, 1990, 5001);
+INSERT INTO customer (c_customer_sk, c_customer_id, c_birth_month, c_birth_year, c_current_cdemo_sk) VALUES (3000, 'CUST0003', 1, 1970, 5002);
+INSERT INTO customer (c_customer_sk, c_customer_id, c_birth_month, c_birth_year, c_current_cdemo_sk) VALUES (3001, 'CUST0004', 1, 1970, 5003);
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_education_status, cd_marital_status) VALUES (5000, 'M', '4 yr Degree', 'S');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_education_status, cd_marital_status) VALUES (5001, 'M', '4 yr Degree', 'S');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_education_status, cd_marital_status) VALUES (5002, 'F', 'High School', 'M');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_education_status, cd_marital_status) VALUES (5003, 'F', 'High School', 'M');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (1, 2000);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (2, 2000);
+INSERT INTO store (s_store_sk, s_state) VALUES (1000, 'IA');
+INSERT INTO store (s_store_sk, s_state) VALUES (1001, 'KY');
+INSERT INTO store_returns (sr_customer_sk, sr_store_sk, sr_reason_sk, sr_return_amt, sr_return_quantity, sr_return_amt_inc_tax, sr_returned_date_sk) VALUES (2000, 1000, 18, 120.0, 1, 150.0, 1);
+INSERT INTO store_returns (sr_customer_sk, sr_store_sk, sr_reason_sk, sr_return_amt, sr_return_quantity, sr_return_amt_inc_tax, sr_returned_date_sk) VALUES (3000, 1000, 18, 130.0, 1, 50.0, 2);
+INSERT INTO store_returns (sr_customer_sk, sr_store_sk, sr_reason_sk, sr_return_amt, sr_return_quantity, sr_return_amt_inc_tax, sr_returned_date_sk) VALUES (2001, 1001, 18, 120.0, 1, 200.0, 1);
+INSERT INTO store_returns (sr_customer_sk, sr_store_sk, sr_reason_sk, sr_return_amt, sr_return_quantity, sr_return_amt_inc_tax, sr_returned_date_sk) VALUES (3001, 1001, 18, 130.0, 1, 60.0, 2);

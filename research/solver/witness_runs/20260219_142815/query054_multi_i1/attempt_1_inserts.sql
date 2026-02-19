@@ -1,0 +1,14 @@
+INSERT INTO customer (c_customer_sk, c_birth_year, c_current_addr_sk) VALUES (1000, 1930, 2000);
+INSERT INTO customer (c_customer_sk, c_birth_year, c_current_addr_sk) VALUES (1001, 1935, 2001);
+INSERT INTO customer_address (ca_address_sk, ca_state, ca_county) VALUES (2000, 'TX', 'Travis');
+INSERT INTO customer_address (ca_address_sk, ca_state, ca_county) VALUES (2001, 'TX', 'Travis');
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_month_seq) VALUES (3000, 1998, 1, 1200);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_month_seq) VALUES (3001, 1998, 2, 1201);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_month_seq) VALUES (3002, 1998, 3, 1202);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_month_seq) VALUES (3003, 1998, 4, 1203);
+INSERT INTO item (i_item_sk, i_category, i_class) VALUES (4000, 'Electronics', 'personal');
+INSERT INTO store (s_state, s_county) VALUES (5000, 'TX', 'Travis');
+INSERT INTO store_sales (ss_customer_sk, ss_ext_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (1000, 75.0, 3001, 40.0);
+INSERT INTO store_sales (ss_customer_sk, ss_ext_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (1001, 75.0, 3002, 40.0);
+INSERT INTO catalog_sales (cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk, cs_wholesale_cost) VALUES (3000, 1000, 4000, 40.0);
+INSERT INTO catalog_sales (cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk, cs_wholesale_cost) VALUES (3000, 1001, 4000, 40.0);

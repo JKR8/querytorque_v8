@@ -1,0 +1,10 @@
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (1000, 'CA');
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (1001, 'TX');
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (2000, '2002-09-01');
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (2001, '2002-09-02');
+INSERT INTO web_site (web_site_sk, web_gmt_offset) VALUES (3000, -4.5);
+INSERT INTO web_site (web_site_sk, web_gmt_offset) VALUES (3001, 0.0);
+INSERT INTO web_sales (ws_order_number, ws_ship_addr_sk, ws_ship_date_sk, ws_web_site_sk, ws_list_price, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk) VALUES (1000, 1000, 2000, 3000, 240.0, 10.0, 50.0, 1);
+INSERT INTO web_sales (ws_order_number, ws_ship_addr_sk, ws_ship_date_sk, ws_web_site_sk, ws_list_price, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk) VALUES (1000, 1000, 2000, 3000, 240.0, 10.0, 50.0, 2);
+INSERT INTO web_sales (ws_order_number, ws_ship_addr_sk, ws_ship_date_sk, ws_web_site_sk, ws_list_price, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk) VALUES (1001, 1001, 2001, 3001, 250.0, 15.0, 60.0, 1);
+INSERT INTO web_sales (ws_order_number, ws_ship_addr_sk, ws_ship_date_sk, ws_web_site_sk, ws_list_price, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk) VALUES (1001, 1001, 2001, 3001, 250.0, 15.0, 60.0, 2);

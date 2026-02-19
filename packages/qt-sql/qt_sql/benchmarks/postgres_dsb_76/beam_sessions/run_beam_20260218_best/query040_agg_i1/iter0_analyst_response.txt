@@ -1,0 +1,179 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary hotspot is a sequential Nested Loop scanning catalog_sales 30 times (once per date_dim row) because dimension filters on item and warehouse are applied late after the fact table join. Converting comma joins to explicit JOINs and pre-filtering selective dimensions into CTEs can reduce the fact table probe size and allow better join ordering. A secondary hotspot is the Sort before aggregation, which could be mitigated by earlier row reduction.",
+    "reasoning_trace": [
+      "Nested Loop between date_dim (30 rows) and catalog_sales (1147 rows per loop) dominates runtime (735 ms) and is massively underestimated (est 1477 vs act ~35K rows).",
+      "Item and warehouse filters are applied after the fact table join, missing opportunity to prune catalog_sales rows early.",
+      "Comma‑join syntax may inhibit PostgreSQL's join reordering; explicit JOIN with pre‑filtered CTEs can improve cardinality estimates.",
+      "Left join with cr_reason_sk=33 effectively acts as an inner join; converting it may unlock further reordering."
+    ],
+    "cost_spine": [
+      "Seq Scan on date_dim",
+      "Index Scan on catalog_sales (nested loop inner)",
+      "Nested Loop (date_dim × catalog_sales)",
+      "Sort",
+      "Aggregate"
+    ],
+    "hotspots": [
+      {
+        "op": "Nested Loop (date_dim × catalog_sales)",
+        "why": "fact‑table scan repeated for each date_dim row; dimension filters applied late",
+        "evidence": "rows=34968 time=735.634 ms, estimated 1477 rows (23.7x underestimate)"
+      },
+      {
+        "op": "Sort",
+        "why": "sorts 35K rows before aggregation",
+        "evidence": "rows=0 time=1239.603 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid same‑column OR to UNION ALL (PostgreSQL BitmapOr is optimal)",
+      "do not materialize CTEs that block predicate push‑down unless reuse is proven",
+      "do not duplicate large CTE bodies for different filter values"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Convert comma joins to explicit JOINs and pre‑filter date_dim into a CTE with MATERIALIZED to create a tiny hash table, then join with catalog_sales.",
+      "dag_target_hint": "Replace FROM clause with explicit JOINs; wrap date_dim filter in a CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "catalog_sales", "item", "warehouse", "catalog_returns"],
+        "where_must_preserve": ["d_date between (cast('2002-02-19' as date) - interval '30 day') and (cast('2002-02-19' as date) + interval '30 day')", "i_category = 'Jewelry'", "i_manager_id between 61 and 100", "cs_wholesale_cost between 42 and 61", "cr_reason_sk = 33"],
+        "output_must_preserve": ["w_state", "i_item_id", "sales_before", "sales_after", "ORDER BY w_state, i_item_id", "LIMIT 100"]
+      },
+      "gates_checked": [
+        "G_PG_COMMA_JOIN_PRESENT:PASS",
+        "G_PG_COMMA_FACT_FANOUT:PASS",
+        "G_PG_COMMA_SEMANTIC:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Seq Scan on date_dim replaced by CTE scan; Nested Loop may become Hash Join with smaller build side; fact‑table scan rows reduced.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot: addresses comma‑join weakness and pushes date filter early.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "target": "Convert LEFT JOIN catalog_returns to INNER JOIN because cr_reason_sk=33 filters out NULL rows, enabling more flexible join reordering.",
+      "dag_target_hint": "Change LEFT JOIN ... ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) to INNER JOIN and move cr_reason_sk=33 into ON clause.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns"],
+        "where_must_preserve": ["cr_reason_sk = 33"],
+        "output_must_preserve": ["All output rows unchanged; no NULLs introduced from catalog_returns"]
+      },
+      "gates_checked": [
+        "LEFT_JOIN_RIGHT_FILTER:PASS",
+        "NULL_DEPENDENT_LOGIC:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.90,
+      "expected_explain_delta": "LEFT JOIN removed; optimizer may reorder joins more aggressively.",
+      "recommended_patch_ops": ["replace_join_type", "move_predicate_to_on"],
+      "rank_rationale": "Secondary hotspot: removes outer‑join constraint, may improve join order.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre‑filter item and warehouse into separate CTEs (MATERIALIZED) before joining with catalog_sales, applying i_category and i_manager_id filters early.",
+      "dag_target_hint": "Create CTEs for filtered item and warehouse, then join them with catalog_sales before date_dim.",
+      "node_contract": {
+        "from_must_include": ["item", "warehouse"],
+        "where_must_preserve": ["i_category = 'Jewelry'", "i_manager_id between 61 and 100"],
+        "output_must_preserve": ["All original join columns for downstream grouping and ordering"]
+      },
+      "gates_checked": [
+        "G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS",
+        "G_PG_CROSS_CTE_SCALE_GUARD:REQUIRE_MANUAL_REVIEW"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering of item and warehouse may reduce catalog_sales probe rows further, but PostgreSQL's CTE materialization could fence predicate push‑down; validate at target scale.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Item and warehouse scans become tiny CTE scans; catalog_sales index scan may use composite filter (cs_item_sk, cs_warehouse_sk) if indexes exist.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: targets secondary dimension filters; may compound with date CTE.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create a MATERIALIZED CTE that joins filtered date_dim, item, warehouse with catalog_sales on their keys, then join with catalog_returns (as inner) and aggregate.",
+      "dag_target_hint": "Build a single CTE containing all dimension‑filtered keys and fact columns needed for the final aggregate, then join with catalog_returns.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "item", "warehouse", "catalog_sales"],
+        "where_must_preserve": ["d_date between ...", "i_category = 'Jewelry'", "i_manager_id between 61 and 100", "cs_wholesale_cost between 42 and 61"],
+        "output_must_preserve": ["cs_item_sk", "cs_warehouse_sk", "cs_sales_price", "cs_order_number", "d_date"]
+      },
+      "gates_checked": [
+        "G_PG_CTE_REUSE_REQUIRED:PASS",
+        "G_PG_CTE_DUPLICATION_BLOCK:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the filtered fact‑dimension join may reduce rows before the expensive sort and aggregate, but could interfere with parallelism.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Nested Loops replaced by a single CTE scan; sort input rows reduced.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration: addresses both primary and secondary hotspots by staging the join.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already optimal."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in query or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation uses CASE expression depending on date_dim column, cannot be pushed below join with date_dim."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Non‑native transform; no evidence of predicate‑transitivity failure on date_sk."
+    }
+  ]
+}

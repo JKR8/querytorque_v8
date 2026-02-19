@@ -1,0 +1,17 @@
+INSERT INTO date_dim (d_date_sk, d_date, d_month_seq) VALUES (1000, '1998-05-19', 12345);
+INSERT INTO customer (c_customer_sk, c_birth_year) VALUES (1000, 1946);
+INSERT INTO customer (c_customer_sk, c_birth_year) VALUES (1001, 1947);
+INSERT INTO item (i_item_sk, i_item_id, i_manager_id) VALUES (1000, 'item1', 80);
+INSERT INTO item (i_item_sk, i_item_id, i_manager_id) VALUES (1001, 'item2', 85);
+INSERT INTO store_sales (ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price, ss_ext_sales_price) VALUES (1000, 1000, 1000, 250, 1000);
+INSERT INTO store_sales (ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price, ss_ext_sales_price) VALUES (1000, 1001, 1000, 250, 1000);
+INSERT INTO store_sales (ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price, ss_ext_sales_price) VALUES (1001, 1000, 1000, 250, 1000);
+INSERT INTO store_sales (ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price, ss_ext_sales_price) VALUES (1001, 1001, 1000, 250, 1000);
+INSERT INTO catalog_sales (cs_item_sk, cs_bill_customer_sk, cs_sold_date_sk, cs_list_price, cs_ext_sales_price) VALUES (1000, 1000, 1000, 250, 1000);
+INSERT INTO catalog_sales (cs_item_sk, cs_bill_customer_sk, cs_sold_date_sk, cs_list_price, cs_ext_sales_price) VALUES (1000, 1001, 1000, 250, 1000);
+INSERT INTO catalog_sales (cs_item_sk, cs_bill_customer_sk, cs_sold_date_sk, cs_list_price, cs_ext_sales_price) VALUES (1001, 1000, 1000, 250, 1000);
+INSERT INTO catalog_sales (cs_item_sk, cs_bill_customer_sk, cs_sold_date_sk, cs_list_price, cs_ext_sales_price) VALUES (1001, 1001, 1000, 250, 1000);
+INSERT INTO web_sales (ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, ws_list_price, ws_ext_sales_price) VALUES (1000, 1000, 1000, 250, 1000);
+INSERT INTO web_sales (ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, ws_list_price, ws_ext_sales_price) VALUES (1000, 1001, 1000, 250, 1000);
+INSERT INTO web_sales (ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, ws_list_price, ws_ext_sales_price) VALUES (1001, 1000, 1000, 250, 1000);
+INSERT INTO web_sales (ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, ws_list_price, ws_ext_sales_price) VALUES (1001, 1001, 1000, 250, 1000);

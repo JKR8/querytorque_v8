@@ -1,0 +1,10 @@
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (1000, '1999-01-30');
+INSERT INTO date_dim (d_date_sk, d_date) VALUES (1001, '1999-02-01');
+INSERT INTO item (i_item_sk, i_category, i_manufact_id) VALUES (1000, 'Men', 800);
+INSERT INTO item (i_item_sk, i_category, i_manufact_id) VALUES (1001, 'Shoes', 850);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1000, 1000, 40, 100, 80, 100);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1000, 1000, 40, 100, 80, 200);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1000, 1000, 40, 100, 80, 300);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1001, 1000, 45, 100, 80, 100);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1001, 1000, 45, 100, 80, 200);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_ext_discount_amt) VALUES (1001, 1000, 45, 100, 80, 300);

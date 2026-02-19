@@ -1,0 +1,98 @@
+```json
+[
+  {
+    "plan_id": "compile_p1",
+    "dialect": "postgres",
+    "hypothesis": "Winning probe p02 (1.61x) consolidates duplicate store_sales+date_dim scans into a single CTE, eliminating 2.5s+ of repeated work. Materializing filtered fact-dimension join once reduces I/O by ~50% while preserving semantics.",
+    "target_ir": "Replace sb and sc subqueries with shared CTE filtered_store_sales_date, compute average per store via separate CTE.",
+    "confidence": 0.80,
+    "based_on": "p02",
+    "strategy": "Materialized dimension-fact prefilter with single-pass scan consolidation.",
+    "expected_explain_delta": "Eliminate duplicate Nested Loop + Index Only Scan on store_sales and date_dim; replace with single scan + aggregate; keep Merge Join between sb and sc.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["store", "item", "sb", "filtered_store_sales_date"],
+          "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+          "changed": true,
+          "sql": "WITH filtered_store_sales_date AS (\n  SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue\n  FROM store_sales, date_dim\n  WHERE ss_sold_date_sk = d_date_sk\n    AND d_month_seq BETWEEN 1195 AND 1195 + 11\n    AND ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01\n  GROUP BY ss_store_sk, ss_item_sk\n),\nsb AS (\n  SELECT ss_store_sk, AVG(revenue) AS ave\n  FROM filtered_store_sales_date\n  GROUP BY ss_store_sk\n)\nSELECT s_store_name, i_item_desc, sc.revenue, i_current_price, i_wholesale_cost, i_brand\nFROM store, item, sb, filtered_store_sales_date sc\nWHERE sb.ss_store_sk = sc.ss_store_sk\n  AND sc.revenue <= 0.1 * sb.ave\n  AND s_store_sk = sc.ss_store_sk\n  AND i_item_sk = sc.ss_item_sk\n  AND i_manager_id BETWEEN 80 AND 84\n  AND s_state IN ('IA','IL','NC')\nORDER BY s_store_name, i_item_desc\nLIMIT 100;"
+        },
+        {
+          "node_id": "filtered_store_sales_date",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales", "date_dim"],
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+          "changed": true,
+          "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue\nFROM store_sales, date_dim\nWHERE ss_sold_date_sk = d_date_sk\n  AND d_month_seq BETWEEN 1195 AND 1195 + 11\n  AND ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01\nGROUP BY ss_store_sk, ss_item_sk"
+        },
+        {
+          "node_id": "sb",
+          "parent_node_id": "final_select",
+          "sources": ["filtered_store_sales_date"],
+          "outputs": ["ss_store_sk", "ave"],
+          "changed": true,
+          "sql": "SELECT ss_store_sk, AVG(revenue) AS ave\nFROM filtered_store_sales_date\nGROUP BY ss_store_sk"
+        }
+      ]
+    }
+  },
+  {
+    "plan_id": "compile_p2",
+    "dialect": "postgres",
+    "hypothesis": "Winning probe p03 (1.85x) prefilters dimension tables early and computes both aggregates in a single pass using a window function, further reducing join complexity while maintaining scan consolidation benefits.",
+    "target_ir": "Replace sb and sc subqueries with prefetch CTEs for store and date_dim, compute revenue and store average via window aggregate in a single pass.",
+    "confidence": 0.85,
+    "based_on": "p03",
+    "strategy": "Dimension prefetch with window aggregation to compute per-store average inline.",
+    "expected_explain_delta": "Eliminate duplicate scans and one aggregation layer; merge sb and sc computation into single aggregate node with window function; push store and date filters early.",
+    "tree": {
+      "root_node_id": "final_select",
+      "nodes": [
+        {
+          "node_id": "final_select",
+          "parent_node_id": null,
+          "sources": ["store_prefetch", "item", "combined_aggregates"],
+          "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+          "changed": true,
+          "sql": "WITH date_dim_prefetch AS (\n  SELECT d_date_sk\n  FROM date_dim\n  WHERE d_month_seq BETWEEN 1195 AND 1195 + 11\n    AND d_date_sk IS NOT NULL\n),\nstore_prefetch AS (\n  SELECT s_store_sk, s_store_name\n  FROM store\n  WHERE s_state IN ('IA','IL','NC')\n),\nstore_sales_prefiltered AS (\n  SELECT ss.ss_store_sk, ss.ss_item_sk, ss.ss_sales_price\n  FROM store_sales ss\n  JOIN date_dim_prefetch d ON ss.ss_sold_date_sk = d.d_date_sk\n  WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01\n),\ncombined_aggregates AS (\n  SELECT\n    ss_store_sk,\n    ss_item_sk,\n    SUM(ss_sales_price) AS revenue,\n    AVG(SUM(ss_sales_price)) OVER (PARTITION BY ss_store_sk) AS ave\n  FROM store_sales_prefiltered\n  GROUP BY ss_store_sk, ss_item_sk\n)\nSELECT\n  s.s_store_name,\n  i.i_item_desc,\n  sc.revenue,\n  i.i_current_price,\n  i.i_wholesale_cost,\n  i.i_brand\nFROM store_prefetch s\nJOIN item i ON i.i_manager_id BETWEEN 80 AND 84\nJOIN combined_aggregates sc\n  ON s.s_store_sk = sc.ss_store_sk\n AND i.i_item_sk = sc.ss_item_sk\nWHERE sc.revenue <= 0.1 * sc.ave\nORDER BY s.s_store_name, i.i_item_desc\nLIMIT 100;"
+        },
+        {
+          "node_id": "date_dim_prefetch",
+          "parent_node_id": "final_select",
+          "sources": ["date_dim"],
+          "outputs": ["d_date_sk"],
+          "changed": true,
+          "sql": "SELECT d_date_sk\nFROM date_dim\nWHERE d_month_seq BETWEEN 1195 AND 1195 + 11\n  AND d_date_sk IS NOT NULL"
+        },
+        {
+          "node_id": "store_prefetch",
+          "parent_node_id": "final_select",
+          "sources": ["store"],
+          "outputs": ["s_store_sk", "s_store_name"],
+          "changed": true,
+          "sql": "SELECT s_store_sk, s_store_name\nFROM store\nWHERE s_state IN ('IA','IL','NC')"
+        },
+        {
+          "node_id": "store_sales_prefiltered",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales", "date_dim_prefetch"],
+          "outputs": ["ss_store_sk", "ss_item_sk", "ss_sales_price"],
+          "changed": true,
+          "sql": "SELECT ss.ss_store_sk, ss.ss_item_sk, ss.ss_sales_price\nFROM store_sales ss\nJOIN date_dim_prefetch d ON ss.ss_sold_date_sk = d.d_date_sk\nWHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01"
+        },
+        {
+          "node_id": "combined_aggregates",
+          "parent_node_id": "final_select",
+          "sources": ["store_sales_prefiltered"],
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue", "ave"],
+          "changed": true,
+          "sql": "SELECT\n  ss_store_sk,\n  ss_item_sk,\n  SUM(ss_sales_price) AS revenue,\n  AVG(SUM(ss_sales_price)) OVER (PARTITION BY ss_store_sk) AS ave\nFROM store_sales_prefiltered\nGROUP BY ss_store_sk, ss_item_sk"
+        }
+      ]
+    }
+  }
+]
+```

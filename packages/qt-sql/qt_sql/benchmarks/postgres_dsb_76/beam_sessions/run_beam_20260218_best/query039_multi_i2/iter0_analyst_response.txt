@@ -1,0 +1,181 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "exact",
+    "hypothesis": "The primary bottleneck is a massive parallel sequential scan on inventory (8M rows per worker) filtered late by quantity range, followed by a costly nested loop with warehouse driven by a materialized hash join result. The CTE materialization fence blocks predicate pushdown of warehouse_sk and d_moy filters, forcing full materialization of 187K groups before filtering to 0 rows.",
+    "reasoning_trace": [
+      "Parallel Seq Scan on inventory scans 8,048,979 rows per worker (24M total) with filter on inv_quantity_on_hand between 791 and 991.",
+      "Nested Loop with warehouse has 10 loops with Materialize node (254K rows per loop) and 2.3M rows removed by join filter.",
+      "CTE 'inv' materializes 187,271 groups then filters to 0 rows with case expression on aggregates, but outer query filters d_moy=5/6 and cov>1.5 cannot be pushed into CTE.",
+      "Zero cardinality estimation at Subquery Scan (est=2,460, act=0) indicates statistics propagation failure across CTE boundary."
+    ],
+    "cost_spine": ["Parallel Seq Scan on inventory", "Parallel Hash Join (item)", "Hash Join (date_dim)", "Gather", "Materialize", "Nested Loop (warehouse)", "GroupAggregate", "Filter (case)", "CTE Scan", "Hash Join (self-join)"],
+    "hotspots": [
+      {
+        "op": "Parallel Seq Scan on inventory",
+        "why": "massive I/O volume with late filter on quantity range",
+        "evidence": "rows=8,048,979 per worker, total rows scanned ~24M, filter applied during scan but still processes all rows"
+      },
+      {
+        "op": "Nested Loop with warehouse",
+        "why": "inefficient join pattern with materialized large inner side repeated 10 times",
+        "evidence": "loops=10, rows per loop=254,709, rows removed by join filter=2,292,381"
+      },
+      {
+        "op": "GroupAggregate -> Filter",
+        "why": "computes 187K groups then filters all out, wasted aggregation work",
+        "evidence": "Rows Removed by Filter: 187,271"
+      },
+      {
+        "op": "CTE materialization fence",
+        "why": "blocks predicate pushdown of d_moy and cov filters, forcing full materialization",
+        "evidence": "CTE scan filtered after materialization, zero rows out"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR-to-UNION split (PostgreSQL BitmapOr already optimal)",
+      "do not duplicate heavy CTE body (CTE_MATERIALIZATION_FENCE blocker)",
+      "do not decorrelate (no correlated subqueries present)",
+      "do not convert explicit joins (already comma joins, but engine guardrails caution against aggressive join order forcing)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "self_join_decomposition",
+      "family": "F",
+      "target": "Split CTE 'inv' into two specialized CTEs (inv5, inv6) embedding d_moy=5 and d_moy=6 filters directly in their definitions, allowing predicate pushdown into the grouped subquery.",
+      "dag_target_hint": "Replace CTE 'inv' with two CTEs inv5 and inv6, each with d_moy filter in WHERE clause before grouping, then self-join inv5 and inv6.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year = 2002", "i_category IN ('Shoes', 'Sports')", "i_manager_id BETWEEN 42 and 61", "inv_quantity_on_hand between 791 and 991"],
+        "output_must_preserve": ["w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov calculation semantics"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS (CTE reused twice)", "G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "CTE scans become filtered by d_moy before grouping, reducing GroupAggregate input rows dramatically; nested loop may disappear if warehouse join can be pushed down.",
+      "recommended_patch_ops": ["split_cte_by_filter", "embed_filter_in_cte_definition", "replace_self_join_with_two_ctes"],
+      "rank_rationale": "Primary hotspot: eliminates full materialization of 187K groups by pushing d_moy filter into CTE definitions.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": "pg_self_join_decomposition"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all three dimension tables (date_dim, item, warehouse) into separate MATERIALIZED CTEs before joining with inventory, using explicit JOIN syntax to allow better join order optimization.",
+      "dag_target_hint": "Create CTEs filtered_date, filtered_item, filtered_warehouse, then join them with inventory in a single FROM clause with explicit JOIN .. ON syntax.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "warehouse", "date_dim"],
+        "where_must_preserve": ["d_year = 2002", "i_category IN ('Shoes', 'Sports')", "i_manager_id BETWEEN 42 and 61", "inv_quantity_on_hand between 791 and 991"],
+        "output_must_preserve": ["All original grouping columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS (single fact table)", "G_PG_CROSS_CTE_SCALE_GUARD:WARN (scale unknown)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Nested loop replaced by hash joins with tiny dimension CTEs; warehouse join filter eliminated; parallel seq scan may benefit from earlier key restriction.",
+      "recommended_patch_ops": ["create_materialized_cte", "convert_comma_to_explicit_join", "push_dimension_filters_early"],
+      "rank_rationale": "Targets nested-loop hotspot by creating tiny dimension hash tables and enabling better join ordering.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create a MATERIALIZED CTE that pre-joins filtered date_dim and item with inventory on their keys, then join with warehouse, allowing the planner to reduce inventory rows via date and item filters before warehouse join.",
+      "dag_target_hint": "Insert CTE prefiltered_inv as SELECT ... FROM inventory JOIN date_dim ON ... JOIN item ON ... WHERE all filters; then join prefiltered_inv with warehouse and group.",
+      "node_contract": {
+        "from_must_include": ["inventory", "item", "date_dim"],
+        "where_must_preserve": ["d_year = 2002", "i_category IN ('Shoes', 'Sports')", "i_manager_id BETWEEN 42 and 61", "inv_quantity_on_hand between 791 and 991"],
+        "output_must_preserve": ["inv_item_sk", "inv_warehouse_sk", "inv_quantity_on_hand", "d_moy"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:FAIL (no non-equi join)", "G_PG_NONEQUI_CARDINALITY:SKIP", "G_PG_CTE_REUSE_REQUIRED:PASS (CTE used twice for d_moy=5 and d_moy=6)"],
+      "exploration": true,
+      "exploration_hypothesis": "Even without non-equi joins, staged reduction via MATERIALIZED CTE may allow predicate pushdown across CTE boundary and better parallelization.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Inventory scan reduced by date and item filters earlier; warehouse join becomes a hash join with smaller build side.",
+      "recommended_patch_ops": ["insert_materialized_cte", "rearrange_join_order", "push_filters_into_cte"],
+      "rank_rationale": "Exploration: addresses CTE materialization fence by pre-joining fact with selective dimensions before warehouse.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push the highly selective warehouse table filter (w_warehouse_sk = ?) into the subquery before joining with inventory, using explicit JOIN and WHERE to eliminate nested loop.",
+      "dag_target_hint": "Rewrite FROM clause to join warehouse early: FROM inventory JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk JOIN item ... JOIN date_dim ...",
+      "node_contract": {
+        "from_must_include": ["inventory", "warehouse"],
+        "where_must_preserve": ["inv_warehouse_sk = w_warehouse_sk"],
+        "output_must_preserve": ["All original columns and aggregates"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:FAIL (no correlated subquery)", "G_PG_CORR_ALREADY_DECORRELATED:SKIP", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering of warehouse may allow index scan on warehouse_pkey and reduce the nested loop to a hash join, even without correlation.",
+      "confidence": 0.48,
+      "expected_explain_delta": "Nested loop replaced by hash join; warehouse filter applied before inventory scan via join condition.",
+      "recommended_patch_ops": ["convert_comma_to_explicit_join", "reorder_joins", "push_warehouse_filter_early"],
+      "rank_rationale": "Exploration: targets nested-loop inefficiency by forcing warehouse join early; low confidence because no correlated subquery.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already optimal for indexed OR."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation is already at leaf level (group by warehouse, item, date); no aggregation after large join to push down."
+    },
+    {
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "reason": "Previous optimization attempt failed (speedup=0.00x); likely insufficient benefit at this scale."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "Previous optimization attempt failed (speedup=0.00x); no LEFT JOIN in query."
+    },
+    {
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "reason": "Previous optimization attempt failed (speedup=0.00x); CTE already materialized by PostgreSQL."
+    },
+    {
+      "transform_id": "early_filter",
+      "family": "A",
+      "reason": "Previous optimization attempt failed (speedup=0.00x); dimensions already filtered early in plan."
+    }
+  ]
+}

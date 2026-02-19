@@ -1,0 +1,18 @@
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 1000, 1000, 0, 0.0);
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 1001, 1001, 0, 0.0);
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 1002, 1002, 0, 0.0);
+INSERT INTO catalog_returns (cr_reason_sk, cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount) VALUES (8, 1003, 1003, 0, 0.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1000, 2000, 1000, 10, 100.0, 80.0, 800.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1001, 2001, 1001, 8, 100.0, 80.0, 640.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1002, 2000, 1002, 10, 100.0, 80.0, 800.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_order_number, cs_quantity, cs_list_price, cs_sales_price, cs_ext_sales_price) VALUES (1003, 2001, 1003, 8, 100.0, 80.0, 640.0);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (2000, 1998);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (2001, 1999);
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1000, 1000, 1000, 1000, 1000, 'Children');
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1001, 1000, 1000, 1000, 1000, 'Children');
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1002, 1001, 1001, 1001, 1001, 'Children');
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category) VALUES (1003, 1001, 1001, 1001, 1001, 'Children');
+INSERT INTO store_returns (sr_reason_sk, sr_ticket_number, sr_item_sk, sr_return_quantity, sr_return_amt) VALUES (8, 1, 1000, 0, 0.0);
+INSERT INTO store_sales (ss_item_sk, ss_sold_date_sk, ss_ticket_number, ss_quantity, ss_list_price, ss_sales_price, ss_ext_sales_price) VALUES (1000, 2000, 1, 0, 100.0, 80.0, 0.0);
+INSERT INTO web_returns (wr_reason_sk, wr_order_number, wr_item_sk, wr_return_quantity, wr_return_amt) VALUES (8, 1, 1000, 0, 0.0);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_order_number, ws_quantity, ws_list_price, ws_sales_price, ws_ext_sales_price) VALUES (1000, 2000, 1, 0, 100.0, 80.0, 0.0);

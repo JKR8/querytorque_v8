@@ -1,0 +1,18 @@
+INSERT INTO customer_address (ca_address_sk, ca_county, ca_state) VALUES (1000, 'Franklin', 'KS');
+INSERT INTO customer_address (ca_address_sk, ca_county, ca_state) VALUES (1001, 'Hamilton', 'OH');
+INSERT INTO date_dim (d_date_sk, d_qoy, d_year) VALUES (2000, 1, 1999);
+INSERT INTO date_dim (d_date_sk, d_qoy, d_year) VALUES (2001, 2, 1999);
+INSERT INTO date_dim (d_date_sk, d_qoy, d_year) VALUES (2002, 3, 1999);
+INSERT INTO item (i_item_sk, i_color, i_manager_id) VALUES (3000, 'dark', 20);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1000, 100.0, 3000, 250.0, 2000);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1000, 150.0, 3000, 250.0, 2001);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1000, 225.0, 3000, 250.0, 2002);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1001, 200.0, 3000, 250.0, 2000);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1001, 240.0, 3000, 250.0, 2001);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1001, 288.0, 3000, 250.0, 2002);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1000, 100.0, 3000, 250.0, 2000);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1000, 200.0, 3000, 250.0, 2001);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1000, 400.0, 3000, 250.0, 2002);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1001, 200.0, 3000, 250.0, 2000);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1001, 300.0, 3000, 250.0, 2001);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1001, 450.0, 3000, 250.0, 2002);

@@ -1,0 +1,13 @@
+INSERT INTO call_center (cc_call_center_sk, cc_call_center_id, cc_name, cc_manager) VALUES (1000, '1', 'Center A', 'Manager A');
+INSERT INTO call_center (cc_call_center_sk, cc_call_center_id, cc_name, cc_manager) VALUES (1001, '2', 'Center B', 'Manager B');
+INSERT INTO catalog_returns (cr_call_center_sk, cr_returning_customer_sk, cr_returned_date_sk, cr_net_loss) VALUES (1000, 1000, 1000, 10.0);
+INSERT INTO catalog_returns (cr_call_center_sk, cr_returning_customer_sk, cr_returned_date_sk, cr_net_loss) VALUES (1001, 1001, 1001, 20.0);
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk) VALUES (1000, 1000, 1000, 1000);
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk) VALUES (1001, 1001, 1001, 1000);
+INSERT INTO customer_address (ca_address_sk, ca_gmt_offset) VALUES (1000, -6.0);
+INSERT INTO customer_address (ca_address_sk, ca_gmt_offset) VALUES (1001, -6.0);
+INSERT INTO customer_demographics (cd_demo_sk, cd_marital_status, cd_education_status) VALUES (1000, 'M', 'Unknown');
+INSERT INTO customer_demographics (cd_demo_sk, cd_marital_status, cd_education_status) VALUES (1001, 'W', 'Advanced Degree');
+INSERT INTO date_dim (d_date_sk, d_year, d_moy) VALUES (1000, 2001, 12);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy) VALUES (1001, 2001, 12);
+INSERT INTO household_demographics (hd_demo_sk, hd_buy_potential) VALUES (1000, '>10000%');

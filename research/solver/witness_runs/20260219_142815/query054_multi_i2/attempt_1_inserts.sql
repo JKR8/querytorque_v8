@@ -1,0 +1,14 @@
+INSERT INTO catalog_sales (cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk, cs_wholesale_cost) VALUES (2000, 1000, 3000, 75);
+INSERT INTO catalog_sales (cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk, cs_wholesale_cost) VALUES (2000, 1001, 3000, 80);
+INSERT INTO customer (c_customer_sk, c_birth_year, c_current_addr_sk) VALUES (1000, 1950, 4000);
+INSERT INTO customer (c_customer_sk, c_birth_year, c_current_addr_sk) VALUES (1001, 1945, 4001);
+INSERT INTO customer_address (ca_address_sk, ca_county, ca_state) VALUES (4000, 'Franklin', 'AR');
+INSERT INTO customer_address (ca_address_sk, ca_county, ca_state) VALUES (4001, 'Jefferson', 'GA');
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_month_seq) VALUES (2000, 1998, 5, 1000);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_month_seq) VALUES (2001, 1998, 6, 1001);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_month_seq) VALUES (2002, 1998, 7, 1002);
+INSERT INTO item (i_item_sk, i_category, i_class) VALUES (3000, 'Home', 'curtains/drapes');
+INSERT INTO store (s_state, s_county) VALUES ('AR', 'Franklin');
+INSERT INTO store (s_state, s_county) VALUES ('GA', 'Jefferson');
+INSERT INTO store_sales (ss_customer_sk, ss_ext_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (1000, 75, 2001, 75);
+INSERT INTO store_sales (ss_customer_sk, ss_ext_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (1001, 125, 2002, 80);

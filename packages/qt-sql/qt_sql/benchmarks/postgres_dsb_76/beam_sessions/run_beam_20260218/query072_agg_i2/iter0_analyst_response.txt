@@ -1,0 +1,161 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan is dominated by a large nested loop (113k rows) between catalog_sales and date_dim d1, feeding a hash join with household_demographics, then a non‑equi join with inventory. Late filters and repeated date_dim scans suggest early dimension filtering and staged reduction could shrink intermediate cardinality before the expensive join.",
+    "reasoning_trace": [
+      "Nested Loop between date_dim d1 and catalog_sales yields 113k rows (2519 ms), the largest intermediate result.",
+      "Hash Join with household_demographics (2542 ms) further amplifies before final aggregate.",
+      "Non‑equi join condition inv_quantity_on_hand < cs_quantity appears late, likely causing nested‑loop amplification.",
+      "Multiple date_dim scans (d1, d2, d3) with selective filters are repeated; materializing them once may reduce work."
+    ],
+    "cost_spine": ["Nested Loop (catalog_sales×d1)", "Hash Join (household_demographics)", "Nested Loop (inventory non‑equi)", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (catalog_sales × date_dim d1)",
+        "why": "largest intermediate row count (113468 rows) and time (2519 ms)",
+        "evidence": "rows=113468 time=2519.105 ms"
+      },
+      {
+        "op": "Hash Join (household_demographics)",
+        "why": "second‑largest time (2542 ms) after the 113k‑row nested loop",
+        "evidence": "time=2542.358 ms"
+      },
+      {
+        "op": "Non‑equi join (inv_quantity_on_hand < cs_quantity)",
+        "why": "inequality join likely forces nested‑loop with large outer side",
+        "evidence": "plan shows Index Scan on inventory after Hash Join, no hash/merge for inequality"
+      }
+    ],
+    "do_not_do": [
+      "do not convert LEFT JOIN promotion to INNER JOIN (semantic change for promo/no_promo counts)",
+      "do not split OR to UNION ALL (no OR predicate in query)",
+      "do not duplicate large CTE bodies (respect G_PG_CTE_DUPLICATION_BLOCK)",
+      "do not materialize EXISTS paths (none present)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Pre‑filter date_dim d1, household_demographics, customer_demographics, and item into separate MATERIALIZED CTEs with their selective WHERE clauses, then join them with catalog_sales and inventory in a staged pipeline, ensuring the non‑equi condition inv_quantity_on_hand < cs_quantity is applied after both sides are reduced.",
+      "dag_target_hint": "Replace final_select FROM clause with a chain of CTEs (filtered_d1, filtered_hd, filtered_cd, filtered_item, filtered_cs) that progressively join, materializing before the non‑equi join.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "inventory", "date_dim d1", "household_demographics", "customer_demographics", "item"],
+        "where_must_preserve": ["d1.d_year = 1999", "hd_buy_potential = '>10000'", "cd_marital_status = 'S'", "cd_dep_count between 9 and 11", "i_category IN ('Men', 'Shoes', 'Sports')", "cs_wholesale_cost BETWEEN 76 AND 96", "inv_quantity_on_hand < cs_quantity"],
+        "output_must_preserve": ["i_item_desc", "w_warehouse_name", "d_week_seq", "no_promo", "promo", "total_cnt", "ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq", "LIMIT 100"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Large Nested Loop and Hash Join replaced by smaller hash joins on pre‑materialized CTEs; non‑equi join input rows reduced.",
+      "recommended_patch_ops": ["insert_cte_filtered_d1", "insert_cte_filtered_hd", "insert_cte_filtered_cd", "insert_cte_filtered_item", "insert_cte_filtered_cs", "replace_from_with_cte_chain", "preserve_left_join_promotion"],
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "rank_rationale": "Targets primary hotspot (large nested loop) and the non‑equi join, with strong PostgreSQL evidence.",
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Materialize filtered date_dim rows for d1, d2, d3 into separate CTEs with explicit JOIN syntax, ensuring each date CTE is tiny and joined early to reduce fact‑table scans.",
+      "dag_target_hint": "Replace the three date_dim joins with CTEs (d1_cte, d2_cte, d3_cte) and use explicit JOIN … ON syntax throughout.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["d1.d_year = 1999", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'"],
+        "output_must_preserve": ["all original output columns and ordering"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:FAIL (query already uses explicit JOIN, but transform still applicable for materialization)", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Repeated date_dim index scans replaced by single scans of tiny materialized CTEs; join order may improve.",
+      "recommended_patch_ops": ["insert_cte_d1", "insert_cte_d2", "insert_cte_d3", "replace_joins_with_cte_references"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Addresses secondary hotspot (multiple date_dim scans) and follows PostgreSQL gold pattern.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Create MATERIALIZED CTEs for all selective dimensions (date_dim d1, household_demographics, customer_demographics, item) with their filters, then join them together before joining with catalog_sales and inventory.",
+      "dag_target_hint": "Replace the star‑join pattern with a prefetch CTE that pre‑joins all filtered dimensions on their surrogate keys, then joins that result with catalog_sales.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "household_demographics", "customer_demographics", "item"],
+        "where_must_preserve": ["d1.d_year = 1999", "hd_buy_potential = '>10000'", "cd_marital_status = 'S'", "cd_dep_count between 9 and 11", "i_category IN ('Men', 'Shoes', 'Sports')"],
+        "output_must_preserve": ["all original output columns and grouping keys"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:FAIL (explicit joins already)", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Dimension filters applied before fact‑table join, reducing catalog_sales scan rows.",
+      "recommended_patch_ops": ["insert_cte_prefiltered_dims", "replace_from_with_prefetch_cte"],
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "rank_rationale": "Targets secondary hotspot (dimension filters applied late) and uses native PostgreSQL pattern.",
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered date_dim rows for d1, d2, d3 into a single CTE that returns all needed columns (d_date_sk, d_week_seq, d_date, d_year) and then reference that CTE three times with different aliases, preserving the original join conditions.",
+      "dag_target_hint": "Replace the three separate date_dim table references with a single CTE 'date_cte' and join it as d1, d2, d3 with appropriate predicates.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2", "date_dim d3"],
+        "where_must_preserve": ["d1.d_year = 1999", "d1.d_week_seq = d2.d_week_seq", "d3.d_date > d1.d_date + interval '3 day'"],
+        "output_must_preserve": ["all original output columns and ordering"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS (CTE scanned three times)", "G_PG_CTE_DUPLICATION_BLOCK:PASS (no duplication of large CTE bodies)", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS (no set operations)"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing date_dim once may reduce total scan cost and improve hash‑join planning, even though filters differ per alias.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Three separate index scans on date_dim become one scan of a materialized CTE; join planning may change.",
+      "recommended_patch_ops": ["insert_cte_date_unified", "replace_date_dim_references_with_cte_aliases"],
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "rank_rationale": "Exploration probe targeting repeated date_dim scans, testing materialization reuse.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in query; transform requires correlation gap."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation depends on left‑joined promotion table; pushing aggregation before that join would change semantics."
+    },
+    {
+      "transform_id": "inner_join_conversion",
+      "family": "F",
+      "reason": "LEFT JOIN promotion must stay left‑joined for correct promo/no_promo counts; WHERE does not filter on promotion columns."
+    }
+  ]
+}

@@ -1,0 +1,160 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary bottleneck is a full sequential scan of web_returns (33,995 rows, 944 ms) for the NOT EXISTS anti-join, amplified by a nested loop for the EXISTS check. The plan uses comma joins and late application of selective dimension filters (date_dim, customer_address) which may prevent optimal join ordering and early reduction.",
+    "reasoning_trace": [
+      "Seq Scan on web_returns is the largest I/O operation (33,995 rows, 944 ms) and drives the hash anti-join.",
+      "Nested Loop for EXISTS executes 315 times (Index Only Scan on web_sales ws2) contributing 1895 ms total.",
+      "Plan uses comma-separated FROM clause; explicit JOIN syntax may improve optimizer's join reordering.",
+      "Selective filters on date_dim (20 rows) and customer_address (via index) are applied late after the web_sales scan."
+    ],
+    "cost_spine": ["Seq Scan on web_returns", "Hash Join", "Nested Loop (EXISTS)", "Nested Loop (main)"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on web_returns",
+        "why": "Full table scan for NOT EXISTS anti-join filter on wr_reason_sk; no index on this column.",
+        "evidence": "rows=33995 time=944.227ms"
+      },
+      {
+        "op": "Nested Loop (EXISTS)",
+        "why": "Correlated EXISTS re-executes per outer row (315 times) though each iteration is fast (0.184 ms).",
+        "evidence": "rows=315 time=1895.581ms"
+      },
+      {
+        "op": "Hash Join",
+        "why": "Build side includes a nested loop of date_dim and web_sales; web_sales scan returns 1688 rows.",
+        "evidence": "rows=1427 time=1748.39ms"
+      }
+    ],
+    "do_not_do": [
+      "Avoid OR-to-UNION transforms (PostgreSQL uses BitmapOr for indexed OR).",
+      "Do not materialize EXISTS/NOT EXISTS into CTEs if they are already optimized as semi/anti joins.",
+      "Do not duplicate large CTE bodies; prefer filter pushdown into existing CTEs."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit INNER JOIN syntax and isolate date_dim filter into a CTE to create a tiny hash table for early join.",
+      "dag_target_hint": "Replace FROM clause with explicit JOINs and add date_cte as a materialized CTE.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date between '2002-9-01' and cast('2002-9-01' as date) + interval '60 day'", "ca_state in ('CA','MI','OH','SD','TX','VA')", "web_gmt_offset >= -5", "ws_list_price between 237 and 266"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Explicit JOINs allow better join reordering; date_cte materializes 20 rows, reducing web_sales scan rows via early join.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets comma-join weakness and early date filter application, which may reduce rows entering the main join.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, customer_address, web_site) into separate CTEs, then join them with web_sales (ws1) before applying EXISTS/NOT EXISTS checks.",
+      "dag_target_hint": "Create CTEs for filtered date_dim, customer_address, web_site; rewrite main FROM to join these CTEs with web_sales.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date between '2002-9-01' and cast('2002-9-01' as date) + interval '60 day'", "ca_state in ('CA','MI','OH','SD','TX','VA')", "web_gmt_offset >= -5", "ws_list_price between 237 and 266"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:PASS", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Multiple small dimension CTEs reduce web_sales scan rows via compounded selectivity; hash joins use tiny build sides.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Addresses cross-CTE predicate blindness by pushing all dimension filters early, reducing fact table scan volume.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push dimension filters into CTEs and decorrelate EXISTS/NOT EXISTS by pre-computing distinct ws_order_number sets for each subquery, then join as anti/semi-joins.",
+      "dag_target_hint": "Create CTEs for filtered dimensions and for ws_order_number sets satisfying EXISTS and NOT EXISTS; rewrite main query to join these sets.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date between '2002-9-01' and cast('2002-9-01' as date) + interval '60 day'", "ca_state in ('CA','MI','OH','SD','TX','VA')", "web_gmt_offset >= -5", "ws_list_price between 237 and 266"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:FAIL", "G_PG_CORR_ALREADY_DECORRELATED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "The EXISTS and NOT EXISTS are already semi/anti joins but may benefit from pre-computed keysets to reduce nested loop iterations.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Correlated subqueries replaced with CTE-based key sets; nested loop may become hash semi/anti join with smaller build side.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Exploration targeting correlated subquery paralysis; risk of breaking optimized semi-join paths, but may reduce nested loop work.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Create a MATERIALIZED CTE that pre-joins filtered date_dim, customer_address, web_site with web_sales (ws1) to produce a reduced fact set, then apply EXISTS/NOT EXISTS checks.",
+      "dag_target_hint": "Insert a MATERIALIZED CTE that joins filtered dimensions with web_sales; rewrite main query to use this CTE.",
+      "node_contract": {
+        "from_must_include": ["web_sales ws1", "date_dim", "customer_address", "web_site"],
+        "where_must_preserve": ["d_date between '2002-9-01' and cast('2002-9-01' as date) + interval '60 day'", "ca_state in ('CA','MI','OH','SD','TX','VA')", "web_gmt_offset >= -5", "ws_list_price between 237 and 266"],
+        "output_must_preserve": ["count(distinct ws_order_number)", "sum(ws_ext_ship_cost)", "sum(ws_net_profit)", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:FAIL", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Staged reduction via a MATERIALIZED CTE may shrink the fact table before expensive anti-join, even without non-equi joins.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Materialized CTE reduces web_sales rows significantly; subsequent EXISTS/NOT EXISTS work on smaller dataset.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting secondary hotspot (hash join build); uses PostgreSQL's CTE materialization to fence reduction.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL uses BitmapOr for indexed OR, transform contraindicated by engine guardrail."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operation in query."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Non-native transform (Snowflake) with no strong evidence for predicate transitivity failure in this plan."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar aggregate subquery in query; only EXISTS/NOT EXISTS."
+    }
+  ]
+}

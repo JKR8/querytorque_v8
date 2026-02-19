@@ -1,0 +1,17 @@
+INSERT INTO catalog_sales (cs_bill_customer_sk, cs_item_sk, cs_sold_date_sk, cs_wholesale_cost, cs_quantity, cs_list_price) VALUES (2000, 1000, 3000, 15.0, 1, 100.0);
+INSERT INTO catalog_sales (cs_bill_customer_sk, cs_item_sk, cs_sold_date_sk, cs_wholesale_cost, cs_quantity, cs_list_price) VALUES (2000, 1000, 3000, 15.0, 2, 200.0);
+INSERT INTO customer (c_birth_year, c_customer_sk) VALUES (1935, 2000);
+INSERT INTO customer (c_birth_year, c_customer_sk) VALUES (1936, 2001);
+INSERT INTO date_dim (d_date, d_date_sk, d_moy, d_year) VALUES ('1998-10-01', 3000, 10, 1998);
+INSERT INTO item (i_category, i_item_sk, i_manager_id, i_item_desc) VALUES ('Children', 1000, 85, 'Some description that is long enough for substring');
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2000, 1000, 10, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2000, 1000, 10, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2000, 1000, 10, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2000, 1000, 10, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2000, 1000, 10, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2001, 1000, 5, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2001, 1000, 5, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2001, 1000, 5, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2001, 1000, 5, 100.0, 3000, 15.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_quantity, ss_sales_price, ss_sold_date_sk, ss_wholesale_cost) VALUES (2001, 1000, 5, 100.0, 3000, 15.0);
+INSERT INTO web_sales (ws_bill_customer_sk, ws_item_sk, ws_sold_date_sk, ws_wholesale_cost, ws_quantity, ws_list_price) VALUES (2000, 1000, 3000, 15.0, 1, 150.0);

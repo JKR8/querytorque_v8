@@ -1,0 +1,153 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Correlated EXISTS subqueries drive repeated nested loops, each re-scanning fact and dimension tables, causing high cumulative I/O. Decoupling the correlated loops into pre-materialized key sets should eliminate per-row execution and allow dimension filters to reduce fact scans earlier.",
+    "reasoning_trace": [
+      "Plan shows Nested Loop nodes with inner side re-executing for each outer row (correlated EXISTS).",
+      "Each EXISTS repeats identical dimension scans (date_dim, item) with same filters, causing redundant work.",
+      "Estimation underflow (est=50, act=33K) at Nested Loop indicates planner cannot model correlated subquery cardinality.",
+      "No single dominant fact scan; three fact tables (store_sales, web_sales, catalog_sales) each contribute significant time."
+    ],
+    "cost_spine": ["Limit", "Aggregate", "Sort", "Nested Loop", "Nested Loop", "Nested Loop", "Aggregate", "Gather"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (catalog_sales path)",
+        "why": "Correlated EXISTS drives repeated inner scans; largest runtime segment (5793 ms).",
+        "evidence": "time=5793.167 ms, inner rows=33110, outer rows=?"
+      },
+      {
+        "op": "Nested Loop (store_sales path)",
+        "why": "First correlated EXISTS also repeated; significant time (4736 ms).",
+        "evidence": "time=4736.585 ms, inner rows=40552"
+      },
+      {
+        "op": "Nested Loop (web_sales path)",
+        "why": "OR branch EXISTS repeats dimension scans; moderate time (1.379 ms).",
+        "evidence": "time=1.379 ms, inner rows=1"
+      },
+      {
+        "op": "Repeated Index Only Scan on date_dim",
+        "why": "Same table scanned three times with identical filters; redundant I/O.",
+        "evidence": "three separate date_dim scans (aliases: date_dim, date_dim_1, date_dim_2)"
+      }
+    ],
+    "do_not_do": [
+      "avoid same-column OR to UNION ALL (PostgreSQL BitmapOr is optimal)",
+      "do not break simple EXISTS into materialized CTE if it destroys semi-join optimization",
+      "do not duplicate large CTE bodies for each branch; share materialized results"
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Decouple correlated EXISTS subqueries by pre-materializing qualifying customer keys from each fact channel (store, web, catalog) with shared dimension filters in CTEs, then join as anti/semi-join.",
+      "dag_target_hint": "Replace EXISTS subqueries with CTEs (store_keys, web_keys, catalog_keys) and join via INNER JOIN / LEFT JOIN.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["ca_county IN (...)", "c.c_birth_month IN (1,5)", "cd filters", "OR logic between web and catalog keys"],
+        "output_must_preserve": ["All grouping columns and counts; ORDER BY and LIMIT unchanged"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS (EXISTS preserved as semi-join via key set)", "G_PG_CORR_FACT_COUNT:REVIEW (3 fact tables)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Correlated Nested Loops replaced by hash joins; repeated dimension scans consolidated; fact table scans reduced by early key filtering.",
+      "recommended_patch_ops": ["insert_cte_store_keys", "insert_cte_web_keys", "insert_cte_catalog_keys", "replace_where_exists_with_joins"],
+      "rank_rationale": "Targets primary hotspot—correlated EXISTS driving repeated fact and dimension scans.",
+      "recommended_examples": ["pg_shared_scan_decorrelate"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize shared dimension filters (date_dim, item) into CTEs to avoid redundant scans across three EXISTS branches.",
+      "dag_target_hint": "Add filtered_date and filtered_item CTEs; replace each inline dimension scan with reference to CTE.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "item i"],
+        "where_must_preserve": ["d_year = 1999", "d_moy BETWEEN 8 AND 11", "i_category IN (...)", "i_manager_id BETWEEN 66 AND 75"],
+        "output_must_preserve": ["All join keys and needed columns for fact joins"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS (3 consumers)", "G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Three separate Index Only Scans on date_dim become one CTE scan; three item scans become one.",
+      "recommended_patch_ops": ["insert_cte_filtered_date", "insert_cte_filtered_item", "replace_dimension_scans_with_cte_refs"],
+      "rank_rationale": "Addresses secondary hotspot—repeated dimension scans causing redundant I/O.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-separated joins to explicit JOIN syntax and pre-filter date_dim into a CTE to improve join planning and predicate pushdown.",
+      "dag_target_hint": "Change FROM customer, customer_address, customer_demographics to explicit INNER JOINs and add date_cte.",
+      "node_contract": {
+        "from_must_include": ["customer c", "customer_address ca", "customer_demographics cd"],
+        "where_must_preserve": ["c.c_current_addr_sk = ca.ca_address_sk", "cd_demo_sk = c.c_current_cdemo_sk", "All original WHERE predicates"],
+        "output_must_preserve": ["Same result set and grouping"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.65,
+      "expected_explain_delta": "Explicit JOINs allow better hash join planning; date CTE creates tiny hash table for better cardinality estimates.",
+      "recommended_patch_ops": ["replace_comma_joins_with_explicit", "insert_cte_date_filtered"],
+      "rank_rationale": "Addresses comma-join weakness and may improve join order flexibility.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Pre-filter fact tables by the sales-price-ratio non-equi condition and materialize reduced keysets before joining with dimensions, targeting the BETWEEN filter that may block index usage.",
+      "dag_target_hint": "Add CTEs for each fact table pre-filtered by ratio condition, then join with dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "web_sales", "catalog_sales"],
+        "where_must_preserve": ["ss_sales_price/ss_list_price BETWEEN ...", "ws_sales_price/ws_list_price BETWEEN ...", "cs_sales_price/cs_list_price BETWEEN ..."],
+        "output_must_preserve": ["Customer key and all necessary columns for EXISTS logic"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Non-equi ratio filter may cause full scan of fact table partitions; pre-filtering with CTE could reduce I/O before dimension joins.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Fact table scans reduce rows via early ratio filter; joins become smaller.",
+      "recommended_patch_ops": ["insert_cte_fact_filtered_store", "insert_cte_fact_filtered_web", "insert_cte_fact_filtered_catalog"],
+      "rank_rationale": "Exploration probe targeting non-equi filter that may be applied late; secondary hotspot.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "OR condition is across different EXISTS subqueries, not same-column OR; PostgreSQL BitmapOr already optimal for indexed OR."
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Previous attempts with similar dimension prefetch failed (attempt_1, attempt_2)."
+    },
+    {
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "reason": "Previous attempt_1 failed; likely insufficient benefit or negative interaction with PostgreSQL CTE materialization."
+    },
+    {
+      "transform_id": "composite_decorrelate_union",
+      "family": "B",
+      "reason": "Non-native (portability_candidate) and less direct than early_filter_decorrelate which is native for PostgreSQL."
+    }
+  ]
+}

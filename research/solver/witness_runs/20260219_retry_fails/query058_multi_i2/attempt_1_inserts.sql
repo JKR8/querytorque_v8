@@ -1,0 +1,11 @@
+INSERT INTO date_dim (d_date_sk, d_date, d_month_seq) VALUES (1, '2001-06-06', 123);
+INSERT INTO item (i_item_sk, i_item_id, i_manager_id) VALUES (1000, 'A', 50);
+INSERT INTO item (i_item_sk, i_item_id, i_manager_id) VALUES (1001, 'B', 50);
+INSERT INTO customer (c_customer_sk, c_birth_year) VALUES (2000, 1986);
+INSERT INTO customer (c_customer_sk, c_birth_year) VALUES (2001, 1987);
+INSERT INTO store_sales (ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_list_price, ss_ext_sales_price) VALUES (1000, 1, 2000, 180, 1000);
+INSERT INTO store_sales (ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_list_price, ss_ext_sales_price) VALUES (1001, 1, 2001, 180, 1000);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_bill_customer_sk, cs_list_price, cs_ext_sales_price) VALUES (1000, 1, 2000, 180, 1000);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_bill_customer_sk, cs_list_price, cs_ext_sales_price) VALUES (1001, 1, 2001, 180, 1000);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_list_price, ws_ext_sales_price) VALUES (1000, 1, 2000, 180, 1000);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_list_price, ws_ext_sales_price) VALUES (1001, 1, 2001, 180, 1000);

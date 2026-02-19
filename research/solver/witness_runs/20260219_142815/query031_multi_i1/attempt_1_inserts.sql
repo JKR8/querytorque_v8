@@ -1,0 +1,14 @@
+INSERT INTO customer_address (ca_address_sk, ca_county, ca_state) VALUES (1000, 'Cook', 'IL');
+INSERT INTO customer_address (ca_address_sk, ca_county, ca_state) VALUES (1001, 'Cook', 'IL');
+INSERT INTO customer_address (ca_address_sk, ca_county, ca_state) VALUES (1002, 'Cook', 'IL');
+INSERT INTO date_dim (d_date_sk, d_qoy, d_year) VALUES (2000, 1, 1998);
+INSERT INTO date_dim (d_date_sk, d_qoy, d_year) VALUES (2001, 2, 1998);
+INSERT INTO date_dim (d_date_sk, d_qoy, d_year) VALUES (2002, 3, 1998);
+INSERT INTO item (i_item_sk, i_color, i_manager_id) VALUES (3000, 'navajo', 10);
+INSERT INTO item (i_item_sk, i_color, i_manager_id) VALUES (3001, 'orchid', 15);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1000, 100.0, 3000, 90.0, 2000);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1001, 120.0, 3001, 95.0, 2001);
+INSERT INTO store_sales (ss_addr_sk, ss_ext_sales_price, ss_item_sk, ss_list_price, ss_sold_date_sk) VALUES (1002, 150.0, 3000, 88.0, 2002);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1000, 50.0, 3000, 92.0, 2000);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1001, 80.0, 3001, 87.0, 2001);
+INSERT INTO web_sales (ws_bill_addr_sk, ws_ext_sales_price, ws_item_sk, ws_list_price, ws_sold_date_sk) VALUES (1002, 120.0, 3000, 96.0, 2002);

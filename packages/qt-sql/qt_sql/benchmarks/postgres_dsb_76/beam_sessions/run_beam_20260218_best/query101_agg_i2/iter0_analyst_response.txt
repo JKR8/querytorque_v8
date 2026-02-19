@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Query suffers from comma-join weakness and non-equi join blindness, leading to nested-loop amplification and a severe cardinality underestimate at the Gather node (est=1, act=1917). Primary bottleneck is the nested-loop join between date_dim d1 and store_returns, amplified by repeated inner index scans. Secondary bottleneck is the non-equi BETWEEN join between d1 and d2, which the planner cannot estimate well.",
+    "reasoning_trace": [
+      "Gather node shows worst cardinality mismatch (underestimation 1->1917), indicating planner misjudges join output size.",
+      "Nested Loop (rows=389199, time=10016ms) between date_dim d1 and store_returns drives large I/O before later filters.",
+      "Non-equi join condition (d2.d_date BETWEEN d1.d_date AND d1.d_date + interval '90 day') appears late in plan after large scan.",
+      "Comma-join syntax may prevent optimal join reordering and predicate pushdown in PostgreSQL."
+    ],
+    "cost_spine": ["Gather", "Nested Loop", "Nested Loop", "Hash Join", "Nested Loop", "Index Only Scan on store_returns", "Index Scan on date_dim d1"],
+    "hotspots": [
+      {
+        "op": "Gather",
+        "why": "Severe cardinality underestimate leads to under-provisioned parallel workers and nested-loop amplification.",
+        "evidence": "rows_est=1, rows_act=1917, time=37792ms"
+      },
+      {
+        "op": "Nested Loop (date_dim d1 → store_returns)",
+        "why": "Drives 389k row loops before applying selective dimension filters.",
+        "evidence": "rows=389199, time=10016ms"
+      },
+      {
+        "op": "Non-equi join (d2 BETWEEN d1 AND d1+90d)",
+        "why": "Late-applied range join with poor cardinality estimates, causing nested-loop blow-up.",
+        "evidence": "Condition appears in WHERE clause but plan shows late join after large scans."
+      }
+    ],
+    "do_not_do": [
+      "Do not split same-column OR to UNION ALL (PostgreSQL uses BitmapOr).",
+      "Do not materialize EXISTS paths already optimized as semi-joins.",
+      "Do not duplicate heavy CTE bodies (previous attempts failed).",
+      "Avoid dimension CTE isolation for already fully pruned dimension tables (item scan is small)."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Extract selective date_dim filters (d1.d_year=2000) into a CTE, convert comma joins to explicit INNER JOIN syntax, and push the CTE result as a tiny hash table into the main join graph.",
+      "dag_target_hint": "Change final_select FROM clause to explicit JOINs with CTE references for d1 and d2.",
+      "node_contract": {
+        "from_must_include": ["date_dim d1", "date_dim d2", "store_returns", "store_sales"],
+        "where_must_preserve": ["d1.d_year = 2000", "d2.d_date between d1.d_date AND (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["All original output columns and GROUP BY/ORDER BY semantics"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Gather row estimate improves; nested loop between d1 and store_returns replaced by hash join with tiny build side; explicit join syntax enables better reordering.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_join_predicates"],
+      "rank_rationale": "Primary hotspot: addresses comma-join weakness and cardinality misestimate at Gather node via explicit joins and early date filtering.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered date_dim d1 and d2 into separate CTEs, then pre-join store_returns and store_sales with these CTEs before the non-equi BETWEEN join to reduce input cardinality.",
+      "dag_target_hint": "Insert two date CTEs and restructure main FROM to join fact tables to date CTEs before applying the BETWEEN condition.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "store_sales", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d1.d_year = 2000", "d2.d_date between d1.d_date AND (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["All original output columns and aggregation correctness"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Non-equi join input rows drop sharply; nested loop on store_returns eliminated; plan chooses hash join with small build sides.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "rewrite_non_equi_join"],
+      "rank_rationale": "Targets secondary hotspot (non-equi join blindness) with proven gold pattern (12.07x).",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim d1, item, customer_address, household_demographics) into separate CTEs, then join fact tables (store_sales, store_returns, web_sales) to these tiny CTEs using explicit JOIN syntax.",
+      "dag_target_hint": "Change final_select FROM to explicit joins with dimension CTEs, preserving all original predicates.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "store_returns", "web_sales", "item", "customer_address", "household_demographics", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["i_category IN ('Children','Home','Women')", "ca_state in ('AR','GA','IN','KY','VA')", "hd_income_band_sk BETWEEN 8 AND 14", "hd_buy_potential = '501-1000'", "ss_sales_price/ss_list_price BETWEEN 76*0.01 AND 96*0.01"],
+        "output_must_preserve": ["All original output columns and GROUP BY keys"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Multiple nested loops collapse into hash joins with small build sides; Gather cardinality estimate improves; overall row flow reduces before final aggregate.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicates"],
+      "rank_rationale": "Covers multiple dimension filters and comma-join weakness via proven gold pattern (3.32x).",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Exploration: push selective dimension filters into CTEs and pre-join fact tables to reduce rows before the non-equi join, even though no correlated subquery exists. Use MATERIALIZED hint to prevent inlining.",
+      "dag_target_hint": "Insert CTEs for filtered dimensions and restructure main query to join fact tables to these CTEs before applying the BETWEEN condition.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "store_sales", "date_dim d1", "date_dim d2"],
+        "where_must_preserve": ["d1.d_year = 2000", "d2.d_date between d1.d_date AND (d1.d_date + interval '90 day')"],
+        "output_must_preserve": ["All original output columns and aggregation correctness"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:FAIL (no correlated subquery, but exploration allowed)", "G_PG_CORR_FACT_COUNT:PASS", "G_PG_CORR_EXISTS_PROTECTION:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Even without correlation, early filtering via MATERIALIZED CTEs may reduce nested-loop amplification and improve join ordering for PostgreSQL.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Nested loop on store_returns reduces; date_dim scans become CTE scans; non-equi join inputs shrink.",
+      "recommended_patch_ops": ["insert_cte_materialized", "replace_from", "rewrite_join_order"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot (non-equi join) with a different mechanism (family B) not yet tried.",
+      "recommended_examples": ["early_filter_decorrelate"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "reason": "Previous attempt status=FAIL; likely over-materialization hurt performance."
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Previous attempt status=FAIL; dimension tables are already small and fully pruned (e.g., item scan 9203 rows)."
+    },
+    {
+      "transform_id": "multi_date_range_cte",
+      "family": "A",
+      "reason": "Previous attempt status=FAIL; non-equi join condition is between two date_dim aliases, not a single date range filter."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "Previous attempt status=FAIL; query does not have self-join patterns."
+    },
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr already handles indexed OR efficiently."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregation before final GROUP BY; pushdown would change multiplicity and require careful guarding."
+    }
+  ]
+}

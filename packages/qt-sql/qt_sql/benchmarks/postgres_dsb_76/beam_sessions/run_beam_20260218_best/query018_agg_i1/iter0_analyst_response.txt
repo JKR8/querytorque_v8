@@ -1,0 +1,145 @@
+{  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Aggregate consumes a large intermediate result from nested loop joins, exacerbated by comma-join syntax preventing optimal join order. Estimation errors at nested loops (est=6, act=158) indicate poor cardinality estimates, leading to suboptimal plan choices and late reduction.",
+    "reasoning_trace": [
+      "Aggregate time dominates at 11034.321 ms, indicating late footprint reduction.",
+      "Comma joins present with selective dimension filters, suggesting COMMA_JOIN_WEAKNESS gap.",
+      "Nested loop underestimation (est=6, act=158) at a join locus, hinting at cardinality misestimation."
+    ],
+    "cost_spine": ["Aggregate", "Sort", "Nested Loop", "Gather"],
+    "hotspots": [
+      {
+        "op": "Aggregate",
+        "why": "consumes join result with late reduction",
+        "evidence": "time=11034.321 ms"
+      },
+      {
+        "op": "Nested Loop",
+        "why": "estimation error and amplification",
+        "evidence": "est=6, act=158, time=6134.595 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid same-column OR to UNION ALL split (PostgreSQL BitmapOr strength)",
+      "avoid materializing EXISTS paths (preserve semi-join optimization)",
+      "avoid unfiltered large CTE introductions"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter date_dim, customer_demographics, customer, customer_address, item into CTEs with their respective filters (d_year=1998, cd_gender='F', cd_education_status='College', c_birth_month=2, ca_state IN ('AR','NY','TX'), i_category='Sports'), then join these CTEs with catalog_sales using explicit JOIN syntax and apply cs_wholesale_cost BETWEEN filter early.",
+      "dag_target_hint": "Change final_select FROM clause to use CTEs and explicit JOINs, preserving all join predicates.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "customer_demographics", "customer", "customer_address", "date_dim", "item"],
+        "where_must_preserve": ["cs_sold_date_sk = d_date_sk", "cs_item_sk = i_item_sk", "cs_bill_cdemo_sk = cd_demo_sk", "cs_bill_customer_sk = c_customer_sk", "c_current_addr_sk = ca_address_sk", "cd_gender = 'F'", "cd_education_status = 'College'", "d_year = 1998", "c_birth_month = 2", "ca_state in ('AR', 'NY', 'TX')", "cs_wholesale_cost BETWEEN 41 AND 46", "i_category = 'Sports'"],
+        "output_must_preserve": ["i_item_id", "ca_country", "ca_state", "ca_county", "agg1 to agg6 columns", "ORDER BY and LIMIT behavior"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Nested loops replaced with hash joins, reduced rows flowing into aggregate due to early dimension filtering and better join order.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "recommended_examples": ["pg_explicit_join_materialized"],
+      "rank_rationale": "Targets primary comma-join weakness with native PostgreSQL transform and high expected impact.",
+      "gold_example_id": "pg_explicit_join_materialized"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate catalog_sales by cs_item_sk and cs_bill_customer_sk (or surrogate keys) to compute partial averages before joining with dimensions, ensuring group key compatibility with i_item_id, ca_country, ca_state, ca_county.",
+      "dag_target_hint": "Change final_select SQL to include a CTE that aggregates catalog_sales early, then join with filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales"],
+        "where_must_preserve": ["cs_wholesale_cost BETWEEN 41 AND 46"],
+        "output_must_preserve": ["grouping key compatibility with final projection", "AVG semantics for all aggregated columns"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:AVG safe", "multiplicity_guard_required:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Pushing aggregation below joins may reduce input rows to the final aggregate, but group key matching is ambiguous and requires careful handling.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Aggregate operator moves earlier in plan, reducing rows into final join and aggregate phases.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "adjust_group_by"],
+      "recommended_examples": [],
+      "rank_rationale": "Addresses primary aggregate hotspot with plausible mechanism, but lower confidence due to portability and key-matching risks."
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Extract selective dimension filters into separate CTEs for date_dim, customer_demographics, customer, customer_address, item to apply filters early and create small hash tables for joining, without changing join syntax.",
+      "dag_target_hint": "Add CTEs for each dimension with filters, then reference them in the final SELECT while keeping comma joins.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "customer_demographics", "customer", "customer_address", "item"],
+        "where_must_preserve": ["d_year=1998", "cd_gender='F'", "cd_education_status='College'", "c_birth_month=2", "ca_state IN ('AR','NY','TX')", "i_category='Sports'"],
+        "output_must_preserve": ["all original join predicates and output columns"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:CAUTION"],
+      "exploration": true,
+      "exploration_hypothesis": "Early filtering via CTEs may improve selectivity propagation even with comma joins, but scale validation is needed.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Dimension scans become faster due to pre-filtering, potentially reducing nested loop inner work.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe targeting secondary hotspot with family A, testing early filtering impact."
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "rollup_to_union_windowing",
+      "family": "D",
+      "target": "Replace GROUP BY ROLLUP with explicit UNION ALL of CTEs for each hierarchy level (e.g., no grouping, i_item_id only, etc.) combined with window functions to compute aggregates, preserving order and limit.",
+      "dag_target_hint": "Modify final_select to use UNION ALL of pre-aggregated CTEs instead of ROLLUP.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "customer_demographics", "customer", "customer_address", "date_dim", "item"],
+        "where_must_preserve": ["all original WHERE clauses"],
+        "output_must_preserve": ["all output columns and ORDER BY sequence", "LIMIT 100 behavior"]
+      },
+      "gates_checked": ["multiplicity_guard_required:PASS", "semantic_equivalence:ROLLUP to UNION"],
+      "exploration": true,
+      "exploration_hypothesis": "ROLLUP decomposition might optimize aggregate computation by separating hierarchy levels, but could increase complexity.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Aggregate operator split into multiple stages, possibly enabling better parallelization or reduced sorting.",
+      "recommended_patch_ops": ["insert_cte", "replace_group_by", "add_union"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration probe from underrepresented family D, testing rollup optimization for aggregate hotspot."
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence; PostgreSQL BitmapOr strength makes this transform risky."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL or plan evidence."
+    },
+    {
+      "transform_id": "sf_sk_pushdown_multi_fact",
+      "family": "A",
+      "reason": "Engine-specific to Snowflake, not applicable to PostgreSQL runtime dialect."
+    }
+  ]
+}

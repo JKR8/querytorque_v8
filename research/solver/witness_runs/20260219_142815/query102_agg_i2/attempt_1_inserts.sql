@@ -1,0 +1,18 @@
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk) VALUES (1000, 2000, 3000, 4000);
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk) VALUES (1001, 2001, 3001, 4001);
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2000, 'CA');
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2001, 'NY');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_marital_status, cd_education_status) VALUES (3000, 'M', 'S', 'College');
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_marital_status, cd_education_status) VALUES (3001, 'F', 'M', 'Advanced Degree');
+INSERT INTO household_demographics (hd_demo_sk, hd_vehicle_count) VALUES (4000, 2);
+INSERT INTO household_demographics (hd_demo_sk, hd_vehicle_count) VALUES (4001, 3);
+INSERT INTO date_dim (d_date_sk, d_date, d_year) VALUES (1000, '1998-06-15', 1998);
+INSERT INTO date_dim (d_date_sk, d_date, d_year) VALUES (1001, '1998-06-15', 1998);
+INSERT INTO inventory (inv_warehouse_sk, inv_item_sk, inv_date_sk, inv_quantity_on_hand) VALUES (5000, 6000, 1000, 10);
+INSERT INTO item (i_item_sk, i_category, i_manager_id) VALUES (6000, 'Men', 6);
+INSERT INTO store (s_state) VALUES ('CA');
+INSERT INTO store_sales (ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity) VALUES (6000, 1000, 1000, 5);
+INSERT INTO store_sales (ss_item_sk, ss_sold_date_sk, ss_customer_sk, ss_quantity) VALUES (6000, 1000, 1001, 5);
+INSERT INTO warehouse (w_warehouse_sk, w_state) VALUES (5000, 'CA');
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_warehouse_sk, ws_wholesale_cost) VALUES (6000, 1001, 1000, 5000, 80.0);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_bill_customer_sk, ws_warehouse_sk, ws_wholesale_cost) VALUES (6000, 1001, 1001, 5000, 85.0);

@@ -1,0 +1,13 @@
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (160.0, 1000, 2000, 3000);
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (100.0, 1000, 2001, 3001);
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (240.0, 1000, 2002, 3002);
+INSERT INTO catalog_returns (cr_return_amt_inc_tax, cr_returned_date_sk, cr_returning_addr_sk, cr_returning_customer_sk) VALUES (100.0, 1000, 2003, 3003);
+INSERT INTO customer (c_current_addr_sk, c_customer_id, c_customer_sk, c_first_name, c_last_name, c_salutation) VALUES (2000, 'CUST001', 3000, 'John', 'Doe', 'Mr.');
+INSERT INTO customer (c_current_addr_sk, c_customer_id, c_customer_sk, c_first_name, c_last_name, c_salutation) VALUES (2001, 'CUST002', 3001, 'Jane', 'Smith', 'Ms.');
+INSERT INTO customer (c_current_addr_sk, c_customer_id, c_customer_sk, c_first_name, c_last_name, c_salutation) VALUES (2002, 'CUST003', 3002, 'Bob', 'Johnson', 'Mr.');
+INSERT INTO customer (c_current_addr_sk, c_customer_id, c_customer_sk, c_first_name, c_last_name, c_salutation) VALUES (2003, 'CUST004', 3003, 'Alice', 'Williams', 'Ms.');
+INSERT INTO customer_address (ca_address_sk, ca_city, ca_country, ca_county, ca_gmt_offset, ca_location_type, ca_state, ca_street_name, ca_street_number, ca_street_type, ca_suite_number, ca_zip) VALUES (2000, 'Columbus', 'USA', 'Franklin', -5.0, 'HOME', 'OH', 'Main St', '123', 'Street', 'Apt 1', '43215');
+INSERT INTO customer_address (ca_address_sk, ca_city, ca_country, ca_county, ca_gmt_offset, ca_location_type, ca_state, ca_street_name, ca_street_number, ca_street_type, ca_suite_number, ca_zip) VALUES (2001, 'Cleveland', 'USA', 'Cuyahoga', -5.0, 'HOME', 'OH', 'Oak St', '456', 'Avenue', NULL, '44101');
+INSERT INTO customer_address (ca_address_sk, ca_city, ca_country, ca_county, ca_gmt_offset, ca_location_type, ca_state, ca_street_name, ca_street_number, ca_street_type, ca_suite_number, ca_zip) VALUES (2002, 'Cincinnati', 'USA', 'Hamilton', -5.0, 'HOME', 'OH', 'Elm St', '789', 'Road', 'Suite 2', '45202');
+INSERT INTO customer_address (ca_address_sk, ca_city, ca_country, ca_county, ca_gmt_offset, ca_location_type, ca_state, ca_street_name, ca_street_number, ca_street_type, ca_suite_number, ca_zip) VALUES (2003, 'Dayton', 'USA', 'Montgomery', -5.0, 'HOME', 'OH', 'Maple St', '101', 'Boulevard', NULL, '45402');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (1000, 2002);

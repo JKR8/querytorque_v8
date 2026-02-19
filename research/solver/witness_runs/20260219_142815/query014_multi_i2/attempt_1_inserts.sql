@@ -1,0 +1,11 @@
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_category, i_manager_id) VALUES (1000, 1000, 1001, 1002, 'Electronics', 45);
+INSERT INTO item (i_item_sk, i_brand_id, i_class_id, i_category_id, i_category, i_manager_id) VALUES (1001, 1000, 1001, 1002, 'Electronics', 45);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_dom, d_week_seq) VALUES (2000, 1999, 12, 12, 5000);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_dom, d_week_seq) VALUES (2001, 2000, 12, 12, 5000);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy, d_dom, d_week_seq) VALUES (2002, 2001, 12, 12, 5000);
+INSERT INTO store_sales (ss_item_sk, ss_sold_date_sk, ss_quantity, ss_list_price, ss_wholesale_cost) VALUES (1000, 2000, 10, 30, 80);
+INSERT INTO store_sales (ss_item_sk, ss_sold_date_sk, ss_quantity, ss_list_price, ss_wholesale_cost) VALUES (1001, 2000, 5, 40, 85);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost) VALUES (1000, 2001, 80);
+INSERT INTO web_sales (ws_item_sk, ws_sold_date_sk, ws_wholesale_cost) VALUES (1001, 2001, 85);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_wholesale_cost) VALUES (1000, 2002, 80);
+INSERT INTO catalog_sales (cs_item_sk, cs_sold_date_sk, cs_wholesale_cost) VALUES (1001, 2002, 85);

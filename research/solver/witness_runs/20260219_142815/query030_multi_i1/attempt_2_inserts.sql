@@ -1,0 +1,16 @@
+INSERT INTO customer (c_customer_sk, c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, c_current_addr_sk) VALUES (1000, 'AAAAAAAABAAAAAAA', 'Mr.', 'John', 'Doe', 'Y', 1, 1, 1946, 'USA', 'johndoe', 'john@example.com', NULL, 2000);
+INSERT INTO customer (c_customer_sk, c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, c_current_addr_sk) VALUES (1001, 'AAAAAAAACAAAAAAA', 'Ms.', 'Jane', 'Smith', 'Y', 2, 2, 1947, 'USA', 'janesmith', 'jane@example.com', NULL, 2001);
+INSERT INTO customer (c_customer_sk, c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, c_current_addr_sk) VALUES (1002, 'AAAAAAAADAAAAAAA', 'Dr.', 'Bob', 'Brown', 'Y', 3, 3, 1948, 'USA', 'bobbrown', 'bob@example.com', NULL, 2002);
+INSERT INTO customer (c_customer_sk, c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, c_current_addr_sk) VALUES (1003, 'AAAAAAAAEAAAAAAA', 'Mrs.', 'Alice', 'Green', 'Y', 4, 4, 1949, 'USA', 'alicegreen', 'alice@example.com', NULL, 2003);
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2000, 'CA');
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2001, 'CA');
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2002, 'MI');
+INSERT INTO customer_address (ca_address_sk, ca_state) VALUES (2003, 'MI');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (3000, 1999);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (3001, 1999);
+INSERT INTO item (i_item_sk, i_manager_id) VALUES (4000, 45);
+INSERT INTO item (i_item_sk, i_manager_id) VALUES (4001, 45);
+INSERT INTO web_returns (wr_returning_customer_sk, wr_returning_addr_sk, wr_returned_date_sk, wr_item_sk, wr_reason_sk, wr_return_amt, wr_return_quantity) VALUES (1000, 2000, 3000, 4000, 22, 200.0, 1);
+INSERT INTO web_returns (wr_returning_customer_sk, wr_returning_addr_sk, wr_returned_date_sk, wr_item_sk, wr_reason_sk, wr_return_amt, wr_return_quantity) VALUES (1001, 2001, 3000, 4000, 23, 195.0, 1);
+INSERT INTO web_returns (wr_returning_customer_sk, wr_returning_addr_sk, wr_returned_date_sk, wr_item_sk, wr_reason_sk, wr_return_amt, wr_return_quantity) VALUES (1002, 2002, 3001, 4001, 22, 220.0, 1);
+INSERT INTO web_returns (wr_returning_customer_sk, wr_returning_addr_sk, wr_returned_date_sk, wr_item_sk, wr_reason_sk, wr_return_amt, wr_return_quantity) VALUES (1003, 2003, 3001, 4001, 23, 210.0, 1);

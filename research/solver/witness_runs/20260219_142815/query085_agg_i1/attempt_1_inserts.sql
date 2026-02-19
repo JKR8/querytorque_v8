@@ -1,0 +1,16 @@
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_state) VALUES (1000, 'United States', 'TX');
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_state) VALUES (1001, 'United States', 'TX');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_marital_status) VALUES (2000, 'Secondary', 'M');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_marital_status) VALUES (2001, 'Secondary', 'M');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_marital_status) VALUES (2002, 'Unknown', 'W');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_marital_status) VALUES (2003, 'Unknown', 'W');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (3000, 2000);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (3001, 2000);
+INSERT INTO reason (r_reason_sk, r_reason_desc) VALUES (4000, 'Defective product');
+INSERT INTO reason (r_reason_sk, r_reason_desc) VALUES (4001, 'Wrong size ordered');
+INSERT INTO web_page (wp_web_page_sk) VALUES (5000);
+INSERT INTO web_page (wp_web_page_sk) VALUES (5001);
+INSERT INTO web_returns (wr_item_sk, wr_order_number, wr_reason_sk, wr_refunded_addr_sk, wr_refunded_cdemo_sk, wr_returning_cdemo_sk, wr_refunded_cash, wr_fee) VALUES (6000, 7000, 4000, 1000, 2000, 2001, 50.0, 5.0);
+INSERT INTO web_returns (wr_item_sk, wr_order_number, wr_reason_sk, wr_refunded_addr_sk, wr_refunded_cdemo_sk, wr_returning_cdemo_sk, wr_refunded_cash, wr_fee) VALUES (6001, 7001, 4001, 1001, 2002, 2003, 60.0, 6.0);
+INSERT INTO web_sales (ws_item_sk, ws_order_number, ws_sold_date_sk, ws_web_page_sk, ws_quantity, ws_sales_price, ws_net_profit) VALUES (6000, 7000, 3000, 5000, 10, 160.0, 180);
+INSERT INTO web_sales (ws_item_sk, ws_order_number, ws_sold_date_sk, ws_web_page_sk, ws_quantity, ws_sales_price, ws_net_profit) VALUES (6001, 7001, 3001, 5001, 15, 80.0, 200);

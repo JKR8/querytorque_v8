@@ -1,0 +1,12 @@
+INSERT INTO catalog_sales (cs_bill_cdemo_sk, cs_bill_customer_sk, cs_coupon_amt, cs_item_sk, cs_list_price, cs_net_profit, cs_quantity, cs_sales_price, cs_sold_date_sk, cs_wholesale_cost) VALUES (1000, 1000, 5.0, 1000, 15.0, 3.0, 2, 12.0, 1000, 6.0);
+INSERT INTO catalog_sales (cs_bill_cdemo_sk, cs_bill_customer_sk, cs_coupon_amt, cs_item_sk, cs_list_price, cs_net_profit, cs_quantity, cs_sales_price, cs_sold_date_sk, cs_wholesale_cost) VALUES (1001, 1001, 6.0, 1001, 18.0, 4.0, 3, 14.0, 1001, 8.0);
+INSERT INTO customer (c_birth_month, c_birth_year, c_current_addr_sk, c_customer_sk) VALUES (12, 1970, 1000, 1000);
+INSERT INTO customer (c_birth_month, c_birth_year, c_current_addr_sk, c_customer_sk) VALUES (12, 1975, 1001, 1001);
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_county, ca_state) VALUES (1000, 'USA', 'County1', 'AR');
+INSERT INTO customer_address (ca_address_sk, ca_country, ca_county, ca_state) VALUES (1001, 'USA', 'County2', 'IN');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_gender) VALUES (1000, '4 yr Degree', 'F');
+INSERT INTO customer_demographics (cd_demo_sk, cd_education_status, cd_gender) VALUES (1001, '4 yr Degree', 'F');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (1000, 1999);
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (1001, 1999);
+INSERT INTO item (i_category, i_item_id, i_item_sk) VALUES ('Music', 'ITEM001', 1000);
+INSERT INTO item (i_category, i_item_id, i_item_sk) VALUES ('Music', 'ITEM002', 1001);

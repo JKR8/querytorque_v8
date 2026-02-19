@@ -261,16 +261,30 @@ class WaveRunner:
                     qid = futures[future]
                     logger.warning(f"Wave 1 unhandled error for {qid}: {e}")
 
+        # Clean up cross-engine checkers
+        for state in active.values():
+            if state.session and hasattr(state.session, "close_cross_checker"):
+                state.session.close_cross_checker()
+
         total_probes = sum(len(s.patches) for s in active.values())
         valid_probes = sum(
             sum(1 for p in s.patches if p.semantic_passed)
             for s in active.values()
         )
+        # Count cross-engine failures (patches with "Cross-engine" in apply_error)
+        cross_engine_fails = sum(
+            sum(1 for p in s.patches
+                if p.apply_error and "Cross-engine" in p.apply_error)
+            for s in active.values()
+        )
         pct = (valid_probes / total_probes * 100) if total_probes > 0 else 0
-        console.print(
+        summary = (
             f"  Wave 1 complete: {total} queries, {total_probes} probes, "
             f"{valid_probes} structurally valid ({pct:.1f}%)"
         )
+        if cross_engine_fails:
+            summary += f", {cross_engine_fails} cross-engine equiv fail"
+        console.print(summary)
 
     # ── Wave 3: Compiler API ────────────────────────────────────────────
 

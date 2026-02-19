@@ -1,0 +1,12 @@
+INSERT INTO customer (c_customer_sk, c_current_addr_sk, c_current_cdemo_sk) VALUES (1000, 1000, 1000);
+INSERT INTO customer_address (ca_address_sk) VALUES (1000);
+INSERT INTO customer_demographics (cd_demo_sk, cd_marital_status, cd_education_status) VALUES (1000, 'D', 'College');
+INSERT INTO date_dim (d_date_sk, d_year) VALUES (1000, 1999);
+INSERT INTO item (i_item_sk, i_category, i_manager_id) VALUES (1000, 'Electronics', NULL);
+INSERT INTO item (i_item_sk, i_category, i_manager_id) VALUES (1001, NULL, 50);
+INSERT INTO item (i_item_sk, i_category, i_manager_id) VALUES (1002, 'Men', NULL);
+INSERT INTO item (i_item_sk, i_category, i_manager_id) VALUES (1003, NULL, 55);
+INSERT INTO store_sales (ss_ticket_number, ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price) VALUES (1000, 1000, 1000, 1000, 120);
+INSERT INTO store_sales (ss_ticket_number, ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price) VALUES (1000, 1001, 1000, 1000, 125);
+INSERT INTO store_sales (ss_ticket_number, ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price) VALUES (1001, 1002, 1000, 1000, 118);
+INSERT INTO store_sales (ss_ticket_number, ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_list_price) VALUES (1001, 1003, 1000, 1000, 122);

@@ -1,0 +1,15 @@
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (1000, 5, 2002);
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (1001, 6, 2002);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1000, 1000, 1, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1000, 1000, 1, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1000, 1000, 1000, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1001, 1000, 1, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1001, 1000, 1000, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1000, 1001, 1, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1000, 1001, 1, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1000, 1001, 1000, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1001, 1001, 1, 1000);
+INSERT INTO inventory (inv_date_sk, inv_item_sk, inv_quantity_on_hand, inv_warehouse_sk) VALUES (1001, 1001, 1000, 1000);
+INSERT INTO item (i_category, i_item_sk, i_manager_id) VALUES ('Shoes', 1000, 50);
+INSERT INTO item (i_category, i_item_sk, i_manager_id) VALUES ('Shoes', 1001, 50);
+INSERT INTO warehouse (w_warehouse_name, w_warehouse_sk) VALUES ('Warehouse1', 1000);

@@ -1,0 +1,171 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Hash Join amplifies 41K rows from a Nested Loop of date_dim and store_sales, then later nested loops filter to 12 rows. The comma-separated join syntax may prevent optimal join ordering and predicate pushdown, while the non‑equi zip condition is applied late after the large scan.",
+    "reasoning_trace": [
+      "Hash Join (41155 rows, 443 ms) is the primary time consumer, fed by a Nested Loop of date_dim (9 rows) and store_sales (4465 rows).",
+      "Plan shows comma‑join syntax; PostgreSQL’s optimizer may not reorder joins as freely with comma joins versus explicit JOIN.",
+      "Non‑equi condition substring(ca_zip,1,5) <> substring(s_zip,1,5) is evaluated in the final nested‑loop stage, after the large Hash Join.",
+      "Aggregate reduces 12 rows to 10 rows, indicating aggregation is not the bottleneck."
+    ],
+    "cost_spine": ["Nested Loop (date_dim ⋈ store_sales)", "Hash Join (⋈ store)", "Nested Loop (⋈ item)", "Nested Loop (⋈ customer)", "Nested Loop (⋈ customer_address)", "Aggregate", "Sort", "Limit"],
+    "hotspots": [
+      {
+        "op": "Hash Join",
+        "why": "amplifies 41K rows before later selective filters are applied",
+        "evidence": "rows=41155 time=443.291ms"
+      },
+      {
+        "op": "Nested Loop (date_dim ⋈ store_sales)",
+        "why": "feeds the Hash Join with 41672 rows",
+        "evidence": "rows=41672 time=435.128ms"
+      },
+      {
+        "op": "Nested Loop (⋈ customer_address)",
+        "why": "applies non‑equi zip condition late, but very selective (0 rows)",
+        "evidence": "rows=0 time=0.142ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR‑to‑UNION splits (PostgreSQL uses BitmapOr for indexed OR)",
+      "do not materialize simple EXISTS paths (none present)",
+      "do not duplicate heavy CTE bodies",
+      "avoid unfiltered large CTE introductions"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "A",
+      "target": "Convert comma‑separated joins to explicit JOIN syntax and isolate date_dim filter into a CTE to create a tiny hash table for early probing.",
+      "dag_target_hint": "Replace final_select FROM clause with explicit JOINs and add date_cte.",
+      "node_contract": {
+        "from_must_include": ["date_dim d", "store_sales ss", "item i", "customer c", "customer_address ca", "store s"],
+        "where_must_preserve": ["d.d_year=1999", "d.d_moy=2", "i.i_category='Shoes'", "ca.ca_state='KS'", "c.c_birth_month=2", "ss.ss_wholesale_cost BETWEEN 76 AND 96", "substring(ca.ca_zip,1,5) <> substring(s.s_zip,1,5)"],
+        "output_must_preserve": ["i_brand_id", "i_brand", "i_manufact_id", "i_manufact", "sum(ss_ext_sales_price) as ext_price", "GROUP BY and ORDER BY columns"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Comma joins become explicit JOINs; date_dim scan moves into a CTE; Hash Join may reorder with smaller build side.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot — comma‑join weakness likely blocks optimal join ordering and predicate pushdown.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre‑filter all selective dimensions (date_dim, item, customer, customer_address, store) into separate CTEs, then join the CTEs with store_sales using explicit JOIN syntax.",
+      "dag_target_hint": "Replace final_select FROM with a chain of CTE‑joins, each CTE containing a filtered dimension.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss"],
+        "where_must_preserve": ["d.d_year=1999", "d.d_moy=2", "i.i_category='Shoes'", "ca.ca_state='KS'", "c.c_birth_month=2", "ss.ss_wholesale_cost BETWEEN 76 AND 96", "substring(ca.ca_zip,1,5) <> substring(s.s_zip,1,5)"],
+        "output_must_preserve": ["All original output columns and aggregation semantics"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Multiple small dimension CTEs built first; store_sales scan joins via explicit joins with early key‑filtering; Hash Join may disappear or shrink.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot by reducing fact‑table scan via pre‑filtered dimension hash tables.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "target": "Materialize filtered dimension keys (date_dim, item, customer, customer_address, store) into CTEs, then join them with store_sales in a staged reduction before applying the non‑equi zip condition.",
+      "dag_target_hint": "Build a CTE chain that progressively reduces rows: dim CTEs → fact join → final non‑equi filter.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss"],
+        "where_must_preserve": ["d.d_year=1999", "d.d_moy=2", "i.i_category='Shoes'", "ca.ca_state='KS'", "c.c_birth_month=2", "ss.ss_wholesale_cost BETWEEN 76 AND 96", "substring(ca.ca_zip,1,5) <> substring(s.s_zip,1,5)"],
+        "output_must_preserve": ["All original output columns and aggregation semantics"]
+      },
+      "gates_checked": ["G_PG_NONEQUI_PRESENT:PASS", "G_PG_NONEQUI_CARDINALITY:PASS", "G_PG_NONEQUI_FILTER_QUALITY:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.65,
+      "expected_explain_delta": "Non‑equi join input sizes drop because dimensions are pre‑filtered and fact rows are reduced before the inequality check.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Addresses secondary hotspot (late non‑equi filter) by reducing both dimension and fact rows before the expensive condition.",
+      "recommended_examples": ["pg_materialized_dimension_fact_prefilter"],
+      "gold_example_id": "pg_materialized_dimension_fact_prefilter"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre‑aggregate store_sales by ss_item_sk, ss_customer_sk, ss_store_sk and date_sk before joining with dimensions, preserving the sum(ss_ext_sales_price) and filters on wholesale_cost.",
+      "dag_target_hint": "Insert a CTE that groups store_sales by its foreign keys, then join with filtered dimensions.",
+      "node_contract": {
+        "from_must_include": ["store_sales ss"],
+        "where_must_preserve": ["ss.ss_wholesale_cost BETWEEN 76 AND 96"],
+        "output_must_preserve": ["sum(ss_ext_sales_price) as ext_price", "grouping key compatibility with item, customer, store, and date_dim joins"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregation pushdown may reduce rows entering the multi‑way join, even though the aggregate is not the primary bottleneck.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Store_sales scan outputs fewer rows because aggregation occurs before joining dimensions; Hash Join input shrinks.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration — tests whether early aggregation can reduce the Hash Join amplification despite the presence of multiple dimension filters.",
+      "recommended_examples": ["pg_agg_pushdown_fact_key_01"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan; PostgreSQL uses BitmapOr for indexed OR, and splitting risks regression."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in the SQL."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in the query."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "No repeated scans or self‑join patterns in the plan."
+    },
+    {
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "reason": "Portability candidate with duckdb engine; PostgreSQL runtime profile does not strongly support this shape."
+    },
+    {
+      "transform_id": "dimension_cte_isolate",
+      "family": "A",
+      "reason": "Portability candidate with duckdb engine; prefer native PostgreSQL transforms first."
+    }
+  ]
+}

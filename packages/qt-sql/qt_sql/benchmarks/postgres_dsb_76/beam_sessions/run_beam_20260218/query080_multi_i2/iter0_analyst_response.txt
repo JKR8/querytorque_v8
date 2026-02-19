@@ -1,0 +1,160 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Comma joins in the channel CTEs lead to poor cardinality estimates and inefficient join orders, particularly in the web sales branch where a hash join processes 446 rows versus an estimate of 7. Pre-filtering selective dimensions into materialized CTEs and converting to explicit joins may improve selectivity propagation and reduce intermediate row counts.",
+    "reasoning_trace": [
+      "wsr branch dominates total time (367.779 ms) with hash join cardinality mismatch (est=7, act=446).",
+      "Comma-join syntax in all channel CTEs may prevent optimal join order and selectivity propagation.",
+      "Similar patterns across channels suggest shared dimension pre-filtering could reduce redundant work.",
+      "No correlated subqueries or set operations present, limiting applicability of families B and D."
+    ],
+    "cost_spine": ["Nested Loop (wsr)", "Hash Join (wsr)", "Nested Loop (csr)", "Hash Join (csr)", "Aggregate", "Sort"],
+    "hotspots": [
+      {
+        "op": "Hash Join in wsr",
+        "why": "cardinality estimation error leads to inefficient plan",
+        "evidence": "rows=446 time=170.238 ms, estimated rows=7 per Q-Error"
+      },
+      {
+        "op": "Nested Loop in wsr",
+        "why": "large intermediate result joining date_dim and web_sales",
+        "evidence": "rows=9748 time=169.052 ms"
+      },
+      {
+        "op": "ssr branch",
+        "why": "secondary bottleneck",
+        "evidence": "time=229.097 ms"
+      }
+    ],
+    "do_not_do": [
+      "avoid same-column OR to UNION ALL split (PostgreSQL BitmapOr strength)",
+      "avoid decorrelation on EXISTS paths (protect semi-join optimizations)",
+      "avoid unfiltered large CTE introduction"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, item, promotion) into separate CTEs with their predicates, then rewrite each channel CTE (ssr, csr, wsr) to use explicit JOIN syntax with these dimension CTEs, preserving all original filters and aggregates.",
+      "dag_target_hint": "Change FROM clauses in ssr, csr, wsr to explicit joins with dimension CTEs; insert dimension CTEs before channel CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "item", "promotion"],
+        "where_must_preserve": ["d_date between cast('1999-10-21' as date) and cast('1999-10-21' as date) + interval '30 day'", "i_current_price > 50", "p_channel_email = 'Y' and p_channel_tv = 'N' and p_channel_radio = 'N' and p_channel_press = 'N' and p_channel_event = 'N'", "ss_wholesale_cost BETWEEN 21 AND 36", "i_category IN ('Men', 'Music')"],
+        "output_must_preserve": ["store_id, sales, returns, profit for ssr", "catalog_page_id, sales, returns, profit for csr", "web_site_id, sales, returns, profit for wsr", "final aggregate and rollup structure"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma joins replaced with explicit joins; dimension CTEs materialized as tiny hash tables; hash join rows reduced due to better selectivity propagation.",
+      "recommended_patch_ops": ["insert_cte_for_dimension", "replace_from_with_explicit_joins", "preserve_where_predicates"],
+      "recommended_examples": ["pg_explicit_join_materialized"],
+      "rank_rationale": "Targets primary hotspot—comma joins in wsr with large cardinality mismatch and has gold example support for PostgreSQL.",
+      "gold_example_id": "pg_explicit_join_materialized"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Isolate date_dim filter into a CTE for the date range, then rewrite each channel CTE to use explicit JOIN with this date CTE, keeping other dimensions in the FROM clause with explicit joins.",
+      "dag_target_hint": "Insert date_cte and change date_dim joins to explicit JOIN with date_cte in ssr, csr, wsr.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "item", "promotion"],
+        "where_must_preserve": ["d_date between cast('1999-10-21' as date) and cast('1999-10-21' as date) + interval '30 day'", "all other original filters"],
+        "output_must_preserve": ["same as original CTE outputs", "final aggregate and rollup"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Date dimension pre-filtered into CTE; explicit joins reduce nested loop work; improved cardinality estimates for downstream joins.",
+      "recommended_patch_ops": ["insert_date_cte", "replace_date_dim_join", "ensure_explicit_join_syntax"],
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "rank_rationale": "Addresses comma join weakness with focus on date_dim, which is a selective filter across all channels.",
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate each fact table (store_sales, catalog_sales, web_sales) on their join keys (ss_item_sk, ss_promo_sk, etc.) before joining dimensions, then adjust channel CTEs to join with these pre-aggregated fact CTEs.",
+      "dag_target_hint": "Insert fact_agg CTEs and modify ssr, csr, wsr FROM clauses to join with these CTEs instead of raw fact tables.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "item", "promotion"],
+        "where_must_preserve": ["all original dimension filters", "fact table filters like ss_wholesale_cost BETWEEN 21 AND 36"],
+        "output_must_preserve": ["aggregate results (sales, returns, profit) per group", "grouping keys compatibility with downstream joins"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregating fact tables early may reduce rows entering dimension joins, especially for large fact scans, but could affect join multiplicity if not careful.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Fact table scans replaced with smaller aggregate CTEs; join input rows reduced; potential for faster hash joins.",
+      "recommended_patch_ops": ["insert_fact_agg_cte", "replace_fact_table_in_from", "adjust_group_by_keys"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration targeting secondary hotspot—reducing fact table volume before joins, which is underrepresented in initial probes.",
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract shared dimension filters (date_dim, item, promotion) into a single CTE that returns filtered surrogate keys, then reference this CTE in each channel CTE to avoid redundant dimension scans.",
+      "dag_target_hint": "Create shared_dim_cte and modify ssr, csr, wsr to join with this CTE instead of scanning dimensions separately.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "date_dim", "item", "promotion"],
+        "where_must_preserve": ["all original dimension predicates"],
+        "output_must_preserve": ["dimension key columns for joins", "channel CTE outputs unchanged"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:MANUAL_REVIEW", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Shared dimension CTE could reduce redundant dimension work across channels, but portability from duckdb may not translate directly to PostgreSQL materialization behavior.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Dimension scans consolidated into one CTE; channel CTEs probe smaller hash tables; reduced repeated work.",
+      "recommended_patch_ops": ["insert_shared_dim_cte", "replace_dimension_scans", "ensure_key_join_compatibility"],
+      "recommended_examples": [],
+      "rank_rationale": "Exploration targeting secondary hotspot with underrepresented family A, testing shared dimension reuse across channels.",
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence; PostgreSQL BitmapOr strength makes this transform risky per regression registry."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL or plan; family B not applicable."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query; family D not applicable."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "Designed for non-equi joins; query has only equi joins, so not a direct fit."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+INSERT INTO customer (c_customer_sk, c_current_cdemo_sk, c_current_addr_sk, c_birth_month) VALUES (1000, 2000, 3000, 4);
+INSERT INTO customer (c_customer_sk, c_current_cdemo_sk, c_current_addr_sk, c_birth_month) VALUES (1001, 2001, 3001, 5);
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count) VALUES (2000, 'M', 'U', 'College', 500, 'Good', 2, 1, 1);
+INSERT INTO customer_demographics (cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count) VALUES (2001, 'M', 'S', 'College', 600, 'Good', 2, 1, 1);
+INSERT INTO customer_address (ca_address_sk, ca_county) VALUES (3000, 'Alameda County');
+INSERT INTO customer_address (ca_address_sk, ca_county) VALUES (3001, 'Lexington city');
+INSERT INTO item (i_item_sk, i_category, i_manager_id) VALUES (4000, 'Children', 95);
+INSERT INTO item (i_item_sk, i_category, i_manager_id) VALUES (4001, 'Home', 96);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy) VALUES (5000, 1999, 5);
+INSERT INTO date_dim (d_date_sk, d_year, d_moy) VALUES (5001, 1999, 6);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_sold_date_sk, ss_list_price, ss_sales_price) VALUES (1000, 4000, 5000, 100.0, 70.0);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_sold_date_sk, ss_list_price, ss_sales_price) VALUES (1001, 4001, 5001, 100.0, 70.0);
+INSERT INTO web_sales (ws_bill_customer_sk, ws_item_sk, ws_sold_date_sk, ws_list_price, ws_sales_price) VALUES (1000, 4000, 5000, 100.0, 70.0);
+INSERT INTO web_sales (ws_bill_customer_sk, ws_item_sk, ws_sold_date_sk, ws_list_price, ws_sales_price) VALUES (1001, 4001, 5001, 100.0, 70.0);
+INSERT INTO catalog_sales (cs_ship_customer_sk, cs_item_sk, cs_sold_date_sk, cs_list_price, cs_sales_price) VALUES (1000, 4000, 5000, 100.0, 70.0);
+INSERT INTO catalog_sales (cs_ship_customer_sk, cs_item_sk, cs_sold_date_sk, cs_list_price, cs_sales_price) VALUES (1001, 4001, 5001, 100.0, 70.0);

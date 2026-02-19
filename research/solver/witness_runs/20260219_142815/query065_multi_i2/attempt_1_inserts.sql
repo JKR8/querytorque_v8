@@ -1,0 +1,12 @@
+INSERT INTO date_dim (d_date_sk, d_month_seq) VALUES (1000, 1215);
+INSERT INTO date_dim (d_date_sk, d_month_seq) VALUES (1001, 1216);
+INSERT INTO item (i_item_sk, i_manager_id, i_brand, i_current_price, i_item_desc, i_wholesale_cost) VALUES (2000, 10, 'BrandA', 15.0, 'Item one', 5.0);
+INSERT INTO item (i_item_sk, i_manager_id, i_brand, i_current_price, i_item_desc, i_wholesale_cost) VALUES (2001, 11, 'BrandB', 20.0, 'Item two', 8.0);
+INSERT INTO item (i_item_sk, i_manager_id, i_brand, i_current_price, i_item_desc, i_wholesale_cost) VALUES (2002, 12, 'BrandC', 18.0, 'Item three', 6.0);
+INSERT INTO item (i_item_sk, i_manager_id, i_brand, i_current_price, i_item_desc, i_wholesale_cost) VALUES (2003, 13, 'BrandD', 22.0, 'Item four', 9.0);
+INSERT INTO store (s_store_sk, s_state, s_store_name) VALUES (3000, 'KS', 'Store KS');
+INSERT INTO store (s_store_sk, s_state, s_store_name) VALUES (3001, 'OH', 'Store OH');
+INSERT INTO store_sales (ss_sold_date_sk, ss_store_sk, ss_item_sk, ss_sales_price, ss_list_price) VALUES (1000, 3000, 2000, 8.0, 10.0);
+INSERT INTO store_sales (ss_sold_date_sk, ss_store_sk, ss_item_sk, ss_sales_price, ss_list_price) VALUES (1000, 3000, 2001, 8.0, 10.0);
+INSERT INTO store_sales (ss_sold_date_sk, ss_store_sk, ss_item_sk, ss_sales_price, ss_list_price) VALUES (1001, 3001, 2002, 8.0, 10.0);
+INSERT INTO store_sales (ss_sold_date_sk, ss_store_sk, ss_item_sk, ss_sales_price, ss_list_price) VALUES (1001, 3001, 2003, 8.0, 10.0);

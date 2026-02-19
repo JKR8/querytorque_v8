@@ -1,0 +1,10 @@
+INSERT INTO date_dim (d_date_sk, d_day_name, d_month_seq, d_week_seq, d_week_seq1) VALUES (1000, 'Sunday', 1187, 1000, NULL);
+INSERT INTO date_dim (d_date_sk, d_day_name, d_month_seq, d_week_seq, d_week_seq1) VALUES (1001, 'Monday', 1199, 1052, NULL);
+INSERT INTO date_dim (d_date_sk, d_day_name, d_month_seq, d_week_seq, d_week_seq1) VALUES (1002, 'Sunday', 1187, 1001, NULL);
+INSERT INTO date_dim (d_date_sk, d_day_name, d_month_seq, d_week_seq, d_week_seq1) VALUES (1003, 'Monday', 1199, 1053, NULL);
+INSERT INTO store (s_state, s_store_id1, s_store_id2, s_store_name1, s_store_sk) VALUES ('TX', 'TX_Store1', NULL, NULL, 1000);
+INSERT INTO store (s_state, s_store_id1, s_store_id2, s_store_name1, s_store_sk) VALUES ('TX', 'TX_Store2', NULL, NULL, 1001);
+INSERT INTO store_sales (ss_list_price, ss_sales_price, ss_sold_date_sk, ss_store_sk) VALUES (100.0, 60.0, 1000, 1000);
+INSERT INTO store_sales (ss_list_price, ss_sales_price, ss_sold_date_sk, ss_store_sk) VALUES (100.0, 60.0, 1001, 1000);
+INSERT INTO store_sales (ss_list_price, ss_sales_price, ss_sold_date_sk, ss_store_sk) VALUES (100.0, 60.0, 1002, 1001);
+INSERT INTO store_sales (ss_list_price, ss_sales_price, ss_sold_date_sk, ss_store_sk) VALUES (100.0, 60.0, 1003, 1001);

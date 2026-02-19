@@ -1,0 +1,158 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary bottleneck is a sequential scan on store_sales (138k rows, ~22s) because dimension filters (item, customer_address) are applied after the scan. The comma-join syntax may prevent predicate pushdown and optimal join reordering, leading to a large hash join. Web_sales branch is negligible (0 rows).",
+    "reasoning_trace": [
+      "Seq Scan on store_sales consumes 21992ms, 95% of total runtime.",
+      "Hash Join builds from store_sales (138k rows) with filtered item (272 rows), but item filters are applied after the scan.",
+      "Plan shows comma-join pattern (FROM a,b,c) which PostgreSQL may not reorder as effectively as explicit JOINs.",
+      "Zero rows from web_sales branch, so optimizations should focus solely on store_sales CTE."
+    ],
+    "cost_spine": ["Seq Scan on store_sales", "Hash Join", "Nested Loop", "Nested Loop", "Aggregate"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on store_sales",
+        "why": "Full table scan without early dimension filtering",
+        "evidence": "rows=138412, time=21992.784ms"
+      },
+      {
+        "op": "Hash Join",
+        "why": "Large build side from store_sales before dimension filters reduce rows",
+        "evidence": "rows=138412, time=22878.752ms"
+      }
+    ],
+    "do_not_do": [
+      "Avoid OR-to-UNION transforms (PostgreSQL uses BitmapOr for indexed OR).",
+      "Do not materialize EXISTS/NOT EXISTS paths (no correlated subqueries present).",
+      "Avoid duplicating heavy CTE bodies; filter output instead."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma-separated joins in the ss and ws CTEs to explicit INNER JOIN syntax, preserving all original predicates in ON clauses.",
+      "dag_target_hint": "Change SQL of node 'ss' and node 'ws' from comma joins to explicit JOINs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "Explicit JOIN syntax may enable better join reordering and predicate pushdown, potentially replacing Seq Scan with an index-assisted join.",
+      "recommended_patch_ops": ["replace_from", "replace_where_predicate"],
+      "rank_rationale": "Targets primary hotspot (store_sales scan) by enabling PostgreSQL's inner-join reordering and predicate pushdown via explicit JOINs.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter selective dimension tables (item, customer_address) into separate CTEs with MATERIALIZED keyword, then join them with store_sales using explicit JOINs.",
+      "dag_target_hint": "Replace node 'ss' with a CTE chain: filtered_item, filtered_ca, then join with store_sales and date_dim.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN", "G_PG_CTE_REUSE_REQUIRED:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Small dimension CTEs build tiny hash tables, allowing store_sales to probe via index on ss_item_sk or ss_addr_sk, reducing sequential scan rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "add_materialized_hint"],
+      "rank_rationale": "Addresses primary hotspot by forcing early dimension filtering before store_sales scan, leveraging PostgreSQL's CTE materialization.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter_decorrelate",
+      "family": "B",
+      "target": "Push item and customer_address filters into a pre-filtered CTE, then join with store_sales. Use MATERIALIZED to prevent inlining.",
+      "dag_target_hint": "Wrap filtered item and customer_address in a CTE, then join with store_sales in node 'ss'.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_CORR_SCALAR_REQUIRED:FAIL", "G_PG_CORR_EXISTS_PROTECTION:PASS", "G_PG_CORR_FACT_COUNT:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Although no correlated subquery exists, the early-filtering mechanism may still reduce store_sales scan volume if the planner can push filters across CTE boundaries with MATERIALIZED hint.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Store_sales scan may change to an index scan or reduced rows if dimension CTEs are materialized and joined via indexed keys.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "add_materialized_hint"],
+      "rank_rationale": "Exploration probe targeting secondary hotspot (hash join) by attempting early dimension filtering via CTE materialization, a pattern successful in similar PostgreSQL queries.",
+      "recommended_examples": ["early_filter_decorrelate"]
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create separate CTEs for filtered item and customer_address, then join them with store_sales in a single CTE using explicit joins. Use portability candidate shape adapted for PostgreSQL.",
+      "dag_target_hint": "Replace node 'ss' with a CTE that first filters item and customer_address, then joins with store_sales and date_dim.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["i_color IN ('dark', 'puff')", "i_manager_id BETWEEN 15 and 34", "ss_list_price between 244 and 258", "ca_state in ('KS','OH')"],
+        "output_must_preserve": ["ca_county", "d_qoy", "d_year", "store_sales"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:WARN", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Multi-dimension prefetch, though a portability candidate, may still benefit PostgreSQL by reducing fact-table scan via early filtered dimension hash tables.",
+      "confidence": 0.50,
+      "expected_explain_delta": "Potential reduction in store_sales scan rows if dimension CTEs are materialized and joined via indexes.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration probe testing multi-dimension early filtering, a secondary mechanism to reduce fact-table I/O.",
+      "recommended_examples": ["multi_dimension_prefetch"]
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL uses BitmapOr for indexed OR, transform likely harmful."
+    },
+    {
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "reason": "No correlated scalar subquery present in SQL."
+    },
+    {
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "reason": "CTE 'ss' is already materialized and scanned multiple times; decomposition would duplicate scans without evidence of benefit."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation is already performed directly on the fact table join; no clear pushdown opportunity."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT or set operations in query."
+    }
+  ]
+}

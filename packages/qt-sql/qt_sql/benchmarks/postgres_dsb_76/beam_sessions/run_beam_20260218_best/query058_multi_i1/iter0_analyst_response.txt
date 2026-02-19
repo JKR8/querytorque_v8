@@ -1,0 +1,173 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "The plan shows three independent fact-table scans (store_sales, catalog_sales, web_sales) each joined to the same small dimension tables (date_dim, item, customer) via nested loops. Each branch repeats the same date_dim subquery and dimension filters, causing redundant work. The primary bottleneck is repeated scanning of large fact tables without early reduction from selective dimension filters.",
+    "reasoning_trace": [
+      "Three separate CTEs scan large fact tables (store_sales 28.8M rows, catalog_sales 14.4M rows, web_sales 7.2M rows) with identical dimension filters.",
+      "Each CTE repeats the same date_dim subquery (d_month_seq lookup) and filters on item.manager_id and customer.birth_year.",
+      "Nested loops join patterns indicate dimension tables are small but filters are applied late relative to fact scans.",
+      "No correlated subqueries present, ruling out family B transforms.",
+      "No set operations or OR predicates, ruling out family D transforms.",
+      "Aggregation occurs after joins, but group-by keys include dimension columns, limiting pushdown opportunities."
+    ],
+    "cost_spine": ["Merge Join", "Aggregate", "Nested Loop", "Hash Join", "Index Only Scan", "Seq Scan"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (store_sales branch)",
+        "why": "largest fact table scan with late dimension filtering",
+        "evidence": "rows=6909, time=361ms, store_sales scan returns 446 rows before item/customer filters reduce to 0 rows"
+      },
+      {
+        "op": "Nested Loop (catalog_sales branch)",
+        "why": "second largest fact scan with same late filter pattern",
+        "evidence": "rows=1705, time=179ms"
+      },
+      {
+        "op": "Nested Loop (web_sales branch)",
+        "why": "third fact scan with same pattern",
+        "evidence": "rows=1590, time=374ms"
+      },
+      {
+        "op": "Repeated date_dim subquery",
+        "why": "same subquery executed 6 times across branches",
+        "evidence": "Index Only Scan on date_dim appears 6 times with similar timing"
+      }
+    ],
+    "do_not_do": [
+      "avoid OR to UNION ALL transforms (no OR predicates)",
+      "avoid decorrelation transforms (no correlated subqueries)",
+      "avoid materializing EXISTS paths (none present)",
+      "do not duplicate large CTE bodies (guard against CTE_MATERIALIZATION_FENCE)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Extract date_dim subquery into a CTE returning d_date_sk for the target month_seq, convert comma joins to explicit JOIN syntax in all three channel CTEs.",
+      "dag_target_hint": "Replace date_dim subquery references in ss_items, cs_items, ws_items with CTE join.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales", "item", "customer"],
+        "where_must_preserve": ["i_manager_id BETWEEN 71 and 100", "c_birth_year BETWEEN 1945 AND 1951", "ss_list_price between 242 and 271", "cs_list_price between 242 and 271", "ws_list_price between 242 and 271"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "ss_item_rev", "cs_item_rev", "ws_item_rev", "final ORDER BY and LIMIT"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Eliminate repeated date_dim subquery scans, reduce nested loop iterations via explicit join ordering.",
+      "recommended_patch_ops": ["insert_cte_date_range", "replace_from_comma_to_join", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot — addresses repeated date subquery and comma join weakness directly.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter item and customer tables into CTEs, then join filtered dimensions with fact tables using explicit JOIN syntax.",
+      "dag_target_hint": "Replace dimension table references in ss_items, cs_items, ws_items with pre-filtered CTEs.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["i_manager_id BETWEEN 71 and 100", "c_birth_year BETWEEN 1945 AND 1951", "price range predicates"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "aggregate sums", "final output columns"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.80,
+      "expected_explain_delta": "Reduce fact table scan rows via early dimension filtering, shrink nested loop inner side.",
+      "recommended_patch_ops": ["insert_cte_item_filtered", "insert_cte_customer_filtered", "replace_from_comma_to_join"],
+      "rank_rationale": "Secondary hotspot — reduces fact scan volume by applying dimension filters earlier.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "multi_dimension_prefetch",
+      "family": "A",
+      "target": "Create a single CTE that joins filtered item, customer, and date_range, then join this consolidated dimension set with each fact table separately.",
+      "dag_target_hint": "Replace all dimension references in channel CTEs with a single pre-joined dimension CTE.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "catalog_sales", "web_sales"],
+        "where_must_preserve": ["price range predicates"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "aggregate sums", "final output columns"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:REVIEW", "G_PG_CROSS_CTE_SETOP_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Consolidating all dimension filtering into one CTE may reduce repeated work further than separate dimension CTEs.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Single dimension CTE scanned once per channel, reducing redundant dimension joins.",
+      "recommended_patch_ops": ["insert_cte_dimension_bundle", "replace_from_comma_to_join"],
+      "rank_rationale": "Exploration — tests if dimension consolidation outperforms separate dimension CTEs.",
+      "recommended_examples": ["multi_dimension_prefetch"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered fact-dimension join for each channel into separate CTEs to avoid recomputation of common subplans.",
+      "dag_target_hint": "Replace each channel's FROM clause with a pre-materialized CTE containing the filtered join result.",
+      "node_contract": {
+        "from_must_include": [],
+        "where_must_preserve": ["price range predicates", "dimension filters"],
+        "output_must_preserve": ["i_item_id", "c_birth_year", "aggregate sums", "final output columns"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "PostgreSQL's CTE materialization may fence and reuse the filtered join result, reducing repeated work.",
+      "confidence": 0.55,
+      "expected_explain_delta": "CTE materialization reduces repeated scans of fact and dimension tables.",
+      "recommended_patch_ops": ["insert_cte_ss_filtered", "insert_cte_cs_filtered", "insert_cte_ws_filtered"],
+      "rank_rationale": "Exploration — tests PostgreSQL's CTE materialization benefit for repeated join patterns.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan evidence."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Group-by includes dimension columns (c_birth_year), making pushdown semantically unsafe without joining dimensions first."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    },
+    {
+      "transform_id": "channel_bitmap_aggregation",
+      "family": "C",
+      "reason": "Plan shows separate fact table scans, but aggregation keys differ by customer join column (ss_customer_sk vs cs_bill_customer_sk vs ws_bill_customer_sk), making single-pass unsafe."
+    }
+  ]
+}

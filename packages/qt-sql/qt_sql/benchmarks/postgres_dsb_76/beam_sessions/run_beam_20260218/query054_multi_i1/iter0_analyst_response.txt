@@ -1,0 +1,155 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary bottleneck is the my_customers CTE building a large union of two fact tables (catalog_sales, web_sales) before joining with dimensions, causing 18519 rows to flow through nested loops. Secondary hotspot is the my_revenue CTE where store_sales scan shows zero rows but uses bitmap index scan, indicating late filter application after dimension joins.",
+    "reasoning_trace": [
+      "Nested Loop in my_customers processes 18519 rows (time=456ms) before hash join with customer.",
+      "Append (union) of catalog_sales and web_sales scans 1792 rows total, but date_dim filter (d_moy=1, d_year=1998) returns only 10 rows.",
+      "Bitmap Heap Scan on store_sales shows rows=0, time=0.0, but is executed after multiple nested loops.",
+      "Plan shows comma-join pattern in my_customers CTE (FROM ... cs_or_ws_sales, item, date_dim, customer)."
+    ],
+    "cost_spine": ["Nested Loop (18519 rows)", "Hash Join (134 rows)", "Unique (69 rows)", "Nested Loop (my_revenue)"],
+    "hotspots": [
+      {
+        "op": "Nested Loop (my_customers)",
+        "why": "Large intermediate result from union of two fact tables before dimension filters are fully applied.",
+        "evidence": "rows=18519 time=456ms"
+      },
+      {
+        "op": "Bitmap Heap Scan on store_sales",
+        "why": "Zero rows returned but scan occurs late in plan after dimension joins; indicates filter pushdown opportunity.",
+        "evidence": "rows=0 time=0.0 but part of nested loop chain"
+      }
+    ],
+    "do_not_do": [
+      "Avoid OR-to-UNION transforms (PostgreSQL uses BitmapOr for indexed OR).",
+      "Do not materialize simple EXISTS paths (none present).",
+      "Avoid duplicating heavy CTE bodies."
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins in my_customers CTE to explicit INNER JOIN syntax and pre-filter date_dim (d_moy=1, d_year=1998) into a tiny CTE to create a small hash table for fact probes.",
+      "dag_target_hint": "Rewrite my_customers CTE FROM clause to use explicit JOIN ON predicates.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "item", "date_dim", "customer"],
+        "where_must_preserve": ["i_category = 'Electronics'", "i_class = 'personal'", "c_birth_year BETWEEN 1928 AND 1941", "wholesale_cost BETWEEN 35 AND 65"],
+        "output_must_preserve": ["DISTINCT c_customer_sk, c_current_addr_sk"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.85,
+      "expected_explain_delta": "Comma join replaced with explicit joins; date_dim scan becomes a small CTE; nested loop input rows reduce.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Primary hotspot attack: comma join weakness is confirmed, and transform is native PostgreSQL with gold example support.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Pre-filter all selective dimensions (date_dim, item, customer) into separate CTEs before joining with the UNION of fact tables, using explicit JOIN syntax.",
+      "dag_target_hint": "Replace my_customers CTE with a chain of CTEs: filtered_date, filtered_item, filtered_customer, then join with unioned sales.",
+      "node_contract": {
+        "from_must_include": ["catalog_sales", "web_sales", "item", "date_dim", "customer"],
+        "where_must_preserve": ["i_category = 'Electronics'", "i_class = 'personal'", "c_birth_year BETWEEN 1928 AND 1941", "wholesale_cost BETWEEN 35 AND 65"],
+        "output_must_preserve": ["DISTINCT c_customer_sk, c_current_addr_sk"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.78,
+      "expected_explain_delta": "Multiple small dimension CTEs built; fact table scans probe tiny hash tables; nested loop rows drop significantly.",
+      "recommended_patch_ops": ["insert_cte", "replace_from", "replace_where_predicate"],
+      "rank_rationale": "Secondary dimension prefetch: extends explicit join approach with multi-dimension filtering, native PostgreSQL.",
+      "recommended_examples": ["pg_dimension_prefetch_star"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Push store_sales filter (ss_wholesale_cost BETWEEN 35 AND 65) and date range filter into a pre-filtered CTE before joining with my_customers and other dimensions in my_revenue CTE.",
+      "dag_target_hint": "Modify my_revenue CTE to join with a pre-filtered store_sales CTE that includes date_dim join and wholesale cost filter.",
+      "node_contract": {
+        "from_must_include": ["store_sales", "date_dim"],
+        "where_must_preserve": ["ss_wholesale_cost BETWEEN 35 AND 65", "d_month_seq between (subquery) and (subquery)"],
+        "output_must_preserve": ["ss_customer_sk", "ss_ext_sales_price"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CROSS_CTE_SCALE_GUARD:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Bitmap heap scan on store_sales returns zero rows because filters are applied after dimension joins; early filtering may eliminate the scan entirely.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Store_sales scan moves earlier with filters applied; bitmap heap scan may disappear or show positive rows.",
+      "recommended_patch_ops": ["insert_cte", "replace_from"],
+      "rank_rationale": "Exploration targeting secondary hotspot: store_sales scan with zero rows suggests late filter application.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "materialize_cte",
+      "family": "E",
+      "target": "Materialize the two identical scalar subqueries on date_dim (d_month_seq+1 and d_month_seq+3) into a single CTE to avoid duplicate index-only scans.",
+      "dag_target_hint": "Replace the two scalar subqueries in my_revenue WITH clause with a single CTE returning both values.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_year = 1998", "d_moy = 1"],
+        "output_must_preserve": ["d_month_seq+1 as low_seq", "d_month_seq+3 as high_seq"]
+      },
+      "gates_checked": ["G_PG_CTE_REUSE_REQUIRED:PASS", "G_PG_CTE_DUPLICATION_BLOCK:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Two identical index-only scans on date_dim (date_dim_2, date_dim_3) with zero rows each; materializing once may reduce overhead.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Duplicate index-only scans merge into one CTE scan.",
+      "recommended_patch_ops": ["insert_cte", "replace_scalar_subquery"],
+      "rank_rationale": "Exploration targeting minor duplication; low risk, potential small gain.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; PostgreSQL BitmapOr guard prohibits default use."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries present in SQL or plan."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "No aggregation before join hotspot; my_revenue aggregate is after all joins."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    }
+  ]
+}

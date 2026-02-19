@@ -1,0 +1,150 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Primary hotspot is large sequential scan on catalog_returns (rows=176, time=1521.9ms) feeding a nested loop join. Secondary hotspot is repeated date_dim subquery evaluation (same pattern in sr_items and cr_items) causing redundant work. The plan shows no correlated subqueries or nested loops, but repeated dimension scans and late filter application after fact table scans.",
+    "reasoning_trace": [
+      "Sequential Scan on catalog_returns consumes 1521.9ms, largest single operator cost.",
+      "Date_dim subquery pattern appears twice (sr_items, cr_items) with similar hash join structures, each scanning date_dim via index-only scans then a hash join.",
+      "No nested loops in main join pattern; all joins are hash or nested loop for dimension lookups.",
+      "Estimation error: ZERO_EST for web_returns branch (rows=0) but no time spent, so not a bottleneck.",
+      "Anti-padding guard: store_returns and web_returns scans are negligible in time relative to catalog_returns scan."
+    ],
+    "cost_spine": ["Seq Scan catalog_returns", "Hash Join date_dim", "Nested Loop store_returns", "Aggregate sr_items", "Aggregate cr_items", "Nested Loop final join"],
+    "hotspots": [
+      {
+        "op": "Seq Scan on catalog_returns",
+        "why": "largest measured I/O time, unfiltered scan before date join",
+        "evidence": "rows=176 time=1521.929ms"
+      },
+      {
+        "op": "Hash Join (date_dim subquery branch in sr_items)",
+        "why": "repeated work for same date filter across channels",
+        "evidence": "rows=36524 time=46.783ms (sr_items), similar pattern in cr_items"
+      },
+      {
+        "op": "Nested Loop store_returns",
+        "why": "fact table probe after date filter, but still 20.7ms per row",
+        "evidence": "rows=1 time=20.7ms (multiplied by 60 rows from date hash join)"
+      }
+    ],
+    "do_not_do": [
+      "Do not split OR to UNION; no OR predicates in plan.",
+      "Do not decorrelate; no correlated subqueries in plan.",
+      "Do not materialize CTEs for web_returns branch (zero rows).",
+      "Avoid aggressive join reorder; inner joins already reorder well in PostgreSQL."
+    ]
+  },
+  "probe_summary_schema": ["probe_id", "transform_id", "family", "expected_explain_delta", "confidence", "exploration", "rank_rationale", "target", "dag_target_hint", "recommended_patch_ops", "recommended_examples"],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "shared_dimension_multi_channel",
+      "family": "A",
+      "target": "Extract common date filter subquery into a single CTE (filtered_dates) and reference it in all three channel CTEs (sr_items, cr_items, wr_items) to avoid redundant date_dim scans.",
+      "dag_target_hint": "Replace date_dim subqueries in sr_items, cr_items, wr_items with JOIN filtered_dates.",
+      "node_contract": {
+        "from_must_include": ["date_dim"],
+        "where_must_preserve": ["d_date in ('2002-02-26','2002-05-03','2002-08-19','2002-11-18')"],
+        "output_must_preserve": ["d_date_sk", "d_date"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_COMMA_JOIN_PAIRING:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS (three references)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.75,
+      "expected_explain_delta": "Date_dim scans reduce from three to one; hash joins become simple lookups to materialized CTE.",
+      "recommended_patch_ops": ["insert_cte filtered_dates", "replace_subquery_with_cte_reference"],
+      "rank_rationale": "Primary exploration target: repeated date_dim scans are secondary hotspot; family A underrepresented.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "early_filter",
+      "family": "A",
+      "target": "Pre-filter date_dim by the four hardcoded dates and join only the surrogate keys (d_date_sk) to catalog_returns before other filters, moving i_category and i_manager_id filters earlier.",
+      "dag_target_hint": "Rewrite cr_items CTE to filter date_dim first, then join to catalog_returns, then join to item.",
+      "node_contract": {
+        "from_must_include": ["date_dim", "catalog_returns", "item"],
+        "where_must_preserve": ["i_category IN ('Home', 'Men')", "i_manager_id BETWEEN 8 and 17", "cr_return_amount / cr_return_quantity between 237 and 266", "cr_reason_sk in (6,7,25,45,51)"],
+        "output_must_preserve": ["i_item_id", "sum(cr_return_quantity)"]
+      },
+      "gates_checked": ["G_PG_CROSS_CTE_SCALE_GUARD:PASS", "G_PG_CROSS_CTE_SETOP_RISK:PASS (no set operations)"],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.70,
+      "expected_explain_delta": "Seq Scan on catalog_returns becomes Index Scan using cr_returned_date_sk index; rows scanned drop dramatically.",
+      "recommended_patch_ops": ["rewrite_cte_cr_items", "reorder_joins", "push_predicates"],
+      "rank_rationale": "Targets primary hotspot (catalog_returns scan) via early filtering; high expected impact.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Materialize the filtered date_dim + catalog_returns join once as a CTE, then compute aggregates per item_id, avoiding repeated scans of catalog_returns.",
+      "dag_target_hint": "Replace cr_items CTE with a materialized CTE that pre-joins catalog_returns and filtered date_dim.",
+      "node_contract": {
+        "from_must_include": ["catalog_returns", "date_dim"],
+        "where_must_preserve": ["cr_returned_date_sk = d_date_sk", "d_date in (...)", "cr_return_amount / cr_return_quantity between 237 and 266", "cr_reason_sk in (6,7,25,45,51)"],
+        "output_must_preserve": ["i_item_id", "sum(cr_return_quantity)"]
+      },
+      "gates_checked": ["G_PG_CTE_DUPLICATION_BLOCK:PASS", "G_PG_CTE_REUSE_REQUIRED:PASS (single use but materialization may help)"],
+      "exploration": true,
+      "exploration_hypothesis": "Materializing the fact-dimension join may allow PostgreSQL to better estimate cardinalities and avoid repeated heap fetches.",
+      "confidence": 0.55,
+      "expected_explain_delta": "Seq Scan replaced by CTE scan; possible hash aggregate pushdown.",
+      "recommended_patch_ops": ["insert_materialized_cte", "replace_cte_body"],
+      "rank_rationale": "Exploration of family E; tests CTE materialization impact on fact table scan.",
+      "recommended_examples": [],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "date_cte_explicit_join",
+      "family": "F",
+      "target": "Convert comma joins in sr_items and cr_items to explicit INNER JOIN syntax and isolate date filter into a CTE to improve join planning.",
+      "dag_target_hint": "Change FROM store_returns, item, date_dim to explicit JOINs and add filtered_dates CTE.",
+      "node_contract": {
+        "from_must_include": ["store_returns", "item", "date_dim"],
+        "where_must_preserve": ["sr_item_sk = i_item_sk", "sr_returned_date_sk = d_date_sk", "i_category IN ('Home', 'Men')", "i_manager_id BETWEEN 8 and 17"],
+        "output_must_preserve": ["i_item_id", "sum(sr_return_quantity)"]
+      },
+      "gates_checked": ["G_PG_COMMA_JOIN_PRESENT:PASS", "G_PG_COMMA_FACT_FANOUT:PASS", "G_PG_COMMA_SEMANTIC:PASS"],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may enable better hash join planning and predicate pushdown in PostgreSQL.",
+      "confidence": 0.60,
+      "expected_explain_delta": "Comma joins become explicit hash joins; date filter CTE reduces build side size.",
+      "recommended_patch_ops": ["replace_comma_with_join", "insert_cte filtered_dates"],
+      "rank_rationale": "Exploration of family F; addresses comma join weakness pattern.",
+      "recommended_examples": ["pg_date_cte_explicit_join"],
+      "gold_example_id": "pg_date_cte_explicit_join"
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate in query; plan shows no OR-related hotspot."
+    },
+    {
+      "transform_id": "decorrelate",
+      "family": "B",
+      "reason": "No correlated subqueries in plan; all subqueries are uncorrelated IN lists."
+    },
+    {
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "reason": "Aggregation already occurs directly on fact table scans; no late aggregate after large join."
+    },
+    {
+      "transform_id": "intersect_to_exists",
+      "family": "D",
+      "reason": "No INTERSECT operations in query."
+    }
+  ]
+}

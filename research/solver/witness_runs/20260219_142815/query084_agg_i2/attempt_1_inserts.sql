@@ -1,0 +1,10 @@
+INSERT INTO customer (c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_customer_id, c_first_name, c_last_name) VALUES (1000, 1000, 1000, 'CUST001', 'John', 'Smith');
+INSERT INTO customer (c_current_addr_sk, c_current_cdemo_sk, c_current_hdemo_sk, c_customer_id, c_first_name, c_last_name) VALUES (1001, 1001, 1000, 'CUST002', 'Jane', 'Doe');
+INSERT INTO customer_address (ca_address_sk, ca_city) VALUES (1000, 'Mount Vernon');
+INSERT INTO customer_address (ca_address_sk, ca_city) VALUES (1001, 'Mount Vernon');
+INSERT INTO customer_demographics (cd_demo_sk) VALUES (1000);
+INSERT INTO customer_demographics (cd_demo_sk) VALUES (1001);
+INSERT INTO household_demographics (hd_demo_sk, hd_income_band_sk) VALUES (1000, 1000);
+INSERT INTO income_band (ib_income_band_sk, ib_lower_bound, ib_upper_bound) VALUES (1000, 40374, 90374);
+INSERT INTO store_returns (sr_cdemo_sk) VALUES (1000);
+INSERT INTO store_returns (sr_cdemo_sk) VALUES (1001);

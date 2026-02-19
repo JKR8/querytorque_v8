@@ -1,0 +1,15 @@
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (1000, 2, 2000);
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (1001, 2, 2000);
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (1002, 3, 2000);
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (1003, 2, 2000);
+INSERT INTO date_dim (d_date_sk, d_moy, d_year) VALUES (1004, 3, 2000);
+INSERT INTO item (i_item_sk, i_item_id, i_item_desc) VALUES (2000, 'item1', 'desc1');
+INSERT INTO item (i_item_sk, i_item_id, i_item_desc) VALUES (2001, 'item2', 'desc2');
+INSERT INTO store (s_store_sk, s_store_id, s_store_name) VALUES (3000, 'store1', 'name1');
+INSERT INTO store (s_store_sk, s_store_id, s_store_name) VALUES (3001, 'store2', 'name2');
+INSERT INTO store_sales (ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, ss_sold_date_sk, ss_net_profit) VALUES (4000, 2000, 5000, 3000, 1000, 100.0);
+INSERT INTO store_sales (ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, ss_sold_date_sk, ss_net_profit) VALUES (4001, 2001, 5001, 3001, 1003, 150.0);
+INSERT INTO store_returns (sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk, sr_net_loss) VALUES (4000, 2000, 5000, 1001, 50.0);
+INSERT INTO store_returns (sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk, sr_net_loss) VALUES (4001, 2001, 5001, 1002, 75.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_bill_customer_sk, cs_sold_date_sk, cs_net_profit) VALUES (2000, 5000, 1004, 200.0);
+INSERT INTO catalog_sales (cs_item_sk, cs_bill_customer_sk, cs_sold_date_sk, cs_net_profit) VALUES (2001, 5001, 1004, 250.0);

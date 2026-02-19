@@ -1,0 +1,178 @@
+{
+  "dispatch": {
+    "dialect": "postgresql",
+    "importance_stars": 1,
+    "probe_count": 4,
+    "early_stop": false,
+    "equivalence_tier": "unordered",
+    "hypothesis": "Plan shows dominant full scan of web_returns (2.6K rows, 967ms) feeding nested loops, with a correlated scalar subquery (avg per state) forcing repeated evaluation. The CTE computes aggregates for all states before final filtering, causing late selectivity. Two main bottlenecks: 1) full fact scan without state/reason pushdown, 2) correlated subquery preventing set-based join.",
+    "reasoning_trace": [
+      "Seq Scan on web_returns dominates runtime (967ms) and feeds nested loops with date_dim, item, customer_address.",
+      "Correlated subquery (avg per state) appears as CTE scan + aggregate in nested loop, indicating per-row evaluation.",
+      "CTE groups by state and reason but main query filters to 4 states and 2 reasons—late filtering wastes aggregation work.",
+      "Significant cardinality estimation error: Gather Merge estimated 2 rows vs actual 99 rows (UNDER_EST)."
+    ],
+    "cost_spine": [
+      "Seq Scan on web_returns",
+      "Hash Join (web_returns ⋈ date_dim)",
+      "Nested Loop (⋈ item)",
+      "Nested Loop (⋈ customer_address)",
+      "Aggregate (CTE customer_total_return)",
+      "CTE Scan (ctr1)",
+      "Aggregate (subquery avg)",
+      "CTE Scan (ctr2)",
+      "Nested Loop (final_select)"
+    ],
+    "hotspots": [
+      {
+        "op": "Seq Scan on web_returns",
+        "why": "full table scan without early state/reason filtering, largest I/O contributor",
+        "evidence": "rows=2617 time=967.12ms"
+      },
+      {
+        "op": "Correlated Aggregate (avg per state)",
+        "why": "subquery re-executed per outer row (state group), nested loop pattern",
+        "evidence": "rows=1 time=0.015ms per iteration, nested inside final select"
+      }
+    ],
+    "do_not_do": [
+      "do not split same-column OR to UNION (PostgreSQL BitmapOr handles indexed OR)",
+      "do not convert EXISTS to materialized CTE (PostgreSQL semi-join optimization active)",
+      "do not duplicate full CTE body for each state filter (avoids CTE_MATERIALIZATION_FENCE regression)"
+    ]
+  },
+  "probe_summary_schema": [
+    "probe_id",
+    "transform_id",
+    "family",
+    "expected_explain_delta",
+    "confidence",
+    "exploration",
+    "rank_rationale",
+    "target",
+    "dag_target_hint",
+    "recommended_patch_ops",
+    "recommended_examples"
+  ],
+  "probes": [
+    {
+      "probe_id": "p01",
+      "transform_id": "inline_decorrelate_materialized",
+      "family": "B",
+      "target": "Replace correlated scalar subquery with MATERIALIZED CTE computing avg(ctr_total_return) per state, then join. Use MATERIALIZED to prevent re-inlining and force single evaluation.",
+      "dag_target_hint": "Replace final_select WHERE clause subquery with join to precomputed state_avg CTE.",
+      "node_contract": {
+        "from_must_include": ["customer_total_return ctr1", "customer_address", "customer"],
+        "where_must_preserve": ["ca_state in ('OK','SC','TX','WI')", "ctr_reason_sk in (20,36)", "c_birth_year BETWEEN 1985 AND 1991", "ca_address_sk = c_current_addr_sk", "ctr1.ctr_customer_sk = c_customer_sk"],
+        "output_must_preserve": ["all original output columns", "ORDER BY and LIMIT 100"]
+      },
+      "gates_checked": [
+        "G_PG_CORR_SCALAR_REQUIRED:PASS",
+        "G_PG_CORR_ALREADY_DECORRELATED:PASS",
+        "G_PG_CORR_EXISTS_PROTECTION:PASS",
+        "G_PG_CORR_FACT_COUNT:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.88,
+      "expected_explain_delta": "Correlated Aggregate disappears; replaced by Hash Join to pre‑aggregated state_avg CTE.",
+      "recommended_patch_ops": ["insert_cte_state_avg", "replace_where_subquery_with_join"],
+      "rank_rationale": "Targets primary hotspot—correlated subquery causing repeated evaluation; direct match to gap CORRELATED_SUBQUERY_PARALYSIS.",
+      "recommended_examples": ["inline_decorrelate_materialized"],
+      "gold_example_id": "pg_shared_scan_decorrelate"
+    },
+    {
+      "probe_id": "p02",
+      "transform_id": "pg_self_join_decomposition",
+      "family": "E",
+      "target": "Split customer_total_return CTE into two MATERIALIZED CTEs: ctr_filtered (with state and reason filters pushed down) and ctr_all_states (without reason filter for avg). Avoid recomputing full aggregate for unused states/reasons.",
+      "dag_target_hint": "Replace original customer_total_return CTE with two CTEs; adjust final_select and subquery to reference appropriate CTEs.",
+      "node_contract": {
+        "from_must_include": ["web_returns", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["wr_returned_date_sk = d_date_sk", "d_year = 2002", "wr_returning_addr_sk = ca_address_sk", "wr_item_sk = i_item_sk", "i_manager_id BETWEEN 68 and 77", "wr_return_amt / wr_return_quantity between 242 and 271"],
+        "output_must_preserve": ["ctr_customer_sk", "ctr_state", "ctr_reason_sk", "ctr_total_return grouping"]
+      },
+      "gates_checked": [
+        "G_PG_CTE_DUPLICATION_BLOCK:PASS",
+        "G_PG_CTE_REUSE_REQUIRED:PASS",
+        "G_PG_CTE_EXISTS_INTERSECT_RISK:PASS"
+      ],
+      "exploration": false,
+      "exploration_hypothesis": "",
+      "confidence": 0.82,
+      "expected_explain_delta": "CTE scan rows drop from 33 to ~1-2 per filtered state; aggregation work reduces before join.",
+      "recommended_patch_ops": ["split_cte_filtered_all", "push_predicates_into_cte", "materialize_ctes"],
+      "rank_rationale": "Addresses late filtering hotspot by pushing state and reason filters into CTE definition, reducing aggregate input.",
+      "recommended_examples": ["pg_self_join_decomposition"],
+      "gold_example_id": ""
+    },
+    {
+      "probe_id": "p03",
+      "transform_id": "dimension_prefetch_star",
+      "family": "F",
+      "target": "Convert comma joins to explicit INNER JOINs and prefetch selective dimension filters (date_dim, item, customer_address) into small CTEs to create tiny hash tables before joining web_returns.",
+      "dag_target_hint": "Rewrite customer_total_return CTE FROM clause to use explicit JOIN ON syntax with pre-filtered dimension CTEs.",
+      "node_contract": {
+        "from_must_include": ["web_returns", "date_dim", "customer_address", "item"],
+        "where_must_preserve": ["d_year = 2002", "i_manager_id BETWEEN 68 and 77", "wr_return_amt / wr_return_quantity between 242 and 271"],
+        "output_must_preserve": ["group by wr_returning_customer_sk, ca_state, wr_reason_sk"]
+      },
+      "gates_checked": [
+        "G_PG_COMMA_JOIN_PRESENT:PASS",
+        "G_PG_COMMA_FACT_FANOUT:PASS",
+        "G_PG_COMMA_SEMANTIC:PASS"
+      ],
+      "exploration": true,
+      "exploration_hypothesis": "Explicit join syntax may improve cardinality estimates and allow better join order; prefetching dimensions reduces fact scan via early hash probe.",
+      "confidence": 0.65,
+      "expected_explain_delta": "Comma joins become explicit hash joins; dimension scans become tiny CTE scans; fact scan may reduce rows via early hash probe.",
+      "recommended_patch_ops": ["insert_cte_filtered_date", "insert_cte_filtered_item", "insert_cte_filtered_ca", "replace_from_with_explicit_joins"],
+      "rank_rationale": "Exploration targeting comma join weakness; may improve planner estimates and reduce nested loop risk.",
+      "recommended_examples": ["pg_dimension_prefetch_star", "pg_explicit_join_materialized"],
+      "gold_example_id": "pg_dimension_prefetch_star"
+    },
+    {
+      "probe_id": "p04",
+      "transform_id": "aggregate_pushdown",
+      "family": "C",
+      "target": "Pre-aggregate web_returns by returning_customer_sk, returning_addr_sk, item_sk before joining dimensions, then compute ctr_total_return after filtering by state and reason.",
+      "dag_target_hint": "Replace customer_total_return CTE with two-level aggregation: first aggregate fact by keys, then join dimensions and filter, then final sum.",
+      "node_contract": {
+        "from_must_include": ["web_returns"],
+        "where_must_preserve": ["wr_return_amt / wr_return_quantity between 242 and 271"],
+        "output_must_preserve": ["ctr_total_return as sum(wr_return_amt)", "group by wr_returning_customer_sk, ca_state, wr_reason_sk"]
+      },
+      "gates_checked": ["agg_key_compatibility:PASS", "duplication_sensitive_metrics:none"],
+      "exploration": true,
+      "exploration_hypothesis": "Aggregating fact table early reduces rows flowing into nested loops; may lower hash join cost even if dimensions are small.",
+      "confidence": 0.58,
+      "expected_explain_delta": "Initial aggregate reduces web_returns rows before joining date_dim, item, customer_address; nested loops may become hash joins.",
+      "recommended_patch_ops": ["insert_cte_fact_agg", "rewrite_cte_as_two_stage_agg"],
+      "rank_rationale": "Exploration targeting secondary hotspot; tests if early aggregation reduces nested loop input rows.",
+      "recommended_examples": ["aggregate_pushdown"],
+      "gold_example_id": ""
+    }
+  ],
+  "dropped": [
+    {
+      "transform_id": "or_to_union",
+      "family": "D",
+      "reason": "No OR predicate hotspot in plan; PostgreSQL BitmapOr handles indexed OR efficiently (G_PG_OR_INDEX_PROTECTED)."
+    },
+    {
+      "transform_id": "sf_inline_decorrelate",
+      "family": "B",
+      "reason": "Non‑native transform (Snowflake) with portability_candidate; PostgreSQL‑native inline_decorrelate_materialized already selected."
+    },
+    {
+      "transform_id": "prefetch_fact_join",
+      "family": "A",
+      "reason": "Portability candidate for DuckDB; PostgreSQL native dimension_prefetch_star chosen for similar goal."
+    },
+    {
+      "transform_id": "materialized_dimension_fact_prefilter",
+      "family": "F",
+      "reason": "No non‑equi join present in plan; gap NON_EQUI_JOIN_INPUT_BLINDNESS not triggered."
+    }
+  ]
+}

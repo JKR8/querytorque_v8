@@ -1,0 +1,10 @@
+INSERT INTO date_dim (d_date_sk, d_date, d_year, d_moy) VALUES (1000, '1999-07-15', 1999, 7);
+INSERT INTO date_dim (d_date_sk, d_date, d_year, d_moy) VALUES (1001, '1999-07-01', 1999, 7);
+INSERT INTO date_dim (d_date_sk, d_date, d_year, d_moy) VALUES (1002, '1999-07-15', 1999, 7);
+INSERT INTO date_dim (d_date_sk, d_date, d_year, d_moy) VALUES (1003, '1999-04-01', 1999, 4);
+INSERT INTO store (s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip) VALUES (1000, 'Store1', 1, '123', 'Main', 'St', NULL, 'City1', 'County1', 'ST', '12345');
+INSERT INTO store (s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip) VALUES (1001, 'Store2', 2, '456', 'Oak', 'Ave', NULL, 'City2', 'County2', 'ST', '67890');
+INSERT INTO store_returns (sr_customer_sk, sr_item_sk, sr_returned_date_sk, sr_ticket_number) VALUES (2000, 3000, 1000, 4000);
+INSERT INTO store_returns (sr_customer_sk, sr_item_sk, sr_returned_date_sk, sr_ticket_number) VALUES (2001, 3001, 1002, 4001);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_sold_date_sk, ss_store_sk, ss_ticket_number) VALUES (2000, 3000, 1001, 1000, 4000);
+INSERT INTO store_sales (ss_customer_sk, ss_item_sk, ss_sold_date_sk, ss_store_sk, ss_ticket_number) VALUES (2001, 3001, 1003, 1001, 4001);
