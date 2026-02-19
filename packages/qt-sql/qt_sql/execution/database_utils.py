@@ -26,6 +26,8 @@ def _detect_db_type(database_path: str) -> str:
         return "postgres"
     if path_lower.startswith("snowflake://"):
         return "snowflake"
+    if path_lower.startswith("databricks://"):
+        return "databricks"
     if path_lower.startswith("duckdb://"):
         return "duckdb"
     # Default to DuckDB for file paths
@@ -245,6 +247,8 @@ def run_explain_analyze(
         return _run_explain_analyze_postgres(database_path, sql)
     elif db_type == "snowflake":
         return _run_explain_analyze_snowflake(database_path, sql)
+    elif db_type == "databricks":
+        return _run_explain_analyze_databricks(database_path, sql)
     else:
         return _run_explain_analyze_duckdb(database_path, sql)
 
@@ -275,6 +279,35 @@ def _run_explain_analyze_snowflake(dsn: str, sql: str) -> Optional[dict]:
 
     except Exception as e:
         logger.warning(f"Failed to run Snowflake EXPLAIN: {e}")
+        return None
+
+
+def _run_explain_analyze_databricks(dsn: str, sql: str) -> Optional[dict]:
+    """Run EXPLAIN EXTENDED on Databricks (no ANALYZE available)."""
+    try:
+        from .factory import DatabricksConfig
+
+        config = DatabricksConfig.from_dsn(dsn)
+        executor = config.get_executor()
+
+        with executor:
+            result = {
+                "execution_time_ms": None,
+                "plan_text": None,
+                "plan_json": None,
+                "actual_rows": None,
+            }
+
+            try:
+                plan_data = executor.explain(sql, analyze=False)
+                result["plan_text"] = plan_data.get("plan", "")
+            except Exception as e:
+                logger.warning(f"Databricks EXPLAIN failed: {e}")
+
+            return result
+
+    except Exception as e:
+        logger.warning(f"Failed to run Databricks EXPLAIN: {e}")
         return None
 
 

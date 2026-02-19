@@ -112,6 +112,9 @@ def engine_from_config(benchmark_dir: Path) -> str:
 
 def dialect_from_engine(engine: str) -> str:
     """Map engine name to sqlglot dialect."""
-    return {"postgresql": "postgres", "duckdb": "duckdb", "snowflake": "snowflake"}.get(
-        engine, engine
-    )
+    return {
+        "postgresql": "postgres",
+        "duckdb": "duckdb",
+        "snowflake": "snowflake",
+        "databricks": "databricks",
+    }.get(engine, engine)

@@ -74,6 +74,8 @@ class Pipeline:
                 engine = "duckdb"
             elif "snowflake" in dsn_lower:
                 engine = "snowflake"
+            elif dsn_lower.startswith("databricks://"):
+                engine = "databricks"
             else:
                 engine = "postgresql"
 

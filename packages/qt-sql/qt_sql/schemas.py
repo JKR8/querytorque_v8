@@ -152,6 +152,22 @@ class BenchmarkConfig:
         path = Path(config_path)
         data = json.loads(path.read_text())
         db_path_or_dsn = data.get("db_path") or data.get("dsn", "")
+        # Databricks: synthesize DSN from individual config fields if not explicit
+        if not db_path_or_dsn and data.get("engine") == "databricks":
+            host = data.get("server_hostname", "")
+            http_path = data.get("http_path", "")
+            if host and http_path:
+                import os
+                token = os.getenv("QT_DATABRICKS_ACCESS_TOKEN", "")
+                catalog = data.get("catalog", "hive_metastore")
+                schema = data.get("schema", "default")
+                from urllib.parse import quote
+                hp = http_path.lstrip("/")
+                db_path_or_dsn = (
+                    f"databricks://token:{quote(token, safe='')}@{host}"
+                    f"/{quote(hp, safe='/')}"
+                    f"?catalog={quote(catalog, safe='')}&schema={quote(schema, safe='')}"
+                )
         return cls(
             engine=data["engine"],
             benchmark=data["benchmark"],

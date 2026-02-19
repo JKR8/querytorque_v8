@@ -302,6 +302,68 @@ class SnowflakeConfig(DatabaseConfig):
         )
 
 
+@dataclass
+class DatabricksConfig(DatabaseConfig):
+    """Databricks SQL warehouse connection configuration."""
+
+    server_hostname: str = ""
+    http_path: str = ""
+    access_token: str = ""
+    catalog: str = "hive_metastore"
+    schema: str = "default"
+
+    @property
+    def db_type(self) -> str:
+        return "databricks"
+
+    @classmethod
+    def from_env(cls) -> "DatabricksConfig":
+        """Create config from environment variables (QT_DATABRICKS_*)."""
+        return cls(
+            server_hostname=os.getenv("QT_DATABRICKS_SERVER_HOSTNAME", ""),
+            http_path=os.getenv("QT_DATABRICKS_HTTP_PATH", ""),
+            access_token=os.getenv("QT_DATABRICKS_ACCESS_TOKEN", ""),
+            catalog=os.getenv("QT_DATABRICKS_CATALOG", "hive_metastore"),
+            schema=os.getenv("QT_DATABRICKS_SCHEMA", "default"),
+        )
+
+    @classmethod
+    def from_dsn(cls, dsn: str) -> "DatabricksConfig":
+        """Parse a Databricks connection string.
+
+        Supports:
+        - databricks://token:TOKEN@HOST/HTTP_PATH?catalog=X&schema=Y
+        """
+        if dsn.startswith("databricks://"):
+            parsed = urlparse(dsn)
+            # Query parameters
+            params = {}
+            if parsed.query:
+                for part in parsed.query.split("&"):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        params[k] = unquote(v)
+
+            return cls(
+                server_hostname=parsed.hostname or "",
+                http_path=unquote(parsed.path.lstrip("/")) if parsed.path else "",
+                access_token=unquote(parsed.password or ""),
+                catalog=params.get("catalog", "hive_metastore"),
+                schema=params.get("schema", "default"),
+            )
+        raise ValueError(f"Invalid Databricks DSN: {dsn}")
+
+    def get_executor(self) -> DatabaseExecutor:
+        from .databricks_executor import DatabricksExecutor
+        return DatabricksExecutor(
+            server_hostname=self.server_hostname,
+            http_path=self.http_path,
+            access_token=self.access_token,
+            catalog=self.catalog,
+            schema=self.schema,
+        )
+
+
 # =============================================================================
 # Registry: Database Type to Config Class Mapping
 # =============================================================================
@@ -313,6 +375,8 @@ _CONFIG_REGISTRY: Dict[str, Type[DatabaseConfig]] = {
     "pg": PostgresConfig,
     "snowflake": SnowflakeConfig,
     "sf": SnowflakeConfig,
+    "databricks": DatabricksConfig,
+    "dbx": DatabricksConfig,
 }
 
 
@@ -426,6 +490,8 @@ def create_executor_from_dsn(dsn: str) -> DatabaseExecutor:
         return PostgresConfig.from_dsn(dsn).get_executor()
     elif dsn_lower.startswith("snowflake://"):
         return SnowflakeConfig.from_dsn(dsn).get_executor()
+    elif dsn_lower.startswith("databricks://"):
+        return DatabricksConfig.from_dsn(dsn).get_executor()
     elif dsn_lower.startswith("duckdb://"):
         return DuckDBConfig.from_dsn(dsn).get_executor()
     elif dsn_lower == ":memory:" or dsn_lower.endswith(".duckdb") or dsn_lower.endswith(".db"):
@@ -434,7 +500,7 @@ def create_executor_from_dsn(dsn: str) -> DatabaseExecutor:
     else:
         raise ValueError(
             f"Unrecognized database DSN scheme: {dsn!r}. "
-            f"Supported prefixes: postgres://, postgresql://, snowflake://, duckdb://, "
+            f"Supported prefixes: postgres://, postgresql://, snowflake://, databricks://, duckdb://, "
             f":memory:, *.duckdb, *.db. "
             f"Will NOT silently fall back to another engine."
         )
@@ -452,12 +518,18 @@ def create_executor_from_cli_args(
     pg_database: Optional[str] = None,
     pg_user: Optional[str] = None,
     pg_password: Optional[str] = None,
-    # Snowflake options (for future)
+    # Snowflake options
     sf_account: Optional[str] = None,
     sf_user: Optional[str] = None,
     sf_password: Optional[str] = None,
     sf_warehouse: Optional[str] = None,
     sf_database: Optional[str] = None,
+    # Databricks options
+    dbx_server_hostname: Optional[str] = None,
+    dbx_http_path: Optional[str] = None,
+    dbx_access_token: Optional[str] = None,
+    dbx_catalog: Optional[str] = None,
+    dbx_schema: Optional[str] = None,
 ) -> DatabaseExecutor:
     """Create executor from CLI-style arguments.
 
@@ -471,7 +543,8 @@ def create_executor_from_cli_args(
         read_only: DuckDB read-only mode
         pg_dsn: PostgreSQL DSN (takes precedence over individual params)
         pg_host, pg_port, pg_database, pg_user, pg_password: PG params
-        sf_*: Snowflake params (for future use)
+        sf_*: Snowflake params
+        dbx_*: Databricks params
 
     Returns:
         Database executor instance
@@ -498,6 +571,16 @@ def create_executor_from_cli_args(
             password=sf_password or os.getenv("QT_SNOWFLAKE_PASSWORD", ""),
             warehouse=sf_warehouse or os.getenv("QT_SNOWFLAKE_WAREHOUSE", ""),
             database=sf_database or os.getenv("QT_SNOWFLAKE_DATABASE", ""),
+        )
+        return config.get_executor()
+
+    elif db_type_lower in ("databricks", "dbx"):
+        config = DatabricksConfig(
+            server_hostname=dbx_server_hostname or os.getenv("QT_DATABRICKS_SERVER_HOSTNAME", ""),
+            http_path=dbx_http_path or os.getenv("QT_DATABRICKS_HTTP_PATH", ""),
+            access_token=dbx_access_token or os.getenv("QT_DATABRICKS_ACCESS_TOKEN", ""),
+            catalog=dbx_catalog or os.getenv("QT_DATABRICKS_CATALOG", "hive_metastore"),
+            schema=dbx_schema or os.getenv("QT_DATABRICKS_SCHEMA", "default"),
         )
         return config.get_executor()
 

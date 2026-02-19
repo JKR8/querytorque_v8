@@ -13,6 +13,7 @@ from .factory import (
     DuckDBConfig,
     PostgresConfig,
     SnowflakeConfig,
+    DatabricksConfig,
     # Factory functions
     create_executor,
     create_executor_from_dsn,
@@ -49,6 +50,9 @@ def __getattr__(name: str):
     if name == "SnowflakeExecutor":
         from .snowflake_executor import SnowflakeExecutor
         return SnowflakeExecutor
+    if name == "DatabricksExecutor":
+        from .databricks_executor import DatabricksExecutor
+        return DatabricksExecutor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -57,6 +61,7 @@ __all__ = [
     "DuckDBExecutor",
     "PostgresExecutor",
     "SnowflakeExecutor",
+    "DatabricksExecutor",
     # Protocol
     "DatabaseExecutor",
     # Config classes
@@ -64,6 +69,7 @@ __all__ = [
     "DuckDBConfig",
     "PostgresConfig",
     "SnowflakeConfig",
+    "DatabricksConfig",
     # Factory functions
     "create_executor",
     "create_executor_from_dsn",
