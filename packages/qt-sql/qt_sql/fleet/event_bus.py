@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 class EventType(str, Enum):
     TRIAGE_READY = "triage_ready"
+    TRIAGE_DATA = "triage_data"
     QUERY_UPDATE = "query_update"
     QUERY_COMPLETE = "query_complete"
     WORKER_UPDATE = "worker_update"
@@ -23,6 +24,7 @@ class EventType(str, Enum):
     FLEET_DONE = "fleet_done"
     EDITOR_ITERATION = "editor_iteration"
     EDITOR_COMPLETE = "editor_complete"
+    CONNECTION_TEST_RESULT = "connection_test_result"
 
 
 @dataclass
@@ -215,6 +217,8 @@ def forensic_to_fleet_c2(
             "outcome": None,
             "speedup": None,
             "out_transform": "",
+            "seed_source": tr.prior_source if tr and tr.prior_best_sql else "",
+            "seed_speedup": tr.prior_best_speedup if tr else None,
             "detail": {
                 "cost_rank": fq.cost_rank,
                 "pct_of_total": fq.pct_of_total,
@@ -223,6 +227,11 @@ def forensic_to_fleet_c2(
                 "transforms": transforms,
                 "qerror": qerror,
                 "explain": fq.explain_text,
+                "actual_rows": getattr(fq, "actual_rows", 0),
+                "timing_source": getattr(fq, "timing_source", ""),
+                "prior_best_speedup": tr.prior_best_speedup if tr else None,
+                "prior_source": tr.prior_source if tr else "",
+                "prior_reference": tr.prior_reference if tr else "",
             },
         }
         result.append(entry)

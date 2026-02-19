@@ -129,6 +129,7 @@ class BeamSession(OptimizationSession):
         self._pricing_per_1m = dict(self._DEFAULT_PRICING_PER_1M)
         self._load_pricing_overrides()
         self._rbot_timeouts: Optional[set] = None  # lazy-loaded by _load_rbot_timeouts()
+        self._cross_checker: Optional[Any] = None  # CrossEngineChecker (lazy)
 
     def _load_pricing_overrides(self) -> None:
         """Load optional pricing overrides from environment JSON."""
@@ -384,7 +385,13 @@ class BeamSession(OptimizationSession):
             }
 
     def check_sqlglot_parse(self, patches: List["AppliedPatch"]) -> None:
-        """Gate 1: sqlglot parse. Marks unparseable patches FAIL."""
+        """Gate 1 + Gate 1.5: sqlglot parse + cross-engine equivalence.
+
+        Gate 1: sqlglot parse — marks unparseable patches FAIL.
+        Gate 1.5: cross-engine check — if oracle_db configured and engine != duckdb,
+                  transpile to DuckDB and verify row count + checksum equivalence.
+                  Fail-open on transpile/execution errors.
+        """
         for p in patches:
             if not p.output_sql:
                 continue
@@ -395,6 +402,182 @@ class BeamSession(OptimizationSession):
                 p.apply_error = f"SQLGlot parse error: {err}"
             else:
                 p.semantic_passed = True
+
+        # Gate 1.5: cross-engine equivalence check
+        oracle_db = getattr(self.pipeline.config, "oracle_db", "")
+        engine = getattr(self.pipeline.config, "engine", "duckdb")
+        if oracle_db and engine != "duckdb":
+            self._run_cross_engine_check(patches)
+
+    def _get_cross_checker(self) -> Optional[Any]:
+        """Lazy-init CrossEngineChecker. Returns None if not configured."""
+        if self._cross_checker is not None:
+            return self._cross_checker
+
+        oracle_db = getattr(self.pipeline.config, "oracle_db", "")
+        engine = getattr(self.pipeline.config, "engine", "duckdb")
+        if not oracle_db or engine == "duckdb":
+            return None
+
+        try:
+            from ..validation.cross_engine_checker import CrossEngineChecker
+            import os
+
+            if not os.path.exists(oracle_db):
+                logger.warning(f"oracle_db path does not exist: {oracle_db}")
+                return None
+
+            checker = CrossEngineChecker(
+                oracle_db_path=oracle_db,
+                source_dialect=engine,
+            )
+            checker.__enter__()
+            self._cross_checker = checker
+            return checker
+        except Exception as e:
+            logger.warning(f"Failed to initialize CrossEngineChecker: {e}")
+            return None
+
+    def _run_cross_engine_check(self, patches: List["AppliedPatch"]) -> None:
+        """Gate 1.5: cross-engine equivalence check on DuckDB oracle.
+
+        Only runs for patches that passed Gate 1 (semantic_passed=True).
+        Fail-open: transpile/execution errors leave the patch as-is.
+        """
+        checker = self._get_cross_checker()
+        if not checker:
+            return
+
+        candidates = [p for p in patches if p.semantic_passed and p.output_sql]
+        if not candidates:
+            return
+
+        for p in candidates:
+            try:
+                result = checker.check(self.original_sql, p.output_sql)
+                if not result.equivalent:
+                    p.semantic_passed = False
+                    p.status = "FAIL"
+                    p.apply_error = f"Cross-engine equivalence fail: {result.error}"
+                    logger.info(
+                        f"[{self.query_id}] {p.patch_id} failed cross-engine check: "
+                        f"{result.error} ({result.elapsed_ms:.0f}ms)"
+                    )
+                elif result.transpile_warning:
+                    # Stripped-mode mismatch or other warning — patch proceeds
+                    logger.info(
+                        f"[{self.query_id}] {p.patch_id} cross-engine warning: "
+                        f"{result.transpile_warning} ({result.elapsed_ms:.0f}ms)"
+                    )
+                elif result.error:
+                    # Fail-open: transpile/execution error, patch proceeds
+                    logger.debug(
+                        f"[{self.query_id}] {p.patch_id} cross-engine check "
+                        f"fail-open: {result.error}"
+                    )
+            except Exception as e:
+                # Fail-open: unexpected error
+                logger.warning(
+                    f"[{self.query_id}] {p.patch_id} cross-engine check error: {e}"
+                )
+
+    def close_cross_checker(self) -> None:
+        """Clean up CrossEngineChecker resources."""
+        if self._cross_checker is not None:
+            try:
+                self._cross_checker.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._cross_checker = None
+
+    # ── Main entry point ───────────────────────────────────────────────────
+
+    def run(self) -> SessionResult:
+        """Execute full beam optimization: analyst → workers → benchmark → compiler → finalize.
+
+        Single-query orchestration of the phase methods. For batch execution
+        across many queries, use WaveRunner which separates API and DB phases.
+        """
+        try:
+            ctx = self.prepare_context()
+        except Exception as e:
+            logger.error(f"[{self.query_id}] prepare_context failed: {e}")
+            return SessionResult(
+                query_id=self.query_id, mode="beam",
+                best_speedup=0.0, best_sql=self.original_sql,
+                original_sql=self.original_sql, status="ERROR",
+            )
+
+        try:
+            # Phase 1: Analyst
+            if self.on_phase_change:
+                self.on_phase_change(phase="analyst", iteration=0)
+            scout_result, analyst_response, analyst_prompt, api_calls = \
+                self.run_analyst_phase(ctx)
+
+            if not scout_result or not scout_result.probes:
+                return SessionResult(
+                    query_id=self.query_id, mode="beam",
+                    best_speedup=0.0, best_sql=self.original_sql,
+                    original_sql=self.original_sql, status="NEUTRAL",
+                    n_api_calls=api_calls,
+                )
+
+            # Phase 2: Workers
+            if self.on_phase_change:
+                self.on_phase_change(phase="workers", iteration=0)
+            patches, worker_api_calls = self.run_workers_phase(ctx, scout_result)
+            total_api_calls = api_calls + worker_api_calls
+
+            # Gate 1: sqlglot parse + dedup
+            self.dedup_patches(patches)
+            self.check_sqlglot_parse(patches)
+
+            # Inline retry for parse/tier1 failures
+            retry_calls = self.run_retry_phase(ctx, patches)
+            total_api_calls += retry_calls
+
+            # Phase 3: Benchmark probes
+            if self.on_phase_change:
+                self.on_phase_change(phase="benchmark", iteration=0)
+            self.run_benchmark_patches(
+                patches, ctx.db_path,
+                session_dir=ctx.session_dir, shot=0,
+            )
+
+            # Phase 4: Compiler
+            if self.on_phase_change:
+                self.on_phase_change(phase="snipe", iteration=0)
+            compiler_patches, compiler_api_calls = self.run_compiler_phase(
+                ctx, patches, scout_result,
+            )
+            total_api_calls += compiler_api_calls
+
+            if compiler_patches:
+                self.check_sqlglot_parse(compiler_patches)
+                self.run_benchmark_patches(
+                    compiler_patches, ctx.db_path,
+                    session_dir=ctx.session_dir, shot=1,
+                )
+
+            # Finalize
+            return self.finalize_result(
+                ctx=ctx, patches=patches,
+                compiler_patches=compiler_patches,
+                analyst_prompt=analyst_prompt,
+                analyst_response=analyst_response,
+                total_api_calls=total_api_calls,
+            )
+        except Exception as e:
+            logger.error(f"[{self.query_id}] beam run failed: {e}")
+            return SessionResult(
+                query_id=self.query_id, mode="beam",
+                best_speedup=0.0, best_sql=self.original_sql,
+                original_sql=self.original_sql, status="ERROR",
+                n_api_calls=0,
+            )
+        finally:
+            self.close_cross_checker()
 
     def run_editor_strike(self, transform_id: str = "") -> SessionResult:
         """Single-call strike path for editor mode.

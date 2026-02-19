@@ -547,6 +547,46 @@ class Pipeline:
     # Main entry points
     # =========================================================================
 
+    def run_optimization_session(
+        self,
+        query_id: str,
+        sql: str,
+        max_iterations: int = 3,
+        target_speedup: float = 2.0,
+        mode: str = "beam",
+        patch: bool = True,
+        benchmark_sem: Optional[Any] = None,
+        on_phase_change: Optional[Any] = None,
+    ) -> "SessionResult":
+        """Run a beam optimization session for a single query.
+
+        This is the primary entry point used by the fleet orchestrator,
+        the REST API, and the workload session runner.
+        """
+        from .sessions.beam_session import BeamSession
+
+        # Normalise mode to string (handles OptimizationMode enum)
+        mode_str = mode.value if hasattr(mode, "value") else str(mode)
+
+        if not self.config.benchmark_dsn:
+            self.config.benchmark_dsn = self.config.db_path_or_dsn
+
+        session = BeamSession(
+            pipeline=self,
+            query_id=query_id,
+            original_sql=sql,
+            target_speedup=target_speedup,
+            max_iterations=max_iterations,
+            patch=patch,
+            benchmark_sem=benchmark_sem,
+        )
+        if on_phase_change:
+            session.on_phase_change = on_phase_change
+
+        if mode_str == "strike":
+            return session.run_editor_strike()
+        return session.run()
+
     def run_query(
         self,
         query_id: str,

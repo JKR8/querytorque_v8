@@ -38,7 +38,6 @@ def orch(bus):
     return FleetOrchestrator(
         pipeline=pipeline,
         benchmark_dir=Path("/tmp/fake_bench"),
-        concurrency=2,
         event_bus=bus,
         triage_gate=threading.Event(),
         pause_event=threading.Event(),
@@ -346,7 +345,6 @@ class TestExecuteHistory:
         orch = FleetOrchestrator(
             pipeline=pipeline,
             benchmark_dir=tmp_path,
-            concurrency=1,
         )
         triaged = [
             TriageResult(
@@ -403,7 +401,6 @@ class TestExecuteHistory:
         orch = FleetOrchestrator(
             pipeline=pipeline,
             benchmark_dir=tmp_path,
-            concurrency=1,
         )
         triaged = [
             TriageResult(

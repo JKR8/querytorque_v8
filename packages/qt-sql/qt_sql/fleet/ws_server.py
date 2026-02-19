@@ -323,7 +323,7 @@ class FleetWSServer:
                 level=level,
             )
             self.event_bus.emit(
-                "connection_test_result",
+                EventType.CONNECTION_TEST_RESULT,
                 target=target,
                 ok=ok,
                 message=message,

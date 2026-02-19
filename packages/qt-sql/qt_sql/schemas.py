@@ -15,6 +15,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
+class OptimizationMode(str, Enum):
+    """Optimization mode for sessions."""
+    BEAM = "beam"
+    STRIKE = "strike"
+
+
 class ValidationStatus(str, Enum):
     PASS = "pass"
     FAIL = "fail"
@@ -132,6 +138,9 @@ class BenchmarkConfig:
     beam_api_launch_interval_seconds: float = 0.0  # Stagger worker API call submission (seconds)
     enable_reasoning_mode: bool = False  # Explicit reasoning mode for analyst/compiler LLM calls
 
+    # Cross-engine semantic validation (Gate 1.5)
+    oracle_db: str = ""  # DuckDB path for cross-engine equivalence checking
+
     # Beam benchmark run policy
     beam_baseline_runs: int = 3   # Original query timing runs
     beam_candidate_runs: int = 3  # Default worker candidate timing runs
@@ -178,6 +187,7 @@ class BenchmarkConfig:
                 data.get("beam_api_launch_interval_seconds", 0.0) or 0.0
             ),
             enable_reasoning_mode=bool(data.get("enable_reasoning_mode", False)),
+            oracle_db=data.get("oracle_db", ""),
             beam_baseline_runs=data.get("beam_baseline_runs", 3),
             beam_candidate_runs=data.get("beam_candidate_runs", 3),
             beam_winner_runs=data.get("beam_winner_runs", 3),
