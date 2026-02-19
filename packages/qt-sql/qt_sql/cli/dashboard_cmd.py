@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import webbrowser
 from datetime import datetime
-from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -556,55 +556,142 @@ def _load_fleet_runs(
 
 
 # ---------------------------------------------------------------------------
-# HTTP server
+# Fleet C2 adapter
 # ---------------------------------------------------------------------------
 
-class _DashboardHandler(SimpleHTTPRequestHandler):
-    """Serves the dashboard HTML — re-collects data on every refresh."""
+def _fleet_queries_to_c2(
+    fleet_queries: List[Dict[str, Any]],
+    fleet_runs: List[Dict[str, Any]],
+    benchmark_dir: Path,
+) -> List[Dict[str, Any]]:
+    """Map _collect_fleet_data() output → fleet_c2.html QUERIES JSON format.
 
-    template: str = ""
-    benchmark_dir: Optional[Path] = None
+    Bridges field names from the forensic collector to the shape that
+    fleet_c2.html's normalizeQueryShape() expects.  Also loads raw SQL
+    from queries/*.sql so the Editor tab has content.
+    """
+    queries_dir = benchmark_dir / "queries"
 
-    def do_GET(self):
-        data = collect_dashboard_data(self.benchmark_dir)
-        data_json = json.dumps(data, default=str)
-        html = self.template.replace("__DASHBOARD_DATA__", data_json)
+    # Compute cost context (rank, pct_of_total, cumulative_pct)
+    total_runtime = sum(
+        q["runtime_ms"] for q in fleet_queries if q["runtime_ms"] > 0
+    )
+    by_runtime = sorted(fleet_queries, key=lambda q: -q["runtime_ms"])
+    rank_map: Dict[str, int] = {}
+    pct_map: Dict[str, float] = {}
+    cum_map: Dict[str, float] = {}
+    cumulative = 0.0
+    for rank, q in enumerate(by_runtime, 1):
+        qid = q["query_id"]
+        rank_map[qid] = rank
+        pct = (q["runtime_ms"] / total_runtime) if total_runtime > 0 else 0.0
+        pct_map[qid] = round(pct, 4)
+        cumulative += pct
+        cum_map[qid] = round(cumulative, 4)
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(html.encode("utf-8"))
+    result: List[Dict[str, Any]] = []
+    for q in fleet_queries:
+        qid = q["query_id"]
 
-    def log_message(self, format, *args):
-        pass
+        # Load SQL text
+        sql = ""
+        sql_path = queries_dir / f"{qid}.sql"
+        if sql_path.exists():
+            try:
+                sql = sql_path.read_text().strip()
+            except OSError:
+                pass
 
+        rt = q["runtime_ms"] if q["runtime_ms"] > 0 else 0
+        est_annual = round(rt * 12) if rt > 0 else 0
+        top_transform = q.get("top_transform", "")
+        top_overlap = q.get("structural_bonus", 0.0)
+
+        # Build transforms list from ast_matches
+        transforms = []
+        for m in q.get("ast_matches", []):
+            transforms.append({
+                "id": m.get("id", ""),
+                "overlap": m.get("overlap", 0),
+                "gap": m.get("gap", ""),
+                "family": m.get("family", ""),
+            })
+
+        entry = {
+            "id": qid,
+            "sql": sql,
+            "runtime_ms": rt,
+            "bucket": q.get("bucket", "MEDIUM"),
+            "iters": q.get("max_iterations", 1),
+            "transform": top_transform,
+            "overlap": top_overlap,
+            "est_annual": est_annual,
+            "outcome": q.get("status"),
+            "speedup": q.get("speedup"),
+            "out_transform": "",
+            "detail": {
+                "cost_rank": rank_map.get(qid, 0),
+                "pct_of_total": pct_map.get(qid, 0.0),
+                "cumulative_pct": cum_map.get(qid, 0.0),
+                "structural_flags": [],
+                "transforms": transforms,
+                "qerror": None,
+                "explain": "",
+            },
+        }
+        result.append(entry)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Fleet C2 server
+# ---------------------------------------------------------------------------
 
 def serve_dashboard(benchmark_dir: Path, port: int = 8765) -> None:
-    """Serve live dashboard — each browser refresh re-reads all session data."""
-    template_path = Path(__file__).resolve().parent.parent / "dashboard" / "index.html"
-    if not template_path.exists():
-        raise click.ClickException(f"Dashboard template not found: {template_path}")
+    """Launch the Fleet C2 interactive dashboard with live WebSocket support."""
+    import uvicorn
+    from ..fleet.event_bus import EventBus
+    from ..fleet.ws_server import FleetWSServer
 
-    # Quick initial check
-    sessions_dir = benchmark_dir / "beam_sessions"
-    if not sessions_dir.exists():
-        sessions_dir.mkdir(parents=True)
-    click.echo(f"Serving dashboard for {benchmark_dir.name} (live refresh on F5)")
+    html_path = Path(__file__).resolve().parent.parent / "dashboard" / "fleet_c2.html"
+    if not html_path.exists():
+        raise click.ClickException(f"Dashboard template not found: {html_path}")
 
-    _DashboardHandler.template = template_path.read_text()
-    _DashboardHandler.benchmark_dir = benchmark_dir
-    server = HTTPServer(("127.0.0.1", port), _DashboardHandler)
+    config = _load_json(benchmark_dir / "config.json") or {}
+    engine = config.get("engine", "unknown")
+
+    click.echo(f"Collecting fleet data for {benchmark_dir.name}...")
+    fleet_queries, fleet_runs = _collect_fleet_data(benchmark_dir, engine)
+    initial_data = _fleet_queries_to_c2(fleet_queries, fleet_runs, benchmark_dir)
+    click.echo(f"  {len(initial_data)} queries loaded")
+
+    run_context = {
+        "benchmark_name": benchmark_dir.name,
+        "engine": engine,
+        "benchmark_dir": str(benchmark_dir),
+    }
+
+    event_bus = EventBus()
+    triage_gate = threading.Event()
+
+    server = FleetWSServer(
+        event_bus=event_bus,
+        triage_gate=triage_gate,
+        html_path=html_path,
+        initial_data=initial_data,
+        benchmark_dir=benchmark_dir,
+        run_context=run_context,
+    )
+    app = server.get_app()
 
     url = f"http://127.0.0.1:{port}"
-    click.echo(f"Dashboard: {url}")
+    click.echo(f"Fleet C2 Dashboard: {url}")
     click.echo("Press Ctrl+C to stop.")
 
     webbrowser.open(url)
 
     try:
-        server.serve_forever()
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
     except KeyboardInterrupt:
         click.echo("\nStopped.")
-    finally:
-        server.server_close()

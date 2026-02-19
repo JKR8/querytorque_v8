@@ -8,132 +8,256 @@
 
 ## 1. What This Is
 
-QueryTorque for SQL is a VS Code extension that finds performance problems in SQL, explains them to the developer, and fixes them using an 8-worker AI rewriting engine — with a validation layer that proves the fix returns identical results before writing anything back.
+QueryTorque for SQL is a web application that finds performance problems in SQL, explains them to the developer, and fixes them using an 8-worker AI rewriting engine — with a validation layer that proves the fix returns identical results before writing anything back.
 
-The extension is the product surface. The Beam is the engine underneath. What makes it different from every other SQL tool:
+**Web first. VS Code second.** The web app is the fastest path to users, proof, and revenue. No marketplace review. No extension bundling. No sidecar debates. A developer pastes a query, connects their database, and sees a validated speedup in 30 seconds. That's the proof we need before building IDE integrations.
 
-1. **It actually rewrites SQL and proves it's faster.** Not advice. Not "consider adding an index." A rewritten query, validated to return identical results, benchmarked to run faster, written back to your file.
+What makes it different from every other SQL tool:
 
-2. **8 parallel AI workers attack every query from different angles.** An analyst LLM reasons about the execution plan, dispatches 8 specialist workers that each try a different optimisation strategy, a validator LLM proves semantic equivalence via column lineage, then survivors race against the original on the live database.
+1. **It actually rewrites SQL and proves it's faster.** Not advice. Not "consider adding an index." A rewritten query, validated to return identical results, benchmarked to run faster.
 
-3. **Free tier is genuinely useful.** Static anti-pattern detection (30+ patterns), EXPLAIN-driven PostgreSQL config recommendations you can copy-paste and test immediately (`SET LOCAL work_mem = '512MB'`), and 3 free beam optimisations per month.
+2. **8 parallel AI workers attack every query from different angles.** An analyst LLM reasons about the execution plan, dispatches 8 specialist workers that each try a different optimisation strategy, a validator LLM proves semantic equivalence via column lineage tracing, then survivors race against the original on the live database.
 
-4. **FinOps lives in Fleet Control.** The extension is where developers optimise queries. The web dashboard is where engineering managers see aggregate cost, track savings, and approve gainshare contracts. Two products, one pipeline.
+3. **Free tier is genuinely useful.** Static anti-pattern detection (30+ patterns), EXPLAIN-driven config recommendations you can copy-paste and test immediately (`SET LOCAL work_mem = '512MB'`), and 3 free beam optimisations per month.
+
+4. **FinOps lives in Fleet Control.** The web app is where developers optimise queries. Fleet Control is where engineering managers see aggregate cost, track savings, and approve gainshare contracts. Same platform, different views.
 
 ---
 
-## 2. Architecture: What Exists vs What We Build
+## 2. Go-to-Market Strategy: Why Web First
+
+### 2.1 Speed to Proof
+
+| | Web App | VS Code Extension |
+|--|---------|-------------------|
+| **Time to MVP** | 4-6 weeks | 10-14 weeks |
+| **Distribution** | URL. Done. | Marketplace review, bundling, signing |
+| **Iteration speed** | Deploy in minutes | Publish, review, user updates |
+| **User onboarding** | Paste SQL, click run | Install extension, configure workspace, connect DB |
+| **Analytics** | Full server-side visibility | Extension telemetry (limited, privacy-constrained) |
+| **Proof of demand** | Signups, beam runs, conversion | Install count (vanity metric) |
+| **Sharing** | Share a link to results | "Install this extension and try it" |
+| **Enterprise demo** | Open browser, paste their query | "Install VS Code, install extension, configure..." |
+
+### 2.2 What We Need to Prove
+
+Before investing in IDE integrations, we need hard answers to:
+
+1. **Do developers actually run beams when given the option?** (Usage signal)
+2. **Does the validation loop convince them the fix is safe?** (Trust signal)
+3. **Will they pay $49/mo after 3 free beams?** (Revenue signal)
+4. **Can we demo this to an enterprise buyer in under 2 minutes?** (Sales signal)
+
+A web app answers all four. A VS Code extension answers #1 only, slowly.
+
+### 2.3 Phased Rollout
+
+```
+Phase 1 (Weeks 1-6):   WEB APP MVP
+                        Paste SQL → detect patterns → connect DB → run beam → see validated fix
+                        Free tier + Pro ($49/mo) via Stripe
+
+Phase 2 (Weeks 7-12):  WEB APP GROWTH
+                        Saved queries, project workspaces, team sharing
+                        Batch upload (pg_stat_statements CSV, .sql files)
+                        Fleet Control view (aggregate costs, savings tracking)
+
+Phase 3 (Weeks 13-20): VS CODE EXTENSION
+                        File scanning, CodeLens, diagnostics, write-back
+                        Uses same Beam API as web app
+                        Pro/Team tiers via marketplace
+
+Phase 4 (Weeks 20+):   ENTERPRISE
+                        Fleet Control gainshare, CI/CD GitHub Action
+                        AWS/Snowflake Marketplace listings
+```
+
+---
+
+## 3. Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                                                                  │
-│   WHAT WE BUILD (this PRD)                                      │
+│   WHAT WE BUILD                                                 │
 │                                                                  │
-│   ┌─────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
-│   │ Static      │  │ Validation   │  │ VS Code Extension     │  │
-│   │ Analysis    │  │ Layer        │  │                       │  │
-│   │ Engine      │  │              │  │ - Health Panel        │  │
-│   │             │  │ - Execute    │  │ - Issue Tree          │  │
-│   │ - Anti-     │  │   original   │  │ - Fix Review (diff)   │  │
-│   │   pattern   │  │ - Apply fix  │  │ - CodeLens / Diag     │  │
-│   │   detection │  │ - Execute    │  │ - Query Cost Explorer │  │
-│   │ - Torque    │  │   again      │  │ - Write-back          │  │
-│   │   Score     │  │ - Compare    │  │                       │  │
-│   │ - Config    │  │   results    │  │                       │  │
-│   │   recs      │  │ - Rollback   │  │                       │  │
-│   └──────┬──────┘  └──────┬───────┘  └───────────┬───────────┘  │
-│          │                │                      │              │
-│   ┌──────┴────────────────┴──────────────────────┴───────────┐  │
-│   │  Database Connector Layer                                 │  │
-│   │  pg - mysql2 - snowflake-sdk - @databricks/sql - duckdb  │  │
-│   └──────────────────────┬───────────────────────────────────┘  │
-│                          │                                      │
-└──────────────────────────┼──────────────────────────────────────┘
-                           │
-              ┌────────────┼────────────────┐
-              │            │                │
-              ▼            ▼                ▼
-        ┌──────────┐ ┌──────────┐   ┌─────────────┐
-        │ User's   │ │ BEAM     │   │ Fleet       │
-        │ Database │ │ ENGINE   │   │ Control     │
-        │ (live)   │ │ (exists) │   │ (Phase 4)   │
-        └──────────┘ └──────────┘   └─────────────┘
+│   Phase 1: Web App                                              │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │  querytorque.com                                          │  │
+│   │                                                           │  │
+│   │  ┌──────────┐  ┌───────────┐  ┌──────────────────────┐  │  │
+│   │  │ SQL      │  │ Pattern   │  │ Results              │  │  │
+│   │  │ Editor   │  │ Detection │  │                      │  │  │
+│   │  │          │  │           │  │ - Anti-pattern list   │  │  │
+│   │  │ Paste or │  │ - 30+     │  │ - Config recs        │  │  │
+│   │  │ upload   │  │   rules   │  │ - Beam candidates    │  │  │
+│   │  │ .sql     │  │ - Torque  │  │ - Validated speedup  │  │  │
+│   │  │          │  │   Score   │  │ - Side-by-side diff   │  │  │
+│   │  └────┬─────┘  └─────┬─────┘  └──────────┬───────────┘  │  │
+│   │       └──────────────┴──────────────┬─────┘              │  │
+│   │                                     │                     │  │
+│   │   ┌─────────────────────────────────┴──────────────────┐ │  │
+│   │   │  DB Connector (server-side, secure tunnel)          │ │  │
+│   │   │  PostgreSQL · DuckDB · Snowflake · MySQL · Databricks│ │  │
+│   │   └─────────────────────────────────┬──────────────────┘ │  │
+│   └─────────────────────────────────────┼────────────────────┘  │
+│                                         │                        │
+│   Phase 3: VS Code Extension            │                        │
+│   ┌─────────────────────────────┐       │                        │
+│   │ - File scanning             │       │                        │
+│   │ - CodeLens / Diagnostics    │       │                        │
+│   │ - Fix Review (diff)         │       │                        │
+│   │ - Write-back to source      │       │                        │
+│   │ - Calls same Beam API ──────┼───────┤                        │
+│   └─────────────────────────────┘       │                        │
+│                                         │                        │
+└─────────────────────────────────────────┼────────────────────────┘
+                                          │
+                             ┌────────────┼────────────────┐
+                             │            │                │
+                             ▼            ▼                ▼
+                       ┌──────────┐ ┌──────────┐   ┌─────────────┐
+                       │ User's   │ │ BEAM     │   │ Fleet       │
+                       │ Database │ │ ENGINE   │   │ Control     │
+                       │ (live)   │ │ (exists) │   │ (Phase 2)   │
+                       └──────────┘ └──────────┘   └─────────────┘
 
-        WHAT EXISTS    WHAT EXISTS    FUTURE
+                       THEIR DB     WHAT EXISTS    PHASE 2
 ```
 
-### 2.1 What Runs Where
+### 3.1 What Runs Where
 
 | Component | Runs In | Language | Why |
 |-----------|---------|----------|-----|
-| File scanning + pattern detection | Extension | TypeScript | Must be instant, offline, no network |
-| Database connection + EXPLAIN | Extension | TypeScript (native drivers) | Direct connection, no proxy |
-| Config recommendations (SET LOCAL) | Extension | TypeScript | Rule-based, deterministic, free |
-| Beam optimisation (analyst + 8 workers + validator) | QT API | Python | 30K+ lines of battle-tested engine |
-| Result validation (checksums, benchmarks) | Extension + DB | TypeScript + SQL | Runs against user's DB directly |
-| Write-back | Extension | TypeScript | Modifies user's source files |
-| Fleet Control dashboard | Web app | React | Separate product for FinOps buyers |
+| SQL editor + pattern detection | Web app (client) | TypeScript/React | Instant, interactive |
+| Database connection + EXPLAIN | Web app (server) | Python (FastAPI) | Secure tunnel, no browser DB drivers |
+| Config recommendations (SET LOCAL) | Web app (server) | Python | Rule-based, deterministic, free |
+| Beam optimisation (analyst + 8 workers + validator) | Beam API (server) | Python | 30K+ lines of battle-tested engine |
+| Result validation (checksums, benchmarks) | Web app (server) + DB | Python + SQL | Runs against user's DB |
+| VS Code extension (Phase 3) | Extension | TypeScript | Calls same Beam API |
+| Fleet Control dashboard | Web app | React | Same platform, FinOps view |
 
-### 2.2 Why Not Pure TypeScript?
+### 3.2 Why Not Rewrite the Beam in TypeScript?
 
 The Beam engine is 30,000+ lines of Python containing 30 transform definitions with regression registries, 10 engine pathologies per database, 30 gold examples with verified speedups (up to 8,044x on PostgreSQL), 3-tier semantic validation, race validation with barrier synchronisation, EXPLAIN-first reasoning with hypothesis-driven dispatch, and per-worker SET LOCAL tuning. Rewriting this in TypeScript would take 6+ months and lose battle-tested correctness.
 
-**The extension calls the Beam via API.** The Beam does not run locally. This keeps the Beam proprietary and the extension lightweight (<15MB, no sidecar, no Docker).
+**The web app calls the Beam via internal API. The VS Code extension will call the same API.** One engine, two surfaces.
+
+### 3.3 Database Connection Strategy
+
+**Phase 1 (Web App):** Users provide connection strings. Server connects directly. All connections use SSL. Credentials encrypted at rest (AES-256), never logged, auto-deleted after session.
+
+**Phase 3 (VS Code Extension):** Direct connection from user's machine. No credentials leave the local machine.
+
+Both paths hit the same Beam API for optimisation.
 
 ---
 
-## 3. The Product Loop
+## 4. The Product Loop
 
-### 3.1 Five Steps
+### 4.1 Five Steps
 
 ```
-1. DETECT    ──→  Scan .sql files, detect patterns, show Torque Score
+1. DETECT    ──→  Paste SQL, detect patterns instantly, show Torque Score
 2. DIAGNOSE  ──→  Connect to DB, run EXPLAIN, recommend SET LOCAL configs
 3. REWRITE   ──→  8-beam AI fan-out generates optimised candidates
 4. VALIDATE  ──→  Validator LLM proves equivalence, then benchmark on live DB
-5. APPLY     ──→  Write optimised SQL back to source file
+5. DELIVER   ──→  Show validated fix with diff, copy to clipboard or download
 ```
 
 Steps 1-2 are **free**. Step 3 costs a beam credit (3 free/month, then paid). Steps 4-5 execute automatically.
 
-### 3.2 What the User Sees
+### 4.2 What the User Sees (Web App)
 
-**Free (no beam credit):**
+**Step 1 — Paste and scan (instant, free):**
 ```
-⚠ QS-002: Correlated subquery detected (line 14)
-  This pattern forces row-by-row execution. Decorrelation typically yields 2-10x speedup.
-
-  💡 Config recommendation (test for free):
-     SET LOCAL work_mem = '256MB';    -- Hash spill detected (Batches=4)
-     SET LOCAL jit = off;             -- JIT overhead 120ms on 340ms query
-
-  ⚡ Run beam optimisation (2 credits remaining this month)
+┌─────────────────────────────────────────────────────────┐
+│  QueryTorque                            [Connect DB]     │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌─ SQL Editor ──────────────────────────────────────┐  │
+│  │  SELECT o.*, u.name                               │  │
+│  │  FROM orders o, users u                           │  │
+│  │  WHERE o.user_id = u.id                           │  │
+│  │    AND EXISTS (                                    │  │
+│  │      SELECT 1 FROM returns r                      │  │
+│  │      WHERE r.order_id = o.id AND r.amount > 100   │  │
+│  │    )                                              │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                          │
+│  Torque Score: 34/100                                    │
+│                                                          │
+│  ⚠ JN-002: Comma-join syntax (line 2)                   │
+│    Implicit join hides missing predicates.               │
+│                                                          │
+│  ⚠ QS-001: Correlated subquery (line 4)                 │
+│    Row-by-row execution. Decorrelation yields 2-10x.     │
+│                                                          │
+│  [Connect database for EXPLAIN + config recs]            │
+│  [⚡ Run Beam — 3 free credits remaining]                │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**After beam (1 credit):**
+**Step 2 — After connecting DB (free):**
 ```
-✅ Beam complete: 8 candidates generated, 5 validated equivalent, 3 benchmarked
-   Best: Worker 3 (decorrelate + early_filter) — 2.45x faster
-   Original: 4,200ms → Optimised: 1,714ms (validated on 10,000 rows, checksums match)
+│  EXPLAIN Analysis                                        │
+│  ├── Seq Scan on orders (cost: 4,200ms, 847K rows)      │
+│  ├── Nested Loop (correlated subquery)                   │
+│  └── Index Scan on returns                               │
+│                                                          │
+│  💡 Config recommendations (free, test now):             │
+│     SET LOCAL work_mem = '256MB';  -- Hash spill (4x)    │
+│     SET LOCAL jit = off;           -- JIT overhead 120ms │
+│                                                          │
+│  [Copy config] [⚡ Run Beam — uses 1 credit]             │
+```
 
-   [Apply to file]  [View diff]  [View all candidates]  [Reject]
+**Step 4 — After beam (30 seconds):**
+```
+│  ✅ Beam complete                                        │
+│  8 candidates → 5 validated equivalent → 3 benchmarked  │
+│                                                          │
+│  Best: Worker 3 (decorrelate + early_filter) — 2.45x    │
+│  Original: 4,200ms → Optimised: 1,714ms                 │
+│  Validated: 10,000 rows, checksums match ✓               │
+│                                                          │
+│  ┌─ Original ────────────┬─ Optimised ────────────────┐ │
+│  │  SELECT o.*, u.name   │  WITH filtered_returns AS ( │ │
+│  │  FROM orders o, users │    SELECT DISTINCT order_id │ │
+│  │  ...                  │    FROM returns             │ │
+│  │                       │    WHERE amount > 100       │ │
+│  │                       │  )                          │ │
+│  │                       │  SELECT o.*, u.name         │ │
+│  │                       │  FROM orders o              │ │
+│  │                       │  JOIN users u ON ...        │ │
+│  │                       │  JOIN filtered_returns fr   │ │
+│  │                       │    ON fr.order_id = o.id    │ │
+│  └───────────────────────┴────────────────────────────┘ │
+│                                                          │
+│  Validator: "Decorrelation replaces correlated subquery  │
+│  with CTE JOIN. All columns trace to same sources.       │
+│  Confidence: 0.95"                                       │
+│                                                          │
+│  [Copy optimised SQL]  [Download .sql]  [View all 8]     │
+│  [Share results link]  [Save to workspace]               │
 ```
 
 ---
 
-## 4. Free Tier: Pattern Detection + Config Recommendations
+## 5. Free Tier: Pattern Detection + Config Recommendations
 
-### 4.1 Philosophy
+### 5.1 Philosophy
 
-The free tier must be **genuinely useful**. A developer should install QueryTorque, connect their database, and get actionable advice they can test in 30 seconds without paying.
+The free tier must be **genuinely useful**. A developer should visit querytorque.com, paste a query, and get actionable advice they can test in 30 seconds without paying or even signing up.
 
 Free gives you two things:
 
-1. **"We detected a pattern in this query that will likely make it run faster when fixed."** Static AST analysis, no LLM, instant.
+1. **"We detected a pattern in this query that will likely make it run faster when fixed."** Static AST analysis, no LLM, instant. No sign-up required.
 
-2. **"Here are PostgreSQL config settings you can test right now."** EXPLAIN-driven SET LOCAL recommendations. Copy-paste into psql, see the difference.
+2. **"Here are PostgreSQL config settings you can test right now."** EXPLAIN-driven SET LOCAL recommendations. Copy-paste into psql, see the difference. Requires database connection (free sign-up).
 
-### 4.2 Anti-Pattern Library (30+ Static Rules)
+### 5.2 Anti-Pattern Library (30+ Static Rules)
 
 #### Category 1: Join and Relationship Issues
 
@@ -197,7 +321,7 @@ Free gives you two things:
 | ORM-003 | Unfiltered .all() on large table | ORM fetches entire table | Memory explosion |
 | ORM-004 | Count then fetch | `.count()` then `.all()` | Redundant round-trip |
 
-### 4.3 Free Config Recommendations (PostgreSQL)
+### 5.3 Free Config Recommendations (PostgreSQL)
 
 When the user connects their database and we run EXPLAIN ANALYZE, we offer **6 deterministic config recommendations** at zero LLM cost:
 
@@ -212,7 +336,7 @@ When the user connects their database and we run EXPLAIN ANALYZE, we offer **6 d
 
 All use SET LOCAL (transaction-scoped, auto-reverts). All whitelisted against a 16-parameter safety list. Copy-paste into psql and test immediately.
 
-### 4.4 Torque Score
+### 5.4 Torque Score
 
 0-100 per query:
 
@@ -228,9 +352,9 @@ Prioritisation:
 
 ---
 
-## 5. Paid Tier: Beam Optimisation Engine
+## 6. Paid Tier: Beam Optimisation Engine
 
-### 5.1 What a Beam Does
+### 6.1 What a Beam Does
 
 A "beam" is one complete optimisation session for one SQL query.
 
@@ -264,7 +388,7 @@ A "beam" is one complete optimisation session for one SQL query.
                     ┌──────▼──────┐
                     │  VALIDATOR  │  ← 1 LLM call (Qwen 72B)
                     │  LLM        │    Proves equivalence via
-                    │  (Section 6)│    column lineage tracing
+                    │  (Section 7)│    column lineage tracing
                     └──────┬──────┘
                            │
                     ┌──────▼──────┐
@@ -283,7 +407,7 @@ A "beam" is one complete optimisation session for one SQL query.
 **LLM calls per beam:** 10 typical (1 analyst + 8 workers + 1 validator)
 **Cost per beam:** ~$0.02-0.08
 
-### 5.2 Worker Strategy Allocation
+### 6.2 Worker Strategy Allocation
 
 | Worker | Strategy Family | What It Tries | Best Verified Speedup |
 |--------|----------------|---------------|----------------------|
@@ -296,7 +420,7 @@ A "beam" is one complete optimisation session for one SQL query.
 | W7 | Config + Rewrite | SET LOCAL tuning combined with SQL rewrite | 2.22x (PG Q102) |
 | W8 | Exploration | Novel strategies, compound transforms | 4.47x (DuckDB Q9) |
 
-### 5.3 Engine Knowledge
+### 6.3 Engine Knowledge
 
 | Database | Pathologies | Gold Examples | Verified Speedups |
 |----------|------------|---------------|-------------------|
@@ -308,9 +432,9 @@ A "beam" is one complete optimisation session for one SQL query.
 
 ---
 
-## 6. The Validator LLM
+## 7. The Validator LLM
 
-### 6.1 Why We Need It
+### 7.1 Why We Need It
 
 Current validation catches most errors but has blind spots:
 
@@ -327,7 +451,7 @@ Current validation catches most errors but has blind spots:
 
 The validator catches the "sometimes" cases **before** benchmark execution. $0.003 per validation vs $0.10+ per wasted benchmark — 30x ROI.
 
-### 6.2 Architecture
+### 7.2 Architecture
 
 **Model:** Qwen-2.5-72B-Instruct (systematic verification, not creative reasoning — cheaper and faster than DeepSeek R1).
 
@@ -353,7 +477,7 @@ The validator catches the "sometimes" cases **before** benchmark execution. $0.0
 }
 ```
 
-### 6.3 Integration Point
+### 7.3 Integration Point
 
 ```
 Workers return 8 candidates
@@ -377,7 +501,7 @@ Benchmark: Row count + MD5 checksum + timing
 Result: Best candidate with proven speedup
 ```
 
-### 6.4 What the Validator Catches (Examples)
+### 7.4 What the Validator Catches (Examples)
 
 **LEFT → INNER conversion:**
 ```sql
@@ -402,9 +526,9 @@ Result: Best candidate with proven speedup
 
 ---
 
-## 7. Validation Framework (Post-Validator)
+## 8. Validation Framework (Post-Validator)
 
-### 7.1 Execution-Based Validation
+### 8.1 Execution-Based Validation
 
 After the validator LLM approves candidates:
 
@@ -416,7 +540,7 @@ After the validator LLM approves candidates:
    - Query < 2s: 5x trimmed mean (discard min/max, average remaining 3)
 5. **Classify:** >= 1.10x WIN, >= 1.05x IMPROVED, >= 0.95x NEUTRAL, < 0.95x REGRESSION (rejected)
 
-### 7.2 Safety Mechanisms
+### 8.2 Safety Mechanisms
 
 | Concern | Handling |
 |---------|---------|
@@ -427,7 +551,7 @@ After the validator LLM approves candidates:
 | Production database | Warn, recommend dev/staging |
 | Cloud credit cost | Estimate before execution, approve >$1 |
 
-### 7.3 Fix Categories
+### 8.3 Fix Categories
 
 | Category | What Changes | Validation | Auto-Apply |
 |----------|-------------|------------|------------|
@@ -440,58 +564,93 @@ After the validator LLM approves candidates:
 
 ---
 
-## 8. VS Code Extension UX
+## 9. Web App UX (Phase 1 MVP)
 
-### 8.1 Activation
+### 9.1 Pages
 
-Activates when workspace contains `.sql` files, `dbt_project.yml`, or `.querytorque.yml`. Immediate workspace scan on activation.
+**Landing / Editor (no auth required)**
+- Monaco editor with SQL syntax highlighting
+- Paste SQL → instant pattern detection + Torque Score
+- "Connect database" and "Run Beam" CTAs
+- No sign-up wall for static analysis
 
-### 8.2 Primary Views
+**Dashboard (authenticated)**
+- Saved queries with results history
+- Database connections (manage, test)
+- Beam credit balance + usage
+- Recent optimisations with speedup badges
 
-**Database Health Panel (Activity Bar)**
-- Connection status, latency, database version
-- Workspace Torque Score (0-100 gauge)
-- Issue tree: Fix Now / Fix Soon / Improve → by file/query
-- Top Expensive Queries (by $/month or execution time)
-- Quick actions: Scan Workspace, Connect to Database
+**Results Page (shareable link)**
+- Original vs optimised side-by-side diff
+- Validator reasoning
+- Benchmark results (timing, row count, checksum)
+- All 8 worker candidates (expandable)
+- EXPLAIN plan comparison (before/after tree view)
+- Copy / Download / Share actions
 
-**Issue Detail Panel**
-- Plain-language description of what's wrong
-- Current SQL with problematic section highlighted
-- EXPLAIN plan visualisation (tree view with node costs)
-- Impact: "Runs 2,400x/day, scans 847K rows, takes 4.2s. Monthly cost: ~$340."
-- Config recommendations (free, copy-paste ready)
-- "Run Beam" button (uses 1 credit)
+**Fleet Control View (Phase 2, Team tier)**
+- Aggregate Torque Score across all team queries
+- Top expensive queries by $/month
+- Savings waterfall: $ saved per week, cumulative
+- Batch upload: pg_stat_statements CSV or .sql files
 
-**Fix Review Panel (Side-by-Side)**
-- Left: Original SQL, problems in red. Right: Optimised, changes in green.
-- Explanation, confidence, speedup metrics
-- EXPLAIN plan comparison (before/after)
-- All 8 worker results (expandable)
-- Validator reasoning per candidate
-- Buttons: **[Apply to File]**, View Full Diff, Reject, Edit
+### 9.2 Key Interactions
 
-**Query Cost Explorer**
-- Most expensive queries across connected databases
-- Links to source file, shows issue count and beam availability
-- Discovery view: find problems you didn't know you had
+| Action | Auth Required | Credit Cost |
+|--------|--------------|-------------|
+| Paste SQL + pattern detection | No | Free |
+| View Torque Score | No | Free |
+| Connect database | Sign-up (free) | Free |
+| Run EXPLAIN + config recs | Sign-up (free) | Free |
+| Run Beam | Sign-up (free) | 1 credit |
+| Save query to workspace | Sign-up (free) | Free |
+| Share results link | No | Free |
+| Batch upload | Pro ($49/mo) | 1 credit/query |
+| Fleet Control view | Team ($199/seat) | N/A |
 
-### 8.3 Editor Integration
+### 9.3 Sharing and Virality
 
-- **Diagnostics:** Squiggly underlines on anti-patterns in .sql and inline SQL. Hover shows issue + cost.
+Every beam result gets a shareable URL: `querytorque.com/r/abc123`
+
+The results page shows the full before/after with speedup — no auth required to view. This is the growth loop:
+
+```
+Developer runs beam → gets 2.45x speedup → shares link in Slack
+    → teammate clicks → sees result → pastes their own query → hooks
+```
+
+---
+
+## 10. VS Code Extension (Phase 3)
+
+### 10.1 Why Phase 3
+
+The extension reuses 100% of the Beam API built for the web app. By Phase 3 we'll have:
+- Battle-tested API with rate limiting, auth, error handling
+- Proven UX patterns (what information developers actually look at)
+- Conversion data (what triggers upgrades)
+- User feedback on result presentation
+
+### 10.2 Extension Features
+
+**Activation:** Activates when workspace contains `.sql` files, `dbt_project.yml`, or `.querytorque.yml`.
+
+**Primary Views:**
+- **Database Health Panel** — Connection status, workspace Torque Score, issue tree
+- **Issue Detail Panel** — Plain-language description, EXPLAIN visualisation, config recs, "Run Beam" button
+- **Fix Review Panel** — Side-by-side diff, validator reasoning, all 8 candidates, Apply/Reject
+
+**Editor Integration:**
+- **Diagnostics:** Squiggly underlines on anti-patterns. Hover shows issue + cost.
 - **Code Actions:** Lightbulb → "Fix this query" / "Explain this plan" / "Show config recs"
 - **CodeLens:** Above each query: `Torque: 72 | $34/mo | 3 issues | Last run: 2.4s`
 - **Status bar:** Workspace score, connection indicator, credits remaining
 
-### 8.4 Command Palette
-
+**Command Palette:**
 ```
 QueryTorque: Scan Current File
 QueryTorque: Scan Workspace
 QueryTorque: Connect to Database
-QueryTorque: Disconnect
-QueryTorque: Show Query Cost Explorer
-QueryTorque: Explain Query at Cursor
 QueryTorque: Run Beam on Query at Cursor
 QueryTorque: Show Config Recommendations
 QueryTorque: Fix All Safe Issues in File
@@ -499,9 +658,13 @@ QueryTorque: Export Report (HTML / JSON)
 QueryTorque: Open Fleet Control Dashboard
 ```
 
+### 10.3 Write-Back
+
+The extension does what the web app can't — write the optimised SQL directly back to the source file. This is the killer feature that justifies the extension as a separate product surface, not just a web app wrapper.
+
 ---
 
-## 9. SQL File Detection
+## 11. SQL File Detection
 
 | Source | Detection | Parsing |
 |--------|-----------|---------|
@@ -513,7 +676,7 @@ QueryTorque: Open Fleet Control Dashboard
 | Inline SQL strings | Python, TypeScript, Go, Java, Ruby | Regex + AST detection |
 | Stored procedures | `CREATE FUNCTION/PROCEDURE` | Parse body SQL |
 
-### 9.1 ORM Fix Mapping
+### 11.1 ORM Fix Mapping
 
 When ORM-generated SQL is detected, show two fixes:
 
@@ -526,22 +689,20 @@ ORM Fix (Django):  Order.objects.filter(user__in=users).select_related('user')
 ORM Fix (Rails):   User.includes(:orders).where(id: user_ids)
 ```
 
-The SQL fix goes through the Beam and validation. The ORM fix is a suggestion shown alongside.
-
-### 9.2 dbt Integration
+### 11.2 dbt Integration
 
 First-class, not an afterthought:
 - Resolve `{{ ref() }}` and `{{ source() }}` to real table names
 - Analyse materialisation choices (table vs view vs incremental)
 - Flag unused models (not referenced downstream)
 - Validate incremental model merge keys
-- GitHub Action understands dbt project structure
+- CI/CD action understands dbt project structure
 
 ---
 
-## 10. Database Connector Layer
+## 12. Database Connector Layer
 
-### 10.1 Common Interface
+### 12.1 Common Interface
 
 ```typescript
 interface DatabaseConnector {
@@ -556,20 +717,22 @@ interface DatabaseConnector {
 }
 ```
 
-### 10.2 Connector Matrix
+### 12.2 Connector Matrix
 
 | Database | Driver | Plan Command | Stats Source | Status |
 |----------|--------|-------------|--------------|--------|
-| PostgreSQL | `pg` | `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` | `pg_stat_statements` | **Ready** |
-| DuckDB | `duckdb-node` | `EXPLAIN ANALYZE` | Built-in profiling | **Ready** |
-| Snowflake | `snowflake-sdk` | `GET_QUERY_PLAN` + query history | `QUERY_HISTORY` | **Ready** |
-| MySQL | `mysql2` | `EXPLAIN ANALYZE FORMAT=JSON` (8.0+) | `performance_schema` | Phase 3 |
-| Databricks | `@databricks/sql` | `EXPLAIN EXTENDED` | Query history API | Phase 4 |
+| PostgreSQL | `asyncpg` (web) / `pg` (ext) | `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` | `pg_stat_statements` | **Ready** |
+| DuckDB | `duckdb` (web) / `duckdb-node` (ext) | `EXPLAIN ANALYZE` | Built-in profiling | **Ready** |
+| Snowflake | `snowflake-connector-python` (web) / `snowflake-sdk` (ext) | `GET_QUERY_PLAN` + query history | `QUERY_HISTORY` | **Ready** |
+| MySQL | `aiomysql` (web) / `mysql2` (ext) | `EXPLAIN ANALYZE FORMAT=JSON` (8.0+) | `performance_schema` | Phase 2 |
+| Databricks | `databricks-sql-connector` (web) / `@databricks/sql` (ext) | `EXPLAIN EXTENDED` | Query history API | Phase 3 |
 
-### 10.3 Connection Configuration
+### 12.3 Connection Configuration
 
+**Web App:** Connection form with fields for host, port, database, username, password. SSL required. Connection string import supported.
+
+**VS Code Extension (.querytorque.yml):**
 ```yaml
-# .querytorque.yml
 connections:
   - name: main-postgres
     type: postgresql
@@ -578,41 +741,32 @@ connections:
     database: myapp_dev
     username_env: PGUSER
     password_env: PGPASSWORD
-
-  - name: analytics-snowflake
-    type: snowflake
-    account_env: SNOWFLAKE_ACCOUNT
-    warehouse: COMPUTE_WH
-    auth: externalbrowser
-
-  - name: local-duckdb
-    type: duckdb
-    path: ./data/analytics.duckdb
 ```
 
 **Security — non-negotiable:**
-- Never store credentials in config files. Environment variables, VS Code SecretStorage, or SSO only.
-- All queries the extension runs are logged locally (`.querytorque/query-log.jsonl`).
+- Web app: Credentials encrypted at rest (AES-256), auto-deleted after session expiry (24h default). Never logged.
+- Extension: Never store credentials in config files. Environment variables, VS Code SecretStorage, or SSO only.
+- All queries logged locally (extension) or per-session (web app).
 - Read-only connection mode available.
-- Connection credentials never leave the local machine. Never sent to Beam API or Fleet Control.
+- Connection credentials never sent to Beam API.
 
 ---
 
-## 11. Pricing and Tiers
+## 13. Pricing and Tiers
 
-### 11.1 Pricing Model
+### 13.1 Pricing Model
 
-Two different models for two different buyers. The extension is a developer tool sold per-seat. Fleet Control is a FinOps platform sold on value.
+Two different models for two different buyers. The web app + extension is a developer tool sold per-seat. Fleet Control is a FinOps platform sold on value.
 
 **Competitive context:** EverSQL (acquired by Aiven, 100K+ users, bootstrapped to profitability) charges $99/mo for 10 single-pass optimisations (~$10/optimisation). Our Beam runs 8 parallel workers with a validator LLM. EverSQL never did gainshare.
 
-#### Developer Tool (Extension)
+#### Developer Tool (Web App + Extension)
 
 | Tier | Price | Beams | Static Analysis | Buyer |
 |------|-------|-------|----------------|-------|
 | **Free** | $0 | **3/month** | Full (top 5 issues) | Individual dev trying it out |
 | **Pro** | **$49/mo** | **50/month** (~$1/beam) | Full (all issues) | Individual dev who's hooked |
-| **Team** | **$199/seat/mo** | **Unlimited** | Full + shared config | Team lead, 5+ devs |
+| **Team** | **$199/seat/mo** | **Unlimited** | Full + shared config + Fleet Control | Team lead, 5+ devs |
 
 #### FinOps Platform (Fleet Control)
 
@@ -622,7 +776,7 @@ Two different models for two different buyers. The extension is a developer tool
 | **Gainshare** | **10-15% of verified savings** | Orgs with large cloud spend |
 | **Hybrid** | **$1,500/mo base + 10% gainshare** | Negotiated enterprise deals |
 
-### 11.2 Feature Matrix
+### 13.2 Feature Matrix
 
 | Feature | Free | Pro ($49/mo) | Team ($199/seat) | Fleet Control |
 |---------|------|-------------|-----------------|--------------|
@@ -632,16 +786,18 @@ Two different models for two different buyers. The extension is a developer tool
 | Cost estimation | Time only | Full ($/month) | Full | Full + historical |
 | **Beam optimisations** | **3/month** | **50/month** | **Unlimited** | **Batch** |
 | Credit rollover | No | **Yes (1 month, max 100)** | N/A | N/A |
-| Validation + write-back | Yes (on beams) | Yes | Yes | Report |
-| ORM fix suggestions | Detection only | Detection + fix | Full | Full |
+| Validation + results | Yes (on beams) | Yes | Yes | Report |
+| Shareable result links | Yes | Yes | Yes (branded) | Yes |
+| Batch upload | No | **50 queries/batch** | **Unlimited** | **Unlimited** |
+| Saved workspaces | 1 | 10 | Unlimited | Org-wide |
+| VS Code extension | Free tier | Pro tier | Team tier | N/A |
 | dbt integration | File scanning | Full | Full | Full |
-| Query Cost Explorer | Top 5 | Full | Full + trending | Org-wide |
 | Export report | Watermarked | Full | Custom branding | Full + PDF |
-| Fleet Control sync | No | No | Yes | Core |
+| Fleet Control | No | No | Yes | Core |
 | CI/CD (GitHub Action) | Score gate | Score + blocking | Full | Full + compliance |
 | Gainshare tracking | No | No | No | Yes |
 
-### 11.3 Why Each Price Point Works
+### 13.3 Why Each Price Point Works
 
 **$49/mo Pro (~$1/beam).** EverSQL proved $99 for 10 optimisations works (~$10 each). We give 50 for $49 — ~$1/beam. Feels like a steal, but margins are 95%+ because a beam costs ~$0.05. Lower per-unit cost drives higher usage, which drives more data for Fleet Control.
 
@@ -652,36 +808,35 @@ Two different models for two different buyers. The extension is a developer tool
 - $200K/mo cloud bill × 20% savings × 15% gainshare = **$6,000/mo**
 - $500K/mo cloud bill × 15% savings × 12% gainshare = **$9,000/mo**
 
-### 11.4 Why 3 Free Beams
+### 13.4 Why 3 Free Beams
 
 Three beams lets a developer experience the full loop:
 1. **Beam 1:** See fan-out, validator reasoning, validated speedup. The "holy shit" moment.
 2. **Beam 2:** Confirm it's not a fluke.
 3. **Beam 3:** The query they actually care about. Where ROI calculation happens.
 
-Zero beams = never see what you're paying for. One = might be a fluke. Three = a pattern. Enough to hook, not enough to satisfy.
-
-### 11.5 Credit Rollover (Pro Only)
+### 13.5 Credit Rollover (Pro Only)
 
 Unused Pro credits carry forward 1 month, max 100 banked. Kills the "paying but not using" churn trigger.
 
-### 11.6 Conversion Triggers
+### 13.6 Conversion Triggers
 
 - **4th beam:** "3 free beams used. Upgrade to Pro for 50/month at ~$1 each."
 - **6th issue hidden:** "14 issues found. Upgrade to see all."
 - **2nd connection:** "Pro supports 3 connections."
-- **Team upsell:** "4 Pro seats? Team is unlimited beams + shared config — saves $196/mo."
+- **Batch upload:** "Upload pg_stat_statements for bulk analysis. Pro feature."
+- **Team upsell:** "4 Pro seats? Team is unlimited beams + Fleet Control — saves $196/mo."
 - **Fleet Control:** "47 fixes deployed saving $8,200/month. See the full picture."
 
 ---
 
-## 12. Fleet Control (Web Dashboard — FinOps)
+## 14. Fleet Control (Web Dashboard — FinOps)
 
-### 12.1 Scope
+### 14.1 Scope
 
-Separate web product for the buyer who never opens VS Code. Consumes extension telemetry, presents aggregate cost data, tracks gainshare.
+Same web platform, different view. Consumes beam telemetry from all team members, presents aggregate cost data, tracks gainshare. Available to Team tier and above.
 
-### 12.2 Gainshare Mechanics
+### 14.2 Gainshare Mechanics
 
 1. **Baseline:** Capture original timing (5x trimmed mean) + frequency from pg_stat_statements / query history.
 2. **Optimisation:** Beam generates validated rewrite. Checksummed equivalence.
@@ -692,7 +847,7 @@ Separate web product for the buyer who never opens VS Code. Consumes extension t
 
 All savings based on checksummed benchmarks. Customer can audit every number.
 
-### 12.3 Dashboard Features
+### 14.3 Dashboard Features
 
 - Org-wide Torque Score trending
 - Cost leaderboard: top 50 queries by monthly cost
@@ -701,7 +856,7 @@ All savings based on checksummed benchmarks. Customer can audit every number.
 - Compliance: % of PRs passing Torque Score gates
 - Batch processor: upload SQL or pg_stat_statements export for bulk beam
 
-### 12.4 Privacy
+### 14.4 Privacy
 
 | Data | Sent? |
 |------|-------|
@@ -709,24 +864,34 @@ All savings based on checksummed benchmarks. Customer can audit every number.
 | Issue counts by severity | Yes |
 | Cost estimates (anonymised hash) | Yes |
 | Fix acceptance rate | Yes |
-| **Actual SQL queries** | **Never** |
+| **Actual SQL queries** | **Only with explicit opt-in (Team tier)** |
 | **Query results/data** | **Never** |
 | **Credentials** | **Never** |
 | **Source code** | **Never** |
 
 ---
 
-## 13. Distribution and Marketplace Strategy
+## 15. Distribution and Marketplace Strategy
 
-### 13.1 Developer Acquisition (Free to List)
+### 15.1 Phase 1-2: Web-First Acquisition
 
 | Channel | What | Buyer |
 |---------|------|-------|
-| **VS Code Marketplace** | Free extension, Pro/Team via Stripe | Individual developers |
+| **querytorque.com** | Web app, free tier, Pro/Team via Stripe | Individual developers |
+| **Product Hunt** | Launch day — "8 AI workers race to optimise your SQL" | Early adopters |
+| **Hacker News** | Show HN — share a real 1,465x speedup result | Developer community |
+| **Twitter/X + LinkedIn** | Shareable result links from user beams | Organic virality |
+| **Dev.to / blog** | "We made PostgreSQL 8,044x faster" case studies | SEO + credibility |
+
+### 15.2 Phase 3: IDE Distribution
+
+| Channel | What | Buyer |
+|---------|------|-------|
+| **VS Code Marketplace** | Free extension, Pro/Team via existing account | Developers who want IDE integration |
 | **Open VSX** | Same extension | Cursor, Gitpod, Windsurf users |
 | **GitHub Marketplace** | GitHub Action | CI/CD teams |
 
-### 13.2 Enterprise Revenue (Marketplace Fees)
+### 15.3 Phase 4: Enterprise Revenue
 
 | Channel | What | Fee | Why |
 |---------|------|-----|-----|
@@ -734,15 +899,15 @@ All savings based on checksummed benchmarks. Customer can audit every number.
 | **Snowflake Marketplace** | Fleet Control (Native App) | Rev share | Embedded in Snowflake console, 330K+ customers |
 | **Databricks Marketplace** | Fleet Control integration | Rev share | Partner ecosystem |
 
-**The extension is not sold through enterprise marketplaces.** A $49/mo extension doesn't belong on AWS Marketplace where minimum viable listing is $50K+ ACV. Fleet Control at $50-150K ACV with gainshare is what enterprise marketplaces are for.
+**The web app / extension is not sold through enterprise marketplaces.** A $49/mo tool doesn't belong on AWS Marketplace where minimum viable listing is $50K+ ACV. Fleet Control at $50-150K ACV with gainshare is what enterprise marketplaces are for.
 
-The extension is the acquisition engine. Developers adopt bottom-up. When 8 developers on a team use it, the manager asks "can I see this across everyone?" That's Fleet Control. That's the $75K contract.
+The web app is the acquisition engine. Developers adopt bottom-up. When 8 developers on a team use it, the manager asks "can I see this across everyone?" That's Fleet Control. That's the $75K contract.
 
 ---
 
-## 14. CLI and CI/CD
+## 16. CLI and CI/CD
 
-### 14.1 CLI
+### 16.1 CLI
 
 ```bash
 npx @querytorque/cli scan ./src/queries/ --db postgresql
@@ -752,7 +917,7 @@ npx @querytorque/cli scan ./dbt_project/ --project-type dbt
 npx @querytorque/cli scan ./src/ --format sarif --output results.sarif
 ```
 
-### 14.2 GitHub Action
+### 16.2 GitHub Action
 
 ```yaml
 name: QueryTorque SQL Check
@@ -775,59 +940,87 @@ jobs:
 
 ---
 
-## 15. Technical Requirements
+## 17. Technical Requirements
 
-| Requirement | Minimum |
-|-------------|---------|
-| VS Code | 1.85+ (or Cursor, Windsurf) |
-| Node.js | 18+ |
-| OS | Windows 10+, macOS 12+, Linux |
-| Python | Not required on client (Beam runs server-side) |
-| Network | Required for beams and Fleet Control only. Static analysis works offline. |
-| Extension size | <15MB. No sidecar. |
+| Requirement | Web App | VS Code Extension |
+|-------------|---------|-------------------|
+| Browser | Chrome/Firefox/Safari/Edge (latest 2 versions) | N/A |
+| VS Code | N/A | 1.85+ (or Cursor, Windsurf) |
+| Node.js | N/A | 18+ |
+| OS | Any (browser) | Windows 10+, macOS 12+, Linux |
+| Python | Not required on client | Not required on client |
+| Network | Required for beams. Static analysis works offline (extension only). | Required for beams. Static analysis works offline. |
+| Extension size | N/A | <15MB. No sidecar. |
 
 ---
 
-## 16. Risks
+## 18. Risks
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
+| Web app DB connections (security perception) | High | SSL-only, credentials encrypted at rest, auto-delete, read-only mode, audit log. Extension mode for paranoid users. |
 | Validator LLM false negatives | Medium | Execution-based validation is the final gate. Validator is additive. |
 | SQL parser dialect variations | High | Start with PostgreSQL (best tooling). Add incrementally. False negatives > false positives. |
 | Copilot competition | High | Copilot generates SQL but doesn't validate against live DB, track cost, or prove speedup. Closed loop is the moat. |
-| Credential sensitivity | Medium | Extension-local only. Never sent to API. Read-only mode. Query logging for audit. |
 | Beam API latency | Medium | 8 workers parallel. ~15-30s total. Progress spinner with per-worker status. |
-| Enterprise security blocks telemetry | Low | Fleet Control opt-in, Team tier only. Core extension fully offline. |
+| Nobody wants to paste SQL into a web app | Medium | Shareable results prove value fast. Extension (Phase 3) for daily workflow. pg_stat_statements batch upload for discovery. |
+| Enterprise security blocks web connections | Low | VS Code extension (Phase 3) runs connections locally. Fleet Control opt-in. |
 | Qwen model availability | Low | Validator prompt is model-agnostic. Can swap to any instruction model. |
 
 ---
 
-## 17. Success Metrics
+## 19. Success Metrics
 
-| Phase | Metric | Target |
-|-------|--------|--------|
-| 1 (Extension MVP) | Marketplace installs | >500 |
-| 1 | Beams executed | >200 |
-| 1 | Validation pass rate | >70% |
-| 2 (Free Tier) | Weekly active users | >500 |
-| 2 | Config recommendations generated | >2,000 |
-| 2 | Free→Pro conversion | >5% |
-| 3 (Growth) | Pro + Team subscribers | >100 |
-| 3 | Total MRR | >$15K |
-| 4 (Enterprise) | Fleet Control active orgs | >10 |
-| 4 | Gainshare revenue | >$5K/month |
+### Phase 1: Web App MVP (Weeks 1-6)
+
+| Metric | Target | Why It Matters |
+|--------|--------|----------------|
+| Signups | >200 | Demand signal |
+| Beams executed | >100 | Core loop works |
+| Validation pass rate | >70% | Engine quality |
+| Free→Pro conversion | >3% | Willingness to pay |
+| Shareable links created | >50 | Virality signal |
+
+### Phase 2: Web App Growth (Weeks 7-12)
+
+| Metric | Target | Why It Matters |
+|--------|--------|----------------|
+| Weekly active users | >500 | Retention |
+| Config recommendations generated | >2,000 | Free tier engagement |
+| Batch uploads | >50 | Enterprise interest |
+| Pro subscribers | >25 | Revenue |
+| Monthly recurring revenue | >$1,200 | Business viability |
+
+### Phase 3: VS Code Extension (Weeks 13-20)
+
+| Metric | Target | Why It Matters |
+|--------|--------|----------------|
+| Marketplace installs | >500 | IDE adoption |
+| Extension beam runs | >200 | Extension adds value beyond web |
+| Write-backs accepted | >50% | Trust in automated fixes |
+| Team tier subscribers | >5 | Enterprise pipeline |
+
+### Phase 4: Enterprise (Weeks 20+)
+
+| Metric | Target | Why It Matters |
+|--------|--------|----------------|
+| Fleet Control active orgs | >10 | Enterprise product-market fit |
+| Gainshare revenue | >$5K/month | Business model validation |
+| Total MRR | >$15K | Sustainability |
 
 ---
 
-## 18. Open Decisions
+## 20. Open Decisions
 
 | Decision | Options | Decide By |
 |----------|---------|-----------|
-| SQL parser | `node-sql-parser` (broad) vs `libpg-query` WASM (PG-first) | Week 1 |
-| Bundle all DB drivers or lazy-load? | ~8MB bundle vs ~2MB + on-demand | Week 1 |
+| Web app framework | Next.js (SSR + API routes) vs FastAPI + React SPA | Week 1 |
+| SQL editor component | Monaco (VS Code parity) vs CodeMirror 6 (lighter) | Week 1 |
+| SQL parser (web) | `sqlglot` (Python, server-side) vs `node-sql-parser` (client-side) | Week 1 |
+| DB connection security | Direct connect + encryption vs SSH tunnel option | Week 2 |
 | Validator model | Qwen-72B vs Qwen-32B vs DeepSeek-V3 | Week 2 |
-| Beam API | Local Python server vs hosted api.querytorque.com vs both | Week 4 |
-| Credential storage | VS Code SecretStorage vs env-only | Week 2 |
+| Auth | Clerk vs Auth0 vs Supabase Auth | Week 1 |
+| Beam API | Internal Python service vs separate hosted API | Week 3 |
 | Free beams | 3/month vs 1/month vs 5/month | Week 8 (A/B test) |
 
 ---
@@ -866,4 +1059,4 @@ Real, validated speedups from benchmark corpus (5x trimmed mean or 3x3 validatio
 
 ---
 
-*The Beam is the engine. The extension is the car. The static analysis tells you where to drive. The validation proves you arrived.*
+*The Beam is the engine. The web app is the fastest car to the starting line. Prove it works, then build the garage.*

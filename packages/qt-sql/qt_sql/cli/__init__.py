@@ -34,7 +34,7 @@ def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
 @click.argument("benchmark")
 @click.option("--port", default=8765, show_default=True, help="HTTP port for the dashboard.")
 def dashboard(benchmark: str, port: int) -> None:
-    """Open fleet dashboard in browser."""
+    """Open Fleet C2 dashboard in browser."""
     from ._common import resolve_benchmark
     from .dashboard_cmd import serve_dashboard
 
