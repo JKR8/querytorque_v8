@@ -73,32 +73,52 @@ def _update_job_status(
     asyncio.run(_update())
 
 
+def _is_private_ip(addr) -> bool:
+    """Check if an ipaddress object points to a non-public network."""
+    return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+
+
 def _validate_callback_url(url: str) -> bool:
-    """Reject callback URLs that target internal networks (SSRF prevention)."""
+    """Reject callback URLs that target internal networks (SSRF prevention).
+
+    Resolves the hostname via DNS and checks every resolved address against
+    private/loopback/link-local/reserved ranges. This defeats alternate IP
+    notations (127.1, 2130706433, 0x7f000001) and DNS rebinding to RFC-1918.
+    """
     from urllib.parse import urlparse
     import ipaddress
+    import socket
 
     parsed = urlparse(url)
     if parsed.scheme not in ("https",):
-        # Only allow HTTPS callbacks
         return False
     hostname = parsed.hostname or ""
     if not hostname:
         return False
-    # Block obviously-internal hostnames
-    _blocked = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"}
-    if hostname in _blocked:
+
+    # Block well-known internal hostnames before DNS
+    _blocked_hosts = {"localhost", "metadata.google.internal"}
+    if hostname.lower() in _blocked_hosts:
         return False
-    # Block RFC-1918 / link-local / loopback IPs
+
+    # Resolve hostname and check ALL returned addresses
     try:
-        addr = ipaddress.ip_address(hostname)
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            return False
-    except ValueError:
-        pass  # Not an IP literal — allow DNS names through
-    # Block common cloud metadata endpoints
-    if hostname.startswith("169.254."):
+        infos = socket.getaddrinfo(hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False  # unresolvable → reject
+
+    if not infos:
         return False
+
+    for family, _type, _proto, _canonname, sockaddr in infos:
+        ip_str = sockaddr[0]
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False  # unparseable resolved IP → reject
+        if _is_private_ip(addr):
+            return False
+
     return True
 
 

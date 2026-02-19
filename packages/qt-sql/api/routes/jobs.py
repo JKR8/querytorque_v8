@@ -83,13 +83,17 @@ async def submit_job(
     Creates an AnalysisJob row and dispatches a Celery task.
     Returns immediately — poll GET /api/v1/jobs/{id} for results.
     """
-    # Resolve DSN
-    dsn = request.dsn
-    if request.credential_id and not dsn:
+    # Validate credential_id format up front (before any branching)
+    cred_uuid = None
+    if request.credential_id:
         try:
             cred_uuid = uuid.UUID(request.credential_id)
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid credential_id format")
+
+    # Resolve DSN
+    dsn = request.dsn
+    if cred_uuid and not dsn:
         stmt = select(Credential).where(
             Credential.id == cred_uuid,
             Credential.org_id == user.org_id,
@@ -112,7 +116,7 @@ async def submit_job(
         file_type="sql",
         file_hash=hashlib.sha256(request.sql.encode()).hexdigest(),
         input_sql=request.sql,
-        credential_id=uuid.UUID(request.credential_id) if request.credential_id else None,
+        credential_id=cred_uuid,
         job_type="optimize",
         status="pending",
         callback_url=request.callback_url,
