@@ -73,8 +73,40 @@ def _update_job_status(
     asyncio.run(_update())
 
 
+def _validate_callback_url(url: str) -> bool:
+    """Reject callback URLs that target internal networks (SSRF prevention)."""
+    from urllib.parse import urlparse
+    import ipaddress
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https",):
+        # Only allow HTTPS callbacks
+        return False
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return False
+    # Block obviously-internal hostnames
+    _blocked = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"}
+    if hostname in _blocked:
+        return False
+    # Block RFC-1918 / link-local / loopback IPs
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            return False
+    except ValueError:
+        pass  # Not an IP literal — allow DNS names through
+    # Block common cloud metadata endpoints
+    if hostname.startswith("169.254."):
+        return False
+    return True
+
+
 def _send_callback(callback_url: str, payload: dict) -> None:
     """POST results to customer webhook callback URL."""
+    if not _validate_callback_url(callback_url):
+        logger.warning("Callback URL rejected (SSRF check): %s", callback_url)
+        return
     try:
         resp = httpx.post(callback_url, json=payload, timeout=30)
         logger.info("Callback to %s: %s", callback_url, resp.status_code)

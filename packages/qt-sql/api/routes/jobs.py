@@ -86,8 +86,12 @@ async def submit_job(
     # Resolve DSN
     dsn = request.dsn
     if request.credential_id and not dsn:
+        try:
+            cred_uuid = uuid.UUID(request.credential_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid credential_id format")
         stmt = select(Credential).where(
-            Credential.id == uuid.UUID(request.credential_id),
+            Credential.id == cred_uuid,
             Credential.org_id == user.org_id,
             Credential.is_active == True,
         )
@@ -164,19 +168,25 @@ async def submit_batch(
             detail=f"Maximum {max_files} files per batch (got {len(files)})",
         )
 
-    # Resolve DSN once
-    dsn = None
-    if credential_id:
-        stmt = select(Credential).where(
-            Credential.id == uuid.UUID(credential_id),
-            Credential.org_id == user.org_id,
-            Credential.is_active == True,
-        )
-        result = await session.execute(stmt)
-        cred = result.scalar_one_or_none()
-        if not cred:
-            raise HTTPException(status_code=404, detail="Credential not found")
-        dsn = decrypt_dsn(cred.encrypted_dsn)
+    # Resolve DSN once — batch requires a credential
+    if not credential_id:
+        raise HTTPException(status_code=400, detail="credential_id is required for batch submissions")
+
+    try:
+        cred_uuid = uuid.UUID(credential_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid credential_id format")
+
+    stmt = select(Credential).where(
+        Credential.id == cred_uuid,
+        Credential.org_id == user.org_id,
+        Credential.is_active == True,
+    )
+    result = await session.execute(stmt)
+    cred = result.scalar_one_or_none()
+    if not cred:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    dsn = decrypt_dsn(cred.encrypted_dsn)
 
     jobs = []
     for f in files:
@@ -195,16 +205,15 @@ async def submit_batch(
         session.add(job)
         await session.flush()
 
-        if dsn:
-            from qt_sql.tasks import optimize_query
-            task = optimize_query.delay(
-                job_id=str(job.id),
-                sql=content,
-                dsn=dsn,
-                engine=engine,
-                org_id=str(user.org_id),
-            )
-            job.celery_task_id = task.id
+        from qt_sql.tasks import optimize_query
+        task = optimize_query.delay(
+            job_id=str(job.id),
+            sql=content,
+            dsn=dsn,
+            engine=engine,
+            org_id=str(user.org_id),
+        )
+        job.celery_task_id = task.id
 
         jobs.append(job)
 
@@ -275,8 +284,13 @@ async def get_job(
     session: AsyncSession = Depends(get_async_session),
 ):
     """Get job status and result."""
+    try:
+        job_uuid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid job ID format")
+
     stmt = select(AnalysisJob).where(
-        AnalysisJob.id == uuid.UUID(job_id),
+        AnalysisJob.id == job_uuid,
         AnalysisJob.org_id == user.org_id,
     )
     result = await session.execute(stmt)
@@ -307,8 +321,13 @@ async def get_job_results(
     session: AsyncSession = Depends(get_async_session),
 ):
     """Download optimization results for a completed job."""
+    try:
+        job_uuid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid job ID format")
+
     stmt = select(AnalysisJob).where(
-        AnalysisJob.id == uuid.UUID(job_id),
+        AnalysisJob.id == job_uuid,
         AnalysisJob.org_id == user.org_id,
     )
     result = await session.execute(stmt)

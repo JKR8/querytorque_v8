@@ -114,8 +114,13 @@ async def test_credential(
     session: AsyncSession = Depends(get_async_session),
 ):
     """Test database connectivity for a stored credential."""
+    try:
+        cred_uuid = uuid.UUID(credential_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid credential ID format")
+
     stmt = select(Credential).where(
-        Credential.id == uuid.UUID(credential_id),
+        Credential.id == cred_uuid,
         Credential.org_id == user.org_id,
     )
     result = await session.execute(stmt)
@@ -156,8 +161,13 @@ async def delete_credential(
     session: AsyncSession = Depends(get_async_session),
 ):
     """Delete a stored credential."""
+    try:
+        cred_uuid = uuid.UUID(credential_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid credential ID format")
+
     stmt = select(Credential).where(
-        Credential.id == uuid.UUID(credential_id),
+        Credential.id == cred_uuid,
         Credential.org_id == user.org_id,
     )
     result = await session.execute(stmt)

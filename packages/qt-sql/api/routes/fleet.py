@@ -58,8 +58,13 @@ async def create_survey(
     and produces triage results.
     """
     # Verify credential
+    try:
+        cred_uuid = uuid.UUID(request.credential_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid credential_id format")
+
     stmt = select(Credential).where(
-        Credential.id == uuid.UUID(request.credential_id),
+        Credential.id == cred_uuid,
         Credential.org_id == user.org_id,
         Credential.is_active == True,
     )
@@ -136,8 +141,13 @@ async def get_survey(
     session: AsyncSession = Depends(get_async_session),
 ):
     """Get survey status and triage results."""
+    try:
+        survey_uuid = uuid.UUID(survey_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid survey ID format")
+
     stmt = select(FleetSurvey).where(
-        FleetSurvey.id == uuid.UUID(survey_id),
+        FleetSurvey.id == survey_uuid,
         FleetSurvey.org_id == user.org_id,
     )
     result = await session.execute(stmt)

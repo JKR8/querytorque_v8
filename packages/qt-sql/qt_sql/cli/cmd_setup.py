@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import click
@@ -77,13 +78,13 @@ def setup(
         click.echo(f"  Connected: {len(tables)} tables found")
     except Exception as e:
         print_error(f"Connection failed: {e}")
-        # Clean up
-        bench_dir.rmdir()
+        # Clean up entire tree (queries/ may already exist)
+        shutil.rmtree(bench_dir, ignore_errors=True)
         raise SystemExit(1)
 
     # Build config.json
     config = {
-        "benchmark_name": name,
+        "benchmark": name,
         "engine": engine,
         "db_path_or_dsn": dsn,
         "benchmark_dsn": dsn,
