@@ -74,6 +74,18 @@ class Settings(BaseSettings):
     snowflake_database: str = ""
     snowflake_schema: str = ""
 
+    # Vault (Fernet encryption for customer credentials)
+    vault_key: str = ""
+
+    # GitHub App (Tier C PR bot)
+    github_app_id: str = ""
+    github_app_private_key: str = ""
+    github_webhook_secret: str = ""
+
+    # Celery
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/1"
+
     class Config:
         env_prefix = "QT_"
         env_file = ".env"

@@ -89,15 +89,15 @@ class FleetOrchestrator:
 
     def __init__(
         self,
-        pipeline: "Pipeline",
-        benchmark_dir: Path,
+        pipeline: Optional["Pipeline"] = None,
+        benchmark_dir: Optional[Path] = None,
         dashboard: Optional["FleetDashboard"] = None,
         event_bus: Optional[Any] = None,
         triage_gate: Optional[threading.Event] = None,
         pause_event: Optional[threading.Event] = None,
     ) -> None:
         self.pipeline = pipeline
-        self.benchmark_dir = benchmark_dir
+        self.benchmark_dir = benchmark_dir or (Path(pipeline.benchmark_dir) if pipeline else None)
         self.dashboard = dashboard
         self.event_bus = event_bus
         self.triage_gate = triage_gate
@@ -390,6 +390,65 @@ class FleetOrchestrator:
         return self.triage_gate.wait(timeout=timeout)
 
     # ── Phase 0: Survey ────────────────────────────────────────────────
+
+    def survey_from_dsn(
+        self,
+        dsn: str,
+        engine: str = "postgresql",
+        limit: int = 50,
+    ) -> List["TriageResult"]:
+        """Survey a customer database for slow queries without a benchmark_dir.
+
+        Connects to the live database and discovers slow queries from
+        pg_stat_statements (PostgreSQL) or system views. Creates an
+        ephemeral Pipeline and runs survey + triage.
+
+        Args:
+            dsn: Database connection string
+            engine: Database engine
+            limit: Max queries to discover
+
+        Returns:
+            List of TriageResult sorted by priority
+        """
+        from ..pipeline import Pipeline
+
+        # Create pipeline from DSN if not already set
+        if self.pipeline is None:
+            self.pipeline = Pipeline.from_dsn(dsn=dsn, engine=engine)
+            self.benchmark_dir = self.pipeline.benchmark_dir
+
+        # Discover slow queries from pg_stat_statements
+        queries: Dict[str, str] = {}
+        try:
+            from ..execution.factory import create_executor_from_dsn
+
+            with create_executor_from_dsn(dsn) as executor:
+                if engine in ("postgresql", "postgres"):
+                    rows = executor.execute(
+                        "SELECT queryid::text, query, mean_exec_time "
+                        "FROM pg_stat_statements "
+                        "WHERE mean_exec_time > 100 "
+                        "ORDER BY mean_exec_time DESC "
+                        f"LIMIT {limit}"
+                    )
+                    for row in rows:
+                        qid = f"q_{row['queryid']}"
+                        queries[qid] = row["query"]
+                else:
+                    logger.warning("survey_from_dsn: unsupported engine %s", engine)
+        except Exception as e:
+            logger.error("Failed to discover queries from %s: %s", engine, e)
+
+        if not queries:
+            return []
+
+        # Run standard survey + triage
+        query_ids = list(queries.keys())
+        survey_results = self.survey(query_ids, queries)
+        triage_results = self.triage(query_ids, queries, survey_results)
+
+        return triage_results
 
     def survey(
         self,

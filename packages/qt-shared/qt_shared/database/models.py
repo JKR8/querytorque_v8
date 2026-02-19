@@ -11,11 +11,13 @@ from sqlalchemy import (
     String,
     Text,
     Integer,
+    Float,
     Boolean,
     DateTime,
     ForeignKey,
     Index,
     JSON,
+    LargeBinary,
     TypeDecorator,
     CHAR,
 )
@@ -219,6 +221,11 @@ class AnalysisJob(Base):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    org_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        GUID(),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     file_type: Mapped[str] = mapped_column(String(20), nullable=False, default="sql")
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     file_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -235,15 +242,36 @@ class AnalysisJob(Base):
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # SaaS extensions
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    job_type: Mapped[str] = mapped_column(String(50), default="optimize")
+    input_sql: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    credential_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        GUID(),
+        ForeignKey("credentials.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    llm_tokens_prompt: Mapped[int] = mapped_column(Integer, default=0)
+    llm_tokens_completion: Mapped[int] = mapped_column(Integer, default=0)
+    llm_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    best_speedup: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    best_sql: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    outcome: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    callback_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
+
     # Relationships
     workspace: Mapped[Optional["Workspace"]] = relationship("Workspace", back_populates="analysis_jobs")
     user: Mapped[Optional["User"]] = relationship("User", back_populates="analysis_jobs")
+    credential: Mapped[Optional["Credential"]] = relationship("Credential")
+    llm_usage: Mapped[List["LLMUsage"]] = relationship("LLMUsage", back_populates="job")
 
     __table_args__ = (
         Index("idx_jobs_workspace", "workspace_id"),
         Index("idx_jobs_user", "user_id"),
+        Index("idx_jobs_org", "org_id"),
         Index("idx_jobs_status", "status"),
         Index("idx_jobs_created", "created_at"),
+        Index("idx_jobs_celery", "celery_task_id"),
     )
 
     def __repr__(self) -> str:
@@ -338,3 +366,179 @@ class APIUsage(Base):
 
     def __repr__(self) -> str:
         return f"<APIUsage(id={self.id}, endpoint='{self.endpoint}')>"
+
+
+class Credential(Base):
+    """Encrypted database credential storage (Fernet AES-128-CBC).
+
+    Stores customer database connection strings encrypted at rest.
+    Scoped to an organization — only org members can use/list credentials.
+    """
+
+    __tablename__ = "credentials"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    engine: Mapped[str] = mapped_column(String(50), nullable=False)
+    encrypted_dsn: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_tested_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization")
+
+    __table_args__ = (
+        Index("idx_credentials_org", "org_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Credential(id={self.id}, name='{self.name}', engine='{self.engine}')>"
+
+
+class LLMUsage(Base):
+    """Per-LLM-call token tracking for billing and cost attribution."""
+
+    __tablename__ = "llm_usage"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    job_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        GUID(),
+        ForeignKey("analysis_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    cache_hit_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    call_type: Mapped[str] = mapped_column(String(50), default="optimize")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization")
+    job: Mapped[Optional["AnalysisJob"]] = relationship("AnalysisJob", back_populates="llm_usage")
+
+    __table_args__ = (
+        Index("idx_llm_usage_org_date", "org_id", "created_at"),
+        Index("idx_llm_usage_job", "job_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<LLMUsage(id={self.id}, provider='{self.provider}', tokens={self.total_tokens})>"
+
+
+class FleetSurvey(Base):
+    """Fleet survey state persistence — survives page reloads."""
+
+    __tablename__ = "fleet_surveys"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    credential_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        GUID(),
+        ForeignKey("credentials.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    triage_json: Mapped[Optional[dict]] = mapped_column(FlexibleJSON, nullable=True)
+    results_json: Mapped[Optional[dict]] = mapped_column(FlexibleJSON, nullable=True)
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization")
+
+    __table_args__ = (
+        Index("idx_fleet_surveys_org", "org_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<FleetSurvey(id={self.id}, status='{self.status}')>"
+
+
+class GitHubInstallation(Base):
+    """GitHub App installation for PR bot (Tier C)."""
+
+    __tablename__ = "github_installations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    installation_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    encrypted_access_token: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    repos: Mapped[Optional[dict]] = mapped_column(FlexibleJSON, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization")
+
+    __table_args__ = (
+        Index("idx_github_installations_org", "org_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GitHubInstallation(id={self.id}, installation_id={self.installation_id})>"

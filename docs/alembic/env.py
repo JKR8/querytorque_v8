@@ -15,13 +15,17 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 # Import all models from qt_shared to ensure they're registered with Base
 from qt_shared.database import Base
-from qt_shared.database.models import (
+from qt_shared.database.models import (  # noqa: F401
     Organization,
     User,
     Workspace,
     AnalysisJob,
     Subscription,
     APIUsage,
+    Credential,
+    LLMUsage,
+    FleetSurvey,
+    GitHubInstallation,
 )
 
 # Alembic Config object for access to .ini file values

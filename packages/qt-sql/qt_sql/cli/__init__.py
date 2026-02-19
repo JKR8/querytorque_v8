@@ -62,6 +62,7 @@ def _register_commands() -> None:
     from .cmd_analyze import analyze
     from .cmd_promote import promote
     from .cmd_playbook import playbook
+    from .cmd_setup import setup
 
     main.add_command(status)
     main.add_command(prepare)
@@ -82,6 +83,7 @@ def _register_commands() -> None:
     main.add_command(analyze)
     main.add_command(promote)
     main.add_command(playbook)
+    main.add_command(setup)
 
 
 _register_commands()

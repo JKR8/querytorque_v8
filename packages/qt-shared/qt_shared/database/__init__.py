@@ -10,6 +10,10 @@ from .models import (
     AnalysisJob,
     Subscription,
     APIUsage,
+    Credential,
+    LLMUsage,
+    FleetSurvey,
+    GitHubInstallation,
 )
 from .connection import (
     get_database_url,
@@ -32,6 +36,10 @@ __all__ = [
     "AnalysisJob",
     "Subscription",
     "APIUsage",
+    "Credential",
+    "LLMUsage",
+    "FleetSurvey",
+    "GitHubInstallation",
     # Connection
     "get_database_url",
     "get_engine",

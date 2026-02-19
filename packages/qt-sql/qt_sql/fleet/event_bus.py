@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -43,13 +44,31 @@ class FleetEvent:
 
 
 class EventBus:
-    """Thread-safe event queue for orchestrator → WebSocket server communication."""
+    """Thread-safe event queue for orchestrator → WebSocket server communication.
+
+    Supports optional multi-tenant routing: events emitted with an ``org_id``
+    keyword are placed on that org's dedicated queue. Events without ``org_id``
+    go to the global queue (backward-compatible with the local CLI dashboard).
+    """
 
     def __init__(self, maxsize: int = 1000) -> None:
         self._queue: queue.Queue[FleetEvent] = queue.Queue(maxsize=maxsize)
+        # Multi-tenant: per-org queues (created lazily)
+        self._org_queues: Dict[str, queue.Queue[FleetEvent]] = {}
+        self._org_queues_lock = threading.Lock()
+
+    def _get_org_queue(self, org_id: str) -> queue.Queue[FleetEvent]:
+        with self._org_queues_lock:
+            if org_id not in self._org_queues:
+                self._org_queues[org_id] = queue.Queue(maxsize=1000)
+            return self._org_queues[org_id]
 
     def emit(self, event_type: EventType | str, **data: Any) -> None:
-        """Non-blocking put. Drop event if queue is full."""
+        """Non-blocking put. Drop event if queue is full.
+
+        If ``org_id`` is in data, the event is routed to that org's queue.
+        Otherwise it goes to the global queue.
+        """
         normalized_type: EventType | str = event_type
         if isinstance(event_type, str):
             try:
@@ -57,10 +76,21 @@ class EventBus:
             except ValueError:
                 normalized_type = event_type
         event = FleetEvent(type=normalized_type, data=data)
+
+        org_id = data.get("org_id")
+        target_queue = self._get_org_queue(org_id) if org_id else self._queue
+
         try:
-            self._queue.put_nowait(event)
+            target_queue.put_nowait(event)
         except queue.Full:
             pass  # drop oldest-unread event rather than block
+
+        # Also put on global queue for backward compatibility (local CLI)
+        if org_id:
+            try:
+                self._queue.put_nowait(event)
+            except queue.Full:
+                pass
 
     def get_event(self, timeout: float = 0.1) -> Optional[FleetEvent]:
         """Blocking get with timeout. Returns None if no event available."""
@@ -69,12 +99,17 @@ class EventBus:
         except queue.Empty:
             return None
 
-    def drain(self, max_events: int = 50) -> List[FleetEvent]:
-        """Non-blocking batch get. Returns up to max_events."""
+    def drain(self, max_events: int = 50, org_id: Optional[str] = None) -> List[FleetEvent]:
+        """Non-blocking batch get. Returns up to max_events.
+
+        If ``org_id`` is given, drains from that org's queue only.
+        Otherwise drains the global queue.
+        """
+        target_queue = self._get_org_queue(org_id) if org_id else self._queue
         events: List[FleetEvent] = []
         for _ in range(max_events):
             try:
-                events.append(self._queue.get_nowait())
+                events.append(target_queue.get_nowait())
             except queue.Empty:
                 break
         return events

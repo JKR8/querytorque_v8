@@ -2,19 +2,19 @@
 
 FastAPI backend for the qt_sql optimization pipeline.
 
-Routes:
+Routes (legacy, kept for backwards compatibility):
     POST /api/sql/optimize  - Run 7-phase optimization pipeline
     POST /api/sql/validate  - Validate candidate SQL equivalence + timing
     GET  /health            - Health check
+    Database session routes under /api/database/
 
-    Database session routes:
-    POST   /api/database/connect/duckdb       - Upload fixture file
-    POST   /api/database/connect/duckdb/quick - Connect via server path
-    GET    /api/database/status/{session_id}   - Connection status
-    DELETE /api/database/disconnect/{session_id} - Disconnect
-    POST   /api/database/execute/{session_id}  - Execute SQL
-    POST   /api/database/explain/{session_id}  - EXPLAIN plan
-    GET    /api/database/schema/{session_id}   - Schema info
+SaaS API (v1):
+    /api/v1/jobs/*          - Job submission and management
+    /api/v1/auth/*          - Authentication and API keys
+    /api/v1/billing/*       - Stripe billing
+    /api/v1/credentials/*   - Credential management
+    /api/v1/fleet/*         - Fleet dashboard
+    /api/v1/github/*        - GitHub PR bot
 """
 
 import logging
@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 # Create FastAPI app
 app = FastAPI(
     title="QueryTorque SQL API",
-    description="SQL optimization pipeline API — 7-phase LLM-powered query rewriting",
-    version="2.0.0",
+    description="SQL optimization pipeline API — LLM-powered query rewriting with SaaS tier support",
+    version="3.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",
@@ -56,6 +56,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── SaaS API Routers (v1) ─────────────────────────────────────────
+# Import and register routers — each is self-contained with its own prefix
+try:
+    from api.routes.jobs import router as jobs_router
+    from api.routes.auth import router as auth_router
+    from api.routes.billing import router as billing_router
+    from api.routes.credentials import router as credentials_router
+    from api.routes.fleet import router as fleet_router
+    from api.routes.github import router as github_router
+
+    app.include_router(jobs_router)
+    app.include_router(auth_router)
+    app.include_router(billing_router)
+    app.include_router(credentials_router)
+    app.include_router(fleet_router)
+    app.include_router(github_router)
+    logger.info("SaaS API routers loaded (v1)")
+except ImportError as e:
+    logger.warning("SaaS routers not available (missing deps): %s", e)
 
 
 # ============================================
@@ -114,6 +134,8 @@ class HealthResponse(BaseModel):
     version: str
     llm_configured: bool
     llm_provider: Optional[str] = None
+    auth_enabled: bool = False
+    saas_mode: bool = False
 
 
 # ============================================
@@ -127,9 +149,11 @@ async def health_check():
     settings = get_settings()
     return HealthResponse(
         status="ok",
-        version="2.0.0",
+        version="3.0.0",
         llm_configured=settings.has_llm_provider,
         llm_provider=settings.llm_provider if settings.llm_provider else None,
+        auth_enabled=settings.auth_enabled,
+        saas_mode=settings.saas_mode,
     )
 
 

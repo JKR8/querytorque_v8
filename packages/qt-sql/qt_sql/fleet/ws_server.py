@@ -1,4 +1,9 @@
-"""WebSocket server for Fleet C2 live dashboard."""
+"""WebSocket server for Fleet C2 live dashboard.
+
+CRITICAL: Do NOT add ``from __future__ import annotations`` to this file.
+It breaks FastAPI WebSocket dependency injection (type annotation becomes a
+string and FastAPI treats it as a required query parameter → HTTP 403).
+"""
 
 import asyncio
 import json
@@ -7,6 +12,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -15,8 +21,23 @@ from .event_bus import EventBus, EventType
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class WSClient:
+    """Tracks a connected WebSocket client with its org context."""
+
+    ws: Any  # fastapi.WebSocket — kept as Any to avoid import-time issues
+    org_id: str = "default"  # from JWT or "default" for local CLI mode
+    user_id: str = "anonymous"
+
+
 class FleetWSServer:
-    """Serves fleet_c2.html with live data injection + WebSocket for real-time updates."""
+    """Serves fleet_c2.html with live data injection + WebSocket for real-time updates.
+
+    Supports two modes:
+    - **Local CLI mode** (auth_enabled=False): accepts all connections, single tenant.
+    - **SaaS mode** (auth_enabled=True): validates JWT on WS handshake,
+      routes events only to the connecting org's clients.
+    """
 
     def __init__(
         self,
@@ -36,7 +57,7 @@ class FleetWSServer:
         self.benchmark_dir = benchmark_dir
         self.run_context: Dict[str, Any] = dict(run_context or {})
         self.runtime_config: Dict[str, Any] = {}
-        self._clients: List[Any] = []  # WebSocket connections
+        self._clients: List[WSClient] = []
 
     @staticmethod
     def _cfg_flag_enabled(value: Any, default: bool = False) -> bool:
@@ -66,6 +87,41 @@ class FleetWSServer:
         # URI user:pass@host form
         masked = re.sub(r"://([^:/\s]+):([^@/\s]+)@", r"://\1:***@", masked)
         return masked
+
+    async def _authenticate_ws(self, websocket) -> Optional[WSClient]:
+        """Authenticate a WebSocket connection via JWT query param or first message.
+
+        In SaaS mode (auth_enabled=True), requires a valid JWT token passed as
+        ``?token=<jwt>`` query parameter. Returns None on auth failure.
+
+        In local CLI mode (auth_enabled=False), always succeeds with defaults.
+        """
+        from qt_shared.config import get_settings
+        settings = get_settings()
+
+        if not settings.auth_enabled:
+            return WSClient(ws=websocket, org_id="default", user_id="anonymous")
+
+        # Extract token from query string: ws://host/ws?token=<jwt>
+        token = websocket.query_params.get("token", "")
+        if not token:
+            logger.warning("Fleet C2: WS connection rejected — no token")
+            return None
+
+        try:
+            from qt_shared.auth.middleware import verify_jwt_token
+            user_ctx = await verify_jwt_token(token)
+            if not user_ctx:
+                logger.warning("Fleet C2: WS connection rejected — invalid JWT")
+                return None
+            return WSClient(
+                ws=websocket,
+                org_id=user_ctx.org_id or "default",
+                user_id=user_ctx.user_id,
+            )
+        except Exception as exc:
+            logger.warning("Fleet C2: WS auth error: %s", exc)
+            return None
 
     def get_app(self):
         """Build and return a FastAPI app."""
@@ -101,9 +157,18 @@ class FleetWSServer:
 
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
+            # Authenticate before accepting
+            client = await self._authenticate_ws(websocket)
+            if client is None:
+                await websocket.close(code=4001, reason="Authentication required")
+                return
+
             await websocket.accept()
-            self._clients.append(websocket)
-            logger.info("Fleet C2: WebSocket client connected")
+            self._clients.append(client)
+            logger.info(
+                "Fleet C2: WebSocket client connected (org=%s, user=%s)",
+                client.org_id, client.user_id,
+            )
             self.event_bus.emit(
                 EventType.EVENT_LOG,
                 scope="fleet",
@@ -144,11 +209,12 @@ class FleetWSServer:
                     msg = await websocket.receive_json()
                     self._handle_client_message(msg)
             except WebSocketDisconnect:
-                self._clients.remove(websocket)
+                if client in self._clients:
+                    self._clients.remove(client)
                 logger.info("Fleet C2: WebSocket client disconnected")
             except Exception:
-                if websocket in self._clients:
-                    self._clients.remove(websocket)
+                if client in self._clients:
+                    self._clients.remove(client)
 
         @app.on_event("startup")
         async def start_broadcast():
@@ -586,7 +652,11 @@ class FleetWSServer:
         t.start()
 
     async def _broadcast_loop(self) -> None:
-        """Async loop consuming EventBus and broadcasting to all WebSocket clients."""
+        """Async loop consuming EventBus and broadcasting to WebSocket clients.
+
+        In multi-tenant mode, events with ``org_id`` in data are routed only
+        to clients belonging to that org. Events without ``org_id`` go to all.
+        """
         while True:
             events = self.event_bus.drain(max_events=20)
             if not events:
@@ -599,15 +669,21 @@ class FleetWSServer:
                 except Exception:
                     logger.exception("Fleet C2: failed to serialize event: %r", event)
                     continue
-                dead: List[Any] = []
-                for ws in self._clients:
+
+                event_org = event.data.get("org_id")
+
+                dead: List[WSClient] = []
+                for client in self._clients:
+                    # Route: if event has org_id, only send to matching clients
+                    if event_org and client.org_id != "default" and client.org_id != event_org:
+                        continue
                     try:
-                        await ws.send_text(payload)
+                        await client.ws.send_text(payload)
                     except Exception:
-                        dead.append(ws)
-                for ws in dead:
-                    if ws in self._clients:
-                        self._clients.remove(ws)
+                        dead.append(client)
+                for client in dead:
+                    if client in self._clients:
+                        self._clients.remove(client)
 
 
 def run_server_in_thread(

@@ -42,13 +42,73 @@ logger = logging.getLogger(__name__)
 class Pipeline:
     """QueryTorque pipeline with tag-based example retrieval, LLM rewrite, and validation."""
 
+    @classmethod
+    def from_dsn(
+        cls,
+        dsn: str,
+        engine: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> "Pipeline":
+        """Create a Pipeline from just a DSN — no pre-existing benchmark_dir needed.
+
+        SaaS customers don't have benchmark directories. This factory creates an
+        ephemeral temp directory with a generated config.json, then constructs a
+        Pipeline pointed at it.
+
+        Args:
+            dsn: Database connection string (postgres://... or duckdb:///path)
+            engine: Database engine override. Auto-detected from DSN if not given.
+            provider: LLM provider override
+            model: LLM model override
+
+        Returns:
+            Pipeline instance with ephemeral benchmark_dir
+        """
+        # Auto-detect engine from DSN
+        if engine is None:
+            dsn_lower = dsn.lower()
+            if dsn_lower.startswith(("postgres://", "postgresql://")):
+                engine = "postgresql"
+            elif dsn_lower.startswith("duckdb://") or dsn_lower.endswith(".duckdb"):
+                engine = "duckdb"
+            elif "snowflake" in dsn_lower:
+                engine = "snowflake"
+            else:
+                engine = "postgresql"
+
+        # Create ephemeral benchmark dir with minimal config
+        tmp_dir = Path(tempfile.mkdtemp(prefix="qt_saas_"))
+        (tmp_dir / "queries").mkdir(exist_ok=True)
+        (tmp_dir / "explains").mkdir(exist_ok=True)
+
+        config = {
+            "benchmark": "saas_ephemeral",
+            "engine": engine,
+            "db_path_or_dsn": dsn,
+            "benchmark_dsn": dsn,
+            "scale_factor": "unknown",
+            "explain_policy": "analyze",
+            "workers_state_0": 4,
+            "workers_state_n": 1,
+            "promote_threshold": 1.05,
+        }
+        (tmp_dir / "config.json").write_text(json.dumps(config, indent=2))
+
+        return cls(
+            benchmark_dir=tmp_dir,
+            provider=provider,
+            model=model,
+        )
+
     def __init__(
         self,
-        benchmark_dir: str | Path,
+        benchmark_dir: Optional[str | Path] = None,
         provider: Optional[str] = None,
         model: Optional[str] = None,
         analyze_fn=None,
         use_analyst: bool = False,
+        dsn: Optional[str] = None,
     ):
         """Load config.json from benchmark dir, initialize components.
 
@@ -59,7 +119,18 @@ class Pipeline:
             analyze_fn: Optional custom LLM function
             use_analyst: If True, runs LLM analyst before rewrite (costs 1 extra
                          API call per query). Use for stubborn queries only.
+            dsn: Shortcut — if benchmark_dir is not given, creates an ephemeral
+                 Pipeline from this DSN via from_dsn(). Kept for backwards
+                 compatibility with api/main.py's Pipeline(dsn=dsn) pattern.
         """
+        if benchmark_dir is None and dsn is not None:
+            tmp = Pipeline.from_dsn(dsn=dsn, provider=provider, model=model)
+            self.__dict__.update(tmp.__dict__)
+            return
+
+        if benchmark_dir is None:
+            raise ValueError("Either benchmark_dir or dsn must be provided")
+
         self.benchmark_dir = Path(benchmark_dir)
         self.config = BenchmarkConfig.from_file(
             self.benchmark_dir / "config.json"
